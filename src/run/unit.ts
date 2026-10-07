@@ -271,21 +271,6 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	if (forceEscalate) log(pc.dim(`  routed to ${o.config.models.escalate.id}: Jev rates this unit hard (${Math.round((route!.difficultyConfidence ?? 0) * 100)}%)`));
 	let lastGateText = "";
 	while (attemptNo < maxTotal) {
-		// Budget per unit is a hard cap enforced by code: spend so far (all roles, all attempts) vs config.
-		const spent = (o.ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM attempts WHERE unit_id = ?").get(o.unitId) as { c: number }).c;
-		if (spent >= o.config.run.budgetUsdPerUnit) {
-			const q = await ask({
-				point: "budget",
-				facts: `${o.unitId} has spent $${spent.toFixed(2)} over ${attemptNo} implement attempt(s); the per-unit cap run.budgetUsdPerUnit is $${o.config.run.budgetUsdPerUnit}. The unit is quarantined now.${lastGateText ? `\nLast gate failure:\n${lastGateText.slice(0, 800)}` : ""}`,
-				options: [
-					{ value: "raise", facts: "raise run.budgetUsdPerUnit in bigrefactor.config.json, then br requeue the unit" },
-					{ value: "leave", facts: "leave the unit quarantined for a human to port" },
-				],
-			});
-			o.ledger.transitionUnit(o.unitId, "quarantined", `budget cap $${o.config.run.budgetUsdPerUnit} reached ($${spent.toFixed(2)})`);
-			log(pc.red(`  budget cap reached ($${spent.toFixed(2)}); quarantined, question #${q}`));
-			break;
-		}
 		attemptNo++;
 		const role = forceEscalate || attemptNo > maxImpl ? "escalate" : "implement";
 		const modelRole = o.config.models[role];

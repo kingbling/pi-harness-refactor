@@ -284,9 +284,11 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 					if (m.usage) {
 						usage.input += m.usage.input ?? 0;
 						usage.output += m.usage.output ?? 0;
-						usage.cost += m.usage.cost?.total ?? 0;
-						progress.agentCost(agentId, m.usage.cost?.total ?? 0);
-						recordSpend(m.usage.cost?.total ?? 0, `session: ${roleName} ${agentLabel}`, role.id);
+						// the Codex login is a subscription: its list price is not money spent (budgets count paid calls only)
+						const paid = m.provider === CODEX_PROVIDER ? 0 : (m.usage.cost?.total ?? 0);
+						usage.cost += paid;
+						progress.agentCost(agentId, paid);
+						recordSpend(paid, `session: ${roleName} ${agentLabel}`, `${m.provider ?? "openrouter"}/${m.model ?? role.id}`);
 					}
 					if (m.stopReason === "error" || m.errorMessage) error = m.errorMessage ?? "assistant message ended with error";
 					record({ type: "assistant", text, stopReason: m.stopReason, error: m.errorMessage, usage: m.usage, toolCalls: (m.content ?? []).filter((c: any) => c.type === "toolCall").map((c: any) => ({ name: c.name, args: c.arguments })) });

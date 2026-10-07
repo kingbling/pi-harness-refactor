@@ -515,7 +515,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		if (!dayCapHit && spentToday() >= config.run.budgetUsdPerDay) {
 			dayCapHit = true;
-			await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Spent today: $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
+			await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Paid model spend today (OpenRouter fallback; the Codex subscription is not counted): $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
 			log(pc.red(`daily budget cap reached ($${spentToday().toFixed(2)}); not starting new units`));
 		}
 		if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");

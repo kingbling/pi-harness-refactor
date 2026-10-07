@@ -1,6 +1,5 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { recordSpend } from "../spend.ts";
 import type { ChatRequest, ChatResponse } from "./types.ts";
 
 /**
@@ -63,9 +62,8 @@ export async function codexChat(req: ChatRequest): Promise<ChatResponse | undefi
 			const required = (req.schema["required"] as string[] | undefined) ?? [];
 			if (!json || typeof json !== "object" || required.some((k) => !(k in (json as object)))) return undefined;
 		}
-		const cost = res.usage?.cost?.total ?? 0;
-		recordSpend(cost, "api: chat (codex)", `${CODEX_PROVIDER}/${model.id}`);
-		return { text, json, usage: { inputTokens: res.usage?.input ?? 0, outputTokens: res.usage?.output ?? 0, costUsd: cost, model: `${CODEX_PROVIDER}/${model.id}`, tierServed: "codex" } };
+		// subscription: no money spent, so no spend entry and no cost (budgets count paid calls only)
+		return { text, json, usage: { inputTokens: res.usage?.input ?? 0, outputTokens: res.usage?.output ?? 0, costUsd: 0, model: `${CODEX_PROVIDER}/${model.id}`, tierServed: "codex" } };
 	} catch {
 		return undefined;
 	}
