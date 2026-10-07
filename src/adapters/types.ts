@@ -133,11 +133,12 @@ export interface FrameworkConcern {
 	verdict: "platform" | "port" | "drop" | "review";
 }
 
-/** A third-party library the legacy app depends on, with the adapter's suggested successor (if known). */
+/** A third-party library the legacy app depends on. Adapters only list it; verdict and successor come from decisions. */
 export interface ExternalDep {
 	name: string;
 	version?: string;
 	dev?: boolean;
+	/** The decided replacement (set from decisions, never by an adapter). */
 	successor?: string;
 	verdict: "platform" | "replace" | "drop" | "review";
 	note?: string;
@@ -222,7 +223,7 @@ export interface SourceAdapter {
 	/** Drop any cached framework profile so the next call re-reads `.bigrefactor/framework-profile.json` (after `br profile`). */
 	reloadProfile?(): void;
 	validateProfile?(json: unknown): string[];
-	/** Declared third-party dependencies (composer/pip/gems…) with successor suggestions. */
+	/** Declared third-party dependencies (composer/pip/gems…), as listed by the manifest: verdict "review", no successor. */
 	externalDeps?(root: string): ExternalDep[];
 	/**
 	 * How truth is established on the OLD code: the tester writes `scriptName` in the unit's truth dir, the
