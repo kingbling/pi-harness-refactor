@@ -59,7 +59,7 @@ export function loadBrief(root: string | undefined): string {
 }
 
 /** Facts the code can gather about the source repo, stack-neutral: tree with counts, readme, ledger stats. */
-export function repoFacts(config: Config, ledger?: Ledger): string {
+export function repoFacts(config: Config, ledger?: Ledger, root?: string): string {
 	const src = config.source.path;
 	const skip = new Set(["node_modules", "vendor", ".git", "dist", "build", ".idea", ".vscode"]);
 	const count = (dir: string, depth: number): number => {
@@ -87,7 +87,9 @@ export function repoFacts(config: Config, ledger?: Ledger): string {
 	};
 	walk(src, "", 0);
 	const readme = safeList(src).find((n) => /^readme(\.md|\.txt)?$/i.test(n));
-	const L = [`stack: ${config.source.stack}${config.source.framework ? ` / ${config.source.framework}` : ""}`, `targets: ${config.target.stacks.join(" + ")}`, `data stores: ${config.db.from.join(", ") || "none found"} → ${config.db.to ?? "unset"}`];
+	const L = [`stack: ${config.source.stack}${config.source.framework ? ` / ${config.source.framework}` : ""}`, `targets: ${config.target.stacks.join(" + ")}`, `data stores: ${config.db.from.map((s) => `${s}${config.db.stores[s] ? ` (${config.db.stores[s]})` : ""}`).join(", ") || "none found"}; target engine ${config.db.to ?? "unset"}; strategy ${config.db.strategy}`];
+	const answers = root && existsSync(join(root, ".bigrefactor", "decisions.json")) ? (JSON.parse(readFileSync(join(root, ".bigrefactor", "decisions.json"), "utf8")) as { answers?: Record<string, { answer: string }> }).answers ?? {} : {};
+	if (Object.keys(answers).length) L.push(`owner decisions already made (binding facts): ${Object.entries(answers).map(([k, a]) => `${k}=${a.answer}`).join("; ")}`);
 	if (ledger) {
 		const kinds = ledger.db.prepare("SELECT json_extract(meta,'$.kind') k, COUNT(*) n FROM units GROUP BY k ORDER BY n DESC LIMIT 12").all() as Array<{ k: string | null; n: number }>;
 		if (kinds.length) L.push(`units by kind: ${kinds.map((k) => `${k.k ?? "?"}=${k.n}`).join(", ")}`);
@@ -108,7 +110,7 @@ export async function repoBrief(d: AskDeps, opts: { force?: boolean } = {}): Pro
 	if (!d.root) throw new Error("repoBrief needs the workspace root");
 	const existing = loadBrief(d.root);
 	if (existing && !opts.force) return { brief: existing, costUsd: 0 };
-	const facts = repoFacts(d.config, d.ledger);
+	const facts = repoFacts(d.config, d.ledger, d.root);
 	if (!d.client) return { brief: facts, costUsd: 0 };
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -116,7 +118,7 @@ export async function repoBrief(d: AskDeps, opts: { force?: boolean } = {}): Pro
 		tier: role.tier as "default" | "flex" | "priority",
 		effort: "medium",
 		messages: [
-			{ role: "system", content: "You are a senior engineer reading a legacy codebase before migrating it. Write what a migration lead must know, concretely, from the facts given. No generic advice." },
+			{ role: "system", content: "You are a senior engineer reading a legacy codebase before migrating it. Write what a migration lead must know, concretely, from the facts given. Owner decisions are settled facts: state them, never contradict them. No generic advice." },
 			{ role: "user", content: `Facts gathered from the legacy repo:\n\n${facts}\n\nWrite a brief (≤ 60 lines, markdown) with sections: What the app does; Feature areas (name → directories); UI (how pages are produced, client-side code); Data (stores, how they are accessed); Cross-cutting (auth, i18n, jobs, files, external APIs); Odd patterns a migration will trip over; Open points a human must decide.` },
 		],
 	});

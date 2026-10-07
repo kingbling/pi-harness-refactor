@@ -99,6 +99,20 @@ describe("OpenRouter client", () => {
 		expect(r.text).toBe("ok");
 		expect(n).toBe(3);
 	}, 30_000);
+	it("a 200 response carrying an error body (flex unavailable) falls back to the default tier instead of returning empty text", async () => {
+		const { OpenRouterClient } = await import("../src/models/openrouter.ts");
+		const tiers: unknown[] = [];
+		const fetchImpl = (async (_u: string, init: RequestInit) => {
+			const body = JSON.parse(String(init.body));
+			tiers.push(body.service_tier ?? "default");
+			if (body.service_tier === "flex") return new Response("\n  \n" + JSON.stringify({ error: { message: "Flex processing is temporarily unavailable.", code: 502 } }), { status: 200 });
+			return new Response(JSON.stringify({ choices: [{ message: { content: "{\"a\":1}" } }], usage: { cost: 0.01 } }), { status: 200 });
+		}) as unknown as typeof fetch;
+		const c = new OpenRouterClient({ apiKey: "test", fetchImpl, flexRetries: 1 } as any);
+		const r = await c.chat({ model: "m", tier: "flex", schema: { type: "object" }, messages: [{ role: "user", content: "x" }] });
+		expect(r.json).toEqual({ a: 1 });
+		expect(tiers).toEqual(["flex", "flex", "default"]);
+	}, 60_000);
 });
 
 describe("advice hygiene", () => {

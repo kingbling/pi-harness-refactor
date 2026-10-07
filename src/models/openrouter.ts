@@ -77,9 +77,12 @@ export class OpenRouterClient implements ModelClient {
 			} catch {
 				json = { raw: text };
 			}
-			if (!res.ok) {
-				const err: any = new Error(`OpenRouter ${res.status}: ${json?.error?.message ?? text.slice(0, 300)}`);
-				err.status = res.status;
+			// OpenRouter reports some provider failures as HTTP 200 with an `error` body (e.g. flex capacity: code 502);
+			// treat them like the HTTP error they stand for, so tier fallback and retries apply.
+			const status = !res.ok ? res.status : json?.error ? Number(json.error.code) || 502 : 0;
+			if (status) {
+				const err: any = new Error(`OpenRouter ${status}: ${json?.error?.message ?? text.slice(0, 300)}`);
+				err.status = status;
 				err.body = json;
 				throw err;
 			}
@@ -127,7 +130,7 @@ export class OpenRouterClient implements ModelClient {
 			} catch (e: any) {
 				attempt++;
 				const status = e?.status as number | undefined;
-				const capacity = status === 429 || status === 503 || status === 529;
+				const capacity = status === 429 || status === 502 || status === 503 || status === 529;
 				if (capacity && tier === "flex") {
 					flexFails++;
 					if (flexFails > this.flexRetries) {
