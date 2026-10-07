@@ -266,8 +266,8 @@ export function run(cmd: string, args: string[], cwd: string, timeoutMs: number)
 /** Files changed in the project, without generated paths (`ignored`: dependencies, build output; symlinked in worktrees). */
 export function changedFiles(dir: string, ignored: string[] = []): string[] {
 	try {
-		const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8" }).trim();
-		const out = execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8" });
+		const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+		const out = execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 		return out
 			.split("\n")
 			.filter(Boolean)
@@ -282,7 +282,7 @@ export function changedFiles(dir: string, ignored: string[] = []): string[] {
 /** Files git already tracks under `dir` (relative to `dir`). */
 export function trackedFiles(dir: string): string[] {
 	try {
-		return execFileSync("git", ["ls-files", "--", "."], { cwd: dir, encoding: "utf8" }).split("\n").filter(Boolean);
+		return execFileSync("git", ["ls-files", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean);
 	} catch {
 		return [];
 	}

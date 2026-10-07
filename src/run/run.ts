@@ -612,7 +612,7 @@ function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _
 	const main = config.target.git.branch;
 	const before = headOf(config.target.path);
 	gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
-	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8" }).trim();
+	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 	if (staged) execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`], { stdio: "pipe" });
 	try {
 		execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", main], { stdio: "pipe" });
@@ -640,7 +640,7 @@ export function worktreeDir(root: string, unitId: string): string {
 /** Repo-level excludes shared by all worktrees. A generator's `.gitignore` line `dir/` does not match our symlinked dir. */
 export function excludeFromGit(repo: string, patterns: string[]): void {
 	try {
-		const gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+		const gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 		const abs = gitDir.startsWith("/") ? gitDir : join(repo, gitDir);
 		const file = join(abs, "info", "exclude");
 		mkdirSync(join(abs, "info"), { recursive: true });

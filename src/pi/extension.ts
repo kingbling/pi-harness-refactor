@@ -20,6 +20,7 @@ import { lanes, parseLanesArgs } from "../run/lanes.ts";
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { setOutputHost } from "../proc.ts";
 import { QuestionCard, type CardAnswer, type CardQuestion } from "./question-card.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -540,6 +541,8 @@ const PRESETS: Record<string, string> = {
 };
 
 export default function (pi: ExtensionAPI) {
+	// Pi draws the whole terminal: no command may write to it directly (see proc.ts outputCaptured)
+	setOutputHost("ui");
 	/** Human-facing output: a transcript entry outside the model's context, or the console without a UI. */
 	const show = (ctx: ExtensionCommandContext, title: string, text: string) => {
 		if (ctx.hasUI) pi.appendEntry<BrEntry>("br", { title, text });

@@ -10,9 +10,20 @@ import { progress } from "./progress.ts";
  * Silence is reported, not guessed at: every 30 s without output the feed says the command still runs (slow
  * downloads look like a hang); after `idleKillMs` (default 15 min) without any output it is stopped as hung.
  */
+/**
+ * Who owns the terminal. "ui": a full-screen host (Pi) draws it; a child process that writes to it directly breaks
+ * the screen (a PHP warning over the status bar), so every command's output is captured, whatever the tool.
+ * "terminal": the plain CLI; untracked output may stream through as before.
+ */
+let outputHost: "terminal" | "ui" = "terminal";
+export function setOutputHost(host: "terminal" | "ui"): void {
+	outputHost = host;
+}
+export const outputCaptured = () => outputHost === "ui" || progress.running;
+
 export function runCommand(cmd: string, args: string[], opts: { cwd: string; env?: NodeJS.ProcessEnv; idleKillMs?: number }): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const tracked = progress.running;
+		const tracked = outputCaptured();
 		// stdin is never the terminal: generators must not prompt (CI=1 makes most of them non-interactive too).
 		// Detached process group so a stop kills the whole tree (pnpm → create-x → dev server), not just the wrapper.
 		const child = spawn(cmd, args, { cwd: opts.cwd, detached: true, env: { ...process.env, ...(opts.env ?? {}), CI: "1", ...(tracked ? { FORCE_COLOR: "0" } : {}) }, stdio: tracked ? ["ignore", "pipe", "pipe"] : ["ignore", "inherit", "inherit"] });

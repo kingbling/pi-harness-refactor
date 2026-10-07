@@ -141,8 +141,8 @@ export async function simulateL1(): Promise<void> {
 	const commits = (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE json_extract(meta,'$.commit') IS NOT NULL").get() as { n: number }).n;
 	const worktrees = existsSync(join(ws, ".bigrefactor", "worktrees")) ? readdirSync(join(ws, ".bigrefactor", "worktrees")).length : 0;
 	if (worktrees) problems.push(`${worktrees} worktree(s) left behind`);
-	const mainLog = execFileSync("git", ["-C", target, "log", "--oneline"], { encoding: "utf8" }).trim().split("\n");
-	if (execFileSync("git", ["-C", target, "ls-files", "node_modules"], { encoding: "utf8" }).trim()) problems.push("node_modules got committed");
+	const mainLog = execFileSync("git", ["-C", target, "log", "--oneline"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n");
+	if (execFileSync("git", ["-C", target, "ls-files", "node_modules"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()) problems.push("node_modules got committed");
 	if (!statSync(join(target, "node_modules")).isDirectory() || lstatSync(join(target, "node_modules")).isSymbolicLink()) problems.push("node_modules in the main checkout is no longer a real directory");
 	if (mainLog.length < 6) problems.push(`expected ≥6 commits on migration/main, got ${mainLog.length}`);
 	if (commits < 5) problems.push(`expected ≥5 commits, got ${commits}`);

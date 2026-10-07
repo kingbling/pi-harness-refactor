@@ -500,7 +500,7 @@ function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAda
 	if (!existsSync(script)) return { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
 	try {
 		const { cmd, args } = source.truth.run(config.source.path, script);
-		const out = execFileSync(cmd, args, { cwd: config.source.path, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024 });
+		const out = execFileSync(cmd, args, { cwd: config.source.path, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 		const start = out.indexOf("[");
 		const cases = JSON.parse(out.slice(start)) as Array<{ symbol: string; inputs: unknown; expected: unknown }>;
 		if (!Array.isArray(cases) || !cases.length) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases` };
@@ -508,7 +508,8 @@ function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAda
 		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
 		return { ok: true, cases };
 	} catch (e: any) {
-		return { ok: false, cases: [], error: (e?.stdout || e?.stderr || e?.message || String(e)).toString().slice(-800) };
+		// stderr carries PHP's own message ("Failed opening required …"); it is captured, never printed into the UI
+		return { ok: false, cases: [], error: [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || String(e?.message ?? e) };
 	}
 }
 
