@@ -41,6 +41,11 @@ describe("model judgments", () => {
 		// init asks nothing beyond the folders; the stack is provisional
 		await init(["--source", join(d, "legacy"), "--stack", "php", "--target", join(d, "migrated"), "--to", "nestjs", "--yes", "--no-docs", "--no-llm"], { root: d, prompter: quiet });
 		expect(client.calls.length).toBe(0);
+		// --to answers the dimensions directly (no combined "targets" answer)
+		const answers = JSON.parse(readFileSync(join(d, ".bigrefactor", "decisions.json"), "utf8")).answers;
+		expect(answers["target:server"].answer).toBe("nestjs");
+		expect(answers["target:ui"].answer).toBe("none");
+		expect(answers["targets"]).toBeUndefined();
 		const { loadConfig } = await import("../src/config.ts");
 		const config = loadConfig(join(d, "bigrefactor.config.json")).config;
 		const ledger = new Ledger(join(d, ".bigrefactor", "ledger.sqlite"));

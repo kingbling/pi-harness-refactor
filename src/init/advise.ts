@@ -21,7 +21,6 @@ import { planFrameworks } from "../inventory/frameworks.ts";
  * recommendation with its reason and confidence; a human (or `--yes`) still decides. Static tables in the
  * adapters remain only as the offline fallback (`--no-llm`).
  */
-const ADVICE_VERSION = 3;
 
 export interface Advice {
 	value: string;
@@ -31,15 +30,7 @@ export interface Advice {
 }
 
 export async function advise(config: Config, root: string, ledger: Ledger, client: ModelClient, source: SourceAdapter, targets: TargetAdapter[], log: (l: string) => void = console.log): Promise<{ libraries: number; classes: number; decisions: number; costUsd: number; implied: Array<{ id: string; value: string; reason: string }> }> {
-	const file = loadDecisions(root) as ReturnType<typeof loadDecisions> & { advice?: Record<string, Advice>; adviceVersion?: number; adviceBasis?: string };
-	// advice from before v2 was anchored on code defaults and provisional targets: judged again (answers stay)
-	if ((file.adviceVersion ?? 1) < ADVICE_VERSION) {
-		delete file.advice;
-		delete file.phrased;
-		delete file.discovered;
-		delete file.dimensions;
-		file.adviceVersion = ADVICE_VERSION;
-	}
+	const file = loadDecisions(root) as ReturnType<typeof loadDecisions> & { advice?: Record<string, Advice>; adviceBasis?: string };
 	// advice sees the code's points, not an earlier phrasing
 	const advice: Record<string, Advice> = (file.advice ??= {});
 	// library successors, class verdicts and stack choices are judged FOR a target: when the stacks or the
@@ -56,12 +47,12 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 	const plan = planFrameworks(ledger, source, targets, config.source.path, file, config.target.choices);
 	// only what the owner decided is stated as fact; provisional config values would anchor every judgment
 	const decidedChoices = Object.fromEntries(Object.entries(file.answers).filter(([k]) => k.startsWith("stack:")).map(([k, a]) => [k.slice(6), a.answer]));
-	const decidedTargets = file.answers["targets"]?.answer.replace(/\+/g, " + ") ?? (file.answers["target:server"] ? config.target.stacks.join(" + ") : undefined);
+	const decidedTargets = file.answers["target:server"] ? config.target.stacks.join(" + ") : undefined;
 	const { phraseDecisions, discoverDecisions, pointHash, repoBrief } = await import("../jev/ask.ts");
 	const deps = { ledger, config, root, client };
 	// every judgment below reads the repo: the brief is what a model understood of it. Until the target is
 	// decided, a brief written while provisional targets were stated as fact is rewritten.
-	const targetsOpen = !file.answers["targets"] && !file.answers["target:server"] && !file.dimensions;
+	const targetsOpen = !file.answers["target:server"] && !file.dimensions;
 	const b = await repoBrief(deps, { force: targetsOpen });
 	cost += b.costUsd;
 	const { surveySource, adviseStack, adviseDimensions } = await import("./survey.ts");
@@ -167,7 +158,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 		// one call per decision, each with its own evidence: a combined call reports the minimum confidence of
 		// unrelated questions and gives Jev no specific facts (observed 0.05–0.14 that way)
 		// no code default goes in (it would anchor the pick); targets only once the owner decided them
-		const repo = { stack: config.source.stack, framework: config.source.framework, db: { from: config.db.from }, targets: file.answers["targets"]?.answer ?? "not decided yet", brief: b.brief.slice(0, 3000) };
+		const repo = { stack: config.source.stack, framework: config.source.framework, db: { from: config.db.from }, targets: decidedTargets ?? "not decided yet", brief: b.brief.slice(0, 3000) };
 		const facts = { frameworks: plan.concerns.filter((c) => c.appRefs > 0).map((c) => `${c.concern}:${c.verdict}`), slices: ledger.getMeta("slice_plan") ? JSON.parse(ledger.getMeta("slice_plan")!).map((s: { name: string; units: number }) => `${s.name}:${s.units}`) : [] };
 		let spent = 0;
 		await Promise.all(

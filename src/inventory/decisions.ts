@@ -23,7 +23,7 @@ import { JEV_ACT } from "../jev/questions.ts";
  */
 export interface Decision {
 	id: string;
-	topic: "data" | "frontend" | "framework" | "library" | "slicing" | "truth" | "target" | "repo";
+	topic: "data" | "framework" | "library" | "slicing" | "truth" | "target" | "repo";
 	question: string;
 	options: Array<{ value: string; label: string; hint?: string }>;
 	recommended?: string;
@@ -84,15 +84,13 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 	const dims = file0.dimensions ?? [];
 	const byRole = (role: string) => Object.keys(TARGET_ROLES).filter((k) => TARGET_ROLES[k] === role);
 	const adapterNote = (id: string) => (id === "none" || id in TARGET_ROLES ? "" : "no bigrefactor adapter yet: one is generated and verified when you pick it");
-	const legacyTargets = file0.answers["targets"]?.answer.split("+"); // given as a flag at init
 	for (const key of ["server", "ui"]) {
-		if (dims.some((d) => d.key === key) || legacyTargets) continue;
+		if (dims.some((d) => d.key === key)) continue;
 		const ids = key === "ui" ? [...byRole("ui"), "none"] : byRole("server");
 		const provisional = config.target.stacks.find((s) => TARGET_ROLES[s] === key) ?? (key === "ui" ? "none" : ids[0]);
 		out.push({ id: `target:${key}`, topic: "target", question: `Which ${key} stack should the new codebase use?`, evidence: survey?.why.join("; ") ?? `config: ${config.target.stacks.join("+")}`, recommended: provisional, options: ids.map((v) => ({ value: v, label: v })) });
 	}
 	for (const d of dims) {
-		if (legacyTargets && (d.key === "server" || d.key === "ui")) continue;
 		const options = d.candidates.map((c) => ({ value: c.id, label: `${c.id} — ${c.score}/100`, hint: [c.reason, d.key === "server" || d.key === "ui" ? adapterNote(c.id) : ""].filter(Boolean).join(" · ") }));
 		if (d.key === "server" || d.key === "ui") for (const id of [...byRole(d.key), ...(d.key === "ui" ? ["none"] : [])]) if (!options.some((o) => o.value === id)) options.push({ value: id, label: `${id} — not rated`, hint: "bigrefactor adapter available" });
 		const top = d.candidates[0]!;
@@ -244,9 +242,6 @@ export function applyDecision(ledger: Ledger, config: Config, root: string, id: 
 				note = `config.db.stores.${store} = ${raw.db.stores[store]}${raw.db.stores[store] === "keep" && answer !== store ? ` (moves to ${answer}: binding for rules)` : ""}`;
 			}
 		} else note = `${id} = ${answer} (binding for advice and rules)`;
-	} else if (id === "targets") {
-		raw.target.stacks = answer.split("+").filter(Boolean);
-		note = `config.target.stacks = ${raw.target.stacks.join(", ")}`;
 	} else if (id === "db-strategy") {
 		raw.db ??= {};
 		raw.db.strategy = answer;

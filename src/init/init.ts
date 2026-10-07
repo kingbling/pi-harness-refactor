@@ -159,7 +159,8 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 			else (choices[t.id] ??= {})[c.key] = c.default;
 		}
 	if (surveyed) saveSurvey(root, surveyed.rec);
-	if (flagged.targets) recordEarlyDecision(root, "targets", to.join("+"), "init flag");
+	// --to answers the server/ui dimensions (no ui stack given = no separate ui codebase)
+	if (flagged.targets) for (const role of ["server", "ui"] as const) recordEarlyDecision(root, `target:${role}`, targets.find((t) => t.role === role)?.id ?? "none", "init flag");
 	if (flagged.db) recordEarlyDecision(root, "db-strategy", db!, "init flag");
 	const sourceAdapter = getSourceAdapter(stack);
 	for (const [id, answer] of Object.entries(parseReplaceFlag(flag("--replace")))) recordEarlyDecision(resolve(root), id, answer, "init flag");

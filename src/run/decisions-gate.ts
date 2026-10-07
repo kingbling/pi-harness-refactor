@@ -15,7 +15,7 @@ import type { Ledger } from "../ledger/db.ts";
  *   scoped  → blocks exactly the affected units (framework class → units that call it, budget → huge units, …)
  *   free    → affects no unit directly (library successor, low-use classes): asked, never blocks
  */
-const GLOBAL = /^(targets|db-strategy|frontend|truth-env|target-location|cycle-cuts)$|^stack:/;
+const GLOBAL = /^(db-strategy|truth-env|target-location|cycle-cuts)$|^(stack|target):/;
 
 export interface DecisionGate {
 	global: Decision[];
