@@ -6,7 +6,8 @@ import type { Config } from "../config.ts";
 import { searchDocs } from "../init/docs.ts";
 import { MOVE_OPS, type MoveOp } from "../ledger/schema.ts";
 import type { Ledger } from "../ledger/db.ts";
-import { captures, parse } from "../inventory/treesitter.ts";
+import { callersOf, callsFrom, findFunction, readFunction } from "../inventory/codemap.ts";
+import { getSourceAdapter } from "../adapters/registry.ts";
 import { sharedSymbols, stackTagLike } from "../inventory/target.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { QUIRK_KINDS, recordQuirk, type QuirkKind } from "../run/quirks.ts";
@@ -48,7 +49,11 @@ export function symbolLookup(d: ToolDeps): ToolDefinition {
 				.all(p.query, p.query, `%::${p.query}`) as Array<any>;
 			if (!rows.length) return text(`no symbol matches "${p.query}"`);
 			const out = rows.map((r) => {
-				const deps = d.ledger.db.prepare("SELECT to_id, kind FROM index_deps WHERE from_id = ?").all(r.id) as Array<{ to_id: string; kind: string }>;
+				const calls = callsFrom(d.ledger, r.id).filter((c) => c.to || c.candidates);
+				const deps = [
+					...(d.ledger.db.prepare("SELECT to_id, kind FROM index_deps WHERE from_id = ? AND (kind NOT IN ('call','static_call') OR from_id NOT IN (SELECT id FROM code_functions))").all(r.id) as Array<{ to_id: string; kind: string }>),
+					...calls.map((c) => ({ to_id: c.to ?? `${c.name}() → ${c.candidates!.slice(0, 3).join(" | ")}`, kind: c.resolution === "code" ? `call L${c.line}` : `${c.resolution} L${c.line}` })),
+				];
 				const moves = d.ledger.db.prepare("SELECT op, target_symbols, why FROM moves WHERE src_symbol = ?").all(r.id) as Array<{ op: string; target_symbols: string; why: string }>;
 				return `${r.id}  [${r.kind}] ${r.path}:${r.line ?? "?"}${r.signature ? ` ${r.signature}` : ""}\n  state=${r.state} unit=${r.unit_id ?? "-"}${deps.length ? `\n  deps: ${deps.map((x) => `${x.to_id} (${x.kind})`).join(", ")}` : ""}${moves.length ? `\n  migrated: ${moves.map((m) => `${m.op} → ${JSON.parse(m.target_symbols).join(", ")} (${m.why})`).join("; ")}` : ""}`;
 			});
@@ -65,7 +70,8 @@ export function whoCalls(d: ToolDeps): ToolDefinition {
 		promptSnippet: "who_calls: every caller of a legacy symbol",
 		parameters: Type.Object({ symbolId: Type.String() }),
 		execute: async (_id, p) => {
-			const callers = d.ledger.db.prepare("SELECT from_id, kind FROM index_deps WHERE to_id = ?").all(p.symbolId) as Array<{ from_id: string; kind: string }>;
+			const fromCalls = callersOf(d.ledger, [p.symbolId]).map((c) => ({ from_id: `${c.from} L${c.line}`, kind: `${c.kind} call` }));
+			const callers = [...fromCalls, ...(d.ledger.db.prepare("SELECT from_id, kind FROM index_deps WHERE to_id = ? AND (kind NOT IN ('call','static_call') OR from_id NOT IN (SELECT id FROM code_functions))").all(p.symbolId) as Array<{ from_id: string; kind: string }>)];
 			const name = p.symbolId.split("::").pop()!;
 			const literal = d.ledger.db.prepare("SELECT DISTINCT path FROM index_literal_refs WHERE name = ?").all(name) as Array<{ path: string }>;
 			return text(
@@ -80,22 +86,45 @@ export function sourceSymbolBody(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "source_symbol_body",
 		label: "Source symbol body",
-		description: "Exact source code of one legacy symbol (function, method, class) extracted via tree-sitter, so you never need to read whole unrelated files.",
-		promptSnippet: "source_symbol_body: code of one legacy symbol",
+		description: "Exact, unmodified source code of one legacy symbol (function, method, class) by its line span, so you never need to read whole unrelated files. For reading rather than pinning exact behaviour, read_function is shorter.",
+		promptSnippet: "source_symbol_body: exact code of one legacy symbol",
 		parameters: Type.Object({ symbolId: Type.String() }),
 		execute: async (_id, p) => {
-			const row = d.ledger.db.prepare("SELECT path, name, kind FROM symbols WHERE id = ?").get(p.symbolId) as { path: string; name: string; kind: string } | undefined;
+			const row = d.ledger.db.prepare("SELECT s.path, i.line, i.end_line FROM symbols s LEFT JOIN index_symbols i ON i.id = s.id WHERE s.id = ?").get(p.symbolId) as { path: string; line: number | null; end_line: number | null } | undefined;
 			if (!row) return text(`unknown symbol ${p.symbolId}`);
-			const src = readFileSync(join(d.config.source.path, row.path), "utf8");
-			const tree = await parse(d.config.source.stack, src);
-			const short = row.name.split("::").pop()!;
-			const q = row.kind === "method" ? `(method_declaration name: (name) @n)` : row.kind === "function" ? `(function_definition name: (name) @n)` : row.kind === "class" ? `(class_declaration name: (name) @n)` : `(const_element (name) @n)`;
-			for (const c of await captures(d.config.source.stack, tree, q)) {
-				if (c.node.text !== short) continue;
-				const decl = c.node.parent!;
-				return text("```" + d.config.source.stack + `\n// ${row.path}:${decl.startPosition.row + 1}\n` + decl.text + "\n```");
-			}
-			return text(`could not locate ${p.symbolId} in ${row.path}`);
+			const src = safeRead(join(d.config.source.path, row.path));
+			if (src === undefined) return text(`cannot read ${row.path}`);
+			const lines = src.split("\n");
+			const fn = findFunction(d.ledger, p.symbolId);
+			const from = fn?.line ?? row.line ?? 1;
+			const end = fn?.end_line ?? row.end_line;
+			// ledgers indexed before end lines existed: bounded slice instead of the rest of the file
+			const to = end ?? Math.min(lines.length, from + 199);
+			return text("```" + d.config.source.stack + `\n// ${row.path}:${from}-${to}\n` + lines.slice(from - 1, to).join("\n") + "\n```" + (end ? "" : `\n(end of the symbol unknown: showing at most 200 lines; re-run br inventory for exact spans)`));
+		},
+	});
+}
+
+export function readFunctionTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "read_function",
+		label: "Read function",
+		description: "Reading view of one legacy function/method: purpose (when known), its comments lifted out with line numbers, then the code without comments or indentation (line positions kept). Use it to follow the call tree on your task card; use source_symbol_body when you must pin exact text.",
+		promptSnippet: "read_function: one legacy function, comments lifted out, ready to read",
+		parameters: Type.Object({ id: Type.String({ description: "function id from the task card / who_calls, or Class::method" }) }),
+		execute: async (_id, p) => {
+			const adapter = (() => {
+				try {
+					return getSourceAdapter(d.config.source.stack);
+				} catch {
+					return undefined;
+				}
+			})();
+			const view = readFunction(d.ledger, d.config.source.path, p.id, { indentSignificant: adapter?.reading?.indentSignificant });
+			if (!view) return text(`no function "${p.id}" in the code map (symbol_lookup to find its id)`);
+			const calls = callsFrom(d.ledger, findFunction(d.ledger, p.id)!.id).filter((c) => c.resolution !== "external");
+			const callText = calls.length ? `\ncalls:\n${calls.map((c) => `  L${c.line} ${c.name}() → ${c.to ?? c.candidates?.slice(0, 3).join(" | ") ?? "?"} [${c.resolution}]`).join("\n")}` : "";
+			return text(view + callText);
 		},
 	});
 }
@@ -271,10 +300,10 @@ export function proposeRuleTool(d: ToolDeps): ToolDefinition {
 }
 
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d)];
 }
 
 function safeRead(p: string): string | undefined {

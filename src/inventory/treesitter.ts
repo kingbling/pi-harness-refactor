@@ -6,16 +6,16 @@ export type { Node, Tree, Language };
 const require = createRequire(import.meta.url);
 
 /**
- * Grammar wasm comes from each grammar's own npm package (current tree-sitter ABI), the same
- * approach pi-tree-sitter uses. Add a language = add its npm package here (and to package.json).
- * Packages that do not ship wasm can be fetched from jsdelivr at init; not needed for v1.
+ * Grammar wasm comes from each grammar's own npm package (current tree-sitter ABI), the same approach
+ * pi-tree-sitter uses. The core knows no language: each adapter registers the grammars it needs when it is
+ * loaded (registerGrammar), so adding a language = an adapter + its grammar package.
  */
-const GRAMMARS: Record<string, string> = {
-	php: "tree-sitter-php/tree-sitter-php.wasm",
-	typescript: "tree-sitter-typescript/tree-sitter-typescript.wasm",
-	tsx: "tree-sitter-typescript/tree-sitter-tsx.wasm",
-	javascript: "tree-sitter-javascript/tree-sitter-javascript.wasm",
-};
+const GRAMMARS: Record<string, string> = {};
+
+/** `lang` → npm module path of the grammar wasm (resolved from this package's dependencies). */
+export function registerGrammar(lang: string, wasmModule: string): void {
+	GRAMMARS[lang] = wasmModule;
+}
 
 let initialized: Promise<void> | undefined;
 const languages = new Map<string, Promise<Language>>();
@@ -27,7 +27,7 @@ export async function getLanguage(lang: string): Promise<Language> {
 	let p = languages.get(lang);
 	if (!p) {
 		const rel = GRAMMARS[lang];
-		if (!rel) throw new Error(`no tree-sitter grammar for "${lang}" (have: ${Object.keys(GRAMMARS).join(", ")})`);
+		if (!rel) throw new Error(`no tree-sitter grammar registered for "${lang}" (have: ${Object.keys(GRAMMARS).join(", ") || "none"}; an adapter registers its grammar)`);
 		p = Language.load(require.resolve(rel));
 		languages.set(lang, p);
 	}

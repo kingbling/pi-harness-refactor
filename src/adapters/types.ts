@@ -14,6 +14,66 @@ export interface IndexedSymbol {
 	/** Hash of the normalized AST (identifiers kept, whitespace/comments dropped) for dedupe candidates. */
 	astHash?: string;
 	signature?: string;
+	/** Last line of the declaration (inclusive); slices the symbol without re-parsing. */
+	endLine?: number;
+}
+
+/**
+ * Code map, per function/method: where it is, its comments lifted out of the code, and its call sites with what
+ * the adapter knows about each receiver. The core resolves the calls (src/inventory/codemap.ts), so the adapter
+ * only reports syntax: names, positions, declared types.
+ */
+export interface CodeComment {
+	line: number;
+	endLine: number;
+	/** 0-based columns of the comment's first and last character (exclusive end) on line / endLine. */
+	col: number;
+	endCol: number;
+	text: string;
+	/** The comment's words without the language's comment markers (what a reader is shown). */
+	body: string;
+	/** doc = documentation of the function; code = commented-out code; banner = license/author/separator boilerplate; note = everything else. */
+	kind: "doc" | "code" | "banner" | "note";
+}
+
+export interface CodeCall {
+	line: number;
+	/** function: bare call; static: Scope::name; member: receiver.name; new: constructor. */
+	kind: "function" | "static" | "member" | "new";
+	name: string;
+	/** static: the class name, or self / parent (relative to the enclosing class). */
+	scope?: string;
+	/** member: `this` for the enclosing object, else the receiver variable as written. */
+	receiver?: string;
+	/** member call on the result of another call in the same function (index into calls). */
+	receiverCall?: number;
+}
+
+export interface CodeFunction {
+	/** Same id as the IndexedSymbol of the function/method. */
+	id: string;
+	/** Class (or other container) it belongs to, if any. */
+	container?: string;
+	name: string;
+	line: number;
+	endLine: number;
+	signature: string;
+	/** Declared return type, if the language states one. */
+	returns?: string;
+	comments: CodeComment[];
+	calls: CodeCall[];
+	/** Local variable → declared/constructed type (parameters, `new X`, doc annotations). */
+	locals: Record<string, string>;
+	/** Local variable → index of the call whose result it holds (typed later from that callee's return type). */
+	assigned: Record<string, number>;
+}
+
+export interface CodeContainer {
+	name: string;
+	/** Parent class (extends), for method lookup through inheritance. */
+	parent?: string;
+	/** Traits/mixins whose methods it has. */
+	uses?: string[];
 }
 
 export interface IndexedDep {
@@ -75,6 +135,9 @@ export interface FileIndex {
 	literalRefs: string[];
 	/** Markers like `new $cls`, `call_user_func`, variable includes. */
 	dynamicMarkers: string[];
+	/** Code map (optional: adapters without it fall back to symbol-level deps only). */
+	functions?: CodeFunction[];
+	containers?: CodeContainer[];
 }
 
 export interface SourceAdapter {
@@ -87,6 +150,10 @@ export interface SourceAdapter {
 	/** Autodetect from the repo; returns a confidence 0..1 and detected framework/version if any. */
 	detect(root: string): Promise<{ confidence: number; framework?: string; version?: string }>;
 	indexFile(root: string, relPath: string, source: string): Promise<FileIndex>;
+	/** How code of this language is shown to models for reading (read_function): indentation is syntax in some languages. */
+	reading?: { indentSignificant?: boolean };
+	/** Name semantics the core needs to resolve calls: true when class/function/method names match regardless of case. */
+	names?: { caseInsensitive?: boolean };
 	/** Route table extraction when it is not derivable per file (framework route files, CLI dumps). */
 	indexRoutes?(root: string): Promise<IndexedRoute[]>;
 	/** Which tier a symbol belongs to, from its own shape (deps decide the rest). */

@@ -7,6 +7,7 @@ import { sharedSymbols, similarTargetSymbols, stackTagLike } from "../inventory/
 import type { TargetAdapter } from "../adapters/types.ts";
 import { placeUnit, type Placement } from "../run/placement.ts";
 import { tidyTaskCard } from "../run/tidy.ts";
+import { callTree } from "../inventory/codemap.ts";
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -29,6 +30,8 @@ export interface TaskCard {
 	dynamicMarkers: string[];
 	cutDeps: string[];
 	frameworkRefs: Array<{ cls: string; refs: number; verdict: string; platform: string }>;
+	/** Where the unit's code leads outside its files (code map), with migration state per target. */
+	callTree: string[];
 	truthCases: number;
 	/** Cross-cutting helpers that already exist in the target (reuse, never reimplement). */
 	sharedHelpers: Array<{ id: string; kind: string; signature: string | null; doc: string | null }>;
@@ -88,7 +91,11 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const ids = new Set(symbols.map((s) => s.id));
 
 	// deps: edges leaving the unit → resolved via moves (if the target unit is accepted) or unresolved
-	const outEdges = db.prepare(`SELECT DISTINCT d.to_id FROM index_deps d JOIN symbols s ON s.id = d.from_id WHERE s.unit_id = ?`).all(unitId) as Array<{ to_id: string }>;
+	// edges: symbol-level deps (new/extends/use/includes) plus code-map calls (every call kind, receivers typed)
+	const outEdges = db.prepare(`SELECT DISTINCT d.to_id FROM index_deps d JOIN symbols s ON s.id = d.from_id WHERE s.unit_id = ?
+		UNION SELECT DISTINCT c.to_id FROM code_calls c JOIN symbols s ON s.id = c.from_id WHERE s.unit_id = ? AND c.to_id IS NOT NULL AND c.resolution = 'code'`).all(unitId, unitId) as Array<{ to_id: string }>;
+	// typed calls into the framework: only for the framework section (never "not migrated yet": the framework is not ported)
+	const fwCalls = db.prepare(`SELECT c.to_id FROM code_calls c JOIN symbols s ON s.id = c.from_id WHERE s.unit_id = ? AND c.to_id IS NOT NULL AND c.resolution = 'framework'`).all(unitId) as Array<{ to_id: string }>;
 	const resolvedDeps: TaskCard["resolvedDeps"] = [];
 	const unresolvedDeps: string[] = [];
 	for (const { to_id } of outEdges) {
@@ -99,7 +106,10 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 		else if (!isFile) unresolvedDeps.push(to_id);
 	}
 
-	const callers = (db.prepare(`SELECT DISTINCT d.from_id AS "from", d.kind FROM index_deps d WHERE d.to_id IN (${[...ids].map(() => "?").join(",") || "''"}) AND d.from_id NOT IN (${[...ids].map(() => "?").join(",") || "''"})`).all(...ids, ...ids) as Array<{ from: string; kind: string }>) ?? [];
+	const inIds = [...ids].map(() => "?").join(",") || "''";
+	// calls inside functions come from the code map; file-scope calls (templates, scripts) only exist as symbol-level deps
+	const callers = (db.prepare(`SELECT DISTINCT d.from_id AS "from", d.kind FROM index_deps d WHERE d.to_id IN (${inIds}) AND d.from_id NOT IN (${inIds}) AND (d.kind NOT IN ('call','static_call') OR d.from_id NOT IN (SELECT id FROM code_functions))
+		UNION SELECT DISTINCT c.from_id AS "from", 'call' AS kind FROM code_calls c WHERE c.to_id IN (${inIds}) AND c.from_id NOT IN (${inIds}) AND c.resolution = 'code'`).all(...ids, ...ids, ...ids, ...ids) as Array<{ from: string; kind: string }>) ?? [];
 
 	// dup candidates: same ast_hash inside the unit, or against anything already accepted (source side; target dedupe comes from target_lookup)
 	const dupCandidates: TaskCard["dupCandidates"] = [];
@@ -120,7 +130,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 		const plan = ledger.getMeta("framework_plan");
 		const concerns = plan ? (JSON.parse(plan) as { concerns: Array<{ concern: string; verdict: string; platform: string; top: string[] }> }).concerns : [];
 		const counts = new Map<string, number>();
-		for (const { to_id } of outEdges) {
+		for (const { to_id } of [...outEdges, ...fwCalls]) {
 			const path = to_id.split("::")[0]!;
 			if (!fwFiles.has(path)) continue;
 			const cls = to_id.split("::")[1] ?? path.split("/").pop()!;
@@ -136,7 +146,9 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const reuseHints = similarTargetSymbols(ledger, symbols.map((s) => s.name), 15, stackId);
 	const candidates = reuseCandidates(ledger, unitId, { stack: stackId, limit: 8 });
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
-	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, truthCases, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
+	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
+	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -229,6 +241,10 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	if (card.frameworkRefs.length) {
 		L.push("", "## Legacy framework classes used here → platform replacement (never port the framework itself)");
 		for (const f of card.frameworkRefs) L.push(`- ${f.cls} (${f.refs}×): ${f.verdict} → ${f.platform}`);
+	}
+	if (card.callTree.length) {
+		L.push("", "## Where this code leads (calls outside this unit, file to file; [state] = migration state; read_function <id> to read one)");
+		L.push(...card.callTree);
 	}
 	if (card.cutDeps.length) {
 		L.push("", "## Forward references (cycle cut: these legacy files are scheduled AFTER this unit)");

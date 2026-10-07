@@ -108,7 +108,7 @@ function detectFrameworkDirs(src: string): string[] {
 		} catch {
 			continue;
 		}
-		if (/framework|core|lib|engine|-php$/i.test(n) || existsSync(join(p, ".git"))) out.push(`${n}/`);
+		if (/framework|core|lib|engine/i.test(n) || existsSync(join(p, ".git"))) out.push(`${n}/`);
 	}
 	return out;
 }

@@ -78,7 +78,7 @@ export class Ledger {
 				PRAGMA foreign_keys = ON;`);
 		}
 		// additive migrations for existing ledgers
-		for (const sql of ["ALTER TABLE index_symbols ADD COLUMN doc TEXT", "ALTER TABLE index_symbols ADD COLUMN tags TEXT", "ALTER TABLE files ADD COLUMN disposition TEXT", "ALTER TABLE decisions ADD COLUMN latency_ms INTEGER"]) {
+		for (const sql of ["ALTER TABLE index_symbols ADD COLUMN doc TEXT", "ALTER TABLE index_symbols ADD COLUMN tags TEXT", "ALTER TABLE files ADD COLUMN disposition TEXT", "ALTER TABLE decisions ADD COLUMN latency_ms INTEGER", "ALTER TABLE index_symbols ADD COLUMN end_line INTEGER"]) {
 			try {
 				this.db.exec(sql);
 			} catch {

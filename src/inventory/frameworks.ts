@@ -39,7 +39,11 @@ export function planFrameworks(ledger: Ledger, source: SourceAdapter, targets: T
 	const syms = ledger.db.prepare("SELECT id, path, kind, name FROM index_symbols WHERE side = 'source'").all() as Array<{ id: string; path: string; kind: string; name: string }>;
 	const classOf = new Map<string, { name: string; path: string }>(); // symbol id → owning class symbol (framework side)
 	for (const s of syms) if (fwSet.has(s.path)) classOf.set(s.id, { name: s.name.split("::")[0]!, path: s.path });
-	const edges = ledger.db.prepare("SELECT from_id, to_id, kind FROM index_deps").all() as Array<{ from_id: string; to_id: string; kind: string }>;
+	// every call site inside functions counts (code map: one row per call); file-scope calls (templates, scripts)
+	// and other relations (extends, new, use…) come from the symbol-level deps
+	const edges = ledger.db
+		.prepare("SELECT from_id, to_id, kind FROM index_deps WHERE kind NOT IN ('call','static_call','new') OR from_id NOT IN (SELECT id FROM code_functions) UNION ALL SELECT from_id, to_id, 'call' FROM code_calls WHERE to_id IS NOT NULL")
+		.all() as Array<{ from_id: string; to_id: string; kind: string }>;
 	const pathOf = (id: string) => id.split("::")[0]!;
 
 	// references from dead code do not count: dead files are dropped, their framework use never migrates

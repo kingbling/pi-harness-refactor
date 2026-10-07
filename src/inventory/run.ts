@@ -8,6 +8,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { buildGraph, condense, cutLargeCycles, tarjanScc } from "./scc.ts";
 import { headOf, isRepo } from "../git.ts";
 import { loadDecisions } from "./decisions.ts";
+import { resolveCodeMap, writeCodeMap } from "./codemap.ts";
 
 export type Tier = "T0" | "T1" | "T2" | "T3";
 
@@ -76,7 +77,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	tx.exec("BEGIN");
 	try {
 		tx.exec("DELETE FROM index_symbols WHERE side='source'; DELETE FROM index_deps; DELETE FROM index_routes WHERE side='source'; DELETE FROM index_literal_refs; DELETE FROM index_queries;");
-		const insSym = tx.prepare("INSERT OR REPLACE INTO index_symbols(id, side, path, kind, name, line, signature, exported, ast_hash) VALUES (?, 'source', ?, ?, ?, ?, ?, ?, ?)");
+		const insSym = tx.prepare("INSERT OR REPLACE INTO index_symbols(id, side, path, kind, name, line, signature, exported, ast_hash, end_line) VALUES (?, 'source', ?, ?, ?, ?, ?, ?, ?, ?)");
 		const insDep = tx.prepare("INSERT OR IGNORE INTO index_deps(from_id, to_id, kind) VALUES (?, ?, ?)");
 		const insLit = tx.prepare("INSERT OR IGNORE INTO index_literal_refs(name, path, line) VALUES (?, ?, 0)");
 		const insQ = tx.prepare("INSERT INTO index_queries(symbol_id, kind, tables, text) VALUES (?, ?, ?, ?)");
@@ -87,7 +88,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 			else if (prev !== undefined && prev !== f.hash) drift.changed.push(f.path);
 			ledger.upsertFile({ path: f.path, hash: f.hash, lang: f.lang, loc: f.loc });
 			for (const s of f.symbols) {
-				insSym.run(s.id, s.path, s.kind, s.name, s.line, s.signature ?? null, s.exported ? 1 : 0, s.astHash ?? null);
+				insSym.run(s.id, s.path, s.kind, s.name, s.line, s.signature ?? null, s.exported ? 1 : 0, s.astHash ?? null, s.endLine ?? null);
 				ledger.upsertSymbol({ id: s.id, path: s.path, kind: s.kind, name: s.name, exported: s.exported });
 			}
 			for (const d of f.deps) {
@@ -102,6 +103,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 			for (const q of f.queries) insQ.run(q.symbolId, q.kind, JSON.stringify(q.tables), q.text ?? null);
 		}
 		for (const r of routes) insRoute.run(r.id, r.method ?? null, r.path, r.handlerSymbol ? resolve(r.handlerSymbol) ?? r.handlerSymbol : null);
+		writeCodeMap(ledger, resolveCodeMap(indexes, isFramework, { caseInsensitive: adapter.names?.caseInsensitive }));
 		tx.exec("COMMIT");
 	} catch (e) {
 		tx.exec("ROLLBACK");

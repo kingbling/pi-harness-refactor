@@ -246,6 +246,22 @@ CREATE TABLE IF NOT EXISTS index_literal_refs (
 CREATE TABLE IF NOT EXISTS index_queries (
   id INTEGER PRIMARY KEY AUTOINCREMENT, symbol_id TEXT NOT NULL, kind TEXT NOT NULL, tables TEXT NOT NULL DEFAULT '[]', text TEXT
 );
+-- Code map (legacy side): every function/method with comments lifted out, and its call sites resolved by the core.
+-- purpose/effects are written later by a cheap model, keyed to body_hash (normalized AST) so they survive re-inventory.
+CREATE TABLE IF NOT EXISTS code_functions (
+  id TEXT PRIMARY KEY, path TEXT NOT NULL, container TEXT, name TEXT NOT NULL,
+  line INTEGER NOT NULL, end_line INTEGER NOT NULL, signature TEXT, returns TEXT,
+  comments TEXT NOT NULL DEFAULT '[]', body_hash TEXT,
+  purpose TEXT, effects TEXT, purpose_model TEXT, purpose_hash TEXT
+);
+CREATE INDEX IF NOT EXISTS code_functions_path ON code_functions(path);
+-- resolution: code (to_id = function or class in the app), framework (to_id in a framework dir), ambiguous
+-- (candidates, receiver type unknown), external (builtin or outside the indexed source).
+CREATE TABLE IF NOT EXISTS code_calls (
+  from_id TEXT NOT NULL, seq INTEGER NOT NULL, line INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+  resolution TEXT NOT NULL, to_id TEXT, candidates TEXT, PRIMARY KEY (from_id, seq)
+);
+CREATE INDEX IF NOT EXISTS code_calls_to ON code_calls(to_id);
 
 -- Legacy quirks the tester noticed instead of pinning them blindly. Each carries the tester's opinion;
 -- language artifacts with opinion drop are dropped without asking, the rest become questions (via a model).

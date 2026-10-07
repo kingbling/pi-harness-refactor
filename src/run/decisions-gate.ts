@@ -36,9 +36,11 @@ export function decisionGate(ledger: Ledger, config: Config, source: SourceAdapt
 				.prepare(
 					`SELECT DISTINCT s.unit_id u FROM index_deps d
 					 JOIN symbols s ON s.path = substr(d.from_id, 1, instr(d.from_id, '::') - 1)
-					 WHERE (d.to_id = ? OR d.to_id LIKE ?) AND s.unit_id IS NOT NULL`,
+					 WHERE (d.to_id = ? OR d.to_id LIKE ?) AND s.unit_id IS NOT NULL
+					 UNION SELECT DISTINCT s.unit_id u FROM code_calls c JOIN symbols s ON s.id = c.from_id
+					 WHERE (c.to_id = ? OR c.to_id LIKE ?) AND s.unit_id IS NOT NULL`,
 				)
-				.all(`${path}::${cls}`, `${path}::${cls}::%`) as Array<{ u: string }>
+				.all(`${path}::${cls}`, `${path}::${cls}::%`, `${path}::${cls}`, `${path}::${cls}::%`) as Array<{ u: string }>
 		).map((r) => r.u);
 	const unitsWhere = (sql: string): string[] => (ledger.db.prepare(`SELECT id FROM units WHERE state = 'planned' AND ${sql}`).all() as Array<{ id: string }>).map((r) => r.id);
 

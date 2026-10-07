@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { captures, parse, type Node } from "../../inventory/treesitter.ts";
+import { captures, parse, registerGrammar, type Node } from "../../inventory/treesitter.ts";
+
+registerGrammar("typescript", "tree-sitter-typescript/tree-sitter-typescript.wasm");
+registerGrammar("tsx", "tree-sitter-typescript/tree-sitter-tsx.wasm");
+registerGrammar("javascript", "tree-sitter-javascript/tree-sitter-javascript.wasm");
 import type { TargetSymbol } from "../types.ts";
 
 /**

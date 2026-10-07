@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, normalize, relative } from "node:path";
-import { captures, enclosing, normalizedAst, parse, walk, type Node } from "../../inventory/treesitter.ts";
+import { captures, enclosing, normalizedAst, parse, registerGrammar, walk, type Node } from "../../inventory/treesitter.ts";
+
+registerGrammar("php", "tree-sitter-php/tree-sitter-php.wasm");
 import { placePhpFile } from "./php-place.ts";
-import type { ExternalDep, FileIndex, FrameworkConcern, IndexedDep, IndexedQuery, IndexedRoute, IndexedSymbol, SourceAdapter } from "../types.ts";
+import type { CodeCall, CodeComment, CodeContainer, CodeFunction, ExternalDep, FileIndex, FrameworkConcern, IndexedDep, IndexedQuery, IndexedRoute, IndexedSymbol, SourceAdapter } from "../types.ts";
 
 const SYMBOL_QUERY = `
 (function_definition name: (name) @fn)
@@ -270,6 +272,165 @@ export function builtinProfileJson(): FrameworkProfileJson {
 		concerns: GYRO.concerns.map((c) => ({ match: c.match.source, concern: c.concern, legacy: c.legacy, verdict: c.verdict })),
 	};
 }
+const CONTAINER_TYPES = ["class_declaration", "interface_declaration", "trait_declaration", "enum_declaration", "anonymous_class"];
+/** Container name; anonymous classes get a synthetic one so their methods never merge into the enclosing class. */
+const containerName = (n: Node | null): string | undefined => (!n ? undefined : n.type === "anonymous_class" ? `class@L${n.startPosition.row + 1}` : n.childForFieldName("name")?.text);
+const FUNCTION_TYPES = ["method_declaration", "function_definition"];
+
+/**
+ * Route handler names are action names; the route class decides the method prefix (gyro: `action_x`,
+ * `forwardaction_x`, `agencyaction_x`). Pick the class method that serves it, preferring one whose prefix the
+ * route class name hints at, else plain `action_`.
+ */
+function routeHandler(symbols: IndexedSymbol[], cls: string, handler: string, routeClass: string): string {
+	const methods = symbols.filter((s) => s.kind === "method" && s.name.startsWith(`${cls}::`)).map((s) => s.name.slice(cls.length + 2));
+	const cands = methods.filter((m) => m === handler || new RegExp(`^[a-z]*action_${handler}$`, "i").test(m));
+	if (cands.length <= 1) return cands[0] ?? handler;
+	const hinted = cands.find((m) => m.indexOf("action_") > 0 && routeClass.toLowerCase().includes(m.slice(0, m.indexOf("action_")).toLowerCase()));
+	return hinted ?? cands.find((m) => m === `action_${handler}`) ?? cands[0]!;
+}
+
+const typeName = (t: string | undefined): string | undefined => {
+	const n = t?.replace(/^\?/, "").replace(/^\\/, "").split("|")[0]?.trim();
+	return n && /^[A-Z_][\w\\]*$/i.test(n) && !/^(int|float|string|bool|array|mixed|void|null|callable|iterable|object|never|false|true)$/i.test(n) ? n.split("\\").pop() : undefined;
+};
+
+/** A comment's words without PHP comment markers (`//`, `#`, `/* *\/`, docblock `*`). */
+const commentBody = (text: string): string =>
+	text
+		.split("\n")
+		.map((l) => l.replace(/^\s*(\/\*+|\/\/+|#|\*(?!\/))\s?/, "").replace(/\s*\*+\/\s*$/, "").trimEnd())
+		.join("\n")
+		.trim();
+const BANNER = /^(copyright|\(c\)|license|licence|all rights reserved|@author|\$Id[:$]|this (library|program|file) is free software)/im;
+const SEPARATOR = /^[\s=*#+\-|_~.]*$/;
+
+/** Commented-out code: the comment's text parses as PHP statements without errors. */
+async function looksLikeCode(text: string): Promise<boolean> {
+	const body = commentBody(text);
+	if (!body || !/[;{}]\s*$/.test(body) || /^[A-Z][a-z]+\s+[a-z]+\s+[a-z]+/.test(body)) return false;
+	try {
+		const t = await parse("php", `<?php ${body}`);
+		return !t.rootNode.hasError;
+	} catch {
+		return false;
+	}
+}
+
+/** Functions (with comments, calls, local types) and containers of one parsed file. */
+async function codeMap(root: Node, idOf: Map<number, string>): Promise<{ functions: CodeFunction[]; containers: CodeContainer[] }> {
+	const functions: CodeFunction[] = [];
+	const containers: CodeContainer[] = [];
+	const fnNodes: Node[] = [];
+	walk(root, (n) => {
+		if (CONTAINER_TYPES.includes(n.type)) {
+			const name = containerName(n);
+			if (name) {
+				const parent = n.namedChildren.find((c) => c?.type === "base_clause")?.namedChildren[0]?.text;
+				const uses: string[] = [];
+				walk(n.childForFieldName("body") ?? n, (u) => {
+					if (u.type === "use_declaration") for (const x of u.namedChildren) if (x?.type === "name" || x?.type === "qualified_name") uses.push(x.text.split("\\").pop()!);
+					return !FUNCTION_TYPES.includes(u.type);
+				});
+				containers.push({ name, parent: parent?.split("\\").pop(), uses: uses.length ? uses : undefined });
+			}
+		}
+		if (FUNCTION_TYPES.includes(n.type)) fnNodes.push(n);
+		return true;
+	});
+	for (const fn of fnNodes) {
+		const id = idOf.get(fn.startIndex);
+		if (!id) continue;
+		// only methods belong to a class; a function declared inside a method is still a global function
+		const container = fn.type === "method_declaration" ? containerName(enclosing(fn, CONTAINER_TYPES)) : undefined;
+		const body = fn.childForFieldName("body");
+		const comments: CodeComment[] = [];
+		const toComment = async (c: Node, kind?: CodeComment["kind"]): Promise<CodeComment> => {
+			const body = commentBody(c.text);
+			return {
+				line: c.startPosition.row + 1, endLine: c.endPosition.row + 1, col: c.startPosition.column, endCol: c.endPosition.column, text: c.text, body,
+				kind: BANNER.test(body) || SEPARATOR.test(body) ? "banner" : (kind ?? ((await looksLikeCode(c.text)) ? "code" : "note")),
+			};
+		};
+		// doc: the comment(s) right above the declaration (attributes may sit in between)
+		for (let p = fn.previousNamedSibling; p && p.type === "comment"; p = p.previousNamedSibling) comments.unshift(await toComment(p, p.text.startsWith("/**") ? "doc" : undefined));
+		const calls: CodeCall[] = [];
+		const callAt = new Map<string, number>();
+		const at = (n: Node) => `${n.startIndex}:${n.endIndex}`;
+		const pending: Array<{ index: number; object: Node }> = [];
+		const locals: Record<string, string> = {};
+		const assigned: Record<string, number> = {};
+		const assigns: Array<{ v: string; right: Node }> = [];
+		for (const p of fn.childForFieldName("parameters")?.namedChildren ?? []) {
+			const t = typeName(p?.childForFieldName("type")?.text);
+			const v = p?.childForFieldName("name")?.text;
+			if (t && v) locals[v] = t;
+		}
+		const inner: Node[] = [];
+		if (body)
+			walk(body, (n) => {
+				if (n !== body && (FUNCTION_TYPES.includes(n.type) || CONTAINER_TYPES.includes(n.type))) return false;
+				inner.push(n);
+				return true;
+			});
+		for (const n of inner) {
+			const line = n.startPosition.row + 1;
+			if (n.type === "comment") comments.push(await toComment(n));
+			else if (n.type === "function_call_expression") {
+				const f = n.childForFieldName("function");
+				if (f && (f.type === "name" || f.type === "qualified_name")) { callAt.set(at(n), calls.length); calls.push({ line, kind: "function", name: f.text.split("\\").pop()! }); }
+			} else if (n.type === "scoped_call_expression") {
+				const scope = n.childForFieldName("scope")?.text ?? "";
+				const name = n.childForFieldName("name")?.text;
+				if (name && /^\w+$/.test(name)) { callAt.set(at(n), calls.length); calls.push({ line, kind: "static", name, scope: /^(self|static)$/i.test(scope) ? "self" : /^parent$/i.test(scope) ? "parent" : scope.split("\\").pop() }); }
+			} else if (n.type === "member_call_expression" || n.type === "nullsafe_member_call_expression") {
+				const obj = n.childForFieldName("object");
+				const name = n.childForFieldName("name")?.text;
+				if (name && /^\w+$/.test(name) && obj) {
+					const index = calls.length;
+					callAt.set(at(n), index);
+					calls.push({ line, kind: "member", name, receiver: obj.text === "$this" ? "this" : obj.type === "variable_name" ? obj.text : undefined });
+					pending.push({ index, object: obj });
+				}
+			} else if (n.type === "object_creation_expression") {
+				const t = n.namedChildren.find((x) => x?.type === "name" || x?.type === "qualified_name")?.text;
+				if (t) { callAt.set(at(n), calls.length); calls.push({ line, kind: "new", name: t.split("\\").pop()! }); }
+			} else if (n.type === "assignment_expression") {
+				const l = n.childForFieldName("left");
+				const r = n.childForFieldName("right");
+				if (l?.type === "variable_name" && r) assigns.push({ v: l.text, right: r });
+			}
+		}
+		for (const p of pending) {
+			const idx = callAt.get(at(p.object));
+			if (idx !== undefined) calls[p.index]!.receiverCall = idx;
+		}
+		for (const a of assigns) {
+			if (a.right.type === "object_creation_expression") {
+				const t = a.right.namedChildren.find((x) => x?.type === "name" || x?.type === "qualified_name")?.text;
+				if (t) locals[a.v] ??= t.split("\\").pop()!;
+			} else {
+				const idx = callAt.get(at(a.right));
+				if (idx !== undefined && !(a.v in locals)) assigned[a.v] = idx;
+			}
+		}
+		// doc annotations: @var Type $x / @var $x Type / @param Type $x
+		for (const c of comments) {
+			for (const m of c.text.matchAll(/@(?:var|param)\s+([\\\w|?]+)\s+(\$\w+)|@var\s+(\$\w+)\s+([\\\w|?]+)/g)) {
+				const [v, t] = m[2] ? [m[2], typeName(m[1])] : [m[3]!, typeName(m[4])];
+				if (t && !(v in locals)) locals[v] = t;
+			}
+		}
+		const name = fn.childForFieldName("name")?.text ?? "?";
+		let returns = typeName(fn.childForFieldName("return_type")?.text);
+		if (!returns) for (const c of comments) if (c.kind === "doc") returns = typeName(/@return\s+([\\\w|?]+)/.exec(c.text)?.[1]) ?? returns;
+		if (returns && /^(self|static)$/i.test(returns)) returns = container;
+		const head = fn.text.slice(0, body ? body.startIndex - fn.startIndex : undefined).replace(/\s+/g, " ").trim();
+		functions.push({ id, container, name, line: fn.startPosition.row + 1, endLine: fn.endPosition.row + 1, signature: head, returns, comments, calls, locals, assigned });
+	}
+	return { functions, containers };
+}
+
 function stringArgs(callNode: Node | null): Array<string | undefined> {
 	// `arguments` is a field on scoped/function calls but a plain child on object_creation_expression
 	const args = callNode?.childForFieldName("arguments") ?? callNode?.namedChildren.find((n) => n?.type === "arguments") ?? null;
@@ -305,6 +466,7 @@ function countFiles(root: string, re: RegExp, depth: number, limit: number): num
 
 export const phpAdapter: SourceAdapter = {
 	id: "php",
+	names: { caseInsensitive: true },
 	include: ["**/*.php", "**/*.phtml", "**/*.inc"],
 	exclude: ["**/vendor/**", "**/docs/**", "**/3rdparty/**", "**/third_party/**", "**/third-party/**", "**/node_modules/**", "**/.git/**", "**/tests/**", "**/test/**", "**/cache/**", "**/storage/**"],
 	docs: [
@@ -353,37 +515,41 @@ export const phpAdapter: SourceAdapter = {
 			seenIds.set(base, n);
 			return n === 1 ? base : `${base}#${n}`;
 		};
-		const enclosingClassName = (n: Node): string | undefined => {
-			const cls = enclosing(n, ["class_declaration", "interface_declaration", "trait_declaration", "enum_declaration"]);
-			return cls?.childForFieldName("name")?.text;
-		};
+		const enclosingClassName = (n: Node): string | undefined => containerName(enclosing(n, CONTAINER_TYPES));
 
-		// --- symbols
+		// --- symbols. Each declaration gets its id once; edges look it up by node (never mint again).
+		const idOf = new Map<number, string>();
+		const declId = (decl: Node, name: string) => {
+			const id = symId(name);
+			idOf.set(decl.startIndex, id);
+			return id;
+		};
 		for (const c of await captures("php", tree, SYMBOL_QUERY)) {
 			const name = c.node.text;
 			const decl = c.node.parent!;
 			const line = c.node.startPosition.row + 1;
+			const endLine = decl.endPosition.row + 1;
 			const body = decl.type === "const_element" ? decl : decl;
 			const astHash = createHash("sha1").update(normalizedAst(body)).digest("hex").slice(0, 16);
 			switch (c.name) {
 				case "fn":
-					symbols.push({ id: symId(name), path: relPath, kind: "function", name, line, exported: true, astHash, signature: decl.childForFieldName("parameters")?.text });
+					symbols.push({ id: declId(decl, name), path: relPath, kind: "function", name, line, endLine, exported: true, astHash, signature: decl.childForFieldName("parameters")?.text });
 					break;
 				case "cls":
 				case "iface":
 				case "trait":
 				case "enum":
-					symbols.push({ id: symId(name), path: relPath, kind: c.name === "cls" ? "class" : c.name === "iface" ? "interface" : c.name === "trait" ? "trait" : "enum", name, line, exported: true, astHash });
+					symbols.push({ id: declId(decl, name), path: relPath, kind: c.name === "cls" ? "class" : c.name === "iface" ? "interface" : c.name === "trait" ? "trait" : "enum", name, line, endLine, exported: true, astHash });
 					break;
 				case "method": {
 					const cls = enclosingClassName(c.node) ?? "?";
 					const isPrivate = /\bprivate\b/.test(decl.text.slice(0, decl.text.indexOf("function")));
-					symbols.push({ id: symId(`${cls}::${name}`), path: relPath, kind: "method", name: `${cls}::${name}`, line, exported: !isPrivate, astHash, signature: decl.childForFieldName("parameters")?.text });
+					symbols.push({ id: declId(decl, `${cls}::${name}`), path: relPath, kind: "method", name: `${cls}::${name}`, line, endLine, exported: !isPrivate, astHash, signature: decl.childForFieldName("parameters")?.text });
 					break;
 				}
 				case "const": {
 					const cls = enclosingClassName(c.node);
-					symbols.push({ id: symId(cls ? `${cls}::${name}` : name), path: relPath, kind: "const", name: cls ? `${cls}::${name}` : name, line, exported: true });
+					symbols.push({ id: declId(decl, cls ? `${cls}::${name}` : name), path: relPath, kind: "const", name: cls ? `${cls}::${name}` : name, line, endLine, exported: true });
 					break;
 				}
 			}
@@ -393,10 +559,11 @@ export const phpAdapter: SourceAdapter = {
 		// --- deps: edges are attributed to the enclosing function/method, else to the file.
 		const owner = (n: Node): string => {
 			const fn = enclosing(n, ["method_declaration", "function_definition"]);
-			if (!fn) return relPath;
-			const name = fn.childForFieldName("name")?.text ?? "?";
-			if (fn.type === "method_declaration") return symId(`${enclosingClassName(fn) ?? "?"}::${name}`);
-			return symId(name);
+			return (fn && idOf.get(fn.startIndex)) || relPath;
+		};
+		const classId = (n: Node): string => {
+			const cls = enclosing(n, CONTAINER_TYPES);
+			return (cls && idOf.get(cls.startIndex)) || relPath;
 		};
 		const caps = await captures("php", tree, DEP_QUERY);
 		for (let i = 0; i < caps.length; i++) {
@@ -442,19 +609,19 @@ export const phpAdapter: SourceAdapter = {
 						const cls = enclosingClassName(c.node);
 						if (url && handler && cls && /^[a-z_][a-z0-9_]*$/i.test(handler)) {
 							const path = url.replace(/^[a-z]+:\/\//, "").replace(/\{(\w+)[^}]*\}/g, "{$1}");
-							routes.push({ id: `${relPath}#${routes.length + 1}`, method: "ANY", path, handlerSymbol: symId(`${cls}::${handler}`) });
+							routes.push({ id: `${relPath}#${routes.length + 1}`, method: "ANY", path, handlerSymbol: ((m) => symbols.find((s) => s.name === `${cls}::${m}`)?.id ?? `${cls}::${m}`)(routeHandler(symbols, cls, handler, c.node.text)) });
 						}
 					}
 					break;
 				}
 				case "extends":
-					deps.push({ from: symId(enclosingClassName(c.node) ?? "?"), to: c.node.text, kind: "extends" });
+					deps.push({ from: classId(c.node), to: c.node.text, kind: "extends" });
 					break;
 				case "implements":
-					deps.push({ from: symId(enclosingClassName(c.node) ?? "?"), to: c.node.text, kind: "implements" });
+					deps.push({ from: classId(c.node), to: c.node.text, kind: "implements" });
 					break;
 				case "use_trait":
-					deps.push({ from: symId(enclosingClassName(c.node) ?? "?"), to: c.node.text, kind: "use" });
+					deps.push({ from: classId(c.node), to: c.node.text, kind: "use" });
 					break;
 			}
 		}
@@ -488,7 +655,8 @@ export const phpAdapter: SourceAdapter = {
 		}
 
 		for (const g of profileFor(root)?.impliedDeps?.(relPath) ?? []) deps.push({ from: relPath, to: `glob:${g}`, kind: "load" });
-		return { path: relPath, lang: "php", loc, hash, symbols, deps, routes, queries, literalRefs: [...literalRefs], dynamicMarkers: [...dynamicMarkers] };
+		const { functions, containers } = await codeMap(tree.rootNode, idOf);
+		return { path: relPath, lang: "php", loc, hash, symbols, deps, routes, queries, literalRefs: [...literalRefs], dynamicMarkers: [...dynamicMarkers], functions, containers };
 	},
 
 	async indexRoutes(root) {
