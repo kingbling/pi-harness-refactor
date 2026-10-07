@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { getSourceAdapter, TARGET_ROLES } from "../adapters/registry.ts";
 import type { TargetLayout } from "../adapters/types.ts";
@@ -94,8 +94,8 @@ export function codePlace(config: Config, meta: UnitMeta, root?: string): { plac
 	let fromRule = false;
 	let shared = false;
 	const votes = files.map((f) => {
-		const rule = rules.filter((r) => covers(r.prefix, f)).sort((a, b) => b.prefix.length - a.prefix.length)[0];
-		if (rule?.stack && !config.target.stacks.includes(rule.stack)) throw new Error(`placement.json: rule "${rule.prefix}" names stack "${rule.stack}", not one of ${config.target.stacks.join(", ")}`);
+		// a rule for a stack that is no longer a target (the owner changed the stacks) is left over: it places nothing
+		const rule = rules.filter((r) => covers(r.prefix, f) && (!r.stack || config.target.stacks.includes(r.stack))).sort((a, b) => b.prefix.length - a.prefix.length)[0];
 		const p = source.placeFile?.(f, config.source.path);
 		if (rule) fromRule = true;
 		if (rule?.shared) shared = true;
@@ -502,6 +502,28 @@ function loadRules(root?: string): PlacementRule[] {
 	rulesCache = { file, mtime, rules };
 	return rules;
 }
+/**
+ * Leftovers of an earlier setup (another source repo, other target stacks) out of placement.json: rules naming a
+ * stack that is not a target any more, and prefixes no file of the current source starts with. Returns what went.
+ */
+export function pruneRules(root: string, config: Config): string[] {
+	const rules = loadRules(root);
+	const exists = (prefix: string) => {
+		try {
+			const name = prefix.split("/").pop() ?? "";
+			return readdirSync(join(config.source.path, dirname(prefix))).some((n) => n.startsWith(name));
+		} catch {
+			return false;
+		}
+	};
+	const keep = rules.filter((r) => (!r.stack || config.target.stacks.includes(r.stack)) && exists(r.prefix.replace(/\/$/, "")));
+	if (keep.length === rules.length) return [];
+	const file = rulesFile(root);
+	writeFileSync(file, JSON.stringify({ rules: keep }, null, 2) + "\n");
+	rulesCache = undefined;
+	return rules.filter((r) => !keep.includes(r)).map((r) => `${r.prefix}${r.stack ? ` (${r.stack})` : ""}`);
+}
+
 function addRules(root: string, add: PlacementRule[]): void {
 	const file = rulesFile(root);
 	const rules = loadRules(root).filter((r) => !add.some((a) => a.prefix === r.prefix));

@@ -6,7 +6,7 @@ import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { draftedOutside, runUnit } from "../src/run/unit.ts";
 import { getTargetAdapter, knownTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdFor } from "../src/adapters/registry.ts";
-import { applyPlacementAnswers, codePlace, placeUnit, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
+import { applyPlacementAnswers, codePlace, placeUnit, pruneRules, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
  * Placement: one legacy area → one feature module per stack. Code places clear cases (gyro layout), placement.json
@@ -261,3 +261,19 @@ describe("placement + taxonomy", () => {
 	});
 });
 
+
+describe("placement rules left from an earlier setup", () => {
+	it("a rule for a stack that is no longer a target places nothing; pruning removes it and rules for files the source does not have", () => {
+		writeFileSync(join(ws, ".bigrefactor", "placement.json"), JSON.stringify({ rules: [
+			{ prefix: "app/controller/money.", area: "billing", stack: "symfony" },
+			{ prefix: ".sim/other-repo/src/Config.", area: "config", stack: "nestjs" },
+			{ prefix: "app/model/classes/agency.", area: "agencies", stack: "nestjs" },
+		] }));
+		const meta = (files: string[]) => ({ files });
+		expect(() => codePlace(config, meta(["app/controller/money.controller.php"]), ws)).not.toThrow();
+		expect(codePlace(config, meta(["app/controller/money.controller.php"]), ws).place.area).not.toBe("billing");
+		expect(pruneRules(ws, config)).toEqual(["app/controller/money. (symfony)", ".sim/other-repo/src/Config. (nestjs)"]);
+		expect(JSON.parse(readFileSync(join(ws, ".bigrefactor", "placement.json"), "utf8")).rules.map((r: { prefix: string }) => r.prefix)).toEqual(["app/model/classes/agency."]);
+		expect(pruneRules(ws, config)).toEqual([]);
+	});
+});

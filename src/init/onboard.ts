@@ -379,6 +379,9 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 		await step("label", () => (noLlm ? "skipped (--no-llm): path heuristics only" : undefined), async () => {
 			const { labelUnits } = await import("./label.ts");
+			// rules from an earlier setup (other stacks, another source repo) would place units wrongly
+			const gone = (await import("../run/placement.ts")).pruneRules(root, config);
+			if (gone.length) ui.log(`removed ${gone.length} placement rule(s) left from an earlier setup: ${gone.slice(0, 5).join(", ")}${gone.length > 5 ? ", …" : ""}`);
 			const { OpenRouterClient } = await import("../models/openrouter.ts");
 			const l = ledger();
 			try {
