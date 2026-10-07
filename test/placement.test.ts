@@ -239,5 +239,19 @@ describe("placement + taxonomy", () => {
 		await resolvePlacements({ ledger, config, root: ws });
 		expect(open()).toEqual(["money"]);
 	});
+
+	it("fresh repo (no curated areas, nothing code-sure): code's guesses are proposals for Jev, not a question per unit", async () => {
+		const plain = join(ws, "plain");
+		for (const f of ["src/InvoiceController.php", "src/Pricing.php"]) (mkdirSync(dirname(join(plain, f)), { recursive: true }), writeFileSync(join(plain, f), "<?php\n"));
+		const cfg = ConfigSchema.parse({ source: { path: plain, stack: "php" }, target: { path: join(ws, "migrated2"), stacks: ["nestjs"] }, models: {} });
+		const l2 = new Ledger(join(ws, ".bigrefactor", "fresh.sqlite"));
+		l2.createUnit({ id: "inv", tier: "T1", deps: [], meta: { files: ["src/InvoiceController.php"] }, symbolIds: [] });
+		l2.createUnit({ id: "pricing", tier: "T1", deps: [], meta: { files: ["src/Pricing.php"] }, symbolIds: [] });
+		const client = new FakeModelClient({ decide: (req) => ({ area: (req.state as { path: string }).path.includes("Invoice") ? "invoice" : "pricing" }) });
+		const r = await resolvePlacements({ ledger: l2, config: cfg, root: join(ws, "fresh-root"), client });
+		expect(r).toMatchObject({ placed: 2, byModel: 2, asked: 0 });
+		expect(placeUnit(cfg, l2.getUnit("inv")!.meta)).toMatchObject({ area: "invoice", source: "model" });
+		l2.close();
+	});
 });
 

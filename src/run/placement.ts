@@ -239,7 +239,6 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 			return false;
 		});
 	}
-	const curatedBefore = curatedAreas(d.root);
 	if (unsure.length) {
 		// after curation: placements as they are now (curated areas), so candidates come from the curated set
 		const ctx = candidateContext(d.config, d.root, d.ledger.listUnits(), planPlacements(d.config, d.ledger.listUnits(), d.root));
@@ -261,8 +260,9 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 		};
 		await Promise.all(Array.from({ length: Math.max(1, d.concurrency ?? 16) }, work));
 	}
-	// areas outside the curated set (code-sure units of a new area, answers naming a new area): curate once more
-	if (d.curate && d.client && curatedBefore && outsideCurated(d.ledger, curatedBefore).length) {
+	// no curated set yet (fresh repo: the model proposed areas) or areas outside it (new area from code or an answer): curate once more
+	const curatedNow = curatedAreas(d.root);
+	if (d.curate && d.client && todo.length && (!curatedNow || outsideCurated(d.ledger, curatedNow).length)) {
 		const t = await curateAreas({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { log });
 		res.costUsd += t.costUsd;
 	}
@@ -352,7 +352,9 @@ function around(u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateConte
 	const known = new Map(stacks.flatMap((s) => [...(ctx.features.get(s) ?? [])]));
 	const byCount = [...known.keys()].sort((a, b) => stacks.reduce((n, s) => n + (ctx.count.get(`${s}:${b}`) ?? 0) - (ctx.count.get(`${s}:${a}`) ?? 0), 0));
 	const near = [code.place.area, ...neighbours.map(([a]) => a), ...uses.map(([a]) => a), ...usedBy.map(([a]) => a)];
-	const cands = [...new Set([...near.filter((a) => known.has(a)), ...byCount])].slice(0, 8);
+	// no vocabulary yet (fresh repo, nothing curated, nothing code-sure on this stack): code's guesses and the
+	// neighbours' areas are proposals, curation consolidates them right after the model pass
+	const cands = known.size ? [...new Set([...near.filter((a) => known.has(a)), ...byCount])].slice(0, 8) : [...new Set(near.filter((a) => a !== SHARED_AREA))].slice(0, 8);
 	const topics = [...new Set(stacks.flatMap((s) => [...(ctx.topics.get(s) ?? [])]))].slice(0, 6);
 	return { files, neighbours, uses, usedBy, cands, topics, purpose: (a: string) => known.get(a) ?? "" };
 }
@@ -397,8 +399,8 @@ async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Re
 	if (pick?.area) options.push({ value: value(stackId, pick.area, !!pick.shared), facts: "Jev's pick (below the confidence to act alone)" });
 	for (const s of stacks) {
 		for (const c of cands) {
-			const v = value(s, c, false);
-			if ((ctx.features.get(s)?.has(c) ?? false) && !options.some((o) => o.value === v)) options.push({ value: v, facts: `${purpose(c) ? `${purpose(c)}; ` : ""}${ctx.count.get(`${s}:${c}`) ?? 0} units already placed there` });
+			const v = value(s, c, false); // a stack without known areas yet (fresh repo): the candidates are proposals
+			if ((ctx.features.get(s)?.size ? ctx.features.get(s)!.has(c) : true) && !options.some((o) => o.value === v)) options.push({ value: v, facts: `${purpose(c) ? `${purpose(c)}; ` : ""}${ctx.count.get(`${s}:${c}`) ?? 0} units already placed there` });
 		}
 		for (const t of ctx.topics.get(s) ?? []) if (topics.includes(t) && !options.some((o) => o.value === value(s, t, true))) options.push({ value: value(s, t, true), facts: "shared topic in use (cross-cutting code)" });
 		// cross-cutting is always an answer, even before any shared topic exists (another topic name can be typed)
