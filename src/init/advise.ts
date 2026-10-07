@@ -9,6 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { decisionsPath, loadDecisions, openDecisions, type Decision } from "../inventory/decisions.ts";
 import { planFrameworks } from "../inventory/frameworks.ts";
+import { progress } from "../progress.ts";
 
 /**
  * `br advise`: judgments come from models, facts from code. Code collects the evidence (index, framework
@@ -61,12 +62,13 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 	// ---- 0. where each part of the app goes (server, ui, every data store, …), rated from the repo
 	if (!file.dimensions) {
 		const { TARGET_ROLES } = await import("../adapters/registry.ts");
+		const t0 = progress.tally();
 		const r = await adviseDimensions(survey, b.brief, client, config.models.escalate.id, { legacyLibraries: plan.libraries.map((l) => l.name), dataStores: config.db.from, adapters: Object.entries(TARGET_ROLES).map(([id, role]) => ({ id, role })) });
 		cost += r.costUsd;
 		if (r.dimensions.length) {
 			file.dimensions = r.dimensions;
 			for (const d of r.dimensions) advice[`target:${d.key}`] = { value: d.candidates[0]!.id, reason: d.candidates[0]!.reason, by: config.models.escalate.id };
-			log(pc.dim(`  advise: rated ${r.dimensions.length} dimensions (${r.dimensions.map((d) => `${d.key} → ${d.candidates[0]!.id} ${d.candidates[0]!.score}`).join(", ")}), $${r.costUsd.toFixed(4)}`));
+			log(pc.dim(`  advise: rated ${r.dimensions.length} dimensions (${r.dimensions.map((d) => `${d.key} → ${d.candidates[0]!.id} ${d.candidates[0]!.score}`).join(", ")}), ${progress.usageSince(t0)}`));
 		}
 	}
 	const implied: Array<{ id: string; value: string; reason: string }> = [];
@@ -76,6 +78,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 	// ---- 1. target stack choices: the escalate model picks among each adapter's options from the repo
 	const stackOpen = targets.some((t) => (t.stackChoices ?? []).some((c) => !file.answers[`stack:${t.id}.${c.key}`] && !advice[`stack:${t.id}.${c.key}`]));
 	if (stackOpen) {
+		const t0 = progress.tally();
 		const r = await adviseStack(survey, targets, client, config.models.escalate.id, { dbTo: config.db.to, legacyLibraries: plan.libraries.map((l) => l.name), brief: b.brief, decided: decidedDims });
 		cost += r.costUsd;
 		for (const [t, picks] of Object.entries(r.picks))
@@ -84,7 +87,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 				// settled by what the owner decided (e.g. the data dimension fixes the database): not asked
 				if (v.implied && !file.answers[`stack:${t}.${k}`]) implied.push({ id: `stack:${t}.${k}`, value: v.id, reason: v.reason });
 			}
-		log(pc.dim(`  advise: ${Object.values(r.picks).reduce((a, x) => a + Object.keys(x).length, 0)} stack choices, $${r.costUsd.toFixed(4)}`));
+		log(pc.dim(`  advise: ${Object.values(r.picks).reduce((a, x) => a + Object.keys(x).length, 0)} stack choices, ${progress.usageSince(t0)}`));
 	}
 	persist(root, file);
 
@@ -136,6 +139,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 			classes.length ? `\nLegacy framework classes the app uses that have no mapping yet (verdict platform:<concern> when the target platform provides it, port when it holds application logic to carry over, drop when obsolete):\n${classes.map((c) => `### ${c.name} (${c.appRefs} app references, ${c.path})\n${excerpt(c.path, c.name)}`).join("\n\n")}` : "",
 			"\nReturn every listed item exactly once with a one-sentence reason grounded in what the code/library does. successor is \"\" unless verdict is replace.",
 		].join("\n");
+		const t0 = progress.tally();
 		const res = await client.chat({ model: config.models.escalate.id, tier: config.models.escalate.tier as any, messages: [{ role: "system", content: "You are a senior migration architect. Be concrete; never invent packages." }, { role: "user", content: prompt }], schema, effort: "medium" });
 		cost += res.usage.costUsd;
 		const out = (res.json ?? {}) as { libraries?: Array<{ name: string; verdict: string; successor: string; condition?: string; reason: string }>; classes?: Array<{ name: string; verdict: string; reason: string }> };
@@ -147,7 +151,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 			advice[`lib:${l.name}`] = { value: l.verdict === "replace" && pkg ? `replace:${pkg}` : l.verdict === "replace" ? "review" : l.verdict, reason: `${l.reason}${condition ? ` (${condition})` : ""}`, by: res.usage.model };
 		}
 		for (const c of out.classes ?? []) advice[`fw:${c.name}`] = { value: c.verdict, reason: c.reason, by: res.usage.model };
-		log(pc.dim(`  advise: ${out.libraries?.length ?? 0} libraries, ${out.classes?.length ?? 0} framework classes, $${res.usage.costUsd.toFixed(4)}`));
+		log(pc.dim(`  advise: ${out.libraries?.length ?? 0} libraries, ${out.classes?.length ?? 0} framework classes, ${progress.usageSince(t0)}`));
 	}
 	persist(root, file);
 
@@ -161,6 +165,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 		const repo = { stack: config.source.stack, framework: config.source.framework, db: { from: config.db.from }, targets: decidedTargets ?? "not decided yet", brief: b.brief.slice(0, 3000) };
 		const facts = { frameworks: plan.concerns.filter((c) => c.appRefs > 0).map((c) => `${c.concern}:${c.verdict}`), slices: ledger.getMeta("slice_plan") ? JSON.parse(ledger.getMeta("slice_plan")!).map((s: { name: string; units: number }) => `${s.name}:${s.units}`) : [] };
 		let spent = 0;
+		const t0 = progress.tally();
 		await Promise.all(
 			jevable.map(async (d) => {
 				const battery: Battery = { choice: { type: "choice", instructions: `${d.question} Use \`evidence\` and \`repo\`. Pick the option a careful migration lead would choose for this repo.`, criteria: { ...Object.fromEntries(d.options.filter((o) => !o.value.includes("?")).map((o) => [o.value, `${o.label}${o.hint ? ` — ${o.hint}` : ""}`])), other: null } } };
@@ -177,7 +182,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 			}),
 		);
 		cost += spent;
-		log(pc.dim(`  advise: ${jevable.length} decisions via Jev, $${spent.toFixed(5)}`));
+		log(pc.dim(`  advise: ${jevable.length} decisions via Jev, ${progress.usageSince(t0)}`));
 	}
 	persist(root, file);
 
@@ -186,16 +191,18 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 	const raw = openDecisions(ledger, config, source, targets, root, { raw: true });
 	const stale = raw.map(toPoint).filter((p) => file.phrased?.[p.id]?.hash !== pointHash(p));
 	if (stale.length) {
+		const t0 = progress.tally();
 		const r = await phraseDecisions(deps, stale);
 		file.phrased = { ...file.phrased, ...r.phrased };
 		cost += r.costUsd;
-		log(pc.dim(`  advise: ${Object.keys(r.phrased).length}/${stale.length} questions phrased for this repo, $${r.costUsd.toFixed(4)}`));
+		log(pc.dim(`  advise: ${Object.keys(r.phrased).length}/${stale.length} questions phrased for this repo, ${progress.usageSince(t0)}`));
 	}
 	if (!file.discovered) {
+		const t0 = progress.tally();
 		const r = await discoverDecisions(deps, raw.map((d) => ({ id: d.id, question: file.phrased?.[d.id]?.question ?? d.question })));
 		file.discovered = r.discovered;
 		cost += r.costUsd;
-		log(pc.dim(`  advise: ${Object.keys(r.discovered).length} repo-specific decisions found, $${r.costUsd.toFixed(4)}`));
+		log(pc.dim(`  advise: ${Object.keys(r.discovered).length} repo-specific decisions found, ${progress.usageSince(t0)}`));
 	}
 	persist(root, file);
 	return { libraries: libs.length, classes: classes.length, decisions: jevable.length, costUsd: cost, implied };

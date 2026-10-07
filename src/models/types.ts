@@ -20,6 +20,8 @@ export interface Usage {
 	inputTokens: number;
 	outputTokens: number;
 	costUsd: number;
+	/** List price of a call served by a subscription (Codex): not spent, so not in costUsd; shown only. */
+	listUsd?: number;
 	/** What actually served the call (fallback / tier may differ from the request). */
 	model: string;
 	tierServed?: string;

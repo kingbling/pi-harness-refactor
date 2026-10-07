@@ -1,4 +1,5 @@
 import { recordSpend } from "../spend.ts";
+import { progress } from "../progress.ts";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +41,9 @@ export interface OpenRouterOptions {
 	/** Try the Codex login in Pi first for openai/* models (default: on, unless a fetch is injected). */
 	codex?: boolean;
 }
+
+/** Every direct call counts in the live job totals (paid dollars, Codex list price, tokens). */
+const tally = (u: Usage) => progress.callUsage({ costUsd: u.costUsd, codexUsd: u.listUsd ?? 0, tokensIn: u.inputTokens, tokensOut: u.outputTokens });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -103,6 +107,7 @@ export class OpenRouterClient implements ModelClient {
 			const viaCodex = await codexChat(req);
 			if (viaCodex) {
 				this.onUsage?.({ ...viaCodex.usage, kind: "chat" });
+				tally(viaCodex.usage);
 				return viaCodex;
 			}
 		}
@@ -130,6 +135,7 @@ export class OpenRouterClient implements ModelClient {
 					tierServed: json.service_tier ?? tier,
 				};
 				this.onUsage?.({ ...usage, kind: "chat" });
+				tally(usage);
 				recordSpend(usage.costUsd, "api: chat", usage.model);
 				let parsed: unknown;
 				if (req.schema) {
@@ -174,6 +180,7 @@ export class OpenRouterClient implements ModelClient {
 					model: json.model ?? req.model,
 				};
 				this.onUsage?.({ ...usage, kind: "decide" });
+				tally(usage);
 				recordSpend(usage.costUsd, "api: decide", usage.model);
 				return { answers: json.answers, usage };
 			} catch (e: any) {

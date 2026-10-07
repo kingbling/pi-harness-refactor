@@ -62,8 +62,8 @@ export async function codexChat(req: ChatRequest): Promise<ChatResponse | undefi
 			const required = (req.schema["required"] as string[] | undefined) ?? [];
 			if (!json || typeof json !== "object" || required.some((k) => !(k in (json as object)))) return undefined;
 		}
-		// subscription: no money spent, so no spend entry and no cost (budgets count paid calls only)
-		return { text, json, usage: { inputTokens: res.usage?.input ?? 0, outputTokens: res.usage?.output ?? 0, costUsd: 0, model: `${CODEX_PROVIDER}/${model.id}`, tierServed: "codex" } };
+		// subscription: no money spent, so no spend entry and no cost (budgets count paid calls only); the list price is shown
+		return { text, json, usage: { inputTokens: res.usage?.input ?? 0, outputTokens: res.usage?.output ?? 0, costUsd: 0, listUsd: res.usage?.cost?.total ?? 0, model: `${CODEX_PROVIDER}/${model.id}`, tierServed: "codex" } };
 	} catch {
 		return undefined;
 	}
