@@ -40,6 +40,7 @@ const MAX_LINES = 200;
 
 const SUBCOMMANDS: Record<string, string> = {
 	status: "ledger dashboard",
+	check: "what bigrefactor needs here (Pi packages, logins, the stacks' tools) and what is missing",
 	forecast: "how far the migration is: done, open, spend and time left",
 	lanes: "lanes [n] [gates m]: show/change parallel units live (running units finish)",
 	why: "why <id|path>: full history of a symbol or file",
@@ -462,6 +463,11 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const [sub = "status", ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			if (sub === "check") {
+				const { checkRequirements, renderRequirements } = await import("../requirements.ts");
+				show(ctx, "check", renderRequirements(await checkRequirements({ cwd: ctx.cwd, tools: pi.getAllTools().map((t) => t.name) }), { color: false }));
+				return;
+			}
 			if (sub === "lanes") {
 				const p = findConfigPath(ctx.cwd);
 				if (!p) return warn(ctx, "no bigrefactor.config.json here");
@@ -771,5 +777,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Keep the ledger in view: a one-line footer status, refreshed when a session starts.
-	pi.on("session_start", async (_e, ctx) => refreshStatus(ctx));
+	pi.on("session_start", async (_e, ctx) => {
+		refreshStatus(ctx);
+		// what this plugin needs (other Pi packages, logins, the stacks' tools): say at startup what is missing
+		void import("../requirements.ts")
+			.then(async ({ checkRequirements, requirementsNotice }) => {
+				const notice = requirementsNotice(await checkRequirements({ cwd: ctx.cwd, tools: pi.getAllTools().map((t) => t.name) }));
+				if (notice) warn(ctx, notice);
+			})
+			.catch(() => undefined);
+	});
 }

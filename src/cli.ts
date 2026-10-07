@@ -45,6 +45,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br questions | answer <id> <text>   open human questions (nothing unrelated waits on them)
   br why <symbol|path>         full history of one symbol or file
   br smoke                     verify configured models and the OpenRouter key
+  br check                     what bigrefactor needs on this machine (logins, git, ast-grep, the stacks' tools) and what is missing
 `);
 	},
 	status: async () => {
@@ -68,6 +69,12 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!id) throw new Error("usage: br why <symbol-id|path>");
 		const { ledger } = open();
 		console.log(renderWhy(ledger, id));
+	},
+	check: async () => {
+		const { checkRequirements, renderRequirements } = await import("./requirements.ts");
+		const rs = await checkRequirements({ cwd: process.cwd() });
+		console.log(renderRequirements(rs));
+		if (rs.some((r) => r.status === "missing")) process.exitCode = 1;
 	},
 	smoke: async () => {
 		const { smoke } = await import("./smoke.ts");
