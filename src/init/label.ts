@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { getSourceAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { decide } from "../jev/decide.ts";
-import { ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
+import { JEV_ACT as ACT, noulConfidence, ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { planSlices, type SliceOverrides } from "../inventory/slices.ts";
@@ -20,7 +20,6 @@ import { resolvePlacements } from "../run/placement.ts";
  * Advice never overrides a human: explicit `overrides` in slices.json win. Every call lands in the
  * decisions table for calibration. Cheap: Jev ≈ $0.00004 per call.
  */
-const ACT = 0.75;
 /** Literal, language-agnostic text signal (code fact, certain): SQL keywords in strings. Global state is the adapter's. */
 const SQL_TEXT = /["'`]\s*(SELECT\s.+\sFROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b/i;
 const LEVELS = ["mechanical", "moderate", "hard"] as const;
@@ -54,7 +53,7 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 			const meta = JSON.parse(u.meta) as { files: string[]; loc: number; queries: number; dynamic_markers?: unknown[]; cutDeps?: string[] };
 			const state = { summary: excerpt(meta.files), path: meta.files[0] };
 			try {
-				const r = await decide({ client, ledger, model }, "label_unit", state, ROUTE_UNIT, ["kind"], u.id);
+				const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_unit", state, ROUTE_UNIT, ["kind"], u.id);
 				cost += r.costUsd;
 				const a = r.answers;
 				const kind = a["kind"]?.type === "choice" ? a["kind"] : undefined;
@@ -95,9 +94,9 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 	let auth: string[] = advised.auth ?? [];
 	if (features.length && !advised.auth) {
 		const battery: Battery = Object.fromEntries(features.map((s) => [s.name.replace(/[^A-Za-z0-9_]/g, "_"), { type: "noul", instructions: `Is the feature slice "${s.name}" (entry points: ${s.entryPoints.slice(0, 12).join(", ")}) about authentication, login, sessions or user identity, so that other features depend on it?` }]));
-		const r = await decide({ client, ledger, model }, "label_auth", { app: config.source.framework ?? config.source.stack }, battery, Object.keys(battery));
+		const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_auth", { app: config.source.framework ?? config.source.stack }, battery, Object.keys(battery));
 		cost += r.costUsd;
-		auth = features.filter((s) => { const a = r.answers[s.name.replace(/[^A-Za-z0-9_]/g, "_")]; return a?.type === "noul" && a.noul >= ACT; }).map((s) => s.name);
+		auth = features.filter((s) => { const a = r.answers[s.name.replace(/[^A-Za-z0-9_]/g, "_")]; return a?.type === "noul" && a.noul >= 0.5 && noulConfidence(a.noul) >= ACT; }).map((s) => s.name);
 		advised.auth = auth;
 	}
 	const dyn = plan.slices.find((s) => s.name === "dynamic")?.units ?? [];
@@ -153,7 +152,7 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 				const criteria: Record<string, string | null> = { ...Object.fromEntries(plausible.map((sl) => [key(sl.name), `feature "${sl.name}" (entry points: ${sl.entryPoints.slice(0, 6).join(", ")})`])), foundation: "shared code many features use", other: null };
 				const battery: Battery = { slice: { type: "choice", instructions: "No route reaches the code in `summary`. `neighbours` lists which feature the other files in its folder belong to. Which feature slice should it be migrated with?", criteria } };
 				try {
-					const r = await decide({ client, ledger, model }, "label_slice", { summary: excerpt(meta.files), path: meta.files[0], neighbours: { folder: v.dir, slices: Object.fromEntries(v.tally) } }, battery, ["slice"], id);
+					const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_slice", { summary: excerpt(meta.files), path: meta.files[0], neighbours: { folder: v.dir, slices: Object.fromEntries(v.tally) } }, battery, ["slice"], id);
 					cost += r.costUsd;
 					const a = r.answers["slice"];
 					if (a?.type === "choice" && a.choice !== "other" && a.confidence >= ACT) {

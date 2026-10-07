@@ -5,7 +5,7 @@ import type { TargetLayout } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { answerValue, askViaModel, type AskOption } from "../jev/ask.ts";
 import { decide } from "../jev/decide.ts";
-import { noulConfidence, type Battery } from "../jev/questions.ts";
+import { JEV_ACT as ACT, noulConfidence, type Battery } from "../jev/questions.ts";
 import type { Ledger, UnitRow } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { genericArea, kebab, SHARED_AREA } from "./areas.ts";
@@ -51,7 +51,6 @@ interface PlacementRule {
 }
 type UnitMeta = { files?: string[]; route?: { has_ui?: number }; place?: StoredPlace; placeQuestion?: number };
 
-const ACT = 0.75;
 const POINT = "placement";
 
 export function placeUnit(config: Config, metaJson: string, root?: string): Placement {
@@ -376,7 +375,7 @@ async function modelPlace(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Retu
 		},
 	};
 	if (!code.surfaceKnown && d.config.target.stacks.length > 1) battery["ui"] = { type: "noul", instructions: "Does the code in `summary` render HTML, templates, or browser-side scripts or styles?" };
-	const r = await decide({ client: d.client!, ledger: d.ledger, model: d.config.models.decide.id }, POINT, { summary: excerpt(d.config, files), path: files[0], neighbours: Object.fromEntries(neighbours), uses: Object.fromEntries(uses), used_by: Object.fromEntries(usedBy) }, battery, Object.keys(battery), u.id);
+	const r = await decide({ client: d.client!, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, POINT, { summary: excerpt(d.config, files), path: files[0], neighbours: Object.fromEntries(neighbours), uses: Object.fromEntries(uses), used_by: Object.fromEntries(usedBy) }, battery, Object.keys(battery), u.id);
 	const a = r.answers["area"];
 	const choice = a?.type === "choice" ? a.choice : "other";
 	const ui = r.answers["ui"];

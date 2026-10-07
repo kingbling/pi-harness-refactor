@@ -109,13 +109,14 @@ export interface Thresholds {
 	act: number; // >= act → act automatically
 	check: number; // >= check → act but flag; below → escalate
 }
+/**
+ * One line for every Jev call: at or above it Jev's answer is acted on; below it a stronger model gives a second
+ * opinion on the same evidence (decide `second`), and only an agreeing one lets the answer stand. Otherwise the
+ * caller falls back to the code's default or asks the owner.
+ */
+export const JEV_ACT = 0.7;
 export const DEFAULT_THRESHOLDS: Record<string, Thresholds> = {
-	route: { act: 0.6, check: 0.4 },
-	triage_gate: { act: 0.7, check: 0.5 },
-	triage_truth: { act: 0.7, check: 0.5 },
-	same_behavior: { act: 0.9, check: 0.75 },
-	slice_sanity: { act: 0.7, check: 0.5 },
-	systemic: { act: 0.8, check: 0.6 },
+	triage_gate: { act: JEV_ACT, check: JEV_ACT },
 };
 
 export function band(confidence: number, t: Thresholds): "act" | "check" | "escalate" {

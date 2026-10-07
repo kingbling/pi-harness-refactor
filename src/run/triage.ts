@@ -76,7 +76,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	};
 	let dec;
 	try {
-		dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
+		dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
 	} catch (e) {
 		// the decision model is unavailable: the playbook still runs, by code (retry → escalate → quarantine)
 		const action: TriageAction = attemptNo >= maxTotal ? "quarantine" : attemptNo >= maxImpl ? "escalate" : "retry";

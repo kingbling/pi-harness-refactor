@@ -14,7 +14,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
-import { SYSTEMIC_FAILURE } from "../jev/questions.ts";
+import { SYSTEMIC_FAILURE, JEV_ACT } from "../jev/questions.ts";
 import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } from "./placement.ts";
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
@@ -418,10 +418,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		if (circuitOpen || !o.client || failed.length < 3 || failed.length < recent.length / 2) return;
 		try {
-			const r = await decide({ client: o.client, ledger, model: config.models.decide.id }, "systemic_failure", { recent_failures: failed.map((f) => ({ unit: f.unit, cause: f.cause, gate: f.gate })) }, SYSTEMIC_FAILURE, ["systemic"]);
+			const r = await decide({ client: o.client, ledger, model: config.models.decide.id, second: config.models.escalate.id }, "systemic_failure", { recent_failures: failed.map((f) => ({ unit: f.unit, cause: f.cause, gate: f.gate })) }, SYSTEMIC_FAILURE, ["systemic"]);
 			const sys = r.answers["systemic"];
 			const kind = r.answers["kind"]?.type === "choice" ? (r.answers["kind"] as { choice: string }).choice : "other";
-			if (sys?.type === "noul" && sys.noul >= 0.75 && kind !== "hard_batch") {
+			if (sys?.type === "noul" && sys.noul >= 0.5 && r.confidence >= JEV_ACT && kind !== "hard_batch") {
 				circuitOpen = true;
 				requestStop(`circuit breaker: systemic failure`);
 				const q = await askSystemic(`${failed.length} of the last ${recent.length} units failed; Jev judges one shared cause (${kind}, ${Math.round(sys.noul * 100)}%): ${failed.map((f) => `${f.unit}${f.cause ? ` (${f.cause})` : ""}`).join(", ")}. The run stopped starting new units; running ones finish.\nGate output:\n${failed.map((f) => `${f.unit}: ${f.gate ?? ""}`).join("\n")}`, r.decisionId);

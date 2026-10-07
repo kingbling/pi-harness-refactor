@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { answerValue, askViaModel, type AskDeps } from "../jev/ask.ts";
 import { decide } from "../jev/decide.ts";
+import { JEV_ACT } from "../jev/questions.ts";
 
 /**
  * Legacy quirks. The tester does not pin every oddity of the old code; it records each one with an opinion
@@ -83,7 +84,6 @@ export async function askPendingQuirks(d: AskDeps & { root: string }, unitId?: s
 }
 
 /** Owner decisions on earlier quirks; a new quirk with the same behaviour and stakes takes the same answer. */
-const PRECEDENT_MIN_CONFIDENCE = 0.85;
 async function precedentFor(d: AskDeps, q: QuirkRow): Promise<{ id?: number; decision?: "drop" | "keep"; costUsd: number }> {
 	syncQuirkAnswers({ ...d, root: d.root ?? "" });
 	const decided = d.ledger.db
@@ -93,10 +93,10 @@ async function precedentFor(d: AskDeps, q: QuirkRow): Promise<{ id?: number; dec
 	const criteria: Record<string, string> = Object.fromEntries(decided.map((p) => [`p${p.id}`, `${p.kind}: ${p.behaviour} → the owner chose ${p.status === "kept" ? "keep" : "drop"}`]));
 	criteria["none"] = "No earlier decision covers it: the behaviour or what callers depend on differs";
 	try {
-		const r = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "quirk_precedent", { quirk: { kind: q.kind, behaviour: q.behaviour, example: q.example, symbol: q.symbol_id } }, { precedent: { type: "choice", instructions: "The old code has the quirk in `quirk`. Does one of the owner's earlier decisions cover the same behaviour with the same stakes, so that its answer applies unchanged?", criteria } }, ["precedent"], q.unit_id);
+		const r = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, "quirk_precedent", { quirk: { kind: q.kind, behaviour: q.behaviour, example: q.example, symbol: q.symbol_id } }, { precedent: { type: "choice", instructions: "The old code has the quirk in `quirk`. Does one of the owner's earlier decisions cover the same behaviour with the same stakes, so that its answer applies unchanged?", criteria } }, ["precedent"], q.unit_id);
 		const pick = r.answers["precedent"]?.type === "choice" ? (r.answers["precedent"] as { choice: string }).choice : "none";
 		const p = decided.find((x) => `p${x.id}` === pick);
-		if (!p || r.confidence < PRECEDENT_MIN_CONFIDENCE) return { costUsd: r.costUsd };
+		if (!p || r.confidence < JEV_ACT) return { costUsd: r.costUsd };
 		return { id: p.id, decision: p.status === "kept" ? "keep" : "drop", costUsd: r.costUsd };
 	} catch {
 		return { costUsd: 0 }; // no decision model: ask
