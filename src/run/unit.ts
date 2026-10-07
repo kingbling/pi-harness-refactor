@@ -26,6 +26,7 @@ import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompt
 import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
 import { triageGate, type Triage } from "./triage.ts";
+import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 
 /**
  * The unit's own small orchestrator. Deterministic playbook ("go instructions"):
@@ -66,6 +67,8 @@ export interface UnitRunOptions {
 	/** Injection points for simulation level 1 (scripted sessions, scripted build/test outcomes). */
 	spawn?: typeof spawnLeaf;
 	gate?: typeof runGate;
+	/** Fixes setup problems of the new project during the run; default: the setup model (none when `spawn` is faked). */
+	setupFixer?: SetupFixer | false;
 }
 
 export interface UnitRunResult {
@@ -374,12 +377,26 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					previousGate = gate;
 					continue;
 				}
+				// a setup problem of the new project: the setup model fixes it first; the owner only when it cannot
+				let setupTried = "";
+				const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
+				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
+					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+					if (fixed) {
+						if (qid) o.ledger.withdrawQuestion(qid, `setup fixed by the model: ${fixed}`);
+						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
+						o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: dx.summary } } } });
+						log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
+						return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
+					}
+					setupTried = " The setup model tried and could not fix it.";
+				}
 				if (qid) {
 					// the doctor knows more than triage did: the question is asked again with the diagnosis (phrased by a model)
 					o.ledger.withdrawQuestion(qid, `diagnosed: ${dx.summary}`);
 					qid = await ask({
 						point: "gate_env",
-						facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
+						facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${setupTried}${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
 						options: [
 							{ value: "fixed", facts: dx.command ? `ran ${dx.command}; the unit runs again` : "the environment is fixed; the unit runs again" },
 							{ value: "quarantine", facts: "leave the unit quarantined for a human" },

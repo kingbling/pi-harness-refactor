@@ -59,3 +59,29 @@ describe("setup check: a model with tools fixes what fails, code decides it work
 		await expect(checkToolchain(config, adapter, { fix: false })).rejects.toThrow(/test command fails on a fresh project/);
 	});
 });
+
+describe("setup fixes during the run", () => {
+	it("units failing on the same setup problem share one fix; the change is committed; nothing changed = ask the owner", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { root, target, adapter, config } = stack({ id: "runfix" } as never);
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		let calls = 0;
+		const fixer: SetupFixer = async (o) => {
+			calls++;
+			await new Promise((r) => setTimeout(r, 20));
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
+			return "added the missing vitest config";
+		};
+		const ask = () => fixRunSetup({ config, root, adapter, projectDir: target, problem: "vitest: no config", fixer });
+		const [a, b] = await Promise.all([ask(), ask()]);
+		expect(calls).toBe(1);
+		expect(a).toBe("added the missing vitest config");
+		expect(b).toBe(a);
+		const { execFileSync } = await import("node:child_process");
+		expect(execFileSync("git", ["-C", target, "log", "-1", "--format=%s"], { encoding: "utf8" })).toMatch(/setup fixed during the run/);
+		// a session that changes nothing is no fix: the unit asks the owner
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "x", fixer: async () => "looked around" })).toBeUndefined();
+	});
+});

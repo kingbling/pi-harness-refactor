@@ -34,7 +34,8 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 	} as unknown as ToolDefinition;
 }
 
-export type SetupFixer = (o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; attempt: number }) => Promise<void>;
+/** Returns the model's one-sentence account of what it changed. */
+export type SetupFixer = (o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; attempt: number }) => Promise<string | void>;
 
 /** One model session that fixes the setup problem in the new project. */
 export const fixSetupWithModel: SetupFixer = async (o) => {
@@ -62,8 +63,42 @@ ${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const r = await session.run(`The setup check failed:\n${o.problem.slice(-4000)}\n\nFix it, then run the failing command yourself to confirm.`);
-		console.log(pc.dim(`  setup fix: ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${r.text.trim().split("\n").at(-1) ?? ""}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
+		const said = r.text.trim().split("\n").at(-1) ?? "";
+		console.log(pc.dim(`  setup fix: ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${said}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
+		return said;
 	} finally {
 		session.dispose();
 	}
 };
+
+// ---- run time ------------------------------------------------------------------------------------------
+
+const fixing = new Map<string, Promise<string | undefined>>();
+const fixes = new Map<string, number>();
+/** Setup fixes per stack in one process: a problem the model keeps not fixing goes to the owner. */
+export const MAX_RUN_FIXES = 3;
+
+/**
+ * A gate failure diagnosed as a setup problem of the new project: the setup model fixes the stack's main project
+ * (not the unit's worktree) and the change is committed, so every unit started from now on has it. One fix per
+ * stack at a time: units failing on the same problem meanwhile wait for that fix instead of starting their own.
+ * Returns what changed, or undefined when nothing did (the owner is asked then).
+ */
+export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; fixer?: SetupFixer }): Promise<string | undefined> {
+	const key = o.adapter.id;
+	const running = fixing.get(key);
+	if (running) return running;
+	if ((fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return undefined;
+	fixes.set(key, (fixes.get(key) ?? 0) + 1);
+	const p = (async () => {
+		const { commitAll } = await import("../git.ts");
+		const { loadCommandOverrides } = await import("../adapters/command-overrides.ts");
+		const before = JSON.stringify(loadCommandOverrides(o.root, key));
+		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(key)! });
+		const sha = commitAll(o.config.target.path, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
+		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
+		return sha || override ? said || "the setup was changed" : undefined;
+	})().finally(() => fixing.delete(key));
+	fixing.set(key, p);
+	return p;
+}
