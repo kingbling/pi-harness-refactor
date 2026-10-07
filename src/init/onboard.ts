@@ -155,6 +155,37 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			const { openDecisions, applyDecision, renderDecisions } = await import("../inventory/decisions.ts");
 			const l = ledger();
 			try {
+				const { knownTargets } = await import("../adapters/registry.ts");
+				// one dialog per decision; besides the options: type another answer, or leave it open for later
+				const OTHER = "\0other", LATER = "\0later";
+				const askOne = async (d: (typeof ds)[number]): Promise<string | undefined> => {
+					const v = await ui.select(`${d.question}\n   ${d.evidence}${d.reason ? `\n   why ${d.recommended}: ${d.reason}` : ""}`, [...d.options.map((o) => ({ value: o.value, label: o.value === d.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), { value: OTHER, label: "something else (type it)" }, { value: LATER, label: "decide later", hint: "stays open; br decide asks again" }], d.recommended);
+					if (v === undefined) throw new Error("onboarding cancelled");
+					if (v === LATER) return undefined;
+					if (v !== OTHER) return v;
+					const typed = (await ui.text(`${d.id}: your answer${d.id === "targets" ? " (stack ids joined by +, e.g. server+ui)" : ""}`, ""))?.trim();
+					return typed || undefined;
+				};
+				// the target stack first: every other question (stack choices, platform concerns) depends on it
+				const tq = openDecisions(l, config, source, targets, root).find((d) => d.id === "targets");
+				if (tq) {
+					const v = yes ? tq.recommended : await askOne(tq);
+					if (v) {
+						applyDecision(l, config, root, "targets", v, yes ? "onboard --yes" : "human (onboard)");
+						reload();
+						const missing = config.target.stacks.filter((s) => !knownTargets().includes(s));
+						if (missing.length) throw new Error(`target stack decided: ${config.target.stacks.join(" + ")}. bigrefactor has no ${missing.join("/")} target adapter yet; add one under src/adapters/target/ (registry.ts), or change it with br decide --answer targets=<stacks>, then br resume`);
+						const now = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
+						const changed = now.map((t) => t.id).join("+") !== targets.map((t) => t.id).join("+");
+						targets.splice(0, targets.length, ...now);
+						// stack choices of a newly chosen target get the same repo-based advice as the rest
+						if (changed && !noLlm) {
+							const { advise } = await import("./advise.ts");
+							const { OpenRouterClient } = await import("../models/openrouter.ts");
+							await advise(config, root, l, new OpenRouterClient(), source, targets, (x) => log(x));
+						}
+					}
+				}
 				let ds = openDecisions(l, config, source, targets, root);
 				if (!ds.length) return "nothing to decide";
 				const total = ds.length;
@@ -169,9 +200,8 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 					reload();
 					ds = openDecisions(l, config, source, targets, root);
 					for (const d of ds) {
-						const v = await ui.select(`${d.question}\n   ${d.evidence}${d.reason ? `\n   why ${d.recommended}: ${d.reason}` : ""}`, d.options.map((o) => ({ value: o.value, label: o.value === d.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), d.recommended);
-						if (v === undefined) throw new Error("onboarding cancelled");
-						applyDecision(l, config, root, d.id, v, "human (onboard)");
+						const v = await askOne(d);
+						if (v) applyDecision(l, config, root, d.id, v, "human (onboard)");
 					}
 				}
 				reload();
@@ -188,7 +218,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		targets.splice(0, targets.length, ...decidedTargets);
 		// Bootstrapped = every project exists AND setup's final commit landed. An interrupted setup (half a
 		// generator run, chosen packages not added) has files but no commit, so a resume redoes it idempotently.
-		await step("setup", () => (config.target.stacks.every((s) => projectReady(config, s)) && targetHasCommit(config.target.path) ? "target already bootstrapped" : undefined), async () => {
+		await step("setup", () => (targets.every((t) => t.toolchain.isProjectReady(projectDir(config, t.id))) && targetHasCommit(config.target.path) ? "target already bootstrapped" : undefined), async () => {
 			await setup(config, root);
 		});
 
@@ -313,10 +343,6 @@ function summary(root: string): string {
 	return L.join("\n");
 }
 
-function projectReady(config: Config, stackId: string): boolean {
-	return existsSync(join(projectDir(config, stackId), "package.json"));
-}
-
 function targetHasCommit(dir: string): boolean {
 	try {
 		execFileSync("git", ["-C", dir, "rev-parse", "--verify", "-q", "HEAD"], { stdio: "ignore" });
@@ -337,16 +363,10 @@ function ledgerHasUnits(root: string): boolean {
 	}
 }
 
-function decisionsTouchInventory(root: string): boolean {
-	const p = join(root, ".bigrefactor", "decisions.json");
-	if (!existsSync(p)) return false;
-	const d = JSON.parse(readFileSync(p, "utf8")) as { answers: Record<string, { answer: string }> };
-	return Object.entries(d.answers).some(([k, v]) => k === "cycle-cuts" || k === "dynamic-slice" || (k === "frontend" && v.answer !== "backend-only"));
-}
-
 function frameworkDirsLikely(src: string): boolean {
 	try {
-		return readdirSync(src).some((n) => /framework|core|engine|-php$/i.test(n));
+		// same signal as the profile's own detection: a framework-ish name or a vendored checkout (own .git)
+		return readdirSync(src).some((n) => /framework|core|lib|engine/i.test(n) || existsSync(join(src, n, ".git")));
 	} catch {
 		return false;
 	}

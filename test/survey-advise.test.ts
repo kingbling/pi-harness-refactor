@@ -25,15 +25,15 @@ function legacyWithData(name: string) {
 	return ws;
 }
 
-describe("init survey: defaults come from the repo, not from code", () => {
+describe("init survey: facts from the repo, provisional values only", () => {
 	it("finds data stores, UI and derives targets, db strategy and target path", async () => {
 		const ws = legacyWithData("survey");
 		const s = await surveySource(join(ws, "legacy"), getSourceAdapter("php"));
 		expect(s.engines.map((e) => e.engine).sort()).toEqual(["arangodb", "mariadb", "redis"]);
-		expect(s.ui.templates + (s.ui.components["vue"] ?? 0)).toBeGreaterThan(0);
+		expect(s.files[".vue"]).toBe(1); // counted, not interpreted: the model reads what the files mean
 		const r = recommend(s, "../legacy");
 		expect(r.targets[0]).toBe("nestjs");
-		expect(r.targets).toContain("react"); // UI present; no vue adapter → first web target
+		expect(r.targets).toContain("react"); // provisional only: every role; the stack is judged by advise
 		expect(r.dbFrom.sort()).toEqual(["arangodb", "mariadb"]); // redis is infrastructure, not data to migrate
 		expect(r.dbStrategy).toBe("keep-schema");
 		expect(r.targetPath).toBe("./legacy-next");
@@ -137,7 +137,48 @@ describe("advice hygiene", () => {
 		expect(lib.reason).toMatch(/only if SFTP is used/);
 		const store = ds.find((d) => d.id === "store:arangodb")!;
 		expect(store.recommended).toBe(staticRec);
-		expect(store.reason).toMatch(/unsure \(20%\)/);
+		expect(store.reason).toMatch(/unsure \(20%/);
+		ledger.close();
+	});
+});
+
+describe("target stack: judged from the analyzed repo, not from the adapters we have", () => {
+	it("a model reading the brief recommends the stack; adapter gaps are flagged, never dropped; nothing anchors on code defaults", async () => {
+		const ws = legacyWithData("advise-targets");
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs", "react"] }, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" }, models: {} });
+		writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config));
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await inventory(config, ws, ledger);
+		const prompts: string[] = [];
+		const client = new FakeModelClient({
+			chat: (req) => {
+				prompts.push(req.messages.map((m) => m.content).join("\n"));
+				const props = (req.schema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
+				if ("alternatives" in props) return { json: { recommended: { server: "nestjs", ui: "vue", reason: "Vue islands already carry the interactive UI" }, alternatives: [{ server: "nestjs", ui: "react", reason: "larger hiring pool" }] } };
+				// the phrasing model returns a single option: the question must still offer every option
+				if ("questions" in props) return { json: { questions: [{ id: "targets", question: "Which stack for the rewrite?", options: [{ value: "nestjs+vue", label: "NestJS + Vue", hint: "" }], recommended: "nestjs+vue", opinion: "keeps the component model" }] } };
+				return req.schema ? { json: { libraries: [], classes: [], decisions: [] } } : { text: "brief" };
+			},
+			decide: () => ({ choice: "other" }),
+		});
+		const source = getSourceAdapter("php");
+		const targets = await Promise.all(["nestjs", "react"].map((t) => getTargetAdapter(t)));
+		await advise(config, ws, ledger, client, source, targets, () => {});
+		const t = openDecisions(ledger, config, source, targets, ws).find((d) => d.id === "targets")!;
+		expect(t.recommended).toBe("nestjs+vue");
+		expect(t.options.map((o) => o.value)).toEqual(expect.arrayContaining(["nestjs+vue", "nestjs+react", "nestjs"]));
+		expect(t.options.find((o) => o.value === "nestjs+vue")!.hint).toMatch(/no vue adapter/);
+		// no model was told the provisional targets as fact, nor a code default to agree with
+		expect(prompts.join("\n")).not.toMatch(/targets: nestjs \+ react|code_default/);
+		expect(prompts.join("\n")).toMatch(/target stack: not decided yet/);
+		for (const c of client.calls.filter((c) => c.kind === "decide")) expect(JSON.stringify((c.req as { state: unknown }).state)).not.toMatch(/current_recommendation/);
+		// no decision without a choice; sharing an options list across decisions must not reorder another's
+		const all = openDecisions(ledger, config, source, targets, ws);
+		for (const d of all) expect(d.options.length, d.id).toBeGreaterThan(1);
+		const { pointHash } = await import("../src/jev/ask.ts");
+		const p = { id: "x", topic: "t", intent: "i", evidence: "e", options: [{ value: "a" }, { value: "b" }] };
+		expect(pointHash(p)).toBe(pointHash({ ...p, options: [{ value: "b" }, { value: "a" }] }));
 		ledger.close();
 	});
 });

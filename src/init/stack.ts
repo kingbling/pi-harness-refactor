@@ -104,22 +104,23 @@ export function stackQuestions(source: SourceAdapter, sourceRoot: string, target
  * forward answers without interpretation. Free-text answers for libraries are npm package names.
  */
 export function askUserQuestionBatches(q: ReturnType<typeof stackQuestions>, targets: TargetAdapter[]) {
+	const eco = (targets.find((t) => t.role === "server") ?? targets[0])?.toolchain.ecosystem ?? "package";
 	type Opt = { label: string; description: string };
 	type Question = { header: string; question: string; options: Opt[]; values: Record<string, string> };
 	const clip = (s: string, n: number) => (s.length <= n ? s : s.slice(0, n - 1) + "…");
 	const gate: Question = {
 		header: "Target stack",
-		question: "Accept the recommended target stack, or decide each item?",
+		question: "Accept the adapter defaults for now (br advise judges them from the repo after inventory), or decide each item?",
 		options: [
-			{ label: "Accept the recommended stack", description: targets.map((t) => `${t.id}: ${(t.stackChoices ?? []).map((c) => c.options.find((o) => o.id === c.default)?.label ?? c.default).join(", ")}`).join(" · ") },
+			{ label: "Accept the adapter defaults", description: targets.map((t) => `${t.id}: ${(t.stackChoices ?? []).map((c) => c.options.find((o) => o.id === c.default)?.label ?? c.default).join(", ")}`).join(" · ") },
 			{ label: `Decide each item (${q.stack.length} questions)`, description: "Walk through ORM, database, styling, data fetching… one by one" },
 		],
-		values: { "Accept the recommended stack": "accept", [`Decide each item (${q.stack.length} questions)`]: "each" },
+		values: { "Accept the adapter defaults": "accept", [`Decide each item (${q.stack.length} questions)`]: "each" },
 	};
 	const stack: Question[] = q.stack.map((s) => {
 		const values: Record<string, string> = {};
 		const options = s.options.slice(0, 4).map((o) => {
-			const label = clip(o.id === s.default ? `${o.label} (recommended)` : o.label, 60);
+			const label = clip(o.id === s.default ? `${o.label} (adapter default)` : o.label, 60);
 			values[label] = `${s.stack}.${s.key}=${o.id}`;
 			return { label, description: o.hint ?? o.label };
 		});
@@ -142,7 +143,7 @@ export function askUserQuestionBatches(q: ReturnType<typeof stackQuestions>, tar
 			options.push({ label, description });
 			values[label] = `${l.name}=${v}`;
 		}
-		return { header: clip(l.name.split("/").pop() ?? l.name, 16), question: `Successor for ${l.name}${l.version ? ` ${l.version}` : ""}${l.note ? ` (${l.note})` : ""}? Type an npm package name for anything else.`, options: options.slice(0, 4), values };
+		return { header: clip(l.name.split("/").pop() ?? l.name, 16), question: `Successor for ${l.name}${l.version ? ` ${l.version}` : ""}${l.note ? ` (${l.note})` : ""}? Type a ${eco} package name for anything else.`, options: options.slice(0, 4), values };
 	});
 	const batch = <T,>(xs: T[]) => Array.from({ length: Math.ceil(xs.length / 4) }, (_, i) => xs.slice(i * 4, i * 4 + 4));
 	return { gate, stack: batch(stack), libraries: batch(libraries) };

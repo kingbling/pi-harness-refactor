@@ -59,9 +59,9 @@ export function loadBrief(root: string | undefined): string {
 }
 
 /** Facts the code can gather about the source repo, stack-neutral: tree with counts, readme, ledger stats. */
-export function repoFacts(config: Config, ledger?: Ledger, root?: string): string {
+export function repoFacts(config: Config, ledger?: Ledger, root?: string, vendorDirs: string[] = []): string {
 	const src = config.source.path;
-	const skip = new Set(["node_modules", "vendor", ".git", "dist", "build", ".idea", ".vscode"]);
+	const skip = new Set(vendorDirs);
 	const count = (dir: string, depth: number): number => {
 		if (depth > 10) return 0;
 		let n = 0;
@@ -87,8 +87,9 @@ export function repoFacts(config: Config, ledger?: Ledger, root?: string): strin
 	};
 	walk(src, "", 0);
 	const readme = safeList(src).find((n) => /^readme(\.md|\.txt)?$/i.test(n));
-	const L = [`stack: ${config.source.stack}${config.source.framework ? ` / ${config.source.framework}` : ""}`, `targets: ${config.target.stacks.join(" + ")}`, `data stores: ${config.db.from.map((s) => `${s}${config.db.stores[s] ? ` (${config.db.stores[s]})` : ""}`).join(", ") || "none found"}; target engine ${config.db.to ?? "unset"}; strategy ${config.db.strategy}`];
 	const answers = root && existsSync(join(root, ".bigrefactor", "decisions.json")) ? (JSON.parse(readFileSync(join(root, ".bigrefactor", "decisions.json"), "utf8")) as { answers?: Record<string, { answer: string }> }).answers ?? {} : {};
+	// config holds provisional values until the owner decides: only decided ones are stated as facts
+	const L = [`stack: ${config.source.stack}${config.source.framework ? ` / ${config.source.framework}` : ""}`, `target stack: ${answers["targets"] ? answers["targets"].answer.replace(/\+/g, " + ") : "not decided yet"}`, `data stores: ${config.db.from.map((s) => `${s}${config.db.stores[s] ? ` (${config.db.stores[s]})` : ""}`).join(", ") || "none found"}${answers["db-strategy"] ? `; strategy ${answers["db-strategy"].answer}` : ""}`];
 	if (Object.keys(answers).length) L.push(`owner decisions already made (binding facts): ${Object.entries(answers).map(([k, a]) => `${k}=${a.answer}`).join("; ")}`);
 	if (ledger) {
 		const kinds = ledger.db.prepare("SELECT json_extract(meta,'$.kind') k, COUNT(*) n FROM units GROUP BY k ORDER BY n DESC LIMIT 12").all() as Array<{ k: string | null; n: number }>;
@@ -110,7 +111,8 @@ export async function repoBrief(d: AskDeps, opts: { force?: boolean } = {}): Pro
 	if (!d.root) throw new Error("repoBrief needs the workspace root");
 	const existing = loadBrief(d.root);
 	if (existing && !opts.force) return { brief: existing, costUsd: 0 };
-	const facts = repoFacts(d.config, d.ledger, d.root);
+	const { getSourceAdapter } = await import("../adapters/registry.ts");
+	const facts = repoFacts(d.config, d.ledger, d.root, getSourceAdapter(d.config.source.stack).traits?.vendorDirs);
 	if (!d.client) return { brief: facts, costUsd: 0 };
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -137,11 +139,14 @@ export interface DecisionPoint {
 	intent: string;
 	evidence: string;
 	options: AskOption[];
+	/** Set only when a model advised it (reason given); a code default never reaches the phrasing model. */
 	recommended?: string;
+	reason?: string;
 }
 
 export function pointHash(p: DecisionPoint): string {
-	return createHash("sha1").update(JSON.stringify([p.id, p.intent, p.evidence, p.options.map((o) => o.value)])).digest("hex").slice(0, 10);
+	// option ORDER is presentation (recommended first), not a fact: sorted, so reordering never invalidates
+	return createHash("sha1").update(JSON.stringify([p.id, p.intent, p.evidence, p.options.map((o) => o.value).sort()])).digest("hex").slice(0, 10);
 }
 
 const PHRASE_SCHEMA = {
@@ -182,8 +187,8 @@ export async function phraseDecisions(d: AskDeps, points: DecisionPoint[]): Prom
 			effort: "medium",
 			schema: PHRASE_SCHEMA,
 			messages: [
-				{ role: "system", content: "You turn migration decision points into questions for the person who owns this legacy app. Each question must be answerable by someone who knows the app but not this tool. Use the repo brief; mention concrete files, features or counts. Keep every option value exactly as given; you may relabel options and omit options that make no sense for this repo, but never invent values. Always recommend one option and give your opinion." },
-				{ role: "user", content: `Repo brief:\n${brief}\n\nDecision points (JSON):\n${JSON.stringify(batch.map((p) => ({ id: p.id, topic: p.topic, intent: p.intent, evidence: p.evidence, options: p.options, code_default: p.recommended })), null, 1)}` },
+				{ role: "system", content: "You turn migration decision points into questions for the person who owns this legacy app. Each question must be answerable by someone who knows the app but not this tool. Use the repo brief; mention concrete files, features or counts. Keep every option value exactly as given; relabel options in plain words, never drop or invent values. Always recommend one option and give your opinion; where an analysis already advised one (advised, advised_because), agree or disagree with it on the evidence." },
+				{ role: "user", content: `Repo brief:\n${brief}\n\nDecision points (JSON):\n${JSON.stringify(batch.map((p) => ({ id: p.id, topic: p.topic, intent: p.intent, evidence: p.evidence, options: p.options, ...(p.reason ? { advised: p.recommended, advised_because: p.reason } : {}) })), null, 1)}` },
 			],
 		});
 		cost += res.usage.costUsd;

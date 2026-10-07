@@ -5,7 +5,7 @@ import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { planFrameworks } from "./frameworks.ts";
-import { TARGET_SUBDIRS } from "../adapters/registry.ts";
+import { TARGET_ROLES } from "../adapters/registry.ts";
 import { pointHash, type DecisionPoint, type PhrasedQuestion } from "../jev/ask.ts";
 
 /**
@@ -31,10 +31,12 @@ export interface Decision {
 	confidence?: number;
 	/** What in the inventory triggered this. */
 	evidence: string;
+	/** The recommendation is a model's judgment of the repo (not the code's offline fallback). */
+	advised?: boolean;
 }
 
 export interface DecisionAnswer { answer: string; by: string; at: string }
-export type DecisionFile = { phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
+export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; targetOptions?: Array<{ value: string; reason: string }>; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
 
 export function decisionsPath(root: string): string {
 	return join(root, ".bigrefactor", "decisions.json");
@@ -73,14 +75,18 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 	const platform = Object.assign({}, ...targets.map((t) => effectivePlatform(t, config.target.choices))) as Record<string, string>;
 	const concernOptions = [...Object.keys(platform).map((k) => ({ value: `platform:${k}`, label: `platform → ${k}`, hint: platform[k] })), { value: "port", label: "port: application logic, becomes units' responsibility (service/helper in target)" }, { value: "drop", label: "drop: obsolete in the target" }];
 
-	// --- the stack itself: provisional values from the init survey, confirmed here after data gathering
-	const survey = loadDecisions(root).survey;
-	const combos = targetCombos();
-	const current = config.target.stacks.join("+");
-	if (combos.length > 1) out.push({ id: "targets", topic: "target", question: "Which target stacks?", evidence: survey?.why.join("; ") ?? `config: ${current}`, recommended: survey?.targets.join("+") ?? current, options: combos.map((c) => ({ value: c, label: c.replace(/\+/g, " + ") })) });
+	// --- the stack itself: judged from the analyzed repo (advise → advice.targets + targetOptions); the code adds
+	// every combination it has adapters for. A pick without an adapter stays a valid answer, flagged as such.
+	// The survey's provisional targets are only the offline fallback.
+	const file0 = loadDecisions(root);
+	const survey = file0.survey;
+	const advisedTargets = file0.advice?.["targets"]?.value;
+	const stackValues = [...new Set([...(advisedTargets ? [advisedTargets] : []), ...(file0.targetOptions ?? []).map((o) => o.value), ...targetCombos()])];
+	const missing = (v: string) => v.split("+").filter((id) => !(id in TARGET_ROLES));
+	out.push({ id: "targets", topic: "target", question: "Which target stacks should the new codebase use?", evidence: survey?.why.join("; ") ?? `config: ${config.target.stacks.join("+")}`, recommended: survey?.targets.join("+") ?? config.target.stacks.join("+"), options: stackValues.map((v) => ({ value: v, label: v.replace(/\+/g, " + "), hint: [file0.targetOptions?.find((o) => o.value === v)?.reason, missing(v).length ? `bigrefactor has no ${missing(v).join("/")} adapter yet: setup and run wait until one is added` : ""].filter(Boolean).join(" · ") || undefined })) });
 	out.push({ id: "db-strategy", topic: "data", question: "Database strategy?", evidence: survey?.dbFrom.length ? `data stores found: ${survey.dbFrom.join(", ")}` : "no data store found", recommended: survey?.dbStrategy ?? config.db.strategy, options: [{ value: "keep-schema", label: "keep the schema", hint: "introspect the existing DB, generate DTOs, translate types" }, { value: "new-schema", label: "new schema", hint: "design a target schema per module after keep-schema is accepted" }, { value: "none", label: "no database" }] });
 	for (const t of targets)
-		for (const c of t.stackChoices ?? []) out.push({ id: `stack:${t.id}.${c.key}`, topic: "target", question: `${t.id}: ${c.question}`, evidence: `${c.options.length} options from the ${t.id} adapter`, recommended: c.options.some((o) => o.id === config.target.choices[t.id]?.[c.key]) ? config.target.choices[t.id]![c.key]! : c.default, options: c.options.map((o) => ({ value: o.id, label: o.label, hint: o.hint })) });
+		for (const c of t.stackChoices ?? []) if (c.options.length > 1) out.push({ id: `stack:${t.id}.${c.key}`, topic: "target", question: `${t.id}: ${c.question}`, evidence: `${c.options.length} options from the ${t.id} adapter`, recommended: c.options.some((o) => o.id === config.target.choices[t.id]?.[c.key]) ? config.target.choices[t.id]![c.key]! : c.default, options: c.options.map((o) => ({ value: o.id, label: o.label, hint: o.hint })) });
 
 	// --- data stores beyond the target engine
 	const target = (config.db.to ?? "").toLowerCase();
@@ -91,21 +97,17 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 		out.push({ id: `store:${store}`, topic: "data", question: `${store} is a second data store. What happens to it?`, evidence: `config.db.from includes ${store}; target engine ${config.db.to ?? "unset"}`, recommended: "keep", options: [{ value: "keep", label: `keep ${store}, new client library`, hint: "lowest risk; its commands port as services" }, { value: "fold", label: `fold into ${config.db.to ?? "the target DB"}`, hint: "new-schema path (JSONB tables + ETL); larger scope" }, { value: "drop", label: "drop: its features are dead", hint: "only if the inventory shows no live referrers" }] });
 	}
 
-	// --- frontend
-	const fe = countFrontendFiles(config.source.path);
-	const hasWeb = targets.some((t) => t.platform?.["rendering"]?.toLowerCase().includes("component"));
-	if (fe.total > 0 && !hasWeb && targetCombos().length <= 1) out.push({ id: "frontend", topic: "frontend", question: `The legacy app has UI (${fe.summary}). Which web target?`, evidence: fe.summary, recommended: "react", options: [{ value: "react", label: "React + TypeScript (adds target stack react)", hint: "existing Vue/templates rewritten as React features" }, { value: "vue", label: "Vue 3 + TypeScript", hint: "needs a vue target adapter; keeps existing Vue components" }, { value: "backend-only", label: "backend only for now", hint: "templates become JSON endpoints + contract; UI later" }] });
-
 	// --- framework concerns under review and unmapped classes
-	for (const c of plan.concerns) if (c.verdict === "review" && c.appRefs > 0) out.push({ id: `concern:${c.concern}`, topic: "framework", question: `Framework concern "${c.concern}" (${c.legacy}) is referenced ${c.appRefs}× from ${c.appFiles} files. Verdict?`, evidence: `top: ${c.top.join(", ")}`, options: concernOptions });
+	for (const c of plan.concerns) if (c.verdict === "review" && c.appRefs > 0) out.push({ id: `concern:${c.concern}`, topic: "framework", question: `Framework concern "${c.concern}" (${c.legacy}) is referenced ${c.appRefs}× from ${c.appFiles} files. Verdict?`, evidence: `top: ${c.top.join(", ")}`, options: [...concernOptions] });
 	const advisedIds = new Set(Object.keys((loadDecisions(root) as { advice?: Record<string, unknown> }).advice ?? {}));
 	const big = plan.unmapped.filter((u) => u.appRefs >= 50 || advisedIds.has(`fw:${u.name}`));
-	for (const u of big) out.push({ id: `fw:${u.name}`, topic: "framework", question: `Framework class ${u.name} (${u.appRefs} app references) has no concern mapping. Which concern / verdict?`, evidence: u.path, recommended: guessConcern(u.name, Object.keys(platform)), options: concernOptions });
+	for (const u of big) out.push({ id: `fw:${u.name}`, topic: "framework", question: `Framework class ${u.name} (${u.appRefs} app references) has no concern mapping. Which concern / verdict?`, evidence: u.path, options: [...concernOptions] });
 	const small = plan.unmapped.filter((u) => u.appRefs < 50 && !advisedIds.has(`fw:${u.name}`));
 	if (small.length) out.push({ id: "fw:rest", topic: "framework", question: `${small.length} low-use framework classes (<50 refs each) are unmapped. Map them by name heuristic?`, evidence: small.slice(0, 12).map((u) => `${u.name}(${u.appRefs})`).join(", ") + (small.length > 12 ? " …" : ""), recommended: "heuristic", options: [{ value: "heuristic", label: "map by name heuristic, implementer may deviate with a why", hint: "recorded per class in decisions.json" }, { value: "review-each", label: "ask me for each one", hint: `${small.length} more questions` }, { value: "port", label: "treat all as port (logic to carry over)" }] });
 
 	// --- libraries under review
-	for (const l of plan.libraries) if (l.verdict === "review" || advisedIds.has(`lib:${l.name}`) && !loadDecisions(root).libraries?.[l.name]) out.push({ id: `lib:${l.name}`, topic: "library", question: `Library ${l.name}${l.version ? ` ${l.version}` : ""}: successor?`, evidence: l.note ?? "no known successor", recommended: l.successor ? `replace:${l.successor}` : undefined, options: [...(l.successor ? [{ value: `replace:${l.successor}`, label: `replace with ${l.successor}` }] : []), { value: "platform", label: "the target platform already covers it" }, { value: "port", label: "port: rewrite the parts the app uses" }, { value: "drop", label: "drop: usage is dead or not needed" }] });
+	// dev tools of the legacy repo (its test/lint tooling) are not migrated: nothing to decide for them
+	for (const l of plan.libraries) if (!l.dev && (l.verdict === "review" || advisedIds.has(`lib:${l.name}`) && !loadDecisions(root).libraries?.[l.name])) out.push({ id: `lib:${l.name}`, topic: "library", question: `Library ${l.name}${l.version ? ` ${l.version}` : ""}: successor?`, evidence: l.note ?? "no known successor", recommended: l.successor ? `replace:${l.successor}` : undefined, options: [...(l.successor ? [{ value: `replace:${l.successor}`, label: `replace with ${l.successor}` }] : []), { value: "platform", label: "the target platform already covers it" }, { value: "port", label: "port: rewrite the parts the app uses" }, { value: "drop", label: "drop: usage is dead or not needed" }] });
 
 	// --- cycles: forward references vs merging pairs
 	const cutUnits = (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE json_array_length(json_extract(meta,'$.cutDeps')) > 0").get() as { n: number }).n;
@@ -132,9 +134,10 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 	for (const d of out) {
 		const a = advice[d.id];
 		if (!a) continue;
-		// an unsure Jev pick (< 50%) does not replace the code recommendation; it is shown, so a human sees the doubt
-		if (a.confidence !== undefined && a.confidence < 0.5 && a.value !== d.recommended) {
-			d.reason = `Jev leans to ${a.value} but is unsure (${Math.round(a.confidence * 100)}%)`;
+		// an unsure Jev pick (< 50%) is no recommendation, even when it matches the code's fallback: the
+		// phrasing model (which read the repo brief) recommends instead; the doubt stays visible
+		if (a.confidence !== undefined && a.confidence < 0.5) {
+			d.reason = `decision model unsure (${Math.round(a.confidence * 100)}% for ${a.value})`;
 			d.confidence = a.confidence;
 			continue;
 		}
@@ -142,13 +145,15 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 		d.recommended = a.value;
 		d.reason = a.reason;
 		d.confidence = a.confidence;
+		d.advised = true;
 	}
-	// every decision carries a recommendation: the model's, else the code's, else the first option
+	// every decision carries a recommendation: a model's (above / phrasing below); without one (offline) the
+	// code's fallback, labelled as such so nobody reads it as a judgment of the repo
 	for (const d of out) if (!d.recommended || !d.options.some((o) => o.value === d.recommended)) {
 		if (d.recommended && !d.options.some((o) => o.value === d.recommended)) d.options.unshift({ value: d.recommended, label: d.recommended });
 		else {
 			d.recommended = d.id.startsWith("lib:") ? "port" : d.options[0]!.value;
-			d.reason ??= "no stronger evidence; safest option";
+			d.reason ??= "offline fallback: no model has judged this for the repo yet (br advise)";
 		}
 	}
 	// the model's phrasing for this repo replaces the code's intent text; facts changed since → code text stays until re-advised
@@ -158,15 +163,19 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 		const ph = file.phrased?.[d.id];
 		if (!ph || ph.hash !== pointHash(toPoint(d))) continue;
 		const labels = new Map(ph.options.map((o) => [o.value, o]));
-		// the model may omit options that make no sense here; the recommended one always stays
-		d.options = d.options.filter((o) => labels.has(o.value) || o.value === d.recommended).map((o) => ({ value: o.value, label: labels.get(o.value)?.label ?? o.label, hint: labels.get(o.value)?.hint ?? o.hint }));
+		// relabelled in the repo's words; every option stays (a one-option question is no question)
+		d.options = d.options.map((o) => ({ value: o.value, label: labels.get(o.value)?.label ?? o.label, hint: labels.get(o.value)?.hint ?? o.hint }));
 		d.question = ph.question;
-		if (!advice[d.id] && ph.recommended && d.options.some((o) => o.value === ph.recommended)) d.recommended = ph.recommended;
-		d.reason = d.reason && advice[d.id] ? `${d.reason}. ${ph.opinion}` : ph.opinion;
+		// the phrasing model read the repo: its pick replaces the code fallback, not a confident analysis
+		if (!d.advised && ph.recommended && d.options.some((o) => o.value === ph.recommended)) {
+			d.recommended = ph.recommended;
+			d.advised = true;
+		}
+		d.reason = d.reason && advice[d.id] ? `${d.reason.replace(/\.\s*$/, "")}. ${ph.opinion}` : ph.opinion;
 	}
 	for (const [id, q] of Object.entries(file.discovered ?? {})) {
 		if (ids.has(id) || opts.raw) continue;
-		out.push({ id, topic: "repo", question: q.question, evidence: q.evidence, options: q.options, recommended: q.recommended ?? q.options[0]?.value, reason: q.opinion });
+		out.push({ id, topic: "repo", question: q.question, evidence: q.evidence, options: q.options, recommended: q.recommended ?? q.options[0]?.value, reason: q.opinion, advised: !!q.recommended });
 	}
 	// recommended option first: in a multiple-choice prompt, Enter takes it
 	for (const d of out) d.options.sort((a, b) => Number(b.value === d.recommended) - Number(a.value === d.recommended));
@@ -175,15 +184,14 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 
 /** The code's view of a decision, as the phrasing model gets it. */
 export function toPoint(d: Decision): DecisionPoint {
-	return { id: d.id, topic: d.topic, intent: d.question, evidence: d.evidence, options: d.options.map((o) => ({ value: o.value, facts: `${o.label}${o.hint ? ` — ${o.hint}` : ""}` })), recommended: d.recommended };
+	// the code's fallback pick is not passed on: it would anchor the model reading the repo
+	return { id: d.id, topic: d.topic, intent: d.question, evidence: d.evidence, options: d.options.map((o) => ({ value: o.value, facts: `${o.label}${o.hint ? ` — ${o.hint}` : ""}` })), ...(d.advised ? { recommended: d.recommended, reason: d.reason } : {}) };
 }
 
-/** api target alone, or api + each web target: the options for the "targets" decision. */
+/** server target alone, or server + each ui target: the options the code adds to the "targets" decision. */
 function targetCombos(): string[] {
-	const roles = TARGET_SUBDIRS;
-	const apis = Object.keys(roles).filter((k) => roles[k] === "api");
-	const webs = Object.keys(roles).filter((k) => roles[k] === "web");
-	return apis.flatMap((a) => [...webs.map((w) => `${a}+${w}`), a]);
+	const ids = (role: string) => Object.keys(TARGET_ROLES).filter((k) => TARGET_ROLES[k] === role);
+	return ids("server").flatMap((a) => [...ids("ui").map((w) => `${a}+${w}`), a]);
 }
 
 export function applyDecision(ledger: Ledger, config: Config, root: string, id: string, answer: string, by = "human"): string {
@@ -212,11 +220,6 @@ export function applyDecision(ledger: Ledger, config: Config, root: string, id: 
 		(raw.target.choices[t!] ??= {})[k!] = answer;
 		if (k === "database") raw.db.to = answer === "postgres" ? "postgresql" : answer === "mysql" ? ((raw.db.from ?? []).includes("mariadb") ? "mariadb" : "mysql") : answer === "legacy" ? (raw.db.from ?? [])[0] : answer;
 		note = `config.target.choices.${t}.${k} = ${answer}`;
-	} else if (id === "frontend") {
-		if (answer === "react" || answer === "vue") {
-			raw.target.stacks = [...new Set([...(raw.target.stacks ?? []), answer])];
-			note = `config.target.stacks = ${raw.target.stacks.join(", ")}`;
-		} else note = "backend only";
 	} else if (kind === "concern" || kind === "fw") {
 		d.frameworkClasses ??= {};
 		d.frameworkClasses[key] = answer;
@@ -275,31 +278,6 @@ export function renderDecisions(ds: Decision[]): string {
 }
 
 // ---- helpers
-
-function guessConcern(name: string, keys: string[]): string | undefined {
-	const table: Array<[RegExp, string]> = [[/DB|Where|Query|Sql|DataObject/i, "orm"], [/Http|Request|Response|Url/i, "http"], [/Render|View|Template|Widget|Html/i, "rendering"], [/Command/i, "commands"], [/Mapper|Route|Action|Controller/i, "routing"], [/Access|User|Login|Session/i, "auth"], [/Cache/i, "cache"], [/Log/i, "logging"], [/Mail/i, "mail"], [/Event/i, "events"], [/String|Arr|Date|Convert|Filter|Helper|History|Stat/i, "helpers"], [/Translat|Locale/i, "i18n"]];
-	for (const [re, k] of table) if (re.test(name) && keys.includes(k)) return k === "auth" || k === "commands" ? "port" : `platform:${k}`;
-	return undefined;
-}
-
-function countFrontendFiles(root: string): { total: number; summary: string } {
-	const counts: Record<string, number> = {};
-	const visit = (dir: string, depth: number) => {
-		if (depth > 6) return;
-		let names: string[];
-		try { names = readdirSync(dir); } catch { return; }
-		for (const n of names) {
-			if (n === "node_modules" || n === ".git" || n === "vendor" || n === "dist" || n === "build") continue;
-			const p = join(dir, n);
-			let st; try { st = statSync(p); } catch { continue; }
-			if (st.isDirectory()) visit(p, depth + 1);
-			else { const m = /\.(vue|jsx|tsx|svelte)$/.exec(n) ?? (/\.tpl\.php$|\.phtml$|\.blade\.php$|\.twig$/.test(n) ? ["", "template"] : null); if (m) counts[m[1]!] = (counts[m[1]!] ?? 0) + 1; }
-		}
-	};
-	visit(root, 0);
-	const total = Object.values(counts).reduce((a, b) => a + b, 0);
-	return { total, summary: Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "none" };
-}
 
 function findCompose(root: string): string | undefined {
 	for (const c of ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml", "docker/docker-compose.yml", "docker/docker-compose.yaml"]) if (existsSync(join(root, c))) return c;
