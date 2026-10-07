@@ -1,7 +1,10 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { loadCommandOverrides } from "../adapters/command-overrides.ts";
+import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
+import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
 import { loadConfig, type Config } from "../config.ts";
 import { addWorktree, headOf, removeWorktree } from "../git.ts";
@@ -67,6 +70,8 @@ export interface SchedulerOptions {
 	/** Injection points (simulation). */
 	spawn?: UnitRunOptions["spawn"];
 	gate?: UnitRunOptions["gate"];
+	/** Heals shared setup failures (circuit breaker, gate failures); default the setup model, none when `spawn` is faked. */
+	setupFixer?: SetupFixer | false;
 }
 
 export interface SchedulerResult {
@@ -136,7 +141,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// dependency dirs (adapter-declared) are linked into it.
 	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
 	const linkAll = (wt: string) => {
-		for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks);
+		for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(o.root, id).worktreeCopy ?? []);
 	};
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
 	excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
@@ -398,39 +403,58 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		running.set(unitId, p.finally(() => running.delete(unitId)));
 	};
 
-	// ---- circuit breaker: when most recently finished units failed, Jev decides whether the failures share one
-	// root cause (bad rule, broken env, model degradation). Systemic → stop starting units + one ledger question.
-	const recent: Array<{ unit: string; ok: boolean; cause?: string; gate?: string; sig?: string }> = [];
-	let circuitOpen = false;
-	const askSystemic = async (facts: string, decisionId?: number): Promise<number> =>
-		(await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "systemic_failure", facts, options: [{ value: "fixed", facts: "the shared cause is fixed: br requeue the failed units and br run again" }, { value: "investigate", facts: "keep the run stopped until someone has looked at it" }], recommended: "investigate", blocks: "none", askedBy: "orchestrator", decisionId })).id;
+	// ---- circuit breaker: when recent units fail the same way (or Jev judges the failures systemic), the run heals
+	// instead of stopping: new units wait, the shared cause is diagnosed, the setup model fixes the project (what it
+	// learns — a command, a worktree copy — is kept for every later unit), the failed units go back into the queue
+	// and the run goes on. Cannot be healed → those units stay quarantined, the run still goes on.
+	const recent: Array<{ unit: string; ok: boolean; cause?: string; gate?: string; sig?: string; step?: string; output?: string }> = [];
+	const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
+	const tried = new Set<string>();
+	let healing: Promise<void> | undefined;
+	const heal = async (what: string, failed: typeof recent) => {
+		const units = failed.map((f) => f.unit);
+		log(pc.cyan(`⚕ ${what} (${units.join(", ")}): fixing the shared cause; new units wait, running ones go on`));
+		const first = failed.find((f) => f.output) ?? failed[0]!;
+		const stackId = placeUnit(config, ledger.getUnit(first.unit)?.meta ?? "{}", o.root).stackId;
+		const adapter = adapters.get(stackId);
+		let fixed: string | undefined;
+		if (adapter && setupFixer) {
+			const dir = projectDir(config, stackId);
+			const dx = await diagnoseFailure({ config, adapter, projectDir: dir, failedStep: first.step ?? "", output: first.output ?? "", client: o.client }).catch(() => undefined);
+			if (dx) log(pc.dim(`  diagnosis (${dx.by}): ${dx.action} — ${dx.summary}`));
+			if (!dx || dx.action === "fix" || dx.action === "unknown")
+				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output of ${first.unit}:\n${(first.output ?? first.gate ?? "").slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+		}
+		recent.length = 0;
+		if (fixed) {
+			const back = requeueUnits(ledger, config, o.root, units.filter((u) => ["quarantined", "truth", "implementing", "gating"].includes(ledger.getUnit(u)?.state ?? "") && !running.has(u)), "self-heal");
+			log(pc.green(`⚕ healed: ${fixed} — ${back.filter((l) => l.endsWith("requeued")).length} unit(s) back in the queue`));
+		} else log(pc.yellow(`⚕ could not heal it here; those units stay quarantined (br requeue after a fix), the run goes on`));
+	};
 	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined, crash?: string) => {
 		const bad = crash ? { name: "exception", output: crash } : res?.gate?.steps.find((x) => !x.ok);
 		const gate = bad ? `${bad.name}: ${String(bad.output ?? "").slice(0, 600)}` : undefined;
-		recent.push({ unit: unitId, ok: !crash && (st === "accepted" || st === "review"), cause: crash ? "exception" : res?.triage?.cause, gate, sig: bad ? errorSignature(bad.name, String(bad.output ?? "")) : undefined });
+		recent.push({ unit: unitId, ok: !crash && (st === "accepted" || st === "review"), cause: crash ? "exception" : res?.triage?.cause, gate, sig: bad ? errorSignature(bad.name, String(bad.output ?? "")) : undefined, step: bad?.name, output: bad ? String(bad.output ?? "") : undefined });
 		if (recent.length > 6) recent.shift();
+		if (healing) return;
 		const failed = recent.filter((r) => !r.ok);
 		// certain case first: the same error in 3 units is one cause, whatever a model says
-		const bySig = new Map<string, string[]>();
-		for (const f of failed) if (f.sig) bySig.set(f.sig, [...(bySig.get(f.sig) ?? []), f.unit]);
-		const same = [...bySig.entries()].find(([, us]) => us.length >= 3);
-		if (!circuitOpen && same) {
-			circuitOpen = true;
-			requestStop(`circuit breaker: same error in ${same[1].length} units`);
-			const q = await askSystemic(`${same[1].length} units failed with the same error signature (${same[0]}): ${same[1].join(", ")}. The run stopped starting new units; running ones finish. Parked units resubmit themselves when the target project or the config changes.\nGate output of the last failures:\n${failed.filter((f) => f.sig === same[0]).map((f) => `${f.unit}: ${f.gate ?? ""}`).join("\n")}`);
-			log(pc.red(`circuit open: ${same[1].length} units failed with the same error (${same[0]}); running units finish, no new ones start — question #${q}`));
+		const bySig = new Map<string, typeof recent>();
+		for (const f of failed) if (f.sig) bySig.set(f.sig, [...(bySig.get(f.sig) ?? []), f]);
+		const same = [...bySig.entries()].find(([sig, fs]) => fs.length >= 3 && !tried.has(sig));
+		if (same) {
+			tried.add(same[0]);
+			healing = heal(`${same[1].length} units failed with the same error`, same[1]).finally(() => (healing = undefined));
 			return;
 		}
-		if (circuitOpen || !o.client || failed.length < 3 || failed.length < recent.length / 2) return;
+		if (!o.client || tried.has("systemic") || failed.length < 3 || failed.length < recent.length / 2) return;
 		try {
 			const r = await decide({ client: o.client, ledger, model: config.models.decide.id, second: config.models.escalate.id }, "systemic_failure", { recent_failures: failed.map((f) => ({ unit: f.unit, cause: f.cause, gate: f.gate })) }, SYSTEMIC_FAILURE, ["systemic"]);
 			const sys = r.answers["systemic"];
 			const kind = r.answers["kind"]?.type === "choice" ? (r.answers["kind"] as { choice: string }).choice : "other";
 			if (sys?.type === "noul" && sys.noul >= 0.5 && r.confidence >= JEV_ACT && kind !== "hard_batch") {
-				circuitOpen = true;
-				requestStop(`circuit breaker: systemic failure`);
-				const q = await askSystemic(`${failed.length} of the last ${recent.length} units failed; Jev judges one shared cause (${kind}, ${Math.round(sys.noul * 100)}%): ${failed.map((f) => `${f.unit}${f.cause ? ` (${f.cause})` : ""}`).join(", ")}. The run stopped starting new units; running ones finish.\nGate output:\n${failed.map((f) => `${f.unit}: ${f.gate ?? ""}`).join("\n")}`, r.decisionId);
-				log(pc.red(`circuit open: failures look systemic (${kind}); running units finish, no new ones start — question #${q}`));
+				tried.add("systemic");
+				healing = heal(`failures look systemic (${kind}, ${Math.round(sys.noul * 100)}%)`, failed).finally(() => (healing = undefined));
 			}
 		} catch {
 			/* Jev unavailable: keep running */
@@ -526,7 +550,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
 		// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
 		const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
-		const sampleReason = stop ? undefined : await samplePause();
+		const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : await samplePause();
 		let readyNow = 0;
 		if (!stop && !dayCapHit && !sampleReason && underLimit()) {
 			const candidates = ready();
@@ -565,6 +589,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			o.onLanes?.({ running: running.size, max, ready: readyNow, ahead: aheadRunning.size, reason });
 		}
 		if (running.size === 0) {
+			// healing a shared failure: wait for it, then go on (never ends the run)
+			if (healing) {
+				await healing;
+				continue;
+			}
 			// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
 			if (sampleReason && !stop && !o.shouldStop?.() && underLimit()) {
 				if (o.waitForDecisions) {
@@ -652,11 +681,23 @@ export function excludeFromGit(repo: string, patterns: string[]): void {
 	}
 }
 
-function linkDependencies(mainProject: string, wtProject: string, dirs: string[]): void {
+/** Dependency dirs into a unit's worktree: linked, or copied (copy-on-write clone where the disk can) when the workspace learned that a link breaks the stack's tools. */
+export function linkDependencies(mainProject: string, wtProject: string, dirs: string[], copy: string[] = []): void {
 	for (const d of dirs) {
 		const src = join(mainProject, d);
 		const dst = join(wtProject, d);
-		if (existsSync(src) && !existsSync(dst)) symlinkSync(src, dst, "dir");
+		if (!existsSync(src) || existsSync(dst)) continue;
+		if (!copy.includes(d)) {
+			symlinkSync(src, dst, "dir");
+			continue;
+		}
+		mkdirSync(dirname(dst), { recursive: true });
+		try {
+			// APFS clone (macOS) / reflink (Linux): instant, no extra space; symlinks inside are kept as they are
+			execFileSync("cp", process.platform === "darwin" ? ["-cR", src, dst] : ["-R", "--reflink=auto", src, dst], { stdio: ["ignore", "pipe", "pipe"] });
+		} catch {
+			cpSync(src, dst, { recursive: true, verbatimSymlinks: true });
+		}
 	}
 }
 

@@ -138,3 +138,32 @@ describe("setup: the model creates the project", () => {
 		await expect(quiet(() => setup(b.config, b.root, { creator: async () => "did nothing" }))).rejects.toThrow(/no project was created/);
 	});
 });
+
+describe("worktree dependency dirs: link or (learned) copy", () => {
+	it("a linked dir resolves to the main project; a learned copy resolves inside the worktree, like an autoloader needs", async () => {
+		const { linkDependencies } = await import("../src/run/run.ts");
+		const { realpathSync } = await import("node:fs");
+		const base = mkdtempSync(join(tmpdir(), "br-wt-"));
+		const main = join(base, "main");
+		mkdirSync(join(main, "vendor", "composer"), { recursive: true });
+		writeFileSync(join(main, "vendor", "composer", "autoload.php"), "<?php // $baseDir = dirname(dirname(__DIR__))\n");
+		const wtLink = join(base, "wt1");
+		const wtCopy = join(base, "wt2");
+		mkdirSync(wtLink);
+		mkdirSync(wtCopy);
+		linkDependencies(main, wtLink, ["vendor"]);
+		linkDependencies(main, wtCopy, ["vendor"], ["vendor"]);
+		expect(realpathSync(join(wtLink, "vendor", "composer"))).toBe(realpathSync(join(main, "vendor", "composer")));
+		expect(realpathSync(join(wtCopy, "vendor", "composer"))).toBe(join(realpathSync(wtCopy), "vendor", "composer"));
+	});
+
+	it("the setup model can switch only a linked dir to a copy; the choice is kept for the workspace", async () => {
+		const { worktreeCopyTool } = await import("../src/init/setup-fixer.ts");
+		const { loadCommandOverrides } = await import("../src/adapters/command-overrides.ts");
+		const root = mkdtempSync(join(tmpdir(), "br-wtc-"));
+		const tool = worktreeCopyTool(root, { id: "s", toolchain: { worktreeLinks: ["vendor"] } } as never) as unknown as { execute: (id: string, p: { dir: string; why: string }) => Promise<{ content: Array<{ text: string }> }> };
+		expect((await tool.execute("1", { dir: "src", why: "x" })).content[0]!.text).toMatch(/refused/);
+		await tool.execute("2", { dir: "vendor", why: "the autoloader resolves the link to the main project" });
+		expect(loadCommandOverrides(root, "s").worktreeCopy).toEqual(["vendor"]);
+	});
+});

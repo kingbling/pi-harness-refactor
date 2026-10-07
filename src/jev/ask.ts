@@ -289,6 +289,8 @@ const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
 	tidy: (v) => v === "apply" || v === "skip",
 	area_taxonomy: (v) => v === "apply" || v === "keep",
 	triage_gate: (v) => v === "retry",
+	// the first units' tree: code found no layout problems and the model agrees → the run goes on
+	layout_sample: (v) => v === "approve",
 };
 
 /** The value the run picks itself, or undefined when the owner must answer. */

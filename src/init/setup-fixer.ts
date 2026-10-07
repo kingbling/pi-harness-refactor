@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
-import { saveCommandOverride } from "../adapters/command-overrides.ts";
+import { saveCommandOverride, saveWorktreeCopy } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
@@ -35,6 +35,24 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 	} as unknown as ToolDefinition;
 }
 
+/** Learned per workspace: a dependency dir every later unit worktree gets as a copy instead of a link. */
+export function worktreeCopyTool(root: string, adapter: TargetAdapter): ToolDefinition {
+	const dirs = adapter.toolchain.worktreeLinks;
+	return {
+		name: "set_worktree_copy",
+		label: "Copy into worktrees",
+		description: `Each migration unit works in its own git worktree; these dependency dirs are linked into it from the main project: ${dirs.join(", ") || "none"}. When a tool resolves the link to its real path (an autoloader, module resolution) and so loads the main project's code instead of the worktree's, give the dir as a copy (copy-on-write clone) to every later worktree.`,
+		promptSnippet: "set_worktree_copy: a linked dependency dir becomes a copy in every later unit worktree",
+		parameters: Type.Object({ dir: Type.String(), why: Type.String() }),
+		execute: async (_id: string, p: { dir: string; why: string }) => {
+			const out = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
+			if (!dirs.includes(p.dir)) return out(`refused: ${p.dir} is not a linked dir (${dirs.join(", ") || "none"})`);
+			saveWorktreeCopy(root, adapter.id, p.dir, p.why);
+			return out(`${p.dir} is copied into every unit worktree from now on`);
+		},
+	} as unknown as ToolDefinition;
+}
+
 /** Returns the model's one-sentence account of what it changed. */
 export type SetupFixer = (o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; attempt: number }) => Promise<string | void>;
 
@@ -62,7 +80,7 @@ async function setupSession(o: { config: Config; root: string; adapter: TargetAd
 		writeGlobs: ["**"],
 		// test files may be written to try things: the code's own check writes its probe afresh, so a written test proves nothing
 		protectedGlobs: [".git/**"],
-		customTools: [setCommandTool(o.root, o.adapter.id)],
+		customTools: [setCommandTool(o.root, o.adapter.id), worktreeCopyTool(o.root, o.adapter)],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.${o.adapter.id}.${label}${o.attempt}.jsonl`),
 		systemPrompt: `${task}\n\n${checkDoc(o.adapter, o.projectDir)}\n\n${RULES} Stop when the commands work; end with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
 	});

@@ -8,7 +8,11 @@ export interface Cmd {
 	args: string[];
 }
 /** Per-workspace replacements of a stack's gate commands; `{files}` in an arg expands to the files (may be none). */
-export type CommandOverrides = Partial<Record<"build" | "lint" | "test", Cmd>> & { why?: string };
+export type CommandOverrides = Partial<Record<"build" | "lint" | "test", Cmd>> & {
+	why?: string;
+	/** Dependency dirs a unit's worktree gets as a copy (copy-on-write where the disk can) instead of a link: tools that resolve real paths (autoloaders) would otherwise load the main project's code. */
+	worktreeCopy?: string[];
+};
 
 export function overridesPath(root: string, stackId: string): string {
 	return join(root, ".bigrefactor", "commands", `${stackId}.json`);
@@ -44,3 +48,10 @@ export function withCommandOverrides(adapter: TargetAdapter, root: string | unde
 	};
 }
 
+
+export function saveWorktreeCopy(root: string, stackId: string, dir: string, why: string): void {
+	const cur = loadCommandOverrides(root, stackId);
+	const p = overridesPath(root, stackId);
+	mkdirSync(dirname(p), { recursive: true });
+	writeFileSync(p, JSON.stringify({ ...cur, worktreeCopy: [...new Set([...(cur.worktreeCopy ?? []), dir])], why: [cur.why, `worktree copy of ${dir}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+}

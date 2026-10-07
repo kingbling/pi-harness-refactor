@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { diagnoseFailure } from "./doctor.ts";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
@@ -265,6 +265,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	}
 	let testFiles = loadTests();
 	if (!testFiles.length) log(pc.yellow("  no ported test files found — the gate cannot prove behaviour"));
+	// the implementer may not edit tests: tests that fail the stack's lint/format check would fail every attempt,
+	// so the tester fixes them now (once). Only with the real gate (simulations fake it).
+	if (testFiles.length && !o.gate) {
+		const c = adapter.lint(targetProjectDir, testFiles.map((t) => t.path));
+		const lintErr = await new Promise<string | undefined>((res) =>
+			execFile(c.cmd, c.args, { cwd: targetProjectDir, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: 5 * 60_000 }, (e, out, err) => res(e ? `${String(err)}\n${String(out)}`.trim().slice(-2500) : undefined)),
+		);
+		if (lintErr) {
+			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
+			if (await runTruth(`The ported tests fail the stack's lint/format check (${[c.cmd, ...c.args].join(" ")}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine), behaviour unchanged.\n${lintErr}`)) testFiles = loadTests();
+		}
+	}
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");
 
 	// ---- implement → gate → triage loop ----------------------------------------------------------
@@ -278,6 +290,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// Jev routing (br label): a unit rated hard with confidence starts on the escalate model
 	const route = (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { route?: { difficulty?: string; difficultyConfidence?: number } }).route;
 	let doctorActions = 0;
+	const diagnosed = new Set<string>();
 	let forceEscalate = route?.difficulty === "hard" && (route.difficultyConfidence ?? 0) >= 0.75;
 	if (forceEscalate) log(pc.dim(`  routed to ${o.config.models.escalate.id}: Jev rates this unit hard (${Math.round((route!.difficultyConfidence ?? 0) * 100)}%)`));
 	let lastGateText = "";
@@ -360,7 +373,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo);
 			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)} ${triage.band})`));
 			if (triage.action === "quarantine") break;
-			if (triage.action === "ask_human") {
+			// the same step failed again: another blind attempt rarely helps — find out why first (once per step)
+			const stuck = triage.action !== "ask_human" && previousGate?.failedStep === gate.failedStep && !diagnosed.has(gate.failedStep ?? "");
+			if (stuck) diagnosed.add(gate.failedStep ?? "");
+			if (triage.action === "ask_human" || stuck) {
 				// Before bothering a human: find out why. Certain/plausible code- or test-side causes are retried
 				// automatically (capped); setup gaps become one exact command the human is told about.
 				const failedOut = gate.steps.find((x) => !x.ok)?.output ?? "";
@@ -381,7 +397,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				let setupTried = "";
 				const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
-					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
 						if (qid) o.ledger.withdrawQuestion(qid, `setup fixed by the model: ${fixed}`);
 						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
@@ -390,6 +406,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 						return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
 					}
 					setupTried = " The setup model tried and could not fix it.";
+				}
+				if (!qid && triage.action !== "ask_human") {
+					// stuck, but nothing to heal here and nobody to ask: go on as triage said (the attempt cap still holds)
+					lastGateText += `\n\nDiagnosis: ${dx.summary}. ${dx.note ?? ""}`;
+					if (triage.action === "escalate") forceEscalate = true;
+					previousGate = gate;
+					continue;
 				}
 				if (qid) {
 					// the doctor knows more than triage did: the question is asked again with the diagnosis (phrased by a model)
