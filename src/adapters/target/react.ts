@@ -95,6 +95,8 @@ export const reactAdapter: TargetAdapter = {
 		return { confidence: existsSync(join(root, "vite.config.ts")) ? 0.8 : 0 };
 	},
 
+	scaffoldHint: "Vite's React + TypeScript template (pnpm create vite, template react-ts, non-interactive, no dev server), then pnpm install; tests with vitest, @testing-library/react, @testing-library/jest-dom and jsdom as dev dependencies.",
+
 	async scaffoldProject(root) {
 		const pkg = join(root, "package.json");
 		const hasVitest = existsSync(pkg) && /"vitest"/.test(readFileSync(pkg, "utf8"));

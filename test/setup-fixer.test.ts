@@ -85,3 +85,56 @@ describe("setup fixes during the run", () => {
 		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "x", fixer: async () => "looked around" })).toBeUndefined();
 	});
 });
+
+describe("setup: the model creates the project", () => {
+	const manifest = (id: string) => ({
+		id, role: "server", subdir: "api", aliases: [], docs: [],
+		scaffold: { cmd: "mkdir", args: ["-p", "{name}"], readyFile: "ready.txt" },
+		postScaffold: [{ cmd: "touch", args: ["ready.txt"] }],
+		build: { cmd: "true", args: [] }, lint: { cmd: "true", args: ["{files}"] }, test: { cmd: "test", args: ["-f", "{files}"] },
+		toolchain: { ecosystem: "x", packageName: "^[a-z]+", packageExamples: [], manifestFiles: ["ready.txt"], installed: { file: "none.json", keys: [] }, add: { cmd: "true", args: ["{packages}"] }, worktreeLinks: [], ignoredPaths: [] },
+		layout: { moduleDir: "src/{area}", structureDoc: "-", sharedDirs: ["src/shared/"], testFileGlobs: ["{moduleDir}/**/*.test.txt"], testFileRegex: "\\.test\\.txt$", sourceExtensions: [".txt"], langByExtension: {}, skipMarker: "skip\\(", interfaceHint: "-", testHint: "-", legacyMarker: "# LEGACY: {why}", dataAccessHint: "", ignoreDirs: [] },
+		platform: {}, stackChoices: [], protectedGlobs: [], patternKinds: ["service"],
+		probeTest: { path: "probe.test.txt", content: "ok\n" }, detect: { file: "ready.txt", contains: "" },
+	});
+	async function workspace(id: string) {
+		const { generateAdapter } = await import("../src/adapters/target/generated.ts");
+		const { registerGeneratedTargets } = await import("../src/adapters/registry.ts");
+		const { FakeModelClient } = await import("../src/models/fake.ts");
+		const root = mkdtempSync(join(tmpdir(), "br-create-"));
+		await generateAdapter({ id, role: "server", why: "t", client: new FakeModelClient({ chat: () => ({ json: manifest(id) }) }), model: "m", root, deferVerify: true });
+		registerGeneratedTargets(root);
+		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: join(root, "new"), stacks: [id] }, models: {} });
+		return { root, config };
+	}
+	const quiet = async (fn: () => Promise<void>) => {
+		const orig = console.log;
+		console.log = () => {};
+		try {
+			await fn();
+		} finally {
+			console.log = orig;
+		}
+	};
+
+	it("no hard-coded generator runs: the model is told how (the adapter's hint) and creates it; code checks", async () => {
+		const { setup } = await import("../src/init/init.ts");
+		const { root, config } = await workspace("create-a");
+		const got: string[] = [];
+		await quiet(() => setup(config, root, { creator: async (o) => {
+			got.push(o.adapter.scaffoldHint ?? "");
+			writeFileSync(join(o.projectDir, "ready.txt"), "made by the model\n");
+		} }));
+		expect(got[0]).toMatch(/^mkdir -p \{name\}, then touch ready.txt/);
+	});
+
+	it("without a model the adapter's own generator is the fallback; a project that never appears stops setup", async () => {
+		const { setup } = await import("../src/init/init.ts");
+		const { existsSync } = await import("node:fs");
+		const a = await workspace("create-b");
+		await quiet(() => setup(a.config, a.root, { creator: async () => { throw new Error("no model"); } }));
+		expect(existsSync(join(a.config.target.path, "ready.txt"))).toBe(true);
+		const b = await workspace("create-c");
+		await expect(quiet(() => setup(b.config, b.root, { creator: async () => "did nothing" }))).rejects.toThrow(/no project was created/);
+	});
+});

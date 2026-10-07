@@ -1,3 +1,4 @@
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
@@ -37,13 +38,23 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 /** Returns the model's one-sentence account of what it changed. */
 export type SetupFixer = (o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; attempt: number }) => Promise<string | void>;
 
-/** One model session that fixes the setup problem in the new project. */
-export const fixSetupWithModel: SetupFixer = async (o) => {
-	const b = o.adapter.build(o.projectDir);
-	const t = o.adapter.test(o.projectDir, ["{files}"]);
-	const l = o.adapter.lint(o.projectDir, ["{files}"]);
-	const probe = o.adapter.probeTest?.(o.projectDir);
-	console.log(pc.cyan(`  ${o.adapter.id}: setup check failed; a model with tools is fixing it (attempt ${o.attempt})`));
+/** What the setup check runs, for the model: the gate commands and the probe test. */
+function checkDoc(adapter: TargetAdapter, projectDir: string): string {
+	const b = adapter.build(projectDir);
+	const t = adapter.test(projectDir, ["{files}"]);
+	const l = adapter.lint(projectDir, ["{files}"]);
+	const probe = adapter.probeTest?.(projectDir);
+	return `The migration tool checks the project with these commands (run in ${projectDir}):
+- build: ${[b.cmd, ...b.args].join(" ")}
+- lint: ${[l.cmd, ...l.args].join(" ")}
+- test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the test files to run)
+${probe ? `The check writes ${probe.path} with this content, runs build, then lint and test with {files} = ${probe.path}, and also checks that the test command FAILS when the expectation is wrong:\n${probe.content}\nTo try it, write that file yourself and delete it afterwards.\n` : ""}When a command is wrong for the installed version (an option removed or renamed, a different runner), replace it with set_gate_command — check the tool's --help first.`;
+}
+
+const RULES = "Never make checks pass by skipping or deleting tests, or by commands that cannot fail. Never interactive prompts (use the non-interactive flags), never dev servers or watch modes. The parent folder is a git repo owned by the migration tool: do not init git or commit.";
+
+async function setupSession(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; attempt: number }, label: string, task: string, prompt: string): Promise<string> {
+	mkdirSync(o.projectDir, { recursive: true });
 	const session = await spawnLeaf({
 		role: "setup",
 		cwd: o.projectDir,
@@ -52,23 +63,37 @@ export const fixSetupWithModel: SetupFixer = async (o) => {
 		// test files may be written to try things: the code's own check writes its probe afresh, so a written test proves nothing
 		protectedGlobs: [".git/**"],
 		customTools: [setCommandTool(o.root, o.adapter.id)],
-		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.${o.adapter.id}.${o.attempt}.jsonl`),
-		systemPrompt: `You set up a freshly generated ${o.adapter.id} project so a migration tool can build and test code in it. The tool checks the project with these commands (run in ${o.projectDir}):
-- build: ${[b.cmd, ...b.args].join(" ")}
-- lint: ${[l.cmd, ...l.args].join(" ")}
-- test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the test files to run)
-${probe ? `The check writes ${probe.path} with this content, runs build, then lint and test with {files} = ${probe.path}, and also checks that the test command FAILS when the expectation is wrong:\n${probe.content}\nTo try it, write that file yourself and delete it afterwards.\n` : ""}Find the cause of the failure and fix it the way the tool's documentation says: install or configure what is missing, with the project's own package manager. When the command itself is wrong for the installed version (an option removed or renamed, a different runner), replace it with set_gate_command — check the tool's --help first. Never make checks pass by skipping or deleting tests, or by commands that cannot fail. Do not start dev servers or watch modes. Stop when the commands work; say in one sentence what you changed.
-
-${PLAIN_LANGUAGE}`,
+		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.${o.adapter.id}.${label}${o.attempt}.jsonl`),
+		systemPrompt: `${task}\n\n${checkDoc(o.adapter, o.projectDir)}\n\n${RULES} Stop when the commands work; end with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
-		const r = await session.run(`The setup check failed:\n${o.problem.slice(-4000)}\n\nFix it, then run the failing command yourself to confirm.`);
+		const r = await session.run(prompt);
 		const said = r.text.trim().split("\n").at(-1) ?? "";
-		console.log(pc.dim(`  setup fix: ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${said}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
+		console.log(pc.dim(`  setup model: ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${said}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
+		if (r.error && !r.toolCalls) throw new Error(`the setup model did not start: ${r.error}`);
 		return said;
 	} finally {
 		session.dispose();
 	}
+}
+
+/** One model session that fixes the setup problem in the new project. */
+export const fixSetupWithModel: SetupFixer = async (o) => {
+	console.log(pc.cyan(`  ${o.adapter.id}: setup check failed; a model with tools is fixing it (attempt ${o.attempt})`));
+	return setupSession(o, "fix", `You set up a ${o.adapter.id} project so a migration tool can build and test code in it. Find the cause of the failure and fix it the way the tool's documentation says: install or configure what is missing, with the project's own package manager.`, `The setup check failed:\n${o.problem.slice(-4000)}\n\nFix it, then run the failing command yourself to confirm.`);
+};
+
+export type ProjectCreator = (o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; packages: Array<{ choice: string; option: string; packages: string[] }> }) => Promise<string | void>;
+
+/**
+ * The new project is created by the setup model with the stack's official tools (the adapter's scaffoldHint says
+ * which), with the packages of the owner's stack choices. Nothing is installed by hard-coded commands; code checks
+ * the result (ready file, choices, gate commands on a probe).
+ */
+export const createProjectWithModel: ProjectCreator = async (o) => {
+	console.log(pc.cyan(`  ${o.adapter.id}: the setup model creates the project with the official tools`));
+	const pk = o.packages.filter((p) => p.packages.length);
+	return setupSession({ ...o, attempt: 1 }, "create", `You create a new ${o.adapter.id} project for a migration tool, with the stack's official generator and package manager, at the current versions.${o.adapter.scaffoldHint ? ` How: ${o.adapter.scaffoldHint}` : ""}`, `Create the project in ${o.projectDir} (the folder may already hold a half-finished project from an interrupted run: complete it, do not start over without need).${pk.length ? `\nThen add the packages of the owner's stack choices:\n${pk.map((p) => `- ${p.choice} = ${p.option}: ${p.packages.join(", ")}`).join("\n")}` : ""}\nThen make the check commands work on the fresh project.`);
 };
 
 // ---- run time ------------------------------------------------------------------------------------------

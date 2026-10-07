@@ -167,6 +167,8 @@ export const nestjsAdapter: TargetAdapter = {
 		}
 	},
 
+	scaffoldHint: "The Nest CLI (npx @nestjs/cli new, package manager pnpm, strict TypeScript, --skip-git because the parent repo owns git); keep the test runner and linter it ships.",
+
 	async scaffoldProject(root) {
 		if (existsSync(join(root, "nest-cli.json"))) return;
 		mkdirSync(dirname(root), { recursive: true });

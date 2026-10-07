@@ -382,7 +382,10 @@ export interface TargetAdapter {
 	projectNotes?(root: string): string[];
 	detect(root: string): Promise<{ confidence: number; version?: string }>;
 	/** Create the empty target project if missing. */
+	/** Offline fallback only: setup asks the setup model to create the project (scaffoldHint says how the official generator is used). */
 	scaffoldProject(root: string): Promise<void>;
+	/** How the project is created with the stack's official tools, for the setup model (it checks --help for the installed version). */
+	scaffoldHint?: string;
 	build(root: string): { cmd: string; args: string[] };
 	lint(root: string, files: string[]): { cmd: string; args: string[] };
 	test(root: string, relatedFiles: string[]): { cmd: string; args: string[] };

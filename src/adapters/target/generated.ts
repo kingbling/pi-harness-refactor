@@ -138,6 +138,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 			if (!existsSync(f)) return { confidence: 0 };
 			return { confidence: readFileSync(f, "utf8").includes(m.detect.contains) ? 0.9 : 0.1 };
 		},
+		scaffoldHint: [m.scaffold, ...(m.postScaffold ?? [])].map((c) => `${c.cmd} ${c.args.join(" ")}`).join(", then ") + ` (run in the parent folder; {name} = the project folder name; the project is ready when ${m.scaffold.readyFile} exists)`,
 		async scaffoldProject(root) {
 			if (existsSync(join(root, m.scaffold.readyFile))) return;
 			mkdirSync(dirname(root), { recursive: true });

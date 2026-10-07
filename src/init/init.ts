@@ -9,7 +9,7 @@ import { getSourceAdapter, getTargetAdapter, knownSources, TARGET_SUBDIRS, targe
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
 import { fetchDocs } from "./docs.ts";
-import { fixSetupWithModel, type SetupFixer } from "./setup-fixer.ts";
+import { createProjectWithModel, fixSetupWithModel, type ProjectCreator, type SetupFixer } from "./setup-fixer.ts";
 import { withCommandOverrides } from "../adapters/command-overrides.ts";
 import { libraryPlan, parseChoiceFlag, parseReplaceFlag, renderStackPlan, resolveChoices } from "./stack.ts";
 import { loadDecisions, recordEarlyDecision } from "../inventory/decisions.ts";
@@ -211,11 +211,11 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 }
 
 /**
- * `br setup`: bootstrap the destination with each technology's own generator (nest new, create vite),
- * put it under git, commit. Nothing here is model-generated. With several stacks, each lives in its own
- * sub-project (`api/`, `web/`) inside the target repo.
+ * `br setup`: the setup model creates each stack's project with the technology's own generator and installs the
+ * stack choices (code checks the result), under git, committed. Without a model the adapter's generator runs.
+ * With several stacks, each lives in its own sub-project (`api/`, `web/`) inside the target repo.
  */
-export async function setup(config: Config, root: string): Promise<void> {
+export async function setup(config: Config, root: string, opts: { creator?: ProjectCreator } = {}): Promise<void> {
 	const target = config.target.path;
 	mkdirSync(target, { recursive: true });
 	const adapters = await Promise.all(config.target.stacks.map((id) => getTargetAdapter(id)));
@@ -236,19 +236,27 @@ export async function setup(config: Config, root: string): Promise<void> {
 			}
 			console.log(pc.dim(`  reused the ${id} project built by the adapter check (no second download)`));
 		}
-		const fixed = (step: string, run: () => Promise<void>, ok: () => boolean) => withSetupFix({ config, root, adapter, projectDir: dir }, step, run, ok);
-		await fixed("creating the project with the stack's generator", () => adapter.scaffoldProject(dir), () => adapter.toolchain.isProjectReady(dir));
 		// the stack choices made at init (ORM, validation, router…) bring their packages; the generator alone does not know them
-		const packages = resolveChoices(adapter, config.target.choices).flatMap((c) => c.option.packages ?? []);
-		if (packages.length && adapter.toolchain.isProjectReady(dir)) {
+		const choices = resolveChoices(adapter, config.target.choices).map((c) => ({ choice: c.choice.key, option: c.option.id, packages: c.option.packages ?? [] }));
+		const missing = () => {
+			if (!adapter.toolchain.isProjectReady(dir)) return choices.flatMap((c) => c.packages);
 			const installed = new Set(adapter.toolchain.installedPackages(dir));
-			const missing = packages.filter((p) => !installed.has(p));
-			if (missing.length) {
-				console.log(pc.dim(`  adding chosen packages: ${missing.join(", ")}`));
-				const add = adapter.toolchain.addPackages(dir, missing);
-				const have = () => new Set(adapter.toolchain.installedPackages(dir));
-				await fixed(`installing the chosen packages ${missing.join(", ")}`, () => runCommand(add.cmd, add.args, { cwd: dir }), () => missing.every((p) => have().has(p)));
+			return choices.flatMap((c) => c.packages).filter((p) => !installed.has(p));
+		};
+		if (!adapter.toolchain.isProjectReady(dir) || missing().length) {
+			// the setup model creates the project and installs the choices with the official tools; code checks below
+			try {
+				await (opts.creator ?? createProjectWithModel)({ config, root, adapter, projectDir: dir, packages: choices });
+			} catch (e: any) {
+				console.log(pc.yellow(`  ${id}: ${e?.message ?? e} — using the built-in generator instead`));
+				await adapter.scaffoldProject(dir);
+				const left = missing();
+				if (left.length && adapter.toolchain.isProjectReady(dir)) {
+					const add = adapter.toolchain.addPackages(dir, left);
+					await runCommand(add.cmd, add.args, { cwd: dir });
+				}
 			}
+			if (!adapter.toolchain.isProjectReady(dir)) throw new Error(`${id}: no project was created in ${dir} (see .bigrefactor/sessions/__setup__.${id}.*)`);
 		}
 	}
 	// Guarantee, before any unit runs: the project matches every stack choice, and the gate's own build and
@@ -331,25 +339,6 @@ async function toolchainProblem(config: Config, adapter: TargetAdapter): Promise
 		return undefined;
 	} finally {
 		rmSync(probePath, { force: true });
-	}
-}
-
-/**
- * A setup step (generator, package install) that fails goes to the setup model, which runs it its own way
- * (a renamed flag, a missing tool); `ok` is the code's check that it worked. Still failing → the original error.
- */
-async function withSetupFix(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; fix?: SetupFixer }, step: string, run: () => Promise<void>, ok: () => boolean, attempts = 2): Promise<void> {
-	try {
-		await run();
-		return;
-	} catch (e: any) {
-		const fix = o.fix ?? fixSetupWithModel;
-		mkdirSync(o.projectDir, { recursive: true });
-		for (let i = 1; i <= attempts; i++) {
-			await fix({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: `${o.adapter.id}: ${step} failed in ${o.projectDir}:\n${String(e?.message ?? e).split("\n").slice(-30).join("\n")}\nDo this step yourself so the project ends up as the step intended.`, attempt: i });
-			if (ok()) return;
-		}
-		throw e;
 	}
 }
 
