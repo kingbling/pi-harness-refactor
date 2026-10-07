@@ -59,6 +59,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	decide: "decide [id=value ...]: open decisions the inventory could not make; run/L3 wait for them",
 	frameworks: "frameworks: legacy framework & library mapping (platform | port | drop)",
 	order: "order: vertical slice plan (foundation → auth → features)",
+	rule: 'rule [stack:] <plain words>: change how the new code is organised, e.g. rule "sub-features in their own folder, no extended/" (checked by code, shown before it applies) · rule: show the current layouts',
 	layout: "layout: preflight — units per stack, top areas, target tree, problems (run refuses on problems)",
 };
 
@@ -633,7 +634,7 @@ export default function (pi: ExtensionAPI) {
 				if (lines.length) console.log(lines.map(plain).join("\n"));
 				return;
 			}
-			if (sub === "decide" || sub === "frameworks" || sub === "order") {
+			if (sub === "decide" || sub === "frameworks" || sub === "order" || sub === "rule") {
 				const lines: string[] = [];
 				try {
 					const { loadConfig } = await import("../config.ts");
@@ -649,7 +650,27 @@ export default function (pi: ExtensionAPI) {
 					const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
 					const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
 					try {
-						if (sub === "frameworks") {
+						if (sub === "rule") {
+							const { ownerRule, layoutPreview } = await import("../rules/owner-layout.ts");
+							const { loadLayoutRules } = await import("../rules/layout-rules.ts");
+							const { projectDir } = await import("../init/init.ts");
+							const ui = piPrompter(ctx, lines);
+							// "nestjs: …" names the stack; one stack needs no name; otherwise ask
+							const named = /^([\w-]+):\s*/.exec(rest.join(" "));
+							const words = (named && targets.some((t) => t.id === named[1]) ? rest.join(" ").slice(named[0].length) : rest.join(" ")).trim().replace(/^["']|["']$/g, "");
+							let stack = named && targets.some((t) => t.id === named[1]) ? named[1]! : targets.length === 1 ? targets[0]!.id : undefined;
+							if (!words) {
+								for (const t of targets) lines.push(`${t.id}:\n${(() => { const r = loadLayoutRules(root, t.id); return r ? layoutPreview(r) : "  no layout decided yet (built-in checks)"; })()}`);
+							} else {
+								stack ??= ctx.hasUI ? await ui.select("Which project should the rule apply to?", targets.map((t) => ({ value: t.id, label: t.id }))) : undefined;
+								const t = targets.find((x) => x.id === stack);
+								if (!t) lines.push("nothing changed (name the stack: rule <stack>: <words>)");
+								else {
+									const { OpenRouterClient } = await import("../models/openrouter.ts");
+									lines.push(await ownerRule({ root, stack: t.id, adapter: t, words, ui, client: new OpenRouterClient(), model: config.models.escalate.id, projectDir: projectDir(config, t.id), ledger }));
+								}
+							}
+						} else if (sub === "frameworks") {
 							const { planFrameworks, renderFrameworkPlan } = await import("../inventory/frameworks.ts");
 							const { loadDecisions } = await import("../inventory/decisions.ts");
 							lines.push(renderFrameworkPlan(planFrameworks(ledger, source, targets, config.source.path, loadDecisions(root), config.target.choices)));

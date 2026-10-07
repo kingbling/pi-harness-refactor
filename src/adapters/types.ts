@@ -296,6 +296,8 @@ export interface TargetLayout {
 	 * root and shared dirs are the core's part (it knows the scaffold).
 	 */
 	checkTree?(projectDir: string, only?: string[]): string[];
+	/** Per-file findings that do not depend on the folder layout (size cap, one class per file); `moduleDir`/`area` when the file is in a feature folder. */
+	fileFindings?(projectDir: string, file: string, moduleDir?: string, area?: string): string[];
 	/** Add-only zones for cross-cutting helpers (reuse, never edit from a feature unit). Trailing slash. */
 	sharedDirs: string[];
 	/** Where the database lives in the project (schema, entities, migrations, data scripts): the DB lane writes only here. Trailing slash. */
@@ -360,6 +362,8 @@ export interface TargetAdapter {
 	/** A project already built and tested for this stack (generated adapters): setup moves it into place instead of building again. */
 	seedProject?: string;
 	layout: TargetLayout;
+	/** The framework's own feature-folder convention, proposed at onboarding; the confirmed answer is the stack's layout.json. */
+	layoutRules?: import("../rules/layout-rules.ts").LayoutRules;
 	toolchain: TargetToolchain;
 	/** Other names users and docs use for this stack (lowercase), e.g. "nest". */
 	aliases?: string[];

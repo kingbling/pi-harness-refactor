@@ -35,6 +35,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br decide [--json] [--answer id=value ...]   decision gate: everything the inventory cannot decide; run/L3 wait for it
   br profile [--force]         generate the legacy framework profile (loaders, routes-in-code, entry points, concerns) from the framework source; validated against the index
   br frameworks                what the legacy framework/libraries do, app reliance per concern, platform/port/drop verdicts
+  br rule [<stack>:] <words>   change how the new code is organised, in plain words (checked by code, shown before it applies); no words: show the layouts
   br layout                    layout preflight: units per stack, top areas, shared units, target tree, problems (br run refuses on problems)
   br order                     vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
   br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
@@ -250,6 +251,24 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
 		const r = await advise(config, root, ledger, makeClient(), source, targets);
 		console.log(`advised ${r.libraries} libraries, ${r.classes} framework classes, ${r.decisions} decisions — $${r.costUsd.toFixed(4)}; see br decide`);
+	},
+	rule: async (args) => {
+		const { ownerRule, layoutPreview } = await import("./rules/owner-layout.ts");
+		const { loadLayoutRules } = await import("./rules/layout-rules.ts");
+		const { getTargetAdapter } = await import("./adapters/registry.ts");
+		const { projectDir, terminalPrompter } = await import("./init/init.ts");
+		const { config, ledger, root } = open();
+		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
+		const text = args.join(" ").trim();
+		const named = /^([\w-]+):\s*/.exec(text);
+		const t = named && targets.find((x) => x.id === named[1]) ? targets.find((x) => x.id === named[1])! : targets.length === 1 ? targets[0] : undefined;
+		const words = (t && named?.[1] === t.id ? text.slice(named[0].length) : text).trim();
+		if (!words) {
+			for (const x of targets) console.log(`${pc.bold(x.id)}\n${(() => { const r = loadLayoutRules(root, x.id); return r ? layoutPreview(r) : "  no layout decided yet (built-in checks)"; })()}`);
+			return;
+		}
+		if (!t) throw new Error(`name the stack: br rule <${targets.map((x) => x.id).join("|")}>: <words>`);
+		console.log(await ownerRule({ root, stack: t.id, adapter: t, words, ui: terminalPrompter, client: makeClient(), model: config.models.escalate.id, projectDir: projectDir(config, t.id), ledger }));
 	},
 	decide: async (args) => {
 		const { openDecisions, applyDecision, renderDecisions } = await import("./inventory/decisions.ts");

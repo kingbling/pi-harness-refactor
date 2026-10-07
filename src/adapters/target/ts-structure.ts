@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { StructureContext } from "../types.ts";
+import type { LayoutRules } from "../../rules/layout-rules.ts";
 import { tsLayoutBase } from "./ts-index.ts";
 
 /**
@@ -189,8 +190,12 @@ function lineCount(projectDir: string, f: string): number | undefined {
 	return read(projectDir, f).replace(/\n$/, "").split("\n").length;
 }
 
-/** Size and one-class-per-responsibility of one file. */
-function fileFindings(projectDir: string, f: string): string[] {
+/** Size and one-class-per-responsibility of one file; `moduleDir`/`area` place the class-home check (default: the built-in feature root). */
+export function tsFileFindings(projectDir: string, f: string, moduleDir?: string, area?: string): string[] {
+	return fileFindings(projectDir, f, moduleDir, area);
+}
+
+function fileFindings(projectDir: string, f: string, moduleDir?: string, areaOf?: string): string[] {
 	if (!existsSync(join(projectDir, f))) return [];
 	const text = read(projectDir, f);
 	const out: string[] = [];
@@ -201,10 +206,12 @@ function fileFindings(projectDir: string, f: string): string[] {
 		const kinds = new Set(classes.map((c) => c.kind));
 		out.push(`${f}: ${classes.length} exported ${kinds.size === 1 ? `${[...kinds][0]} ` : "service/controller/repository "}classes (${classes.map((c) => c.name).join(", ")}); one class per file`);
 	}
-	const area = f.startsWith(TS_FEATURE_ROOT) ? f.slice(TS_FEATURE_ROOT.length).split("/")[0]! : undefined;
+	const area = areaOf ?? (f.startsWith(TS_FEATURE_ROOT) ? f.slice(TS_FEATURE_ROOT.length).split("/")[0]! : undefined);
+	const mod = moduleDir ?? (area ? tsModuleDir(area) : "");
 	for (const c of classes) {
 		if (!area) continue;
-		const home = new RegExp(`^${tsModuleDir(area)}/(${area}(?:-${KEBAB})?)\\.${c.kind}\\.ts$`).exec(f);
+		// <area>[-<sub>].<kind>.ts at the feature root, or <sub>/<area>-<sub>.<kind>.ts in a sub-feature folder
+		const home = new RegExp(`^${mod.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/(?:${KEBAB}/)?(${area}(?:-${KEBAB})?)\\.${c.kind}\\.ts$`).exec(f);
 		if (!home) out.push(`${f}: ${c.name} is a ${c.kind} class outside ${area}[-<sub>].${c.kind}.ts; same-kind classes of an area live in those files`);
 		else if (c.name !== pascal(home[1]!) + c.Kind) out.push(`${f}: class ${c.name} must be named ${pascal(home[1]!)}${c.Kind} after its file (never after a legacy file or another area)`);
 	}
@@ -228,3 +235,56 @@ function listFiles(dir: string, prefix = ""): string[] {
 		.sort()
 		.flatMap((n) => (statSync(join(dir, n)).isDirectory() ? listFiles(join(dir, n), `${prefix}${n}/`) : [`${prefix}${n}`]));
 }
+
+/**
+ * The frameworks' own feature-folder conventions, proposed at onboarding (the owner confirms or changes them; the
+ * answer is the stack's layout.json). NestJS: what `nest g resource <name>` generates, one folder per feature.
+ */
+export const NEST_LAYOUT: LayoutRules = {
+	source: "NestJS docs (nest g resource)",
+	moduleDir: "src/{area}",
+	files: [
+		{ path: "{area}.module.ts", doc: "the one Nest module of the feature ({Area}Module)" },
+		{ path: "{area}.controller.ts", doc: "HTTP endpoints of the feature ({Area}Controller)" },
+		{ path: "{area}.service.ts", doc: "business logic of the feature ({Area}Service); every unit of the area extends it" },
+		{ path: "{area}.repository.ts", doc: "data access of the feature ({Area}Repository)" },
+		{ path: "{area}.(types|constants).ts", doc: "types and constants the feature's files share" },
+		{ path: "{area}.(guard|pipe|interceptor).ts", doc: "access checks and request plumbing of the feature" },
+		{ path: "{area}-{name}.(service|controller|repository|types|constants).ts", doc: `a second file of a kind, only when the code would not fit under ${MAX_LINES} lines in the main one` },
+		{ path: "lib/{name}.ts", doc: "helper functions only this feature uses (no service/controller/repository classes)" },
+		{ path: "dto/{name}.dto.ts", doc: "request/response classes, one per operation (create-campaign.dto.ts)" },
+		{ path: "entities/{name}.entity.ts", doc: "persisted records" },
+		{ path: "{sub}/{area}-{sub}.(service|controller|repository|types|constants).ts", doc: "a sub-feature in a folder named after what it does (creation/campaign-creation.service.ts)" },
+		{ path: "{sub}/dto/{name}.dto.ts", doc: "request/response classes of a sub-feature" },
+	],
+	require: ["{area}.module.ts", "{area}.controller.ts", "{area}.service.ts"],
+	forbidDirs: [],
+	place: [
+		{ text: "^\\s*(?:export\\s+(?:default\\s+)?)?(?:abstract\\s+)?class\\s+\\w+(?:Dto|Request|Response)\\b", in: ["dto/{name}.dto.ts", "{sub}/dto/{name}.dto.ts"], doc: "request/response classes live in dto/" },
+		{ text: "@Controller\\(", in: ["{area}.controller.ts", "{area}-{name}.controller.ts", "{sub}/{area}-{sub}.controller.ts"], doc: "controllers only in controller files" },
+		{ text: "@Module\\(", in: ["{area}.module.ts"], doc: "one module per feature" },
+		{ text: "@Entity\\(", in: ["entities/{name}.entity.ts"], doc: "persisted records live in entities/" },
+	],
+};
+
+/** React: one folder per feature (the feature-folder convention of the React docs' "thinking in components" + bulletproof-react). */
+export const REACT_LAYOUT: LayoutRules = {
+	source: "React feature folders",
+	moduleDir: "src/features/{area}",
+	files: [
+		{ path: "pages/{Area}Page.(tsx|module.css)", doc: "the routed page of the feature (+ its CSS module)" },
+		{ path: "pages/{Area}{Name}Page.(tsx|module.css)", doc: "more pages of the feature (AgencyEditPage.tsx)" },
+		{ path: "components/{Name}.(tsx|module.css)", doc: "presentational pieces, one component per file" },
+		{ path: "components/{Name}/{Name}.(tsx|module.css)", doc: "a component with its own folder" },
+		{ path: "hooks/use-{name}.(ts|tsx)", doc: "state and behaviour hooks (use-agency-filters.ts)" },
+		{ path: "api/{area}.api.ts", doc: "the feature's API client; every unit extends it" },
+		{ path: "api/{area}-{name}.api.ts", doc: `a second API file, only when the code would not fit under ${MAX_LINES} lines in the main one` },
+		{ path: "{area}-{name}.(types|constants).ts", doc: `a second types/constants file, only past ${MAX_LINES} lines` },
+		{ path: "{area}.routes.tsx", doc: "the feature's routes (mirroring the legacy URLs)" },
+		{ path: "{area}.(types|constants).ts", doc: "types and constants the feature's files share" },
+		{ path: "lib/{name}.ts", doc: "helper functions only this feature uses" },
+	],
+	require: [],
+	forbidDirs: [],
+	place: [],
+};

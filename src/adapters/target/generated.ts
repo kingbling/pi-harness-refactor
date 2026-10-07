@@ -5,6 +5,7 @@ import { runCommand } from "../../proc.ts";
 import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
 import type { StackChoice, TargetAdapter } from "../types.ts";
+import { normalize, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
 
 /**
  * A target adapter for a stack bigrefactor has no hand-written adapter for, written as DATA by a model that
@@ -58,6 +59,8 @@ export interface AdapterManifest {
 		legacyMarker: string;
 		dataAccessHint: string;
 		ignoreDirs: string[];
+		/** The stack's official feature-folder convention as checkable data (proposed at onboarding; see rules/layout-rules.ts). Older manifests have none. */
+		rules?: LayoutRules;
 	};
 	platform: Record<string, string>;
 	stackChoices: StackChoice[];
@@ -84,6 +87,7 @@ const expand = (c: Cmd, vars: Record<string, string | string[]>): Cmd => ({
 const pascal = (s: string) => s.split(/[-_\s]+/).filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("");
 
 export function fromManifest(m: AdapterManifest): TargetAdapter {
+	const layoutRules = m.layout.rules ? normalize(m.layout.rules) : undefined;
 	const testRe = new RegExp(m.layout.testFileRegex);
 	const moduleDir = (area: string) => m.layout.moduleDir.replace(/\{area\}/g, area).replace(/\{Area\}/g, pascal(area)).replace(/\{area_snake\}/g, area.replace(/-/g, "_"));
 	return {
@@ -150,6 +154,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 		protectedGlobs: m.protectedGlobs,
 		generatedFiles: [],
 		patternKinds: m.patternKinds,
+		...(layoutRules ? { layoutRules } : {}),
 	};
 }
 
@@ -185,6 +190,11 @@ export function validateManifest(m: AdapterManifest): string[] {
 	if (!m.probeTest?.path || m.probeTest.path.startsWith("/") || m.probeTest.path.includes("..")) out.push("probeTest.path must be project-relative");
 	if (!m.layout?.sourceExtensions?.length) out.push("layout.sourceExtensions is empty");
 	if (!m.patternKinds?.length) out.push("patternKinds is empty");
+	if (m.layout?.rules) {
+		const r = normalize(m.layout.rules);
+		if (r.moduleDir !== m.layout.moduleDir) out.push(`layout.rules.moduleDir "${r.moduleDir}" must equal layout.moduleDir "${m.layout.moduleDir}"`);
+		out.push(...validateLayoutRules(r).map((p) => `layout.rules: ${p}`));
+	}
 	return out;
 }
 
@@ -207,6 +217,16 @@ const S = { type: "string" } as const;
 const SA = { type: "array", items: S } as const;
 const CMD = { type: "object", additionalProperties: false, required: ["cmd", "args"], properties: { cmd: S, args: SA } } as const;
 const obj = (props: Record<string, unknown>) => ({ type: "object", additionalProperties: false, required: Object.keys(props), properties: props });
+/** layout.json as a JSON schema (generated manifests, /br rule drafts). */
+export const LAYOUT_RULES_SCHEMA = obj({
+	source: S,
+	moduleDir: S,
+	files: { type: "array", items: obj({ path: S, doc: S }) },
+	require: SA,
+	forbidDirs: SA,
+	place: { type: "array", items: obj({ text: S, in: SA, doc: S }) },
+	maxLines: { type: "integer" },
+});
 // strict structured output has no open maps: maps travel as [{key, value}] and are folded back (asMap)
 const MAP = { type: "array", items: obj({ key: S, value: S }) } as const;
 const OPTION = obj({ id: S, label: S, hint: S, platform: MAP, packages: SA, docs: { type: "array", items: obj({ name: S, url: S }) } });
@@ -222,7 +242,7 @@ export const MANIFEST_SCHEMA = obj({
 	lint: CMD,
 	test: CMD,
 	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
-	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA }),
+	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, rules: LAYOUT_RULES_SCHEMA }),
 	platform: MAP,
 	stackChoices: { type: "array", items: obj({ key: S, question: S, default: S, options: { type: "array", items: OPTION } }) },
 	protectedGlobs: SA,
@@ -238,6 +258,7 @@ const SYSTEM = [
 	"- EVERY command is ONE executable with plain arguments, run without a shell: no sh/bash/cmd -c, no pipes, &&, ;, $, redirects, loops or globs. When the stack has no single build command, use its main static checker as build (e.g. PHP: vendor/bin/phpstan analyse src; Python: mypy or python -m compileall; Ruby: bundle exec rubocop), its linter/formatter check as lint, and its test runner as test with {files} appended (e.g. vendor/bin/phpunit {files}). Tools installed into the project are called by their project-relative path (vendor/bin/…, node_modules/.bin/…, bin/console) and added in postScaffold.",
 	"- toolchain.installed: a JSON manifest file in the project and the object keys whose keys are package names. toolchain.packageName: a regex (anchored with ^) matching a package name.",
 	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer. testFileGlobs use {moduleDir}.",
+	"- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does; (a|b) either word), each with a short doc. require: files every feature folder has (its entry point, e.g. the controller). place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: []. maxLines: 400. source: where the convention comes from (the docs page or generator).",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up.",

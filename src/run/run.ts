@@ -78,6 +78,7 @@ export interface SchedulerResult {
 }
 
 export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult> {
+	process.env["BR_WORKSPACE"] = o.root; // the stacks' layout.json lives in this workspace
 	const log = o.log ?? ((l: string) => console.log(l));
 	const { ledger, config } = o;
 

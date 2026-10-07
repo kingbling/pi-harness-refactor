@@ -100,6 +100,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	if (unplaced) throw new Error(`unit ${o.unitId} has no placement yet (code unsure: ${unplaced}); br place`);
 	const place = placeUnit(o.config, unit.meta, o.root);
 	const { stackId, area } = place;
+	process.env["BR_WORKSPACE"] = o.root; // the stack's layout.json lives in this workspace
 	const adapter = await getTargetAdapter(stackId);
 	const targetProjectDir = o.workDir ? join(o.workDir, relative(o.config.target.path, projectDir(o.config, stackId))) : projectDir(o.config, stackId);
 	if (!adapter.toolchain.isProjectReady(targetProjectDir)) throw new Error(`target project missing at ${targetProjectDir}; run br setup`);

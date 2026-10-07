@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { basename, dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../types.ts";
 import { indexTsFile, tsLayoutBase, nodeToolchain, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
-import { tsCheckStructure, tsCheckTree, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
+import { NEST_LAYOUT, tsCheckStructure, tsCheckTree, tsFileFindings, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
 
 /**
  * Fresh setup is NOT model-generated: the official Nest CLI bootstraps the project
@@ -26,9 +26,11 @@ export const nestjsAdapter: TargetAdapter = {
 		structureDoc: tsStructureDoc("server"),
 		checkStructure: (files, moduleDir, area, projectDir, ctx) => tsCheckStructure(files, moduleDir, area, projectDir, "server", ctx),
 		checkTree: (projectDir, only) => tsCheckTree(projectDir, "server", only),
+		fileFindings: tsFileFindings,
 		testFileGlobs: (dir) => [`${dir}/**/*.spec.ts`, `${dir}/**/*.test.ts`],
 		testHint: "*.spec.ts files (vitest/jest `describe`/`it`/`expect`) next to the code they test",
 	},
+	layoutRules: NEST_LAYOUT,
 	indexFile: (root, rel) => indexTsFile(root, rel, { sharedDirs: tsLayoutBase().sharedDirs, decoratorKinds: { Controller: "controller", Module: "module", Injectable: "service" }, nameKinds: [[/Repository$|Repo$/, "repository"], [/Dto$|Request$|Response$/, "dto"]] }),
 	projectNotes: (root) => tsProjectNotes(root),
 	verifyChoices: (root, chosen) => tsVerifyChoices(root, chosen),

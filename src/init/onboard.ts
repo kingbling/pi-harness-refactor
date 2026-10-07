@@ -52,6 +52,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		frameworks: "map every legacy framework concern to the new platform (port / platform / drop)",
 		advise: "models judge libraries, framework classes and the target stack; Jev weighs the other decisions",
 		decide: "every open decision, each with a recommendation",
+		folders: "how the new code is organised per stack: the framework's folder convention, confirmed or changed in your words; every agent's work is checked against it",
 		setup: "bootstrap the new codebase with the official generators + chosen packages",
 		docs: "fetch the official docs of every chosen technology for the agents",
 		"inventory (after decisions)": "re-index with the decisions applied",
@@ -326,6 +327,25 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		reload();
 		const decidedTargets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
 		targets.splice(0, targets.length, ...decidedTargets);
+		// the folder layout per stack: still a question, so it comes before the slow setup
+		const { layoutRulesPath } = await import("../rules/layout-rules.ts");
+		const forceLayout = args.includes("--force-layout");
+		await step("folders", () => (!forceLayout && config.target.stacks.every((s) => existsSync(layoutRulesPath(root, s))) ? "layout decided (/br rule changes it)" : undefined), async () => {
+			const { askLayout } = await import("../rules/owner-layout.ts");
+			const { OpenRouterClient } = await import("../models/openrouter.ts");
+			const l = ledger();
+			try {
+				const out: string[] = [];
+				for (const t of targets) {
+					if (!forceLayout && existsSync(layoutRulesPath(root, t.id))) continue;
+					out.push(`${t.id}: ${await askLayout({ root, stack: t.id, adapter: t, ui, yes, client: noLlm ? undefined : new OpenRouterClient(), model: config.models.escalate.id, projectDir: projectDir(config, t.id), ledger: l, log: (x) => log(pc.dim(x)) })}`);
+				}
+				return out.join("; ");
+			} finally {
+				l.close();
+			}
+		});
+
 		// Bootstrapped = every project exists AND setup's final commit landed. An interrupted setup (half a
 		// generator run, chosen packages not added) has files but no commit, so a resume redoes it idempotently.
 		await step("setup", () => (targets.every((t) => t.toolchain.isProjectReady(projectDir(config, t.id))) && targetHasCommit(config.target.path) ? "target already bootstrapped" : undefined), async () => {

@@ -3,7 +3,7 @@ import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { TargetAdapter } from "../types.ts";
 import { indexTsFile, tsLayoutBase, nodeToolchain, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
-import { tsCheckStructure, tsCheckTree, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
+import { REACT_LAYOUT, tsCheckStructure, tsCheckTree, tsFileFindings, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
 
 /** Fresh setup via the official Vite scaffolder (`create vite --template react-ts`), not model-generated. */
 export const reactAdapter: TargetAdapter = {
@@ -21,9 +21,11 @@ export const reactAdapter: TargetAdapter = {
 		structureDoc: tsStructureDoc("ui"),
 		checkStructure: (files, moduleDir, area, projectDir, ctx) => tsCheckStructure(files, moduleDir, area, projectDir, "ui", ctx),
 		checkTree: (projectDir, only) => tsCheckTree(projectDir, "ui", only),
+		fileFindings: tsFileFindings,
 		testFileGlobs: (dir) => [`${dir}/**/*.test.tsx`, `${dir}/**/*.test.ts`],
 		testHint: "*.test.tsx files (vitest + @testing-library/react) next to the component",
 	},
+	layoutRules: REACT_LAYOUT,
 	indexFile: (root, rel) => indexTsFile(root, rel, { sharedDirs: tsLayoutBase().sharedDirs, nameKinds: [[/Page$/, "page"], [/^use[A-Z]/, "hook"]] }),
 	projectNotes: (root) => tsProjectNotes(root),
 	verifyChoices: (root, chosen) => tsVerifyChoices(root, chosen),

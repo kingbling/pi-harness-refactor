@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join, posix } from "node:path";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
@@ -8,6 +7,7 @@ import { projectDir } from "../init/init.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { stackTagLike } from "../inventory/target.ts";
 import { activeRuleFiles, rulesDir, validateRulesLayout } from "../rules/layout.ts";
+import { layoutRulesProblem, scaffoldDirs } from "../rules/layout-rules.ts";
 import { kebab } from "./areas.ts";
 import { placementDir, planPlacements, type Placement } from "./placement.ts";
 
@@ -116,7 +116,12 @@ export async function checkLayout(config: Config, root: string, ledger: Ledger):
 	if (unresolved) warnings.push(`${unresolved} unit(s) without a placement yet, ${unasked} not asked yet (code unsure; they wait, never run on a guess; br place asks Jev, then you)`);
 	if (openQuestions) warnings.push(`${openQuestions} placement question(s) open (br questions); only their units wait`);
 
-	// ---- (b) rules layout == adapter layout
+	// ---- (b) the feature-folder layout is decided and readable; rules layout == adapter layout
+	for (const s of config.target.stacks) {
+		const bad = layoutRulesProblem(root, s);
+		if (bad) problems.push(`${s}: layout.json cannot be used as written (${bad}); fix it or /br rule`);
+		else if (!existsSync(join(rulesDir(root, s), "layout.json"))) warnings.push(`${s}: no folder layout decided yet: only the built-in checks apply (br onboard asks; /br rule changes it)`);
+	}
 	problems.push(...(await validateRulesLayout(root, config)));
 
 	// ---- (c) the target tree as it is now
@@ -163,7 +168,13 @@ function scanDir(dir: string, a: TargetAdapter): StackTree {
 	const moduleRoot = l.moduleDir("x").replace(/x$/, "");
 	const parts = moduleRoot.split("/").filter(Boolean);
 	const srcRoot = parts.slice(0, -1).join("/");
-	const features = listDirs(join(dir, moduleRoot), ig).map((area) => ({ area, files: walk(join(dir, moduleRoot, area), ig).length }));
+	// feature folders straight under the source root (src/{area}): the shared, data and scaffold folders there are no areas
+	const notAreas = new Set<string>();
+	if (parts.length === 1) {
+		for (const d of [...l.sharedDirs, ...(l.dataDirs ?? [])]) if (d.startsWith(moduleRoot)) notAreas.add(d.slice(moduleRoot.length).split("/")[0]!);
+		for (const d of scaffoldDirs(dir, parts[0]!)) notAreas.add(d);
+	}
+	const features = listDirs(join(dir, moduleRoot), ig).filter((d) => !notAreas.has(d)).map((area) => ({ area, files: walk(join(dir, moduleRoot, area), ig).length }));
 	const shared = l.sharedDirs.flatMap((s) => walk(join(dir, s), ig).map((f) => posix.join(s, f)));
 	let stray: string[] = [];
 	if (srcRoot) {
@@ -208,19 +219,6 @@ export function driftReport(ledger: Ledger, stackId: string, area?: string): str
 	const d = JSON.parse(ledger.getMeta(`drift_dirs:${stackId}`) ?? "{}") as { moduleRoot?: string; sharedDirs?: string[] };
 	const dirs = [d.moduleRoot, ...(d.sharedDirs ?? [])].filter(Boolean).map((r) => `${r}${area}/`);
 	return lines.filter((l) => dirs.some((p) => l.startsWith(p)));
-}
-
-/** Dirs under the source root in the project's first commit (what the official generator made). */
-function scaffoldDirs(dir: string, srcRoot: string): string[] {
-	try {
-		const first = execFileSync("git", ["-C", dir, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n").at(-1)!;
-		return execFileSync("git", ["-C", dir, "ls-tree", "-d", "--name-only", first, `${srcRoot}/`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-			.split("\n")
-			.filter(Boolean)
-			.map((p) => posix.basename(p));
-	} catch {
-		return [];
-	}
 }
 
 function listDirs(dir: string, ignore: string[]): string[] {

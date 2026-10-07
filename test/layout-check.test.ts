@@ -65,7 +65,9 @@ describe("checkLayout", () => {
 		for (const [id, files, stack, area] of GOOD) unit(id, files, stack, area);
 		const r = await checkLayout(config, ws, ledger);
 		expect(r.problems).toEqual([]);
-		expect(r.warnings).toEqual([]);
+		// no layout.json yet: said once per stack, the built-in checks apply
+		expect(r.warnings.filter((w) => !/no folder layout decided yet/.test(w))).toEqual([]);
+		expect(r.warnings).toContainEqual(expect.stringMatching(/^nestjs: no folder layout decided yet/));
 		expect(r.summary.perStack).toEqual({ nestjs: 7, react: 5 });
 		expect(r.summary.modules[0]).toEqual({ key: "nestjs:agency", units: 4 });
 		expect(r.summary.areas).toBe(2);
@@ -121,7 +123,7 @@ describe("checkLayout", () => {
 		rmSync(join(rulesDir(ws, "react"), "astgrep"), { recursive: true });
 		const r = await checkLayout(config, ws, ledger);
 		expect(r.problems).toEqual([expect.stringMatching(/^react: RULES\.md exists but no active ast-grep rule/)]);
-		expect(r.warnings).toEqual([expect.stringMatching(/^1 unit\(s\) without a placement yet, 0 not asked yet/), expect.stringMatching(/^1 placement question/)]);
+		expect(r.warnings.filter((w) => !/no folder layout decided yet/.test(w))).toEqual([expect.stringMatching(/^1 unit\(s\) without a placement yet, 0 not asked yet/), expect.stringMatching(/^1 placement question/)]);
 		rmSync(join(rulesDir(ws, "react"), "RULES.md"));
 		expect((await checkLayout(config, ws, ledger)).warnings).toContainEqual(expect.stringMatching(/^react: no active ast-grep rules/));
 	});
