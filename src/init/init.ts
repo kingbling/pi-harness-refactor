@@ -88,6 +88,8 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 		throw new Error(`${CONFIG_FILE} already exists here; use --force to overwrite`);
 	}
 
+	await offerFreshStart(root, ui, { yes, fresh: args.includes("--fresh") });
+
 	let sourcePath = flag("--source");
 	let stack = flag("--stack");
 	let targetPath = flag("--target");
@@ -274,6 +276,38 @@ export function projectDir(config: Config, stackId: string): string {
 /** Adapter-declared sub-directory; resolved synchronously from the registry's static table so callers stay sync. */
 function subdirOf(stackId: string): string {
 	return TARGET_SUBDIRS[stackId] ?? stackId;
+}
+
+/**
+ * A new init in a workspace that still holds earlier work (answers, ledger, rules): those answers would be taken
+ * as decided and their questions never asked again. The owner chooses; "start fresh" moves the old state aside
+ * (.bigrefactor.old-<time>), nothing is deleted. `--fresh` starts fresh without asking; `--yes` keeps it.
+ */
+export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: boolean; fresh: boolean }): Promise<boolean> {
+	const dir = join(root, ".bigrefactor");
+	if (!existsSync(dir) || !readdirSync(dir).length) return false;
+	let answers = 0;
+	try {
+		answers = Object.keys((JSON.parse(readFileSync(join(dir, "decisions.json"), "utf8")) as { answers?: object }).answers ?? {}).length;
+	} catch {
+		/* no decisions yet */
+	}
+	const ledger = existsSync(join(dir, "ledger.sqlite")) ? statSync(join(dir, "ledger.sqlite")).size : 0;
+	const what = [answers ? `${answers} earlier answers (target stacks, libraries, rules …)` : "", ledger ? `the unit ledger (${Math.max(1, Math.round(ledger / 1e6))} MB)` : "", ...["rules", "truth", "placement.json", "areas.json"].filter((f) => existsSync(join(dir, f)))].filter(Boolean).join(", ");
+	let fresh = o.fresh;
+	if (!fresh && !o.yes) {
+		const v = await ui.select(`This workspace still holds earlier work: ${what}.\n   Kept answers count as decided: onboarding will not ask them again.`, [
+			{ value: "fresh", label: "start fresh (recommended)", hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted" },
+			{ value: "keep", label: "keep the earlier answers and work" },
+		], "fresh");
+		if (v === undefined) throw new Error("init cancelled");
+		fresh = v === "fresh";
+	}
+	if (!fresh) return false;
+	const to = join(root, `.bigrefactor.old-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`);
+	renameSync(dir, to);
+	ui.log(`earlier work moved to ${basename(to)}; starting fresh`);
+	return true;
 }
 
 /** "nest + react", "nestjs,react", "NestJS and React" → known target ids (deduped) plus whatever was not recognised. */
