@@ -267,7 +267,13 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const source = getSourceAdapter(config.source.stack);
 		source.frameworkDirs?.(config.source.path);
 		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
-		const answers = args.filter((a, i) => args[i - 1] === "--answer");
+		// every id=value after --answer counts (`--answer a=1 b=2` and `--answer a=1 --answer b=2`), up to the next flag
+		const answers: string[] = [];
+		for (let i = 0, on = false; i < args.length; i++) {
+			if (args[i] === "--answer") on = true;
+			else if (args[i]!.startsWith("--")) on = false;
+			else if (on) answers.push(args[i]!);
+		}
 		for (const a of answers) {
 			const eq = a.indexOf("=");
 			if (eq < 0) throw new Error(`--answer expects id=value, got ${a}`);

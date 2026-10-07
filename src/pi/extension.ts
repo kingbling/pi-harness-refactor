@@ -28,6 +28,7 @@ import { renderStatus, renderWhy } from "../dashboard/status.ts";
 import type { InitPrompter, PromptOption } from "../init/init.ts";
 import { Ledger } from "../ledger/db.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
+import { groupQuestions, optionFor } from "../jev/ask.ts";
 import { progress, short, StoppedError, type AgentState, type ProgressSnapshot } from "../progress.ts";
 import pc from "picocolors";
 
@@ -580,26 +581,32 @@ export default function (pi: ExtensionAPI) {
 			if ("missing" in located) return warn(ctx, located.missing);
 			const ledger = new Ledger(located.path);
 			try {
-				// Interactive: one dialog per distinct question; identical questions (same text + options) share one answer.
+				// Interactive: one dialog per decision; questions that ask the same decision (groupQuestions) share one answer,
+				// each stored as that question's own option. A group with differing texts lists its members and can be split.
 				if (sub === "answer" && ctx.hasUI && !rest.length) {
-					const groups = new Map<string, QuestionRow[]>();
-					for (const q of ledger.openQuestions()) groups.set(`${q.question}\0${q.options ?? ""}`, [...(groups.get(`${q.question}\0${q.options ?? ""}`) ?? []), q]);
-					if (!groups.size) return show(ctx, sub, "no open questions");
+					const groups = groupQuestions(ledger.openQuestions());
+					if (!groups.length) return show(ctx, sub, "no open questions");
 					const done: string[] = [];
-					let i = 0;
-					for (const qs of groups.values()) {
+					const TYPE = "Type an answer…", SKIP = "Skip for now", QUIT = "Stop answering", SPLIT = "Answer these one by one";
+					const ask = async (qs: QuestionRow[], label: string): Promise<"quit" | void> => {
 						const q = qs[0]!;
-						const head = `question ${++i}/${groups.size}${qs.length > 1 ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}`;
+						const differ = qs.some((x) => x.question !== q.question);
+						const members = differ ? `\n\n${qs.length} questions, one answer for all:\n${qs.slice(0, 12).map((x) => `· ${x.unit_id ?? x.point}: ${x.question.split("\n")[0]!.slice(0, 140)}`).join("\n")}${qs.length > 12 ? `\n· … ${qs.length - 12} more` : ""}` : "";
+						const head = `${label}${qs.length > 1 && !differ ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}${members}`;
 						const options = q.options ? (JSON.parse(q.options) as string[]) : [];
-						const TYPE = "Type an answer…", SKIP = "Skip for now", QUIT = "Stop answering";
-						const pick = await ctx.ui.select(head, [...options, TYPE, SKIP, QUIT]);
-						if (pick === undefined || pick === QUIT) break;
-						if (pick === SKIP) continue;
+						const pick = await ctx.ui.select(head, [...options, ...(differ ? [SPLIT] : []), TYPE, SKIP, QUIT]);
+						if (pick === undefined || pick === QUIT) return "quit";
+						if (pick === SKIP) return;
+						if (pick === SPLIT) {
+							for (const [j, x] of qs.entries()) if ((await ask([x], `${label}.${j + 1}`)) === "quit") return "quit";
+							return;
+						}
 						const answer = pick === TYPE ? (await ctx.ui.input(q.question))?.trim() : pick;
-						if (!answer) continue;
-						for (const x of qs) ledger.answerQuestion(x.id, answer, "human (pi)");
+						if (!answer) return;
+						for (const x of qs) ledger.answerQuestion(x.id, pick === TYPE ? answer : optionFor(x, answer), "human (pi)");
 						done.push(`#${qs.map((x) => x.id).join(", #")} = ${answer}`);
-					}
+					};
+					for (const [i, qs] of groups.entries()) if ((await ask(qs, `question ${i + 1}/${groups.length}`)) === "quit") break;
 					const left = ledger.openQuestions().length;
 					show(ctx, sub, [done.length ? `answered:\n${done.join("\n")}` : "nothing answered", left ? `${left} still open: /br answer again` : "no open questions left", "a running migration picks the answers up at its next loop"].join("\n"));
 					return;

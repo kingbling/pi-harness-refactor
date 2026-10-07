@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { dirname, join } from "node:path";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
-import type { QuestionBlocks } from "../ledger/schema.ts";
+import type { QuestionBlocks, QuestionRow } from "../ledger/schema.ts";
 import type { ModelClient } from "../models/types.ts";
 
 /**
@@ -287,6 +287,28 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 /** The machine value of an answer given to an askViaModel question ("drop — remove it" → "drop"). */
 export function answerValue(answer: string | null | undefined): string {
 	return (answer ?? "").split(/\s+—\s+|:\s/)[0]!.trim();
+}
+
+/**
+ * Open questions grouped so one answer can serve several: identical questions, or model-phrased ones that ask
+ * the same decision (same point, same option values, same recommendation) with per-unit wording. Groups keep
+ * ledger order; a group whose texts differ is shown with every member so the owner can still go one by one.
+ */
+export function groupQuestions(rows: QuestionRow[]): QuestionRow[][] {
+	const groups = new Map<string, QuestionRow[]>();
+	for (const q of rows) {
+		const values = q.options ? (JSON.parse(q.options) as string[]).map(answerValue).sort() : [];
+		const rec = (q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined) ?? "";
+		const key = values.length ? `${q.point}\0${values.join("\0")}\0${rec}` : `${q.question}\0`;
+		groups.set(key, [...(groups.get(key) ?? []), q]);
+	}
+	return [...groups.values()];
+}
+
+/** The row's own option string for an answer picked on another row of its group (same value, its own label). */
+export function optionFor(q: QuestionRow, picked: string): string {
+	const v = answerValue(picked);
+	return (q.options ? (JSON.parse(q.options) as string[]) : []).find((o) => answerValue(o) === v) ?? picked;
 }
 
 async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & { costUsd: number }> {
