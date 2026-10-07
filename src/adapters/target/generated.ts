@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { runCommand } from "../../proc.ts";
+import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
 import type { StackChoice, TargetAdapter } from "../types.ts";
 
@@ -66,6 +67,10 @@ export interface AdapterManifest {
 	probeTest: { path: string; content: string };
 	/** File (relative to a project root) that only this stack's projects have, and text it contains. */
 	detect: { file: string; contains: string };
+	/** false = written but not proven yet (verification runs after the owner's questions); absent = verified. */
+	verified?: boolean;
+	/** The project verification built (scaffold + packages, probe test removed): setup moves it into place instead of building again. */
+	seedProject?: string;
 }
 
 const expand = (c: Cmd, vars: Record<string, string | string[]>): Cmd => ({
@@ -85,6 +90,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 		id: m.id,
 		role: m.role,
 		subdir: m.subdir,
+		seedProject: m.verified === false ? undefined : m.seedProject,
 		aliases: m.aliases,
 		docs: m.docs,
 		platform: m.platform,
@@ -229,6 +235,7 @@ const SYSTEM = [
 	"You write a target adapter manifest for an automated legacy migration tool. It is DATA, interpreted by the tool:",
 	"- scaffold: the stack's OFFICIAL project generator, non-interactive, run in the parent dir; {name} is the project folder. readyFile appears in a generated project. postScaffold: commands run inside the new project afterwards so build and test work (install dependencies, add the test runner if the generator has none).",
 	"- build/lint/test: commands run in the project dir. A {files} argument expands to file paths (may be empty). Build must fail on type/compile errors; test must run only the given files when there are some.",
+	"- EVERY command is ONE executable with plain arguments, run without a shell: no sh/bash/cmd -c, no pipes, &&, ;, $, redirects, loops or globs. When the stack has no single build command, use its main static checker as build (e.g. PHP: vendor/bin/phpstan analyse src; Python: mypy or python -m compileall; Ruby: bundle exec rubocop), its linter/formatter check as lint, and its test runner as test with {files} appended (e.g. vendor/bin/phpunit {files}). Tools installed into the project are called by their project-relative path (vendor/bin/…, node_modules/.bin/…, bin/console) and added in postScaffold.",
 	"- toolchain.installed: a JSON manifest file in the project and the object keys whose keys are package names. toolchain.packageName: a regex (anchored with ^) matching a package name.",
 	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer. testFileGlobs use {moduleDir}.",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
@@ -254,40 +261,101 @@ export async function generateAdapter(
 		verify?: (m: AdapterManifest) => Promise<string | undefined>;
 		/** Shown the commands before they run; false stops generation. */
 		confirm?: (commands: string[]) => Promise<boolean>;
+		/** Save the manifest unverified (verified: false) and return: verification runs later (verifyPendingAdapters). */
+		deferVerify?: boolean;
+		/** A manifest that failed verification, with the failure: the model starts from it instead of from scratch. */
+		previous?: { manifest: AdapterManifest; failure: string };
+		/**
+		 * Tools the manifest runs are missing on this machine: get them installed (owner dialog). true = all present
+		 * now, generation goes on; false = the owner picks another stack. Without it a missing tool stops generation.
+		 */
+		ensureTools?: (missing: string[]) => Promise<boolean>;
 		log?: (l: string) => void;
 	},
 ): Promise<AdapterManifest> {
 	const log = opts.log ?? (() => {});
-	const verify = opts.verify ?? verifyManifest;
+	const keepAt = seedDir(opts.root, opts.id);
+	const verify = opts.verify ?? ((m: AdapterManifest) => verifyManifest(m, { keepAt }));
 	const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
 		{ role: "system", content: SYSTEM },
 		{ role: "user", content: `Stack: ${opts.id} (role ${opts.role}). Why it was chosen for this migration: ${opts.why}\nWrite its manifest. id must be "${opts.id}"; subdir is the folder name of this project inside the target repo.` },
 	];
+	if (opts.previous) messages.push({ role: "assistant", content: JSON.stringify({ ...opts.previous.manifest, verified: undefined, seedProject: undefined }) }, { role: "user", content: `Verification failed:\n${opts.previous.failure.slice(-3000)}\nFix the manifest. If a tool is missing on the machine, keep the official command anyway.` });
 	let failure = "";
-	for (let attempt = 0; attempt <= (opts.repairs ?? 2); attempt++) {
+	for (let attempt = 0; attempt <= (opts.repairs ?? 3); attempt++) {
 		const res = await opts.client.chat({ model: opts.model, messages, schema: MANIFEST_SCHEMA, effort: "medium" });
 		const m = fromModel(res.json, opts.id, opts.role);
 		const invalid = validateManifest(m);
 		let problem: string | undefined = invalid.length ? `invalid manifest:\n${invalid.join("\n")}` : undefined;
-		// a tool missing on this machine is not the model's to fix: say what to install, stop
+		// a tool missing on this machine is not the model's to fix (nor a manifest problem): the owner installs it
+		// (offered by ensureTools), then the same manifest goes on to verification
 		const missing = invalid.length ? [] : missingTools(m);
-		if (missing.length) throw new Error(`the ${opts.id} toolchain needs ${missing.join(", ")} on this machine (not found on PATH); install it and pick ${opts.id} again`);
+		if (missing.length) {
+			if (!opts.ensureTools) throw new MissingToolsError(opts.id, missing);
+			if (!(await opts.ensureTools(missing))) throw new Error(`generating the ${opts.id} adapter was declined (tools missing: ${missing.join(", ")})`);
+			const still = missingTools(m);
+			if (still.length) throw new MissingToolsError(opts.id, still);
+		}
 		if (!problem) {
 			if (opts.confirm && !(await opts.confirm(manifestCommands(m)))) throw new Error(`generating the ${opts.id} adapter was declined`);
+			if (opts.deferVerify) {
+				// the owner's questions go on now; the slow trial build runs after them (verifyPendingAdapters)
+				saveManifest(opts.root, { ...m, verified: false });
+				log(`  adapter ${opts.id}: written; it is built and tested once all questions are answered`);
+				return { ...m, verified: false };
+			}
 			log(`  adapter ${opts.id}: manifest written (attempt ${attempt + 1}), verifying on a scratch project…`);
 			problem = await verify(m).catch((e: any) => String(e?.message ?? e));
 		}
 		if (!problem) {
-			mkdirSync(generatedDir(opts.root), { recursive: true });
-			writeFileSync(join(generatedDir(opts.root), `${opts.id}.json`), JSON.stringify(m, null, 2) + "\n");
+			if (!opts.verify && existsSync(join(keepAt, m.subdir || "project"))) m.seedProject = join(keepAt, m.subdir || "project");
+			saveManifest(opts.root, { ...m, verified: undefined });
 			log(`  adapter ${opts.id}: verified (scaffold, build, probe test)`);
 			return m;
 		}
 		failure = problem;
-		log(`  adapter ${opts.id}: ${problem.split("\n")[0]}`);
+		// one readable line: the reason, not just its heading (the widget shows one line per entry)
+		log(`  adapter ${opts.id}: attempt ${attempt + 1} rejected — ${problem.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 4).join("; ").replace(/:;/, ":")}${attempt < (opts.repairs ?? 3) ? " (the model fixes it)" : ""}`);
 		messages.push({ role: "assistant", content: JSON.stringify(m) }, { role: "user", content: `Verification failed:\n${problem.slice(-3000)}\nFix the manifest. If a tool is missing on the machine, keep the official command anyway.` });
 	}
 	throw new Error(`no working ${opts.id} adapter could be generated: ${failure.split("\n").slice(0, 6).join("\n")}`);
+}
+
+function saveManifest(root: string, m: AdapterManifest): void {
+	mkdirSync(generatedDir(root), { recursive: true });
+	writeFileSync(join(generatedDir(root), `${m.id}.json`), JSON.stringify(m, null, 2) + "\n");
+}
+
+/**
+ * Prove every adapter written during the questions (verified: false): build and test a fresh project, kept as
+ * the seed setup moves into place. A failure goes back to the model (when there is one) for a fixed manifest,
+ * proven the same way. Throws in plain words when an adapter cannot be made to work. Returns the ids proven.
+ */
+export async function verifyPendingAdapters(
+	root: string,
+	opts: { client?: ModelClient; model: string; log?: (l: string) => void; ensureTools?: (missing: string[], stack: string) => Promise<boolean> },
+): Promise<string[]> {
+	const log = opts.log ?? (() => {});
+	const done: string[] = [];
+	for (const m of loadManifests(root).filter((x) => x.verified === false)) {
+		const missing = missingTools(m);
+		if (missing.length && !(opts.ensureTools && (await opts.ensureTools(missing, m.id)) && !missingTools(m).length)) throw new MissingToolsError(m.id, missingTools(m));
+		log(`  adapter ${m.id}: building and testing a fresh ${m.id} project (official generator, packages, build, a probe test); it becomes your new project`);
+		const keepAt = seedDir(root, m.id);
+		const failure = await verifyManifest(m, { keepAt }).catch((e: any) => String(e?.message ?? e));
+		if (!failure) {
+			saveManifest(root, { ...m, verified: undefined, seedProject: join(keepAt, m.subdir || "project") });
+			log(`  adapter ${m.id}: works (build and test pass on a fresh project)`);
+			done.push(m.id);
+			continue;
+		}
+		log(`  adapter ${m.id}: the check failed — ${failure.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3).join("; ")}`);
+		if (!opts.client) throw new Error(`the ${m.id} setup does not work yet: ${failure.split("\n").slice(0, 4).join(" ")}`);
+		const { verified: _v, seedProject: _s, ...prev } = m;
+		await generateAdapter({ id: m.id, role: m.role, why: "chosen by the owner during onboarding", client: opts.client, model: opts.model, root, previous: { manifest: prev as AdapterManifest, failure }, ensureTools: opts.ensureTools && ((t) => opts.ensureTools!(t, m.id)), log });
+		done.push(m.id);
+	}
+	return done;
 }
 
 /** Executables a manifest runs that are not on PATH (project-relative ones appear after scaffolding). */
@@ -314,10 +382,14 @@ function fromModel(json: unknown, id: string, role: "server" | "ui"): AdapterMan
 }
 
 /** Scaffold → build → probe test on a scratch project; undefined when all pass, else what failed. */
-export async function verifyManifest(m: AdapterManifest): Promise<string | undefined> {
-	const scratch = mkdtempSync(join(tmpdir(), `br-adapter-${m.id}-`));
+export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string } = {}): Promise<string | undefined> {
+	// keepAt: the verified project stays there (probe test removed) for setup to reuse; a failed one is removed
+	if (opts.keepAt) rmSync(opts.keepAt, { recursive: true, force: true });
+	const scratch = opts.keepAt ?? mkdtempSync(join(tmpdir(), `br-adapter-${m.id}-`));
+	mkdirSync(scratch, { recursive: true });
 	const a = fromManifest(m);
 	const dir = join(scratch, m.subdir || "project");
+	let ok = false;
 	try {
 		try {
 			await a.scaffoldProject(dir);
@@ -336,8 +408,13 @@ export async function verifyManifest(m: AdapterManifest): Promise<string | undef
 				return `${step} failed on the fresh project (${c.cmd} ${c.args.join(" ")}):\n${String(e?.message ?? e)}`;
 			}
 		}
+		rmSync(join(dir, probe.path), { force: true });
+		ok = true;
 		return undefined;
 	} finally {
-		rmSync(scratch, { recursive: true, force: true });
+		if (!ok || !opts.keepAt) rmSync(scratch, { recursive: true, force: true });
 	}
 }
+
+/** Where a workspace keeps the project an adapter's verification built. */
+export const seedDir = (root: string, id: string) => join(generatedDir(root), `${id}.seed`);

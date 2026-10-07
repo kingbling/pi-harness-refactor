@@ -1,5 +1,5 @@
 import { runCommand } from "../proc.ts";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as p from "@clack/prompts";
@@ -213,6 +213,18 @@ export async function setup(config: Config, root: string): Promise<void> {
 		const id = adapter.id;
 		const dir = projectDir(config, id);
 		console.log(pc.bold(`bootstrapping ${id} → ${dir}`));
+		// the project the adapter check already built (generator + packages, probe test removed) is moved, not built again
+		if (adapter.seedProject && existsSync(adapter.seedProject) && !adapter.toolchain.isProjectReady(dir)) {
+			mkdirSync(dirname(dir), { recursive: true });
+			if (existsSync(dir) && !readdirSync(dir).length) rmSync(dir, { recursive: true });
+			try {
+				renameSync(adapter.seedProject, dir);
+			} catch {
+				cpSync(adapter.seedProject, dir, { recursive: true }); // another disk: copy instead
+				rmSync(adapter.seedProject, { recursive: true, force: true });
+			}
+			console.log(pc.dim(`  reused the ${id} project built by the adapter check (no second download)`));
+		}
 		await adapter.scaffoldProject(dir);
 		// the stack choices made at init (ORM, validation, router…) bring their packages; the generator alone does not know them
 		const packages = resolveChoices(adapter, config.target.choices).flatMap((c) => c.option.packages ?? []);
