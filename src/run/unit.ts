@@ -23,7 +23,7 @@ import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
-import { completeTidyTasks, tidyTaskCard, tidyTasks, type TidyTask } from "./tidy.ts";
+import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
 import { triageGate, type Triage } from "./triage.ts";
 
 /**
@@ -100,7 +100,6 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// one legacy area = one feature module (or, for code ≥ 2 areas use, the shared dir + area)
 	const moduleDir = placementDir(adapter.layout, place);
 	// approved tidy tasks of the area: their files are in scope (existing shared ones too); 1:1 moves are done by code
-	tidyTaskCard(o.ledger, stackId, area); // syncs answered tidy questions first: scope, moves and the card read the same tasks
 	const tidy = tidyTasks(o.ledger, stackId, area).filter((t) => t.status === "approved");
 	const tidyMoved = tidyMoves(targetProjectDir, tidy, adapter.layout.isTestFile);
 	if (tidyMoved.length) log(pc.dim(`  tidy: moved ${tidyMoved.join(", ")} (imports are the implementer's job)`));
