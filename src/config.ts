@@ -82,7 +82,6 @@ export const ConfigSchema = z.object({
 			gateConcurrency: z.number().int().min(1).default(2),
 			maxImplementAttempts: z.number().int().min(1).default(3),
 			maxEscalateAttempts: z.number().int().min(0).default(2),
-			budgetUsdPerUnit: z.number().positive().default(5),
 			budgetUsdPerDay: z.number().positive().default(200),
 			/** Packed task-card context above this triggers a pre-split; a session exceeding it in total usage is aborted. */
 			maxUnitTokens: z.number().int().default(250_000),
