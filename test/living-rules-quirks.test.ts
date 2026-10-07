@@ -212,3 +212,42 @@ describe("rules layout validation + ast-grep languages", () => {
 		expect(activeRuleFiles(root, "react").map((f) => f.split("/").pop())).toEqual(["no-any--tsx.yml", "no-any.yml"]);
 	});
 });
+
+describe("area taxonomy", () => {
+	it("one model pass merges file-named areas into business areas, moves utilities to shared, asks before excluding", async () => {
+		const { root, config, ledger } = setup();
+		const mk = (id: string, file: string, stack: string, area: string) => {
+			ledger.upsertFile({ path: file, hash: "h", lang: "php", loc: 10 });
+			ledger.upsertSymbol({ id: `${file}::X`, path: file, kind: "class", name: "X" });
+			ledger.createUnit({ id, tier: "T0", symbolIds: [`${file}::X`], meta: { files: [file], place: { stack, area, shared: false, source: "code" } } });
+		};
+		mk("A1", "app/model/classes/flights.facade.php", "nestjs", "flights");
+		mk("A2", "app/lib/components/flightplayoutscombiner.cls.php", "nestjs", "flightplayouts");
+		mk("A3", "app/lib/components/utils/clock.cls.php", "nestjs", "clock");
+		mk("A4", "phpstan-stubs/macros.php", "nestjs", "phpstan-stubs");
+		const client = new FakeModelClient({ chat: (req) => {
+			const sys = req.messages[0]!.content;
+			if (sys.includes("legacy codebase")) return { text: "brief" };
+			if (sys.includes("feature-module structure")) return { json: { stacks: [{ stack: "nestjs", areas: [{ name: "flights", purpose: "flight booking" }] }], mappings: [
+				{ from: "nestjs:flights", to: "area", stack: "nestjs", area: "flights", confidence: 0.95, why: "domain" },
+				{ from: "nestjs:flightplayouts", to: "area", stack: "nestjs", area: "Flights", confidence: 0.9, why: "part of flights" },
+				{ from: "nestjs:clock", to: "shared", stack: "nestjs", area: "dates", confidence: 0.92, why: "time helper" },
+				{ from: "nestjs:phpstan-stubs", to: "exclude", stack: "nestjs", area: "none", confidence: 0.99, why: "static-analysis stubs" },
+			] } };
+			return undefined;
+		} });
+		const { curateAreas, syncTaxonomyAnswers, taxonomyHold } = await import("../src/run/taxonomy.ts");
+		const r = await curateAreas({ ledger, config, root, client });
+		expect(r).toMatchObject({ applied: 2, asked: 1 });
+		const place = (id: string) => (JSON.parse(ledger.getUnit(id)!.meta) as { place: { area: string; shared: boolean } }).place;
+		expect(place("A2")).toMatchObject({ area: "flights", shared: false });
+		expect(place("A3")).toMatchObject({ area: "dates", shared: true });
+		const rules = JSON.parse(readFileSync(join(root, ".bigrefactor", "placement.json"), "utf8")).rules;
+		expect(rules.find((r: { prefix: string }) => r.prefix === "app/lib/components/utils/clock.cls.php")).toMatchObject({ area: "dates", shared: true });
+		expect(taxonomyHold(ledger.getUnit("A4")!.meta)).toMatch(/waits for area question/);
+		const q = ledger.openQuestions().find((x) => x.point === "area_taxonomy")!;
+		ledger.answerQuestion(q.id, "exclude — do not migrate");
+		expect(syncTaxonomyAnswers({ ledger, root })).toBe(1);
+		expect(taxonomyHold(ledger.getUnit("A4")!.meta)).toMatch(/excluded/);
+	});
+});
