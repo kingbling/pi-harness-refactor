@@ -100,7 +100,7 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed)) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
-			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, the next unit of this area performs it (imports updated, gate-checked); nothing waits for this answer.`,
+			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, the next unit of this area performs it (the build gate catches broken imports); nothing waits for this answer.`,
 			options: [{ value: "apply", facts: "do it with the next unit of the area" }, { value: "skip", facts: "leave the files as they are" }],
 			recommended: "apply",
 			agentOpinion: c.why,

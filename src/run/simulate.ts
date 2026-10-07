@@ -262,8 +262,3 @@ function fakeGate(plan: Script[string], attemptsSeen: Map<string, number>) {
 		return real;
 	};
 }
-
-export function readSim(ws: string, rel: string): string | undefined {
-	const p = join(ws, rel);
-	return existsSync(p) ? readFileSync(p, "utf8") : undefined;
-}

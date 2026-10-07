@@ -110,12 +110,6 @@ export const reactAdapter: TargetAdapter = {
 		await runCommand("pnpm", ["add", "-D", "vitest", "@testing-library/react", "@testing-library/jest-dom", "jsdom"], { cwd: root });
 	},
 
-	async scaffoldUnit(root, unit) {
-		const dir = join(root, reactAdapter.layout.moduleDir(unit.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase()));
-		mkdirSync(dir, { recursive: true });
-		return [dir];
-	},
-
 	build: () => ({ cmd: "npx", args: ["tsc", "-p", "tsconfig.app.json", "--noEmit"] }),
 	lint: (_root, files) => ({ cmd: "npx", args: ["eslint", "--cache", ...files] }),
 	test: (_root, related) => ({ cmd: "npx", args: ["vitest", "run", ...(related.length ? ["--related", ...related] : [])] }),

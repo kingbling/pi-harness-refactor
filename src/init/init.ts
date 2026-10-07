@@ -1,10 +1,10 @@
 import { runCommand } from "../proc.ts";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { CONFIG_FILE, ConfigSchema, saveConfig, type Config } from "../config.ts";
-import { getSourceAdapter, getTargetAdapter, knownSources, knownTargets, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
+import { getSourceAdapter, getTargetAdapter, knownSources, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
 import { fetchDocs } from "./docs.ts";
@@ -242,18 +242,6 @@ export function parseTargets(text: string): { ids: string[]; unknown: string[] }
 		else if (!ids.includes(id)) ids.push(id);
 	}
 	return { ids, unknown };
-}
-
-/**
- * A typed library answer → decision value. Answers starting with "platform" (including the adapter's own
- * wording such as "platform cache (cache-manager)") mean the target platform covers it; drop/port as is;
- * anything else is the successor package.
- */
-export function libraryVerdict(answer: string): string {
-	const v = answer.trim();
-	if (/^platform\b/i.test(v)) return "platform";
-	if (/^(drop|port)$/i.test(v)) return v.toLowerCase();
-	return `replace:${v.replace(/^replace:/, "")}`;
 }
 
 function isDir(p: string): boolean {

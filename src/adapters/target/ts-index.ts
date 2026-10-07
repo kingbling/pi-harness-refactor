@@ -184,8 +184,6 @@ export function nodeToolchain(): import("../types.ts").TargetToolchain {
 		ignoredPaths: ["node_modules", "dist"],
 	};
 }
-/** @deprecated use tsLayoutBase(); kept for importers outside the adapters. */
-export const TS_LAYOUT_BASE = tsLayoutBase();
 
 function jsdoc(n: Node): string | undefined {
 	const prev = n.previousNamedSibling;

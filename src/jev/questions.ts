@@ -89,35 +89,6 @@ export const TRIAGE_GATE: Battery = {
 	escalate: { type: "noul", instructions: "Does fixing `gate_report` require understanding beyond the unit, such as cross-module design or unclear legacy semantics?" },
 };
 
-export const TRIAGE_TRUTH: Battery = {
-	cause: {
-		type: "choice",
-		instructions: "The characterization test in `test` failed against the OLD code with `failure`. Why?",
-		criteria: {
-			wrong_expectation: "The test expects behavior the old code does not have; the expectation is wrong",
-			flaky: "The failure depends on time, randomness, ordering, or external state",
-			real_bug: "The old code's behavior is clearly a defect but it is the real current behavior",
-			wrong_symbol: "The test targets the wrong function, class, or file",
-			env: "Missing dependency, module loading, database, or runtime problem",
-			other: "Cannot tell",
-		},
-	},
-	keep_as_known_bug: { type: "noul", instructions: "If the old behavior in `failure` is a defect, is it still the behavior the new code must reproduce to stay compatible?" },
-};
-
-export const SAME_BEHAVIOR: Battery = {
-	same_behavior: {
-		type: "noul",
-		instructions: "Do `a` and `b` compute the same result for the same inputs, ignoring naming, formatting, and comments?",
-		criteria: { true: "Same inputs always produce the same outputs and side effects", false: "There is at least one input where they differ" },
-	},
-};
-
-export const SLICE_SANITY: Battery = {
-	coherent: { type: "noul", instructions: "Do the symbols listed in `symbols` belong to one feature or responsibility?" },
-	too_big: { type: "noul", instructions: "Does `symbols` mix more than one unrelated feature that a developer would migrate separately?" },
-};
-
 export const SYSTEMIC_FAILURE: Battery = {
 	systemic: { type: "noul", instructions: "Do the failure causes in `recent_failures` point to one shared root cause rather than independent unit problems?" },
 	kind: {
@@ -167,7 +138,4 @@ export function choiceOf(a: DecisionAnswer | undefined): string | undefined {
 }
 export function noulOf(a: DecisionAnswer | undefined): number {
 	return a?.type === "noul" ? a.noul : 0.5;
-}
-export function scoreOf(a: DecisionAnswer | undefined): number {
-	return a?.type === "score" ? a.score : 0;
 }

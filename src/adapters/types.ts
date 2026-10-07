@@ -375,8 +375,6 @@ export interface TargetAdapter {
 	detect(root: string): Promise<{ confidence: number; version?: string }>;
 	/** Create the empty target project if missing. */
 	scaffoldProject(root: string): Promise<void>;
-	/** Scaffold one unit's area module (`name` = the area, see moduleDir). Returns created paths. */
-	scaffoldUnit(root: string, unit: { id: string; kind: string; name: string }): Promise<string[]>;
 	build(root: string): { cmd: string; args: string[] };
 	lint(root: string, files: string[]): { cmd: string; args: string[] };
 	test(root: string, relatedFiles: string[]): { cmd: string; args: string[] };

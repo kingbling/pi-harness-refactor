@@ -1,5 +1,4 @@
 import { runCommand } from "../../proc.ts";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../types.ts";
@@ -171,18 +170,6 @@ export const nestjsAdapter: TargetAdapter = {
 		mkdirSync(dirname(root), { recursive: true });
 		// `nest new <name>` creates the folder; --skip-git because the parent target repo owns git.
 		await runCommand("npx", ["--yes", "@nestjs/cli@latest", "new", basename(root), "--package-manager", "pnpm", "--skip-git", "--strict", "--language", "TS"], { cwd: dirname(root) });
-	},
-
-	async scaffoldUnit(root, unit) {
-		// `nest g module/service/controller` keeps the official layout and registers the module in app.module.ts.
-		const rel = nestjsAdapter.layout.moduleDir(unit.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase());
-		const dir = join(root, rel);
-		if (!existsSync(dir)) {
-			// the schematic name carries the path below src/: `features/agency` → src/features/agency/agency.module.ts
-			const kinds = unit.kind === "http_handler" ? ["module", "controller", "service"] : unit.kind === "data_access" ? ["module", "service"] : ["module"];
-			for (const k of kinds) execFileSync("npx", ["nest", "g", k, rel.replace(/^src\//, ""), "--no-spec", "--flat=false"], { cwd: root, stdio: "pipe" });
-		}
-		return [dir];
 	},
 
 	// The generator decides the toolchain (Nest CLI 11 ships vitest + oxlint; older ones jest + eslint). Read, don't assume.

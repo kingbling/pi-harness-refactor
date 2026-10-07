@@ -55,8 +55,3 @@ export class Semaphore {
 		}
 	}
 }
-
-export function gatePoolSize(configured?: number): number {
-	const cores = typeof navigator !== "undefined" && (navigator as any).hardwareConcurrency ? (navigator as any).hardwareConcurrency : 4;
-	return configured ?? Math.max(2, Math.floor(cores / 4));
-}

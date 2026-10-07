@@ -197,13 +197,13 @@ export class Ledger {
 		const sql = `SELECT * FROM units ${conds.length ? "WHERE " + conds.join(" AND ") : ""} ORDER BY tier, id`;
 		return this.db.prepare(sql).all(...(args as any[])) as unknown as UnitRow[];
 	}
-	updateUnit(id: string, patch: Partial<Pick<UnitRow, "model" | "worktree" | "branch" | "contract_path" | "kind">> & { meta?: Record<string, unknown> }): void {
+	updateUnit(id: string, patch: Partial<Pick<UnitRow, "model" | "worktree" | "branch" | "kind">> & { meta?: Record<string, unknown> }): void {
 		const u = this.getUnit(id);
 		if (!u) throw new LedgerError(`unknown unit ${id}`);
 		const meta = patch.meta ? JSON.stringify({ ...JSON.parse(u.meta), ...patch.meta }) : u.meta;
 		this.db
-			.prepare("UPDATE units SET model=?, worktree=?, branch=?, contract_path=?, kind=?, meta=?, updated_at=? WHERE id=?")
-			.run(patch.model ?? u.model, patch.worktree ?? u.worktree, patch.branch ?? u.branch, patch.contract_path ?? u.contract_path, patch.kind ?? u.kind, meta, now(), id);
+			.prepare("UPDATE units SET model=?, worktree=?, branch=?, kind=?, meta=?, updated_at=? WHERE id=?")
+			.run(patch.model ?? u.model, patch.worktree ?? u.worktree, patch.branch ?? u.branch, patch.kind ?? u.kind, meta, now(), id);
 	}
 
 	transitionUnit(id: string, to: UnitState, reason?: string): void {

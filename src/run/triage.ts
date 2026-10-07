@@ -1,6 +1,6 @@
 import type { Config } from "../config.ts";
 import { decide, setDecisionAction } from "../jev/decide.ts";
-import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE, TRIAGE_TRUTH } from "../jev/questions.ts";
+import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import type { GateReport } from "./gate.ts";
@@ -133,11 +133,6 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	}
 	setDecisionAction(d.ledger, dec.decisionId, action);
 	return { action, cause, confidence: dec.confidence, band: b, decisionId: dec.decisionId, questionId, reason };
-}
-
-export async function triageTruth(d: TriageDeps, unitId: string, test: string, failure: string): Promise<{ cause: string; keep: boolean; confidence: number; decisionId: number }> {
-	const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_truth", { test: test.slice(-2000), failure: failure.slice(-2000) }, TRIAGE_TRUTH, ["cause"], unitId);
-	return { cause: choiceOf(dec.answers["cause"]) ?? "other", keep: noulOf(dec.answers["keep_as_known_bug"]) >= 0.5, confidence: dec.confidence, decisionId: dec.decisionId };
 }
 
 function causeOptions(): Array<{ value: string; facts?: string }> {

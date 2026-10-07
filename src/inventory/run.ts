@@ -329,7 +329,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	}
 
 	// Drift: units already past planning whose source files changed upstream are flagged stale (not reset —
-	// a human or `br sweep --stale` decides whether to redo them). Removed files stay in the ledger with a note.
+	// a human decides whether to redo them). Removed files stay in the ledger with a note.
 	const seen = new Set(indexes.map((f) => f.path));
 	for (const p of previousHashes.keys()) if (!seen.has(p)) drift.removed.push(p);
 	for (const p of [...drift.changed, ...drift.removed]) {

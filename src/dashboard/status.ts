@@ -46,7 +46,7 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 		lines.push(c.yellow(`${qs.length} open question${qs.length > 1 ? "s" : ""} for you (${waiting} unit${waiting === 1 ? "" : "s"} waiting, everything else runs) → br questions`));
 	}
 	const stale = ledger.listUnits().filter((u) => JSON.parse(u.meta).stale).length;
-	if (stale) lines.push(c.yellow(`${stale} stale unit${stale > 1 ? "s" : ""}: source changed upstream since they were done → br sweep --stale`));
+	if (stale) lines.push(c.yellow(`${stale} stale unit${stale > 1 ? "s" : ""}: source changed upstream since they were done; nothing redoes them yet → br why <unit>`));
 	const commit = ledger.getMeta("source_commit");
 	if (commit) lines.push(c.dim(`source pinned @ ${commit.slice(0, 7)}`));
 	return lines.join("\n");

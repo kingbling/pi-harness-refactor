@@ -51,14 +51,11 @@ export interface QuestionRow {
 export const EVIDENCE_TYPES = [
 	"truth_green_on_old",
 	"ported_tests_green",
-	"goldens_green",
 	"build_ok",
 	"lint_ok",
 	"rules_ok",
 	"antigaming_ok",
 	"symbolproof_ok",
-	"review_pass",
-	"human_approval",
 	// tester ran before the deps landed; ported tests are saved under truth/<unit>/ported/
 	"truth_ahead",
 	// written files match the stack layout (area module, no per-legacy-file folders, no duplicate classes)

@@ -39,7 +39,6 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
-  br sweep                     cluster failures → tune → rerun
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
   br forecast                  how far the migration is: done, open, spend and time left (with range)

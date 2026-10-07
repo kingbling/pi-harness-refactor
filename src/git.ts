@@ -62,19 +62,6 @@ export function commitAll(path: string, message: string, opts: { allowEmpty?: bo
 	return headOf(path);
 }
 
-export function currentBranch(path: string): string {
-	return git(path, ["rev-parse", "--abbrev-ref", "HEAD"]);
-}
-
-export function checkoutBranch(path: string, branch: string, create = true): void {
-	try {
-		git(path, ["checkout", "-q", branch]);
-	} catch {
-		if (!create) throw new Error(`branch ${branch} does not exist`);
-		git(path, ["checkout", "-q", "-b", branch]);
-	}
-}
-
 /** Worktree per unit so parallel implementers never share a working copy. */
 export function addWorktree(repo: string, worktreePath: string, branch: string): void {
 	if (existsSync(worktreePath)) return; // same unit resuming in place: keep its work
