@@ -39,8 +39,8 @@ export function libraryPlan(source: SourceAdapter, sourceRoot: string, decided: 
 	const libraries = (source.externalDeps?.(sourceRoot) ?? []).map((l) => {
 		const d = decided[l.name];
 		if (!d) return l;
-		// A decided drop/platform/port has no successor package, whatever the adapter suggested.
-		return { ...l, verdict: d.verdict as ExternalDep["verdict"], successor: d.verdict === "replace" ? (d.successor ?? l.successor) : undefined, note: `${l.note ? l.note + "; " : ""}decided` };
+		// A decided drop/platform/port has no successor package.
+		return { ...l, verdict: d.verdict as ExternalDep["verdict"], successor: d.verdict === "replace" ? d.successor : undefined, note: `${l.note ? l.note + "; " : ""}decided` };
 	});
 	return { libraries, open: libraries.filter((l) => !l.dev && l.verdict === "review") };
 }
@@ -93,7 +93,7 @@ export function stackQuestions(source: SourceAdapter, sourceRoot: string, target
 		(t.stackChoices ?? []).map((c) => ({ stack: t.id, key: c.key, question: c.question, default: c.default, current: choices[t.id]?.[c.key], options: c.options.map((o) => ({ id: o.id, label: o.label, hint: o.hint })) })),
 	);
 	const { open } = libraryPlan(source, sourceRoot, decided);
-	const libraries = open.map((l) => ({ name: l.name, version: l.version, note: l.note, suggested: l.successor, answers: ["replace:<package>", "platform", "drop", "port"] }));
+	const libraries = open.map((l) => ({ name: l.name, version: l.version, note: l.note, answers: ["replace:<package>", "platform", "drop", "port"] }));
 	return { stack, libraries };
 }
 
@@ -129,12 +129,6 @@ export function askUserQuestionBatches(q: ReturnType<typeof stackQuestions>, tar
 	const libraries: Question[] = q.libraries.map((l) => {
 		const values: Record<string, string> = {};
 		const options: Opt[] = [];
-		// A suggestion like "platform cache (cache-manager)" means the platform covers it: no "Replace with …" option.
-		if (l.suggested && !/^platform\b/i.test(l.suggested)) {
-			const label = clip(`Replace with ${l.suggested}`, 60);
-			options.push({ label, description: "the adapter's suggested successor" });
-			values[label] = `${l.name}=${l.suggested}`;
-		}
 		for (const [label, description, v] of [
 			["Platform covers it", "the target framework already provides this", "platform"],
 			["Drop", "usage is dead or not needed in the target", "drop"],
