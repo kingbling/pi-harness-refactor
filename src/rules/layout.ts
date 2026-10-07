@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getTargetAdapter } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
@@ -62,13 +62,25 @@ export async function validateRulesLayout(root: string, config: Config): Promise
 		if (!md.includes(renderLayoutSection(adapter))) problems.push(`${stackId}: RULES.md layout section differs from the adapter layout (br rules --relayout)`);
 		const moduleRoot = adapter.layout.moduleDir("<area>").replace(/<area>$/, "");
 		const allowed = [moduleRoot, ...adapter.layout.sharedDirs];
-		// any other src/<x>/ path the body tells agents to write to is a competing layout
-		for (const m of stripLayout(md).matchAll(/`(src\/[\w.<>-]+\/)/g)) {
-			const dir = m[1]!;
+		const body = stripLayout(md);
+		// any other src/<x>/ path the body names (with or without the project subdir, in or out of backticks) is a competing layout
+		for (const m of body.matchAll(/(?:^|[\s`("'./])((?:[\w-]+\/)?src\/[\w.<>-]+\/)/gm)) {
+			const dir = m[1]!.replace(new RegExp(`^${adapter.subdir}/`), "");
+			if (!dir.startsWith("src/")) continue;
 			if (!allowed.some((a) => dir.startsWith(a) || a.startsWith(dir))) problems.push(`${stackId}: RULES.md names module root ${dir} outside ${allowed.join(", ")}`);
+		}
+		// file shapes under the module root must be ones the adapter's structureDoc lists (by suffix)
+		const doc = adapter.layout.structureDoc;
+		for (const m of body.matchAll(new RegExp(`${escape(moduleRoot)}[^\\s\`)'"]*?/([\\w<>-]+((?:\\.[\\w-]+)+))(?=[\\s\`)'",]|$)`, "gm"))) {
+			const suffix = m[2]!;
+			if (!doc.includes(suffix)) problems.push(`${stackId}: RULES.md names file shape ${m[1]} (${suffix}) that the ${stackId} layout does not list`);
 		}
 	}
 	return [...new Set(problems)];
+}
+
+function escape(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** The ast-grep rule files currently active for a stack (tests excluded). */
@@ -79,4 +91,30 @@ export function activeRuleFiles(root: string, stackId: string): string[] {
 		.filter((f) => f.endsWith(".yml") && !f.endsWith("-test.yml"))
 		.sort()
 		.map((f) => join(dir, f));
+}
+
+/**
+ * A rule only applies to files of its `language`; a stack whose files need several (adapter.layout.astGrepLanguages)
+ * gets a copy of each rule (and its test) per missing language: `<id>--<lang>.yml`. Returns the files written.
+ */
+export function expandRuleLanguages(root: string, adapter: TargetAdapter): string[] {
+	const langs = adapter.layout.astGrepLanguages ?? [];
+	const dir = join(rulesDir(root, adapter.id), "astgrep");
+	if (langs.length < 2 || !existsSync(dir)) return [];
+	const written: string[] = [];
+	for (const f of readdirSync(dir).filter((f) => f.endsWith(".yml") && !f.endsWith("-test.yml") && !f.includes("--"))) {
+		const text = readFileSync(join(dir, f), "utf8");
+		const lang = /^language:\s*(\S+)/m.exec(text)?.[1];
+		const id = /^id:\s*(\S+)/m.exec(text)?.[1];
+		if (!lang || !id) continue;
+		for (const other of langs.filter((l) => l.toLowerCase() !== lang.toLowerCase())) {
+			const suffix = other.toLowerCase();
+			const name = `${f.replace(/\.yml$/, "")}--${suffix}.yml`;
+			writeFileSync(join(dir, name), text.replace(/^language:.*$/m, `language: ${other}`).replace(/^id:.*$/m, `id: ${id}--${suffix}`));
+			written.push(name);
+			const test = join(dir, f.replace(/\.yml$/, "-test.yml"));
+			if (existsSync(test)) writeFileSync(join(dir, name.replace(/\.yml$/, "-test.yml")), readFileSync(test, "utf8").replace(/^id:.*$/m, `id: ${id}--${suffix}`));
+		}
+	}
+	return written;
 }

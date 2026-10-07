@@ -19,6 +19,7 @@ export const nestjsAdapter: TargetAdapter = {
 		...tsLayoutBase(),
 		// one legacy area = one feature module; units of the same area extend its files, never fork them
 		moduleDir: tsModuleDir,
+		astGrepLanguages: ["TypeScript"],
 		structureDoc: tsStructureDoc("server"),
 		checkStructure: (files, moduleDir, area, projectDir, ctx) => tsCheckStructure(files, moduleDir, area, projectDir, "server", ctx),
 		checkTree: (projectDir, only) => tsCheckTree(projectDir, "server", only),

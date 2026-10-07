@@ -7,6 +7,7 @@ import { answerValue, askViaModel, loadBrief } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { proposeRule } from "../rules/living.ts";
+import { stackTagLike } from "../inventory/target.ts";
 
 /**
  * Tidy review: keeps each area module professional and easy to find as it grows. Code checks (structure_ok,
@@ -53,9 +54,9 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const files = listFiles(join(proj, areaDir)).map((f) => relative(proj, f));
 	if (!files.length) return none;
 	const tree = files.map((f) => `${f} (${lineCount(join(proj, f))} lines)`).join("\n");
-	const exports = d.ledger.db.prepare("SELECT path, kind, name FROM index_symbols WHERE side = 'target' AND path LIKE ? ORDER BY path, line").all(`${areaDir}/%`) as Array<{ path: string; kind: string; name: string }>;
+	const exports = d.ledger.db.prepare("SELECT path, kind, name FROM index_symbols WHERE side = 'target' AND path LIKE ? AND tags LIKE ? ORDER BY path, line").all(`${areaDir}/%`, stackTagLike(o.stackId)) as Array<{ path: string; kind: string; name: string }>;
 	const cards = d.ledger.db.prepare("SELECT path, name, summary FROM capabilities WHERE stack = ? AND path LIKE ?").all(o.stackId, `${areaDir}/%`) as Array<{ path: string; name: string; summary: string }>;
-	const drift = (d.ledger.getMeta(`drift:${o.stackId}`) ?? "").split("\n").filter((l) => l.includes(areaDir)).slice(0, 40).join("\n");
+	const drift = (d.ledger.getMeta(`drift:${o.stackId}`) ?? "").split("\n").filter((l) => l.startsWith(`${areaDir}/`)).slice(0, 40).join("\n");
 	const open = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "asked" || t.status === "approved");
 
 	const role = d.config.models.escalate;
@@ -116,6 +117,7 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 }
 
 export function tidyTasks(ledger: Ledger, stack?: string, area?: string): TidyTask[] {
+	syncTidyAnswers(ledger);
 	return loadTasks(ledger).filter((t) => (!stack || t.stack === stack) && (!area || t.area === area));
 }
 
@@ -143,7 +145,7 @@ export function completeTidyTasks(ledger: Ledger, projectDirAbs: string, stack: 
 	return done;
 }
 
-function syncTidyAnswers(ledger: Ledger): void {
+export function syncTidyAnswers(ledger: Ledger): void {
 	const tasks = loadTasks(ledger);
 	let changed = false;
 	for (const t of tasks) {

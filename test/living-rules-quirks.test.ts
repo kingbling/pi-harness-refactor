@@ -190,3 +190,25 @@ describe("tidy review", () => {
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
 	});
 });
+
+describe("rules layout validation + ast-grep languages", () => {
+	it("flags competing module roots anywhere and unknown file shapes; copies rules per ast-grep language", async () => {
+		const { root, config, ledger } = setup();
+		await saveRulesVersion({ ledger, root }, "nestjs", "Put helpers in api/src/helpers/ and see (src/utils/x.ts).\nUse src/features/<area>/<area>.service.ts and src/features/<area>/<area>.helpers.ts", { version: 1 });
+		await saveRulesVersion({ ledger, root }, "react", "ok", { version: 1 });
+		const problems = await validateRulesLayout(root, config);
+		expect(problems.some((p) => p.includes("src/helpers/"))).toBe(true);
+		expect(problems.some((p) => p.includes("src/utils/"))).toBe(true);
+		expect(problems.some((p) => p.includes(".helpers.ts"))).toBe(true);
+		expect(problems.some((p) => p.includes(".service.ts"))).toBe(false);
+		const { expandRuleLanguages } = await import("../src/rules/layout.ts");
+		const dir = join(rulesDir(root, "react"), "astgrep");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "no-any.yml"), "id: no-any\nlanguage: TypeScript\nrule:\n  pattern: $X as any\n");
+		writeFileSync(join(dir, "no-any-test.yml"), "id: no-any\nvalid: []\n");
+		expect(expandRuleLanguages(root, await getTargetAdapter("react"))).toEqual(["no-any--tsx.yml"]);
+		expect(readFileSync(join(dir, "no-any--tsx.yml"), "utf8")).toMatch(/id: no-any--tsx\nlanguage: Tsx/);
+		expect(readFileSync(join(dir, "no-any--tsx-test.yml"), "utf8")).toMatch(/id: no-any--tsx/);
+		expect(activeRuleFiles(root, "react").map((f) => f.split("/").pop())).toEqual(["no-any--tsx.yml", "no-any.yml"]);
+	});
+});

@@ -11,7 +11,7 @@ import { projectDir } from "./init.ts";
 import { libraryPlan, renderStackPlan } from "./stack.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { askViaModel, loadBrief, repoBrief } from "../jev/ask.ts";
-import { composeRules, rulesDir, stripLayout, validateRulesLayout } from "../rules/layout.ts";
+import { composeRules, expandRuleLanguages, rulesDir, stripLayout, validateRulesLayout } from "../rules/layout.ts";
 import { saveRulesVersion } from "../rules/living.ts";
 
 /**
@@ -97,7 +97,7 @@ export async function generateRules(config: Config, root: string, ledger: Ledger
 			`1. ${dirRel}/RULES.md — ≤ 120 lines, NO layout section. Choose the sections this stack needs (e.g. types and data shapes, data access, errors, wiring/DI, UI composition, state, tests, shared helpers, library replacements, legacy framework mapping, forbidden patterns with the ast-grep rule id enforcing each). A "Legacy framework mapping" section is required.`,
 			`2. ${dirRel}/AGENTS.md — how to work in ${targetRel}/: commands from the manifest (build/lint/test), generated files that must never be hand-edited.`,
 			`3. ${dirRel}/idioms.json — JSON array of ≥ 8 objects {"legacy": "<construct as it appears in the legacy files you read>", "target": "<idiom in ${stackId}>", "example": "<one-line snippet>", "rule": "<ast-grep rule id or null>"}; only constructs that actually occur in this repo and land on ${stackId}.`,
-			`4. ${dirRel}/astgrep/<id>.yml — 3–6 ast-grep rules (id, language matching ${adapter.layout.sourceExtensions.join("/")}, rule, message, severity: error) enforcing the forbidden patterns, each with a sibling <id>-test.yml (valid/invalid snippets).`,
+			`4. ${dirRel}/astgrep/<id>.yml — 3–6 ast-grep rules (id, language: ${adapter.layout.astGrepLanguages?.[0] ?? `the ast-grep language of ${adapter.layout.sourceExtensions.join("/")}`}; copies for other languages are made by code, rule, message, severity: error) enforcing the forbidden patterns, each with a sibling <id>-test.yml (valid/invalid snippets).`,
 			`Finish with the line "RULES DONE".`,
 		].join("\n");
 		let res;
@@ -123,6 +123,8 @@ export async function generateRules(config: Config, root: string, ledger: Ledger
 		} catch (e: any) {
 			if (existsSync(join(dir, "idioms.json"))) problems.push(`idioms.json invalid: ${e?.message ?? e}`);
 		}
+		const copies = expandRuleLanguages(root, adapter);
+		if (copies.length) log(pc.dim(`  ${stackId}: ${copies.length} ast-grep rule copies for ${adapter.layout.astGrepLanguages!.join("/")}`));
 		const astRules = readdirSync(join(dir, "astgrep")).filter((f) => f.endsWith(".yml") && !f.endsWith("-test.yml"));
 		if (astRules.length < 3) problems.push(`only ${astRules.length} ast-grep rules`);
 		if (existsSync(rulesPath) && !/legacy framework mapping/i.test(readFileSync(rulesPath, "utf8"))) problems.push(`RULES.md has no "Legacy framework mapping" section`);

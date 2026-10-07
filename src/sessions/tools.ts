@@ -7,7 +7,7 @@ import { searchDocs } from "../init/docs.ts";
 import { MOVE_OPS, type MoveOp } from "../ledger/schema.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { captures, parse } from "../inventory/treesitter.ts";
-import { sharedSymbols } from "../inventory/target.ts";
+import { sharedSymbols, stackTagLike } from "../inventory/target.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { QUIRK_KINDS, recordQuirk, type QuirkKind } from "../run/quirks.ts";
 import { proposeRule } from "../rules/living.ts";
@@ -109,13 +109,13 @@ export function targetLookup(d: ToolDeps): ToolDefinition {
 		parameters: Type.Object({ query: Type.String({ description: "name fragment, or a legacy symbol id to find its migrated counterpart" }) }),
 		execute: async (_id, p) => {
 			if (p.query === "*" && d.moduleDir) {
-				const rows = d.ledger.db.prepare("SELECT id, kind, path, line, signature FROM index_symbols WHERE side = 'target' AND path LIKE ? ORDER BY path, line LIMIT 60").all(`%${d.moduleDir}/%`) as Array<any>;
+				const rows = d.ledger.db.prepare("SELECT id, kind, path, line, signature FROM index_symbols WHERE side = 'target' AND path LIKE ? AND tags LIKE ? ORDER BY path, line LIMIT 60").all(`${d.moduleDir}/%`, stackTagLike(d.adapter.id)) as Array<any>;
 				return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}] ${r.path}:${r.line}${r.signature ? ` ${r.signature}` : ""}`).join("\n") : `the area module ${d.moduleDir}/ is empty — you create its first files`);
 			}
 			const viaMoves = d.ledger.db.prepare("SELECT src_symbol, op, target_symbols, why FROM moves WHERE src_symbol = ? OR src_symbol LIKE ?").all(p.query, `%::${p.query}`) as Array<{ src_symbol: string; op: string; target_symbols: string; why: string }>;
 			const q = `%${p.query.toLowerCase()}%`;
-			const area = d.moduleDir ? `%${d.moduleDir}/%` : "";
-			const direct = d.ledger.db.prepare("SELECT id, kind, path, line, signature, doc FROM index_symbols WHERE side = 'target' AND (lower(name) LIKE ? OR lower(id) LIKE ? OR lower(doc) LIKE ?) ORDER BY (path LIKE ?) DESC LIMIT 15").all(q, q, q, area) as Array<any>;
+			const area = d.moduleDir ? `${d.moduleDir}/%` : "";
+			const direct = d.ledger.db.prepare("SELECT id, kind, path, line, signature, doc FROM index_symbols WHERE side = 'target' AND tags LIKE ? AND (lower(name) LIKE ? OR lower(id) LIKE ? OR lower(doc) LIKE ?) ORDER BY (path LIKE ?) DESC LIMIT 15").all(stackTagLike(d.adapter.id), q, q, q, area) as Array<any>;
 			const out: string[] = [];
 			for (const m of viaMoves) out.push(`${m.src_symbol} was ${m.op} → ${JSON.parse(m.target_symbols).join(", ")}  (${m.why})`);
 			for (const r of direct) out.push(`${r.id}  [${r.kind}] ${r.path}:${r.line}${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`);
@@ -132,7 +132,7 @@ export function patternExamples(d: ToolDeps): ToolDefinition {
 		promptSnippet: "pattern_examples: how accepted code of a kind looks in this codebase",
 		parameters: Type.Object({ kind: Type.String(), limit: Type.Optional(Type.Number()) }),
 		execute: async (_id, p) => {
-			const rows = d.ledger.db.prepare("SELECT path FROM index_symbols WHERE side = 'target' AND kind = ? GROUP BY path ORDER BY MAX(path LIKE ?) DESC, MAX(rowid) DESC LIMIT ?").all(p.kind, d.moduleDir ? `%${d.moduleDir}/%` : "", p.limit ?? 3) as Array<{ path: string }>;
+			const rows = d.ledger.db.prepare("SELECT path FROM index_symbols WHERE side = 'target' AND kind = ? AND tags LIKE ? GROUP BY path ORDER BY MAX(path LIKE ?) DESC, MAX(rowid) DESC LIMIT ?").all(p.kind, stackTagLike(d.adapter.id), d.moduleDir ? `${d.moduleDir}/%` : "", p.limit ?? 3) as Array<{ path: string }>;
 			if (!rows.length) {
 				const idioms = safeRead(join(rulesDir(d.root, d.adapter.id), "idioms.json"));
 				return text(`no accepted ${p.kind} yet. Follow RULES.md and the idiom table${idioms ? `:\n${idioms.slice(0, 3000)}` : ""}.`);
@@ -150,7 +150,7 @@ export function sharedLookup(d: ToolDeps): ToolDefinition {
 		promptSnippet: "shared_lookup: existing cross-cutting helpers to reuse (errors, logging, money, dates…)",
 		parameters: Type.Object({ query: Type.Optional(Type.String()) }),
 		execute: async (_id, p) => {
-			const rows = sharedSymbols(d.ledger, d.adapter.layout.sharedDirs, p.query);
+			const rows = sharedSymbols(d.ledger, d.adapter.layout.sharedDirs, p.query, 40, d.adapter.id);
 			return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}]${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`).join("\n") : `no shared helpers${p.query ? ` match "${p.query}"` : " yet"} — if you need a cross-cutting helper, create it under ${d.adapter.layout.sharedDirs[0] ?? "the shared dir"}<area>/ with a doc comment so others find it`);
 		},
 	});

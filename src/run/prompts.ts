@@ -52,19 +52,17 @@ Finish with one line: "TESTER DONE <n> cases".
 
 ${BEHAVIOUR_POLICY}
 
-## Layout of area "${opts.area}" (${opts.stackId})
-${opts.structureDoc}
-${opts.rules ? `\n## Target rules (${opts.stackId})\n${opts.rules}` : ""}`;
+${opts.rules ? `## Target rules (${opts.stackId}; the layout section is binding)\n${opts.rules}` : `## Layout of area "${opts.area}" (${opts.stackId})\n${opts.structureDoc}`}`;
 }
 
-export function implementerSystemPrompt(config: Config, opts: PlacementPromptOpts & { sharedDirs: string[]; rules: string; attempt: number; quirks?: string }): string {
+export function implementerSystemPrompt(config: Config, opts: PlacementPromptOpts & { sharedDirs: string[]; rules: string; attempt: number; quirks?: string; writeGlobs?: string[] }): string {
 	return `You are the IMPLEMENTER for a legacy migration (${config.source.stack} → ${config.target.stacks.join(" + ")}). You write the new code for ONE unit in ONE pass, then stop. You do not run builds or tests (a gate does that after you finish) and you cannot edit tests.
 
 Rules of the pass:
 - Port the WHOLE unit now: move functions into the right target module/class, extract helpers, deduplicate (the card lists duplicate candidates; use target_lookup before creating anything that might exist). Prefer small, idiomatic, typed code over faithful transliteration — behaviour must match the truth cases (truth_lookup), which pin only what callers observe.
 - Satisfy the drafted interface in the task card (file paths, exported names, signatures) so the ported tests can import it. If it is wrong, implement the closest correct thing and say why in your final message.
 - This unit belongs to area "${opts.area}" on ${opts.stackId}. ${opts.moduleDir}/ is the area's module, shared with every other unit of the area: extend the existing classes/files listed in the task card first (target_lookup), never add a parallel class or a folder per legacy file.
-- Write only inside ${opts.moduleDir}/. Cross-cutting code (errors, logging, money/number formatting, dates, validation, pagination) belongs in ${opts.sharedDirs[0] ?? "the shared dir"}<area>/: call shared_lookup first and REUSE what exists; you may ADD a new file there (with a doc comment) but never edit an existing shared file — other units depend on it; say in your final message if one needs a change. Registration/wiring files are generated — never edit them.
+- You may write: ${(opts.writeGlobs ?? [`${opts.moduleDir}/**`]).join(", ")}, plus new files in an EXISTING shared topic (${opts.sharedDirs[0] ?? "the shared dir"}<topic>/). Cross-cutting code (errors, logging, formatting, dates, validation, pagination) is reused via shared_lookup and find_capability first; you may ADD a file with a doc comment to an existing topic, never edit an existing shared file and never open a new topic (the gate fails it) — say in your final message when something should become shared. Registration/wiring files are generated — never edit them.
 - Call ledger_prove for EVERY legacy symbol in the card (moved / extracted / merged_into / inlined / split / dropped + why). The unit fails the gate otherwise.
 - Pull context with tools (symbol_lookup, who_calls, source_symbol_body, target_lookup, pattern_examples, docs_lookup); do not ask questions. If a convention is missing from the rules and other units will need it, call propose_rule.
 ${opts.attempt > 1 ? `- This is attempt ${opts.attempt}. The gate output is in the task; fix exactly what failed, keep what passed.` : ""}
@@ -73,7 +71,5 @@ Finish with one line: "IMPLEMENTER DONE" plus anything the reviewer must know.
 ${BEHAVIOUR_POLICY.replace("record_quirk", "your final message (the tester records quirks)")}
 ${opts.quirks ? `\n## Quirks of this unit (decided)\n${opts.quirks}\nKept quirks get a \`// LEGACY: <why>\` comment; dropped ones are not reproduced.` : ""}
 
-## Layout of area "${opts.area}" (${opts.stackId})
-${opts.structureDoc}
-${opts.rules ? `\n## Target rules (${opts.stackId})\n${opts.rules}` : ""}`;
+${opts.rules ? `## Target rules (${opts.stackId}; the layout section is binding)\n${opts.rules}` : `## Layout of area "${opts.area}" (${opts.stackId})\n${opts.structureDoc}`}`;
 }

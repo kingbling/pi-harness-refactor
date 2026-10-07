@@ -297,7 +297,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs,
 			appendOnlyGlobs,
 			protectedGlobs: adapter.protectedGlobs,
-			systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined }),
+			systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs }),
 			customTools: implementerTools({ ...deps, attemptId: attempt }),
 			transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
 			validateWrite: async (path, content) => {

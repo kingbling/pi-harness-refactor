@@ -201,6 +201,8 @@ export interface TargetLayout {
 	skipMarker: RegExp;
 	/** One line for the tester on how to write the interface draft (type system, DTO idiom). */
 	interfaceHint: string;
+	/** ast-grep `language` ids this stack's source files need; rules written for one are copied for the others. */
+	astGrepLanguages?: string[];
 	/** One line for the tester on how to write ported tests (file naming, framework). */
 	testHint: string;
 }
