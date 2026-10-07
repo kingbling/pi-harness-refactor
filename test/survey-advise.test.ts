@@ -36,7 +36,7 @@ describe("init survey: facts from the repo, provisional values only", () => {
 		expect(r.targets).toContain("react"); // provisional only: every role; the stack is judged by advise
 		expect(r.dbFrom.sort()).toEqual(["arangodb", "mariadb"]); // redis is infrastructure, not data to migrate
 		expect(r.dbStrategy).toBe("keep-schema");
-		expect(r.targetPath).toBe("./legacy-next");
+		expect(r.targetPath).toBe("../legacy-new"); // beside the source, same as init
 	});
 
 	it("br init --yes with only --source writes a config derived from the survey", async () => {

@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import type { SourceAdapter } from "../adapters/types.ts";
 import { knownTargets, TARGET_SUBDIRS } from "../adapters/registry.ts";
+import { defaultTargetPath } from "./init.ts";
 
 /**
  * What `br init` finds in the legacy repo BEFORE it asks anything, so every default is derived from the
@@ -95,7 +96,7 @@ export function recommend(s: Survey, sourcePath: string): Recommendation {
 	const dbFrom = s.engines.map((e) => e.engine).filter((e) => DATA_STORES.has(e));
 	const dbStrategy = dbFrom.length ? "keep-schema" : "none";
 	why.push(dbFrom.length ? `data stores found: ${s.engines.filter((e) => DATA_STORES.has(e.engine)).map((e) => `${e.engine} (${e.evidence})`).join("; ")} → keep-schema` : "no data store found → db strategy none");
-	const targetPath = `./${basename(sourcePath.replace(/\/+$/, "")) || "legacy"}-next`;
+	const targetPath = defaultTargetPath(sourcePath);
 	return { targets, dbStrategy, dbFrom, targetPath, why };
 }
 
