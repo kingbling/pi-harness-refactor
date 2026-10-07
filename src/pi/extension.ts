@@ -80,6 +80,7 @@ function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<CardAnswer | u
 function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<CardAnswer | undefined> {
 	return ctx.ui.custom<CardAnswer | undefined>((tui, _theme, _kb, done) => {
 		const card = new QuestionCard(q, done);
+		card.maxRows = () => Math.max(12, tui.terminal.rows - 2);
 		const handle = card.handleInput.bind(card);
 		card.handleInput = (data: string) => {
 			handle(data);
@@ -722,12 +723,14 @@ export default function (pi: ExtensionAPI) {
 					const ask = async (qs: QuestionRow[], label: string): Promise<"quit" | void> => {
 						const q = qs[0]!;
 						const differ = qs.some((x) => x.question !== q.question);
-						const members = differ ? `\n\n${qs.length} questions, one answer for all:\n${qs.slice(0, 12).map((x) => `· ${x.unit_id ?? x.point}: ${x.question.split("\n")[0]!.slice(0, 140)}`).join("\n")}${qs.length > 12 ? `\n· … ${qs.length - 12} more` : ""}` : "";
-						const head = `${label}${qs.length > 1 && !differ ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}${members}`;
+						// the group's members: one line each, cut at the screen edge (the card scrolls when they do not fit)
+						const members = differ ? [`${qs.length} questions, one answer for all:`, ...qs.map((x) => `· ${x.unit_id ?? x.point}: ${x.question.split("\n")[0]!}`)] : undefined;
+						const head = `${label}${qs.length > 1 && !differ ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}`;
 						const options = q.options ? (JSON.parse(q.options) as string[]) : [];
 						const recommended = q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined;
 						const pick = await askCard(ctx, {
 							message: head,
+							...(members ? { details: members } : {}),
 							recommended,
 							options: [
 								...options.map((o) => ({ value: o, label: o })),

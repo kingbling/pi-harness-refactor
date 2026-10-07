@@ -99,7 +99,8 @@ describe("/br answer applies every question type", () => {
 				custom: (factory: any) =>
 					new Promise((resolve) => {
 						const card = factory({ requestRender() {} }, {}, {}, resolve);
-						const { message, options } = card.q as { message: string; options?: Array<{ value: string }> };
+						const { message: text, options, details } = card.q as { message: string; options?: Array<{ value: string }>; details?: string[] };
+						const message = [text, ...(details ?? [])].join("\n"); // a group's members are listed one per line below the question
 						if (!options) return resolve("");
 						titles.push(message);
 						const values = options.map((o) => o.value);

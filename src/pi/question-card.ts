@@ -26,6 +26,8 @@ export interface CardQuestion {
 	multi?: { initial: string[] };
 	/** A last row to type your own answer; this is its hint while empty. */
 	other?: string;
+	/** Extra lines shown one per row, cut at the screen edge (e.g. the questions a group answer covers). */
+	details?: string[];
 }
 
 /** Single choice and text: the value (or the typed text); checkboxes: the checked values and the typed note. */
@@ -38,6 +40,10 @@ export class QuestionCard implements Component {
 	private readonly input: Input;
 	private readonly checked: Set<string>;
 	private cursor: number;
+	/** First line of the question text shown when it is taller than the screen (PgUp/PgDn, ←/→). */
+	private scroll = 0;
+	/** Rows the card may use (the terminal's height); the choices always stay visible, the text above them scrolls. */
+	maxRows?: () => number;
 	focused = false;
 
 	constructor(q: CardQuestion, done: (value: CardAnswer | undefined) => void) {
@@ -84,6 +90,9 @@ export class QuestionCard implements Component {
 	}
 
 	handleInput(data: string): void {
+		const page = Math.max(3, (this.maxRows?.() ?? 24) - 12);
+		if (matchesKey(data, Key.pageDown) || (!this.q.text && !this.onOther && matchesKey(data, Key.right))) return void (this.scroll += page);
+		if (matchesKey(data, Key.pageUp) || (!this.q.text && !this.onOther && matchesKey(data, Key.left))) return void (this.scroll = Math.max(0, this.scroll - page));
 		if (this.q.text) return this.input.handleInput(data);
 		const n = this.rows;
 		if (!n) return;
@@ -102,11 +111,27 @@ export class QuestionCard implements Component {
 
 	render(width: number): string[] {
 		const w = Math.max(30, width - 2);
-		const wrap = (s: string, indent = "") => wrapTextWithAnsi(s, Math.max(10, w - indent.length)).map((l) => indent + l);
+		const wrap = (x: string, indent = "") => wrapTextWithAnsi(x, Math.max(10, w - indent.length)).map((l) => indent + l);
 		const [question = "", ...context] = this.q.message.split("\n").map((l) => l.trim());
-		const L: string[] = [pc.dim("─".repeat(w)), ...wrap(pc.bold(question))];
-		for (const c of context.filter(Boolean)) L.push(...wrap(pc.dim(c), "  "));
-		L.push("");
+		const head = [pc.dim("─".repeat(w)), ...wrap(pc.bold(question))];
+		const body: string[] = [];
+		for (const c of context.filter(Boolean)) body.push(...wrap(pc.dim(c), "  "));
+		for (const d of this.q.details ?? []) body.push(truncateToWidth(pc.dim(`  ${d}`), w));
+		const choices = this.choices(w, wrap);
+		// taller than the screen: the choices stay, the text above them scrolls
+		const room = (this.maxRows?.() ?? Infinity) - head.length - choices.length - 2;
+		if (body.length > room) {
+			const show = Math.max(1, room - 1);
+			this.scroll = Math.min(this.scroll, Math.max(0, body.length - show));
+			const below = body.length - this.scroll - show;
+			const hint = [this.scroll ? `${this.scroll} line(s) above` : "", below > 0 ? `${below} more line(s)` : ""].filter(Boolean).join(" · ");
+			return [...head, ...body.slice(this.scroll, this.scroll + show), pc.yellow(`  ${hint} — ${this.q.text ? "PgUp/PgDn" : "←/→ or PgUp/PgDn"} to read`), "", ...choices];
+		}
+		return [...head, ...body, "", ...choices];
+	}
+
+	private choices(w: number, wrap: (s: string, indent?: string) => string[]): string[] {
+		const L: string[] = [];
 		if (this.q.text) {
 			L.push(...this.input.render(w));
 			L.push(pc.dim(this.q.text.initial ? `  recommended: ${this.q.text.initial} (prefilled) · Enter sends · Esc cancels` : "  Enter sends · Esc cancels"));
@@ -128,7 +153,7 @@ export class QuestionCard implements Component {
 			const keys = this.q.multi
 				? `  ↑↓ move · Space or 1-${Math.min(9, opts.length)} check/uncheck · ${this.q.other !== undefined ? "last row: type your own · " : ""}Enter send · Esc cancel`
 				: `  ↑↓ move · ${opts.length > 1 ? `1-${Math.min(9, opts.length)} pick · ` : ""}${this.q.other !== undefined ? "last row: type your own · " : ""}Enter choose · Esc cancel`;
-			L.push("", pc.dim(keys));
+			L.push("", truncateToWidth(pc.dim(keys), w));
 		}
 		L.push(pc.dim("─".repeat(w)));
 		return L;

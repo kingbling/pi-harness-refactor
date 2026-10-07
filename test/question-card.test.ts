@@ -96,4 +96,20 @@ describe("question card", () => {
 		a.c.handleInput(ENTER);
 		expect(a.got).toEqual(["laravel"]);
 	});
+
+	it("taller than the screen: the choices stay visible, the text scrolls with ←/→; group members take one line each", () => {
+		const a = card({ message: `Where should old_export.php go?\n${Array.from({ length: 30 }, (_, i) => `context line ${i + 1}`).join("\n")}`, details: ["10 questions, one answer for all:", `· U1722: ${"very long question text ".repeat(20)}`], recommended: "a", options: [{ value: "a", label: "shared" }, { value: "b", label: "billing" }] });
+		a.c.maxRows = () => 20;
+		let out = a.c.render(60);
+		expect(out.length).toBeLessThanOrEqual(20);
+		expect(plain(out)).toMatch(/❯ 1\. shared \(recommended\)/);
+		expect(plain(out)).toMatch(/more line\(s\) — ←\/→ or PgUp\/PgDn to read/);
+		for (let i = 0; i < 6; i++) a.c.handleInput("\x1b[C"); // → pages down, stops at the end
+		out = a.c.render(60);
+		expect(plain(out)).toContain("· U1722: very long");
+		expect(out.every((l) => plain([l]).length <= 58)).toBe(true);
+		expect(plain(out)).toMatch(/line\(s\) above/);
+		a.c.handleInput(ENTER);
+		expect(a.got).toEqual(["a"]);
+	});
 });
