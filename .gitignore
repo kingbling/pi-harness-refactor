@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.bigrefactor/
+*.sqlite
+*.sqlite-*
+runs/
+.env
+.DS_Store
+.sim/

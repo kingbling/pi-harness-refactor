@@ -1,0 +1,143 @@
+import type { Config } from "../config.ts";
+import { decide, setDecisionAction } from "../jev/decide.ts";
+import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE, TRIAGE_TRUTH } from "../jev/questions.ts";
+import type { Ledger } from "../ledger/db.ts";
+import type { ModelClient } from "../models/types.ts";
+import type { GateReport } from "./gate.ts";
+
+/**
+ * Jev at the gate. Rules for using Jev well: the state is small and literal (the failing step's output
+ * tail + a few numbers), every question is typed, several questions go in ONE call, confidence decides
+ * whether code acts, asks for a label, or hands over. Jev never auto-accepts code; it only picks the
+ * next step of the unit's playbook.
+ */
+export type TriageAction = "retry" | "escalate" | "retest" | "quarantine" | "ask_human";
+
+export interface Triage {
+	action: TriageAction;
+	cause: string;
+	confidence: number;
+	band: "act" | "check" | "escalate";
+	decisionId: number;
+	questionId?: number;
+	reason: string;
+}
+
+export interface TriageDeps {
+	ledger: Ledger;
+	config: Config;
+	client: ModelClient;
+}
+
+export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport, previous: GateReport | undefined, attemptNo: number): Promise<Triage> {
+	const failed = gate.steps.find((s) => !s.ok);
+	const maxImpl = d.config.run.maxImplementAttempts;
+	const maxTotal = maxImpl + d.config.run.maxEscalateAttempts;
+	// Deterministic shortcuts: the gate already knows these; no model needed.
+	if (failed?.name === "symbolproof_ok") return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", "unproven symbols — implementer must call ledger_prove");
+	if (failed?.name === "antigaming_ok") {
+		// The same code-level problems twice in a row (and no escalation) means the environment or the gate is wrong,
+		// not the model: stop burning attempts and ask (only this unit waits).
+		const prevFailed = previous?.steps.find((s) => !s.ok);
+		if (prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) {
+			const q = d.ledger.askQuestion({ unitId, point: "gate_env", question: `Anti-gaming fails identically on consecutive attempts for ${unitId}; the implementer cannot fix it. Inspect the gate report, fix the environment or protected globs, then \`br requeue ${unitId}\`.`, context: { output: failed.output.slice(-1500), changed: gate.changedFiles }, blocks: "unit", askedBy: "orchestrator" });
+			const t = deterministic(d, unitId, "env", "ask_human", "identical anti-gaming failure twice → not the model's fault");
+			return { ...t, questionId: q };
+		}
+		return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", "scope/test tampering caught by code");
+	}
+
+	// Build errors located only in protected test files are the tester's to fix: the implementer cannot edit them.
+	if (failed?.name === "build_ok" && gate.testFiles?.length) {
+		const errFiles = [...failed.output.matchAll(/^([^\s(:]+\.[A-Za-z0-9]+)[(:]/gm)].map((m) => m[1]!);
+		if (errFiles.length && errFiles.every((f) => gate.testFiles!.some((t) => f.endsWith(t)))) return deterministic(d, unitId, "test_bug", "retest", "build errors only in the ported tests → tester re-ports");
+	}
+
+	// State the decision model can actually reason on: not just the tail of the log, but what kind of failure it is.
+	const out = failed?.output ?? "";
+	const body = (out.startsWith("$ ") ? out.split("\n").slice(1).join("\n") : out).trim(); // drop the "$ cmd" line
+	const errFilesAll = [...new Set([...out.matchAll(/(?:^|\s)([\w./-]+\/[\w.-]+\.[A-Za-z0-9]{1,5})(?=[(:]| )/gm)].map((m) => m[1]!))];
+	const testFiles = gate.testFiles ?? [];
+	const state = {
+		stage: failed?.name ?? "unknown",
+		attempt: attemptNo,
+		tool_produced_output: body.length > 0,
+		exit_code: failed?.exitCode ?? null,
+		timed_out: /\[timed out\]/.test(out),
+		error_files: errFilesAll.slice(0, 20),
+		errors_in_protected_tests_only: errFilesAll.length > 0 && errFilesAll.every((f) => testFiles.some((t) => f.endsWith(t))),
+		errors_in_changed_files: errFilesAll.filter((f) => gate.changedFiles.some((c) => f.endsWith(c))).length,
+		gate_report: out.slice(-3000),
+		previous_report: previous?.steps.find((s) => !s.ok)?.output.slice(-1500) ?? "",
+		previous_stage: previous?.failedStep ?? null,
+		diff_stats: { changed_files: gate.changedFiles.length, files: gate.changedFiles.slice(0, 20) },
+	};
+	const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
+	const cause = choiceOf(dec.answers["cause"]) ?? "other";
+	const retryHelps = noulOf(dec.answers["retry_likely_to_help"]);
+	const same = previous ? noulOf(dec.answers["same_as_previous"]) : 0;
+	const needsEscalation = noulOf(dec.answers["escalate"]);
+	const b = band(dec.confidence, DEFAULT_THRESHOLDS["triage_gate"]!);
+
+	let action: TriageAction;
+	let reason: string;
+	if (attemptNo >= maxTotal) {
+		action = "quarantine";
+		reason = `attempt cap ${maxTotal} reached`;
+	} else if (cause === "test_bug" || cause === "interface_mismatch") {
+		action = "retest";
+		reason = `${cause}: tester re-ports interface/tests`;
+	} else if (cause === "env") {
+		action = "ask_human";
+		reason = "environment problem, not code";
+	} else if (!state.tool_produced_output && state.exit_code !== null) {
+		// A tool that printed nothing is an environment problem, whatever the model thinks.
+		action = "ask_human";
+		reason = `gate tool exited ${state.exit_code} without output`;
+	} else if (state.previous_report && state.previous_report === out.slice(-1500)) {
+		// Byte-identical failure twice: a stronger model is not the answer, a human is (only this unit waits).
+		action = "ask_human";
+		reason = "identical failure on consecutive attempts";
+	} else if (needsEscalation > 0.7 || (same > 0.7 && attemptNo >= 2)) {
+		action = "escalate";
+		reason = needsEscalation > 0.7 ? "needs cross-unit understanding" : "same failure class twice → stronger model";
+	} else if (attemptNo >= maxImpl) {
+		action = "escalate";
+		reason = "implement attempts exhausted";
+	} else {
+		action = "retry";
+		reason = retryHelps >= 0.5 ? "retry with the exact gate output" : "retry (escalation needs positive evidence)";
+	}
+
+	// Low confidence: code still acts (retries are cheap) but asks for a label so Jev gets calibrated;
+	// nothing waits on that label. Below the check band on a non-retry action we hand over instead.
+	let questionId: number | undefined;
+	if (action === "ask_human" && !questionId) {
+		questionId = d.ledger.askQuestion({ unitId, point: "triage_gate", question: `Gate step ${state.stage} failed (attempt ${attemptNo}): ${reason}. ${cause === "other" ? "" : `Jev says cause=${cause}. `}Fix or advise, then \`br requeue ${unitId}\` if quarantined.`, options: Object.keys(TRIAGE_GATE["cause"]!.criteria ?? {}), context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files }, blocks: "unit", askedBy: "orchestrator", decisionId: dec.decisionId });
+	} else if (b !== "act") {
+		const blocks = b === "escalate" && action !== "retry" ? "unit" : "none";
+		if (blocks === "unit") action = "ask_human";
+		questionId = d.ledger.askQuestion({
+			unitId,
+			point: "triage_gate",
+			question: `Gate step ${state.stage} failed (attempt ${attemptNo}). Jev says cause=${cause} (confidence ${dec.confidence.toFixed(2)}), planned action ${action}. What is the real cause?`,
+			options: Object.keys(TRIAGE_GATE["cause"]!.criteria ?? {}),
+			context: { gate_tail: state.gate_report.slice(-1200), files: state.diff_stats.files },
+			blocks,
+			askedBy: "orchestrator",
+			decisionId: dec.decisionId,
+		});
+	}
+	setDecisionAction(d.ledger, dec.decisionId, action);
+	return { action, cause, confidence: dec.confidence, band: b, decisionId: dec.decisionId, questionId, reason };
+}
+
+export async function triageTruth(d: TriageDeps, unitId: string, test: string, failure: string): Promise<{ cause: string; keep: boolean; confidence: number; decisionId: number }> {
+	const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_truth", { test: test.slice(-2000), failure: failure.slice(-2000) }, TRIAGE_TRUTH, ["cause"], unitId);
+	return { cause: choiceOf(dec.answers["cause"]) ?? "other", keep: noulOf(dec.answers["keep_as_known_bug"]) >= 0.5, confidence: dec.confidence, decisionId: dec.decisionId };
+}
+
+function deterministic(d: TriageDeps, unitId: string, cause: string, action: TriageAction, reason: string): Triage {
+	const id = d.ledger.recordDecision({ unitId, point: "triage_gate", model: "code", stateHash: "deterministic", answers: { cause }, confidence: 1, action });
+	return { action, cause, confidence: 1, band: "act", decisionId: id, reason };
+}

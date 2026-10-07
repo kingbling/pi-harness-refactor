@@ -1,0 +1,341 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import pc from "picocolors";
+import { findConfigPath, loadConfig, statePath, type Config } from "./config.ts";
+import { Ledger } from "./ledger/db.ts";
+import { renderStatus, renderWhy } from "./dashboard/status.ts";
+import { OpenRouterClient } from "./models/openrouter.ts";
+import type { ModelClient } from "./models/types.ts";
+
+loadDotEnv();
+
+const [cmd = "help", ...rest] = process.argv.slice(2);
+
+const commands: Record<string, (args: string[]) => Promise<void>> = {
+	help: async () => {
+		console.log(`br — bigrefactor
+
+  br init | br start           give the old and the new folder; everything else runs (gather → decide → build)
+  br resume                    continue onboarding where it stopped (finished steps are skipped)
+       flags: [--source <old> --target <new>] [--yes: accept every recommendation] [--no-llm: offline]
+              [--to nestjs,react --db keep-schema --choose nestjs.orm=typeorm,… --replace lib=pkg|drop,…] pre-decide items
+  br onboard                   same as init (kept for scripts)
+  br init --config-only        only write bigrefactor.config.json (no data gathering)
+  br setup                     bootstrap target with each stack's official CLI, git init + commit
+  br rules [--force]           generate RULES.md, AGENTS.md chain, idioms.json, ast-grep rules from docs + layout
+  br docs fetch | <query>      refetch official docs / search them
+  br inventory                 index source → symbols, units, tiers → ledger (re-run = drift report)
+  br index-target              (re)index the new codebase: exports, shared helpers, docs → target_lookup/shared_lookup
+  br simulate --level 1|2|3    prove the pipeline before touching the real repo
+  br label                     Jev labels units (difficulty → model routing, kind, needs_db, has_ui), auth slices, unreached units → slices
+  br advise                    models judge what tables used to: library successors, unmapped framework classes (escalate model), open decisions (Jev)
+  br decide [--json] [--answer id=value ...]   decision gate: everything the inventory cannot decide; run/L3 wait for it
+  br profile [--force]         generate the legacy framework profile (loaders, routes-in-code, entry points, concerns) from the framework source; validated against the index
+  br frameworks                what the legacy framework/libraries do, app reliance per concern, platform/port/drop verdicts
+  br order                     vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
+  br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit
+  br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
+  br sweep                     cluster failures → tune → rerun
+  br status                    ledger dashboard
+  br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
+  br forecast                  how far the migration is: done, open, spend and time left (with range)
+  br questions | answer <id> <text>   open human questions (nothing unrelated waits on them)
+  br why <symbol|path>         full history of one symbol or file
+  br smoke                     verify configured models and the OpenRouter key
+`);
+	},
+	status: async () => {
+		const { ledger } = open();
+		console.log(renderStatus(ledger));
+	},
+	lanes: async (args) => {
+		const { lanes, parseLanesArgs } = await import("./run/lanes.ts");
+		const { findConfigPath } = await import("./config.ts");
+		const p = findConfigPath();
+		if (!p) throw new Error("no bigrefactor.config.json here");
+		console.log(lanes(p, parseLanesArgs(args)));
+	},
+	forecast: async () => {
+		const { forecast, renderForecast } = await import("./run/forecast.ts");
+		const { ledger } = open();
+		console.log(renderForecast(forecast(ledger)));
+	},
+	why: async (args) => {
+		const id = args[0];
+		if (!id) throw new Error("usage: br why <symbol-id|path>");
+		const { ledger } = open();
+		console.log(renderWhy(ledger, id));
+	},
+	smoke: async () => {
+		const { smoke } = await import("./smoke.ts");
+		const cfgPath = findConfigPath();
+		const config = cfgPath ? loadConfig(cfgPath).config : undefined;
+		const client = new OpenRouterClient();
+		const ok = await smoke(client, config);
+		process.exitCode = ok ? 0 : 1;
+	},
+	// `br init` / `br start`: give the old and the new folder, everything else runs (onboarding).
+	// `br resume`: continue where it stopped. `br init --config-only`: only write the config.
+	init: async (args) => {
+		if (args.includes("--config-only")) {
+			const { init } = await import("./init/init.ts");
+			await init(args.filter((a) => a !== "--config-only"));
+			return;
+		}
+		const { onboard } = await import("./init/onboard.ts");
+		const r = await onboard({ args });
+		if (!r.ok) process.exitCode = 1;
+	},
+	start: async (args) => commands.init!(args),
+	resume: async (args) => commands.onboard!(args),
+	questions: async () => {
+		const { ledger } = open();
+		const qs = ledger.openQuestions();
+		if (!qs.length) return console.log(pc.green("no open questions"));
+		const blocked = ledger.blockedUnits();
+		for (const q of qs) {
+			const waiting = [...blocked.entries()].filter(([, ids]) => ids.includes(q.id)).map(([u]) => u);
+			console.log(`${pc.bold(`#${q.id}`)} ${pc.dim(`[${q.point}] by ${q.asked_by}${q.unit_id ? ` on ${q.unit_id}` : ""}`)}\n  ${q.question}${q.options ? pc.dim(`\n  options: ${(JSON.parse(q.options) as string[]).join(" | ")}`) : ""}\n  ${waiting.length ? pc.yellow(`waiting: ${waiting.join(", ")}`) : pc.dim("blocks nothing")}\n`);
+		}
+		console.log(pc.dim("answer with: br answer <id> <text>"));
+	},
+	answer: async (args) => {
+		const [id, ...text] = args;
+		if (!id || !text.length) throw new Error("usage: br answer <id> <text>");
+		const { ledger } = open();
+		ledger.answerQuestion(Number(id), text.join(" "), process.env["USER"] ?? "human");
+		console.log(pc.green(`answered #${id}`));
+	},
+	setup: async () => {
+		const { setup } = await import("./init/init.ts");
+		const { config, root } = loadConfig();
+		await setup(config, root);
+	},
+	"index-target": async () => {
+		const { indexTarget } = await import("./inventory/target.ts");
+		const { projectDir } = await import("./init/init.ts");
+		const { getTargetAdapter } = await import("./adapters/registry.ts");
+		const { config, ledger } = open();
+		const n = await indexTarget(ledger, await getTargetAdapter(config.target.stacks[0]!), projectDir(config, config.target.stacks[0]!));
+		console.log(`indexed ${n} target symbols`);
+	},
+	rules: async (args) => {
+		const { generateRules } = await import("./init/rules.ts");
+		const { config, root, ledger } = open();
+		const r = await generateRules(config, root, ledger, { force: args.includes("--force") });
+		console.log(`rules: ${r.files.length} files, $${r.costUsd.toFixed(4)}`);
+	},
+	docs: async (args) => {
+		const { fetchDocs, searchDocs } = await import("./init/docs.ts");
+		const { config, root } = loadConfig();
+		if (args[0] === "fetch") {
+			const entries = await fetchDocs(config, root, { force: true });
+			console.log(`${entries.length} docs fetched`);
+			return;
+		}
+		const q = args.join(" ");
+		if (!q) throw new Error("usage: br docs fetch | br docs <query>");
+		for (const h of searchDocs(root, q)) console.log(`${pc.cyan(`${h.tech}/${h.name}:${h.line}`)}\n${h.snippet}\n`);
+	},
+	inventory: async () => {
+		const { inventory } = await import("./inventory/run.ts");
+		const { config, root } = loadConfig();
+		const ledger = new Ledger(statePath(root, "ledger.sqlite"));
+		await inventory(config, root, ledger);
+		console.log(renderStatus(ledger));
+	},
+	unit: async (args) => {
+		// Hand-driven single unit (build-order step 2 / pilot). Live models, real target project, no scheduler.
+		const id = args[0];
+		if (!id) throw new Error("usage: br unit <unit-id> [--accept] [--reuse-truth]");
+		const { runUnit } = await import("./run/unit.ts");
+		const { config, root, ledger } = open();
+		const r = await runUnit({ ledger, config, root, unitId: id, client: makeClient(), accept: args.includes("--accept"), reuseTruth: args.includes("--reuse-truth"), retry: args.includes("--retry") });
+		console.log(`${r.unitId}: ${r.state} after ${r.attempts} attempt(s), $${r.costUsd.toFixed(4)}`);
+		process.exitCode = r.state === "review" || r.state === "accepted" ? 0 : 1;
+	},
+	accept: async (args) => {
+		const id = args[0];
+		if (!id) throw new Error("usage: br accept <unit-id>");
+		const { acceptUnit, moduleName } = await import("./run/unit.ts");
+		const { projectDir } = await import("./init/init.ts");
+		const { config, ledger } = open();
+		const u = ledger.getUnit(id);
+		if (!u) throw new Error(`unknown unit ${id}`);
+		if (u.state !== "review") throw new Error(`unit ${id} is ${u.state}, not in review`);
+		const sha = acceptUnit({ ledger, config, unitId: id }, projectDir(config, config.target.stacks[0]!), moduleName(u.meta));
+		console.log(pc.green(`accepted ${id}${sha ? ` @ ${sha.slice(0, 7)}` : ""}`));
+	},
+	simulate: async (args) => {
+		const { simulate } = await import("./run/simulate.ts");
+		const level = Number(flag(args, "--level") ?? "1") as 1 | 2 | 3;
+		if (level === 3) await assertNoOpenDecisions();
+		const sample = Number(flag(args, "--sample") ?? "10");
+		await simulate({ level, sample });
+	},
+	run: async (args) => {
+		// whole-target decisions refuse; scoped ones only block their units (run.ts reads them live)
+		if (!args.includes("--dry")) await assertNoGlobalDecisions();
+		const { run } = await import("./run/run.ts");
+		const limit = flag(args, "--limit");
+		await run({ units: flag(args, "--units")?.split(","), slice: flag(args, "--slice"), limit: limit ? Number(limit) : undefined, dry: args.includes("--dry"), force: args.includes("--force") });
+	},
+	requeue: async (args) => {
+		// Put quarantined units back into the queue (after a sweep/fix). Worktree and branch are dropped; truth is kept.
+		if (!args.length) throw new Error("usage: br requeue <unit-id...> | --all");
+		const { removeWorktree } = await import("./git.ts");
+		const { worktreeDir } = await import("./run/run.ts");
+		const { config, root, ledger } = open();
+		const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
+		const ids = args.includes("--all") ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : args.filter((a) => !a.startsWith("--"));
+		for (const id of ids) {
+			const u = ledger.getUnit(id);
+			if (!u) throw new Error(`unknown unit ${id}`);
+			if (!stuck(u.state)) throw new Error(`${id} is ${u.state}; only quarantined or parked (truth/implementing/gating/review) units can be requeued`);
+			for (const a of ledger.db.prepare("SELECT id FROM attempts WHERE unit_id = ? AND ended_at IS NULL").all(id) as Array<{ id: number }>) ledger.endAttempt(a.id, { outcome: "aborted:requeue" });
+			removeWorktree(config.target.path, worktreeDir(root, id));
+			try {
+				execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", `unit/${id}`], { stdio: "pipe" });
+			} catch {
+				/* no branch */
+			}
+			ledger.transitionUnit(id, "planned", `requeued by ${process.env["USER"] ?? "human"}`);
+			console.log(pc.green(`requeued ${id}`));
+		}
+	},
+	onboard: async (args) => {
+		const { onboard } = await import("./init/onboard.ts");
+		const r = await onboard({ args });
+		if (!r.ok) process.exitCode = 1;
+	},
+	profile: async (args) => {
+		const { generateProfile } = await import("./init/profile.ts");
+		const { config, ledger, root } = open();
+		await generateProfile(config, root, ledger, { force: args.includes("--force") });
+	},
+	frameworks: async () => {
+		const { planFrameworks, renderFrameworkPlan } = await import("./inventory/frameworks.ts");
+		const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
+		const { config, ledger, root } = open();
+		const source = getSourceAdapter(config.source.stack);
+		source.frameworkDirs?.(config.source.path); // detect profile
+		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
+		const { loadDecisions } = await import("./inventory/decisions.ts");
+		console.log(renderFrameworkPlan(planFrameworks(ledger, source, targets, config.source.path, loadDecisions(root), config.target.choices)));
+	},
+	label: async () => {
+		const { labelUnits } = await import("./init/label.ts");
+		const { config, ledger, root } = open();
+		const r = await labelUnits(config, root, ledger, makeClient());
+		console.log(`labelled ${r.units} units (${r.hard} hard), auth slices: ${r.auth.join(", ") || "none"}, placed ${r.placed}, $${r.costUsd.toFixed(4)}`);
+	},
+	advise: async () => {
+		const { advise } = await import("./init/advise.ts");
+		const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
+		const { config, ledger, root } = open();
+		const source = getSourceAdapter(config.source.stack);
+		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
+		const r = await advise(config, root, ledger, makeClient(), source, targets);
+		console.log(`advised ${r.libraries} libraries, ${r.classes} framework classes, ${r.decisions} decisions — $${r.costUsd.toFixed(4)}; see br decide`);
+	},
+	decide: async (args) => {
+		const { openDecisions, applyDecision, renderDecisions } = await import("./inventory/decisions.ts");
+		const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
+		const { config, ledger, root } = open();
+		const source = getSourceAdapter(config.source.stack);
+		source.frameworkDirs?.(config.source.path);
+		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
+		const answers = args.filter((a, i) => args[i - 1] === "--answer");
+		for (const a of answers) {
+			const eq = a.indexOf("=");
+			if (eq < 0) throw new Error(`--answer expects id=value, got ${a}`);
+			const note = applyDecision(ledger, config, root, a.slice(0, eq), a.slice(eq + 1), process.env["USER"] ?? "human");
+			console.log(pc.green(`decided ${a.slice(0, eq)} = ${a.slice(eq + 1)}`) + (note ? pc.dim(`  ${note}`) : ""));
+		}
+		const { config: cfg2 } = open(); // answers may have changed the config
+		const targets2 = await Promise.all(cfg2.target.stacks.map((s) => getTargetAdapter(s)));
+		const ds = openDecisions(ledger, cfg2, source, targets2, root);
+		if (args.includes("--json")) return console.log(JSON.stringify(ds, null, 2));
+		if (!answers.length && !args.includes("--list") && ds.length && process.stdout.isTTY) {
+			const { terminalPrompter } = await import("./init/init.ts");
+			for (const d of ds) {
+				const v = await terminalPrompter.select(`${d.question}\n   ${pc.dim(d.evidence)}`, d.options.map((o) => ({ value: o.value, label: o.label, hint: o.hint })), d.recommended);
+				if (v === undefined) break;
+				console.log(pc.dim(applyDecision(ledger, cfg2, root, d.id, v, process.env["USER"] ?? "human")));
+			}
+			return console.log(renderDecisions(openDecisions(ledger, open().config, source, targets2, root)));
+		}
+		console.log(renderDecisions(ds));
+	},
+	order: async () => {
+		const { planSlices, applySlicePlan, renderSlicePlan } = await import("./inventory/slices.ts");
+		const { ledger, root } = open();
+		const p = join(root, ".bigrefactor", "slices.json");
+		const overrides = existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {};
+		const plan = planSlices(ledger, overrides);
+		applySlicePlan(ledger, plan);
+		console.log(renderSlicePlan(plan));
+	},
+};
+
+async function assertNoGlobalDecisions(): Promise<void> {
+	const { decisionGate, renderGate } = await import("./run/decisions-gate.ts");
+	const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
+	const { config, ledger, root } = open();
+	const g = decisionGate(ledger, config, getSourceAdapter(config.source.stack), await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s))), root);
+	if (g.global.length) throw new Error(`${renderGate(g)[0]} — run \`br decide\` first`);
+	for (const l of renderGate(g)) console.log(pc.yellow(l));
+	if (g.scoped.length || g.free.length) console.log(pc.dim("the run continues with everything else; answer with `br decide` (another terminal works) and blocked units start"));
+}
+
+async function assertNoOpenDecisions(): Promise<void> {
+	const { openDecisions } = await import("./inventory/decisions.ts");
+	const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
+	const { config, ledger, root } = open();
+	const source = getSourceAdapter(config.source.stack);
+	source.frameworkDirs?.(config.source.path);
+	const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
+	const ds = openDecisions(ledger, config, source, targets, root);
+	if (ds.length) throw new Error(`${ds.length} open decision(s): ${ds.map((d) => d.id).join(", ")} — run \`br decide\` first (nothing is defaulted silently)`);
+}
+
+function flag(args: string[], name: string): string | undefined {
+	const i = args.indexOf(name);
+	return i >= 0 ? args[i + 1] : undefined;
+}
+
+export function open(): { config: Config; root: string; ledger: Ledger } {
+	const { config, root } = loadConfig();
+	process.env["BR_WORKSPACE"] = root; // adapters find generated artifacts (framework profile) here
+	return { config, root, ledger: new Ledger(statePath(root, "ledger.sqlite")) };
+}
+
+export function makeClient(): ModelClient {
+	return new OpenRouterClient();
+}
+
+function loadDotEnv() {
+	for (const dir of [process.cwd(), join(import.meta.dirname, "..")]) {
+		const p = join(dir, ".env");
+		if (!existsSync(p)) continue;
+		for (const line of readFileSync(p, "utf8").split("\n")) {
+			const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+			if (m && m[1] && process.env[m[1]] === undefined) process.env[m[1]] = m[2]!.replace(/^["']|["']$/g, "");
+		}
+	}
+}
+
+const handler = commands[cmd];
+if (!handler) {
+	console.error(pc.red(`unknown command: ${cmd}`));
+	await commands["help"]!([]);
+	process.exit(2);
+}
+try {
+	await handler(rest);
+} catch (e: any) {
+	console.error(pc.red(e?.message ?? String(e)));
+	if (process.env["BR_DEBUG"]) console.error(e);
+	process.exit(1);
+}
