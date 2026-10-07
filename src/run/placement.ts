@@ -97,7 +97,7 @@ export function codePlace(config: Config, meta: UnitMeta, root?: string): { plac
 		const p = source.placeFile?.(f, config.source.path);
 		if (rule) fromRule = true;
 		if (rule?.shared) shared = true;
-		if (!p && !rule?.area) why.push(`no adapter placement for ${f}`);
+		if (!p?.area && !rule?.area) why.push(`no adapter area for ${f}`);
 		const surface = p?.surface ?? labelled;
 		return { area: kebab(rule?.area ?? p?.area ?? genericArea(f)) || SHARED_AREA, stack: rule?.stack ?? (surface ? stackFor(config, surface) : undefined) };
 	});
@@ -353,7 +353,7 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 		ledger.updateUnit(r.id, { meta: { place: { stack, area, shared, source: "answer" } satisfies StoredPlace } });
 		// similar files (same dir + stem) follow the answer's area; its stack only where the adapter cannot tell the surface
 		const source = getSourceAdapter(config.source.stack);
-		addRules(root, ((JSON.parse(r.meta) as UnitMeta).files ?? []).map((f) => ({ prefix: similarPrefix(f), area, ...(source.placeFile?.(f, config.source.path) ? {} : { stack }), ...(shared ? { shared } : {}) })));
+		addRules(root, ((JSON.parse(r.meta) as UnitMeta).files ?? []).map((f) => ({ prefix: similarPrefix(f), area, ...(source.placeFile?.(f, config.source.path)?.surface ? {} : { stack }), ...(shared ? { shared } : {}) })));
 		done.push(r.id);
 	}
 	if (done.length) placeCoveredWaiting(ledger, config, root);

@@ -29,11 +29,11 @@ export function phpSurface(path: string): "server" | "ui" {
 
 const gyroRoots = new Map<string, boolean>();
 /** Undefined when the path says nothing certain about its feature (the core then asks a model). */
-export function placePhpFile(path: string, root: string | undefined, isGyro: (root: string) => boolean): { area: string; surface: "server" | "ui" } | undefined {
+export function placePhpFile(path: string, root: string | undefined, isGyro: (root: string) => boolean): { area?: string; surface: "server" | "ui" } | undefined {
 	const gyro = root ? (gyroRoots.get(root) ?? gyroRoots.set(root, isGyro(root)).get(root)!) : GYRO_SHAPE.test(path);
 	if (!gyro) return undefined;
-	const area = gyroArea(path, root ? vocabFor(root) : EMPTY);
-	return area ? { area, surface: phpSurface(path) } : undefined;
+	// the surface is certain from the path even when the feature is not: the model then only picks the area
+	return { area: gyroArea(path, root ? vocabFor(root) : EMPTY), surface: phpSurface(path) };
 }
 
 interface Vocab {
@@ -73,19 +73,19 @@ function gyroArea(path: string, v: Vocab): string | undefined {
 	}
 	if ((m = /(?:^|\/)model\/classes\/(.+)$/.exec(path))) {
 		const segs = m[1]!.split("/");
-		return segs.length > 1 ? match(stem(segs.at(-1)!), v) : canon(stem(segs[0]!), v);
+		return match(stem(segs.at(-1)!), v); // status.base, metadataids.base: no feature of their own → model
 	}
 	if ((m = /(?:^|\/)lib\/components\/(.+)$/.exec(path))) {
 		const segs = m[1]!.split("/");
-		if (segs.length > 1) return SHARED_DIRS.has(segs[0]!) ? match(stem(segs.at(-1)!), v) : canon(segs[0]!, v); // utils/releasemediafileinfo → releasemediafile
+		if (segs.length > 1) return SHARED_DIRS.has(segs[0]!) ? match(stem(segs.at(-1)!), v) : (match(segs[0]!, v) ?? kebab(segs[0]!)); // utils/releasemediafileinfo → releasemediafile; dataservice/… (a subsystem dir) → dataservice
 		const s = stem(segs[0]!);
-		return match(s, v) ?? ((v.families.get(key(s)) ?? 0) >= 2 ? kebab(s) : undefined);
+		return match(s, v); // clock, uuid, normalizer.*: utilities, not features → model (shared topic or a feature)
 	}
 	if ((m = /(?:^|\/)lib\/interfaces\/i?([^/]+)$/.exec(path))) return match(stem(m[1]!), v); // iplannable → plannings
 	if ((m = /(?:^|\/)lib\/[^/]+\/([^/]+)$/.exec(path))) return match(stem(m[1]!), v); // helpers, exceptions
-	if ((m = /(?:^|\/)controller\/([^/]+)$/.exec(path))) return canon(stem(m[1]!), v);
+	if ((m = /(?:^|\/)controller\/([^/]+)$/.exec(path))) return match(stem(m[1]!), v);
 	if (/(?:^|\/)controller\//.test(path)) return COMMON; // base controllers, routes, traits, tools
-	if ((m = /(?:^|\/)behaviour\/([^/]+)\/([^/]+)$/.exec(path))) return SHARED_DIRS.has(m[1]!) ? COMMON : canon(stem(m[2]!), v); // accesscontrol, confirmation handlers
+	if ((m = /(?:^|\/)behaviour\/([^/]+)\/([^/]+)$/.exec(path))) return SHARED_DIRS.has(m[1]!) ? COMMON : match(stem(m[2]!), v); // accesscontrol, confirmation handlers
 	if (/(?:^|\/)behaviour\//.test(path)) return COMMON;
 	if ((m = /(?:^|\/)(dashboards?)\//.exec(path))) return canon(m[1]!, v);
 	return undefined; // entry scripts, bootstrap, stubs: the model decides

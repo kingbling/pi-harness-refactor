@@ -6,7 +6,7 @@ import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { draftedOutside, runUnit } from "../src/run/unit.ts";
 import { getTargetAdapter, knownTargets, TARGET_ROLES } from "../src/adapters/registry.ts";
-import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
+import { applyPlacementAnswers, codePlace, placeUnit, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
  * Placement: one legacy area → one feature module per stack. Code places clear cases (gyro layout), placement.json
@@ -79,6 +79,15 @@ describe("placement", () => {
 		for (const u of ledger.listUnits()) expect(place(u.id).area).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
 	});
 
+	it("code never names an area after a single legacy file, but always knows the surface of a framework file", () => {
+		for (const f of ["app/model/classes/base/status.base.php", "app/lib/components/clock.cls.php", "app/controller/catch400http.controller.php"]) {
+			const c = codePlace(config, { files: [f] }, ws);
+			expect(c.unsure, f).toMatch(/no adapter area/);
+			expect(c.surfaceKnown, f).toBe(true); // Jev only picks the area: server code never lands on the UI stack
+			expect(c.place.stackId, f).toBe("nestjs");
+		}
+	});
+
 	it("overrides: placement.json prefix rules win over code", () => {
 		writeFileSync(join(ws, ".bigrefactor", "placement.json"), JSON.stringify({ rules: [{ prefix: "app/view/templates/default/campaign/", area: "billing" }] }));
 		expect(place("campaign_list")).toMatchObject({ stackId: "react", area: "billing", source: "override" });
@@ -91,17 +100,18 @@ describe("placement", () => {
 				const s = req.state as { path?: string };
 				if (s.path?.includes("fpdf")) return { area: "campaign", ui: false };
 				if (s.path?.includes("uuid")) return { area: "other", ui: false };
+				if (s.path?.includes("money")) return { area: "shared" };
 				return {};
 			},
 			chat: () => ({ json: { id: "placement", question: "Where does the uuid helper belong?", options: [], recommended: "", opinion: "It has no feature of its own." } }),
 		});
 		const r = await resolvePlacements({ ledger, config, root: ws, client });
-		// money: its own area has no other unit, and agency + campaign depend on it → shared (no question)
-		expect(place("money")).toMatchObject({ stackId: "nestjs", area: "money", shared: true });
+		// money matches no feature of the app: never an area named after the file by code; Jev calls it cross-cutting
+		expect(place("money")).toMatchObject({ stackId: "nestjs", area: "money", shared: true, source: "model" });
 		// the agency entity is used by campaign too, but agency is a feature module: it stays there
 		expect(place("agency_model")).toMatchObject({ area: "agency", shared: false });
 		expect(place("fpdf")).toMatchObject({ stackId: "nestjs", area: "campaign", source: "model" });
-		expect(r.byModel).toBe(1);
+		expect(r.byModel).toBe(2);
 		expect(r.asked).toBe(1);
 		const q = ledger.openQuestions().find((x) => x.unit_id === "uuid")!;
 		expect(q.point).toBe("placement");
@@ -117,7 +127,7 @@ describe("placement", () => {
 		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["uuid"]);
 		expect(place("uuid")).toMatchObject({ stackId: "nestjs", area: "ids", shared: true, source: "answer" });
 		const rules = JSON.parse(readFileSync(join(ws, ".bigrefactor", "placement.json"), "utf8")).rules;
-		expect(rules).toContainEqual({ prefix: "app/lib/components/uuid.", area: "ids", stack: "nestjs", shared: true });
+		expect(rules).toContainEqual({ prefix: "app/lib/components/uuid.", area: "ids", shared: true }); // the adapter knows the surface: no stack pin
 		// a similar file is placed by the rule, without Jev or a question
 		writeFileSync(join(config.source.path, "app/lib/components/uuid.v4.cls.php"), "<?php\n");
 		unit("uuid_v4", ["app/lib/components/uuid.v4.cls.php"]);
@@ -147,8 +157,8 @@ describe("placement", () => {
 		writeFileSync(join(config.source.path, "app/lib/components/uuid.v4.cls.php"), "<?php\n");
 		const failing = new FakeModelClient({ decide: () => { throw new Error("provider down"); }, chat: () => ({ json: { id: "placement", question: "Where?", options: [], recommended: "", opinion: "" } }) });
 		const r = await resolvePlacements({ ledger, config, root: ws, client: failing });
-		expect(r.asked).toBe(3); // fpdf, uuid, uuid_v4
-		for (const id of ["fpdf", "uuid", "uuid_v4"]) {
+		expect(r.asked).toBe(4); // money, fpdf, uuid, uuid_v4
+		for (const id of ["money", "fpdf", "uuid", "uuid_v4"]) {
 			expect(unplacedReason(config, ledger.getUnit(id)!.meta, ws), id).toBeTruthy();
 			expect(ledger.blockedUnits().has(id), id).toBe(true);
 		}
@@ -163,7 +173,7 @@ describe("placement", () => {
 
 	it("no model at all: unsure units get a question too", async () => {
 		const r = await resolvePlacements({ ledger, config, root: ws });
-		expect(r.asked).toBe(2);
+		expect(r.asked).toBe(3); // money, fpdf, uuid
 		expect(unplacedReason(config, ledger.getUnit("uuid")!.meta, ws)).toBeTruthy();
 		ledger.withdrawQuestion(ledger.openQuestions().find((x) => x.unit_id === "uuid")!.id, "test");
 		await expect(runUnit({ ledger, config, root: ws, unitId: "uuid", log: () => {} })).rejects.toThrow(/no placement yet \(code unsure/);

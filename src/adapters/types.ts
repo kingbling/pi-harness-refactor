@@ -132,9 +132,10 @@ export interface SourceAdapter {
 	 * one feature module per target stack) and its `surface` (ui → the UI target, server → the backend).
 	 * `root` (the legacy source root) lets the adapter canonicalize names against the whole tree; callers go
 	 * through placeUnit (src/run/placement.ts), which always passes it. Undefined = not sure: the core falls back to a
-	 * generic guess and lets a model (then a human) decide.
+	 * generic guess and lets a model (then a human) decide. `area` may be missing while `surface` is certain (the
+	 * adapter knows a file is server code but not its feature): the model then picks only the area, never the stack.
 	 */
-	placeFile?(path: string, root?: string): { area: string; surface: "server" | "ui" } | undefined;
+	placeFile?(path: string, root?: string): { area?: string; surface: "server" | "ui" } | undefined;
 	/**
 	 * Name parts only legacy file names carry (file kinds, extensions, lowercase). A target file or class name
 	 * containing one is named after a legacy file: structure_ok fails it.
