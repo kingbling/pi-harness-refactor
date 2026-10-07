@@ -25,6 +25,8 @@ export interface PromptOption {
 export interface InitPrompter {
 	text(message: string, initial: string): Promise<string | undefined>;
 	select(message: string, options: PromptOption[], initial?: string): Promise<string | undefined>;
+	/** Checkboxes plus a free-text note (`other` is the hint of the note field). */
+	multi?(message: string, options: PromptOption[], initial: string[], other: string): Promise<{ values: string[]; note: string } | undefined>;
 	log(line: string): void;
 }
 
@@ -44,6 +46,13 @@ export const terminalPrompter: InitPrompter = {
 	// default shown as placeholder, taken on Enter; typing replaces it instead of appending to it
 	text: async (message, initial) => str(await p.text({ message, placeholder: initial, defaultValue: initial })),
 	select: async (message, options, initialValue) => str(await p.select({ message, options, initialValue })),
+	multi: async (message, options, initialValues, other) => {
+		const v = await p.multiselect({ message, options, initialValues, required: false });
+		if (p.isCancel(v)) return undefined;
+		const note = await p.text({ message: "Anything else? (your own words, optional)", placeholder: other, defaultValue: "" });
+		if (p.isCancel(note)) return undefined;
+		return { values: v as string[], note: String(note ?? "").trim() };
+	},
 	log: (line) => console.log(line),
 };
 

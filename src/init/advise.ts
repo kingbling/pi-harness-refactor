@@ -10,6 +10,7 @@ import type { ModelClient } from "../models/types.ts";
 import { decisionsPath, loadDecisions, openDecisions, type Decision } from "../inventory/decisions.ts";
 import { planFrameworks } from "../inventory/frameworks.ts";
 import { progress } from "../progress.ts";
+import { goalsText } from "../policy.ts";
 
 /**
  * `br advise`: judgments come from models, facts from code. Code collects the evidence (index, framework
@@ -140,7 +141,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 			"\nReturn every listed item exactly once with a one-sentence reason grounded in what the code/library does. successor is \"\" unless verdict is replace.",
 		].join("\n");
 		const t0 = progress.tally();
-		const res = await client.chat({ model: config.models.escalate.id, tier: config.models.escalate.tier as any, messages: [{ role: "system", content: "You are a senior migration architect. Be concrete; never invent packages." }, { role: "user", content: prompt }], schema, effort: "medium" });
+		const res = await client.chat({ model: config.models.escalate.id, tier: config.models.escalate.tier as any, messages: [{ role: "system", content: `You are a senior migration architect. Be concrete; never invent packages.${goalsText(config.goals) ? `\n\n${goalsText(config.goals)}` : ""}` }, { role: "user", content: prompt }], schema, effort: "medium" });
 		cost += res.usage.costUsd;
 		const out = (res.json ?? {}) as { libraries?: Array<{ name: string; verdict: string; successor: string; condition?: string; reason: string }>; classes?: Array<{ name: string; verdict: string; reason: string }> };
 		for (const l of out.libraries ?? []) {

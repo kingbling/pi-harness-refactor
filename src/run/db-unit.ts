@@ -8,7 +8,7 @@ import { spawnLeaf } from "../sessions/spawn.ts";
 import { runGate, renderGate, sha1, type GateReport } from "./gate.ts";
 import { rulesText } from "./prompts.ts";
 import type { UnitRunOptions, UnitRunResult } from "./unit.ts";
-import { CODE_QUALITY } from "../policy.ts";
+import { CODE_QUALITY, goalsText } from "../policy.ts";
 
 /** Fallback when a target adapter declares no data dirs. */
 const DEFAULT_DATA_DIRS = ["db/", "migrations/"];
@@ -46,6 +46,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		adapter.layout.dataAccessHint ? `Data access in this stack: ${adapter.layout.dataAccessHint}.` : "",
 		`Tests: ${adapter.layout.testHint} Write at least one test next to your files that proves the schema (entity/column metadata or the migration's DDL) — or for the data lane, the transformation on a small in-memory fixture. Tests must run without a live database.`,
 		CODE_QUALITY,
+		goalsText(o.config.goals),
 		"Never write credentials. Never edit files outside your directories; other units build features on what you write, so names must match the legacy tables exactly unless your task says otherwise.",
 		rulesText(o.root, place.stackId),
 	].filter(Boolean).join("\n\n");

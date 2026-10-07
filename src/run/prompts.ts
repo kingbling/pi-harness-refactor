@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { rulesDir } from "../rules/layout.ts";
 import type { Config } from "../config.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
-import { CODE_QUALITY } from "../policy.ts";
+import { CODE_QUALITY, goalsText } from "../policy.ts";
 
 /** Prompts are short. Everything specific comes from the task card and the pull tools. */
 
@@ -56,7 +56,7 @@ Finish with one line: "TESTER DONE <n> cases".
 
 The interface you draft follows the code quality policy (names, typed input validation at the boundary, no extra layers):
 ${CODE_QUALITY}
-
+${goalsText(config.goals) ? `\n${goalsText(config.goals)}\n` : ""}
 ${behaviourPolicy(opts.source)}
 
 ${opts.rules ? `## Target rules (${opts.stackId}; the layout section is binding)\n${opts.rules}` : `## Layout of area "${opts.area}" (${opts.stackId})\n${opts.structureDoc}`}`;
@@ -76,7 +76,7 @@ ${opts.attempt > 1 ? `- This is attempt ${opts.attempt}. The gate output is in t
 Finish with one line: "IMPLEMENTER DONE" plus anything the reviewer must know.
 
 ${CODE_QUALITY}
-
+${goalsText(config.goals) ? `\n${goalsText(config.goals)}\n` : ""}
 ${behaviourPolicy(opts.source, "your final message (the tester records quirks)")}
 ${opts.quirks ? `\n## Quirks of this unit (decided)\n${opts.quirks}\nKept quirks get a \`${opts.target.layout.legacyMarker("<why>")}\` comment; dropped ones are not reproduced.` : ""}
 

@@ -20,7 +20,7 @@ import { lanes, parseLanesArgs } from "../run/lanes.ts";
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { QuestionCard, type CardQuestion } from "./question-card.ts";
+import { QuestionCard, type CardAnswer, type CardQuestion } from "./question-card.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
@@ -74,8 +74,10 @@ interface BrEntry {
  * result is persisted with the session.
  */
 /** A question card (options with descriptions, recommendation preselected, or a prefilled text field); undefined = cancelled. */
-function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<string | undefined> {
-	return ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) => {
+function askCard(ctx: ExtensionContext, q: CardQuestion & { multi?: undefined }): Promise<string | undefined>;
+function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<CardAnswer | undefined>;
+function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<CardAnswer | undefined> {
+	return ctx.ui.custom<CardAnswer | undefined>((tui, _theme, _kb, done) => {
 		const card = new QuestionCard(q, done);
 		const handle = card.handleInput.bind(card);
 		card.handleInput = (data: string) => {
@@ -111,6 +113,20 @@ function piPrompter(ctx: ExtensionContext, lines: string[], hooks: { asking?: ()
 			const v = await ctx.ui.select(message, labels(ordered));
 			hooks.answered?.();
 			return byLabel(ordered, v);
+		},
+		multi: async (message, options, initial, other) => {
+			hooks.asking?.();
+			let got: { values: string[]; note: string } | undefined;
+			if (ctx.hasUI) {
+				// checkboxes, each with its description, plus a last row for the owner's own words
+				const v = await askCard(ctx, { message, multi: { initial }, other, options: options.map((o) => ({ value: o.value, label: o.label, description: o.hint })) });
+				got = v === undefined || typeof v === "string" ? undefined : v;
+			} else {
+				const note = await ctx.ui.input(`${message.split("\n")[0]} (picked: ${initial.join(", ")}; anything to add?)`, "");
+				got = note === undefined ? undefined : { values: initial, note: note.trim() };
+			}
+			hooks.answered?.();
+			return got;
 		},
 		log: (line) => lines.push(plain(line)),
 	};

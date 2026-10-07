@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { QuestionCard } from "../src/pi/question-card.ts";
+import { QuestionCard, type CardAnswer } from "../src/pi/question-card.ts";
 
 /** The decision card in Pi: context and option descriptions are shown, the recommendation is preselected. */
 const plain = (lines: string[]) => lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
 const UP = "\x1b[A", DOWN = "\x1b[B", ENTER = "\r", ESC = "\x1b";
 
 function card(q: ConstructorParameters<typeof QuestionCard>[0]) {
-	const got: Array<string | undefined> = [];
+	const got: Array<CardAnswer | undefined> = [];
 	const c = new QuestionCard(q, (v) => got.push(v));
 	return { c, got };
 }
@@ -57,5 +57,43 @@ describe("question card", () => {
 		for (const ch of "2") b.c.handleInput(ch);
 		b.c.handleInput(ENTER);
 		expect(b.got).toEqual(["../app-new2"]);
+	});
+
+	it("checkboxes: the defaults start checked, Space or a number toggles, the last row takes your own words (digits and spaces are text there), Enter sends both", () => {
+		const a = card({
+			message: "What should this migration achieve?",
+			multi: { initial: ["new-stack", "security"] },
+			other: "add your own",
+			options: [
+				{ value: "new-stack", label: "move to the new stack" },
+				{ value: "security", label: "fix security problems" },
+				{ value: "new-ui", label: "new look for the UI" },
+			],
+		});
+		let out = plain(a.c.render(80));
+		expect(out).toMatch(/❯ 1\. \[✔\] move to the new stack/);
+		expect(out).toMatch(/3\. \[ \] new look for the UI/);
+		expect(out).toContain("✎  add your own");
+		a.c.handleInput("3"); // check new-ui
+		a.c.handleInput(" "); // cursor on row 1: uncheck new-stack
+		a.c.handleInput(UP); // wraps to the own-words row
+		for (const ch of "keep the 2 APIs") a.c.handleInput(ch);
+		out = plain(a.c.render(80));
+		expect(out).toContain("keep the 2 APIs");
+		expect(out).toMatch(/1\. \[ \] move to the new stack/);
+		expect(a.got).toEqual([]); // typing never sends
+		a.c.handleInput(ENTER);
+		expect(a.got).toEqual([{ values: ["security", "new-ui"], note: "keep the 2 APIs" }]);
+	});
+
+	it("a single choice with an own-words row: the typed text is the answer; Enter on an empty row does nothing", () => {
+		const a = card({ ...q, other: "type something else" });
+		a.c.handleInput(DOWN);
+		a.c.handleInput(DOWN); // 2 → 3 → own words
+		a.c.handleInput(ENTER);
+		expect(a.got).toEqual([]);
+		for (const ch of "laravel") a.c.handleInput(ch);
+		a.c.handleInput(ENTER);
+		expect(a.got).toEqual(["laravel"]);
 	});
 });

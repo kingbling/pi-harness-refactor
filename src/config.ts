@@ -71,6 +71,15 @@ export const ConfigSchema = z.object({
 			inputsAt: z.string().optional(),
 		})
 		.prefault({ strategy: "keep-schema" }),
+	/** What the owner wants from this migration (asked first in onboarding): the picked goals plus their own words. Every model prompt quotes it. */
+	goals: z
+		.object({
+			picked: z.array(z.string()).default([]),
+			note: z.string().optional(),
+			/** When onboarding asked (asked once; `br onboard --force-goals` asks again). */
+			askedAt: z.string().optional(),
+		})
+		.prefault({}),
 	models: z.object({
 		decide: ModelRoleSchema.default({ id: "typesafe/jev-1.13", tier: "default", fallback: [] }),
 		implement: ModelRoleSchema.default({ id: "openai/gpt-6-luna", tier: "flex", fallback: ["openai/gpt-6-luna"] }),

@@ -45,6 +45,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 	const ABOUT: Record<string, string> = {
 		init: "survey the old codebase: framework, data stores, UI, tests",
+		goals: "what this migration should achieve: pick the goals, add your own words",
 		database: "a database was detected: point to its schema files, a data dump and a connection",
 		inventory: "index every file and symbol, find dead code, cut cycles, build migration units",
 		profile: "a model reads the legacy framework source and writes its conventions (loaders, routes, concerns)",
@@ -120,6 +121,18 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			await init(args.filter((a) => a !== "--no-llm"), { root, prompter: ui, embedded: true });
 		});
 		reload();
+
+		// the first real question: what the migration is for; every model prompt quotes the answer
+		await step("goals", () => (config.goals.askedAt && !args.includes("--force-goals") ? `asked ${config.goals.askedAt.slice(0, 10)}: ${config.goals.picked.join(", ")}${config.goals.note ? " + your note" : ""}` : undefined), async () => {
+			const { askGoals } = await import("./goals.ts");
+			const got = await askGoals(ui, yes, config.goals.askedAt ? config.goals : undefined);
+			const { saveConfig } = await import("../config.ts");
+			const raw = loadConfig(configPath).config;
+			raw.goals = { ...got, askedAt: new Date().toISOString() };
+			saveConfig(root, raw);
+			reload();
+			return `${got.picked.join(", ")}${got.note ? ` + "${got.note.length > 60 ? got.note.slice(0, 57) + "…" : got.note}"` : ""}`;
+		});
 
 		// submodules never downloaded (a framework kept as one looks absent): checked on every start, before anything reads the code
 		{
