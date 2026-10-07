@@ -251,3 +251,24 @@ describe("area taxonomy", () => {
 		expect(taxonomyHold(ledger.getUnit("A4")!.meta)).toMatch(/excluded/);
 	});
 });
+
+describe("area taxonomy idempotency", () => {
+	it("a second pass costs nothing when every area is already curated", async () => {
+		const { root, config, ledger } = setup();
+		ledger.upsertFile({ path: "app/f.php", hash: "h", lang: "php", loc: 1 });
+		ledger.upsertSymbol({ id: "app/f.php::X", path: "app/f.php", kind: "class", name: "X" });
+		ledger.createUnit({ id: "B1", tier: "T0", symbolIds: ["app/f.php::X"], meta: { files: ["app/f.php"], place: { stack: "nestjs", area: "flights", shared: false, source: "code" } } });
+		let calls = 0;
+		const client = new FakeModelClient({ chat: (req) => {
+			calls++;
+			if (req.messages[0]!.content.includes("legacy codebase")) return { text: "brief" };
+			return { json: { stacks: [{ stack: "nestjs", areas: [{ name: "flights", purpose: "x" }] }], mappings: [{ from: "nestjs:flights", to: "area", stack: "nestjs", area: "flights", confidence: 1, why: "ok" }] } };
+		} });
+		const { curateAreas } = await import("../src/run/taxonomy.ts");
+		await curateAreas({ ledger, config, root, client });
+		const before = calls;
+		const r = await curateAreas({ ledger, config, root, client });
+		expect(calls).toBe(before);
+		expect(r).toMatchObject({ applied: 0, asked: 0, costUsd: 0, areas: { nestjs: ["flights"] } });
+	});
+});

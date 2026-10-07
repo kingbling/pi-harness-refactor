@@ -64,6 +64,10 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 	if (!d.client) return none;
 	const areas = currentAreas(d.ledger);
 	if (!areas.length) return none;
+	// idempotent: when every feature area is already in the curated set (and no area question is pending), nothing to do
+	const prev = existsSync(areasPath(d.root)) ? (JSON.parse(readFileSync(areasPath(d.root), "utf8")) as { stacks?: Array<{ stack: string; areas: Array<{ name: string }> }> }) : undefined;
+	const curated = new Set((prev?.stacks ?? []).flatMap((s) => s.areas.map((a) => `${s.stack}:${kebab(a.name)}`)));
+	if (prev && areas.every((a) => a.shared || curated.has(`${a.stack}:${a.area}`))) return { ...none, areas: Object.fromEntries((prev.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])) };
 	const brief = await repoBrief(d);
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
