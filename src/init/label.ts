@@ -6,6 +6,7 @@ import { ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { planSlices, type SliceOverrides } from "../inventory/slices.ts";
+import { resolvePlacements } from "../run/placement.ts";
 
 /**
  * `br label` (onboarding step): Jev judges what the inventory can only guess.
@@ -14,6 +15,7 @@ import { planSlices, type SliceOverrides } from "../inventory/slices.ts";
  *     replaces the adapter's path heuristic when Jev is confident.
  *  2. feature slices: which ones are authentication/session (they go first) → `slices.json → advised.auth`.
  *  3. units no entry point reaches (`dynamic` slice): which feature they belong to → `advised.units`.
+ *  4. placement: every planned unit's target stack + legacy area (code, Jev where code is unsure, else a question).
  * Advice never overrides a human: explicit `overrides` in slices.json win. Every call lands in the
  * decisions table for calibration. Cheap: Jev ≈ $0.00004 per call.
  */
@@ -23,7 +25,7 @@ const SQL_TEXT = /["'`]\s*(SELECT\s.+\sFROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DEL
 const GLOBAL_TEXT = /\$_SESSION|\$_COOKIE|\$GLOBALS|^\s*global\s+\$|\bsession_(start|id|destroy)\(/m;
 const LEVELS = ["mechanical", "moderate", "hard"] as const;
 
-export async function labelUnits(config: Config, root: string, ledger: Ledger, client: ModelClient, opts: { concurrency?: number; log?: (l: string) => void; onProgress?: (detail: string) => void } = {}): Promise<{ units: number; hard: number; auth: string[]; placed: number; costUsd: number }> {
+export async function labelUnits(config: Config, root: string, ledger: Ledger, client: ModelClient, opts: { concurrency?: number; log?: (l: string) => void; onProgress?: (detail: string) => void } = {}): Promise<{ units: number; hard: number; auth: string[]; placed: number; areas: { placed: number; asked: number }; costUsd: number }> {
 	const log = opts.log ?? console.log;
 	const model = config.models.decide.id;
 	let cost = 0;
@@ -166,5 +168,8 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 	writeFileSync(p, JSON.stringify(ov, null, 2) + "\n");
 	const placed = Object.keys(advised.units ?? {}).length - placedBefore;
 	if (features.length) log(`  slices: auth = ${auth.join(", ") || "none"}; ${placed}/${dyn.length} unreached units placed (${byCode} by folder neighbours, ${placed - byCode} by Jev)`);
-	return { units: units.length, hard, auth, placed, costUsd: cost };
+	// after the labels: Jev's has_ui decides the surface where the source adapter cannot tell
+	const areas = await resolvePlacements({ ledger, config, root, client, log, concurrency: opts.concurrency });
+	cost += areas.costUsd;
+	return { units: units.length, hard, auth, placed, areas: { placed: areas.placed, asked: areas.asked }, costUsd: cost };
 }

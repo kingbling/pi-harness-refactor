@@ -9,6 +9,10 @@ import type { Ledger } from "../ledger/db.ts";
 import { captures, parse } from "../inventory/treesitter.ts";
 import { sharedSymbols } from "../inventory/target.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
+import { QUIRK_KINDS, recordQuirk, type QuirkKind } from "../run/quirks.ts";
+import { proposeRule } from "../rules/living.ts";
+import { rulesDir } from "../rules/layout.ts";
+import { findCapabilities, renderCapability } from "../inventory/capabilities.ts";
 
 /**
  * Pull tools for leaf sessions. All read from the ledger index (source AND target side) so answers
@@ -23,6 +27,8 @@ export interface ToolDeps {
 	root: string; // project root (where bigrefactor.config.json lives)
 	targetProjectDir: string;
 	adapter: TargetAdapter;
+	/** The unit's area module (from placement), relative to the target project; lookups rank it first. */
+	moduleDir?: string;
 }
 
 const text = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details });
@@ -98,12 +104,18 @@ export function targetLookup(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "target_lookup",
 		label: "Target lookup",
-		description: "Search symbols that already exist in the NEW codebase (accepted migrations): by name fragment, or by the legacy symbol they came from. Use before writing anything that might already exist.",
+		description: "Search symbols that already exist in the NEW codebase (accepted migrations): by name fragment, or by the legacy symbol they came from. Results in this unit's area module come first. Use before writing anything that might already exist; query \"*\" lists the area's existing symbols.",
 		promptSnippet: "target_lookup: what already exists in the new codebase (reuse, do not duplicate)",
 		parameters: Type.Object({ query: Type.String({ description: "name fragment, or a legacy symbol id to find its migrated counterpart" }) }),
 		execute: async (_id, p) => {
+			if (p.query === "*" && d.moduleDir) {
+				const rows = d.ledger.db.prepare("SELECT id, kind, path, line, signature FROM index_symbols WHERE side = 'target' AND path LIKE ? ORDER BY path, line LIMIT 60").all(`%${d.moduleDir}/%`) as Array<any>;
+				return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}] ${r.path}:${r.line}${r.signature ? ` ${r.signature}` : ""}`).join("\n") : `the area module ${d.moduleDir}/ is empty — you create its first files`);
+			}
 			const viaMoves = d.ledger.db.prepare("SELECT src_symbol, op, target_symbols, why FROM moves WHERE src_symbol = ? OR src_symbol LIKE ?").all(p.query, `%::${p.query}`) as Array<{ src_symbol: string; op: string; target_symbols: string; why: string }>;
-			const direct = d.ledger.db.prepare("SELECT id, kind, path, line, signature, doc FROM index_symbols WHERE side = 'target' AND (lower(name) LIKE ? OR lower(id) LIKE ? OR lower(doc) LIKE ?) LIMIT 15").all(`%${p.query.toLowerCase()}%`, `%${p.query.toLowerCase()}%`, `%${p.query.toLowerCase()}%`) as Array<any>;
+			const q = `%${p.query.toLowerCase()}%`;
+			const area = d.moduleDir ? `%${d.moduleDir}/%` : "";
+			const direct = d.ledger.db.prepare("SELECT id, kind, path, line, signature, doc FROM index_symbols WHERE side = 'target' AND (lower(name) LIKE ? OR lower(id) LIKE ? OR lower(doc) LIKE ?) ORDER BY (path LIKE ?) DESC LIMIT 15").all(q, q, q, area) as Array<any>;
 			const out: string[] = [];
 			for (const m of viaMoves) out.push(`${m.src_symbol} was ${m.op} → ${JSON.parse(m.target_symbols).join(", ")}  (${m.why})`);
 			for (const r of direct) out.push(`${r.id}  [${r.kind}] ${r.path}:${r.line}${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`);
@@ -120,9 +132,9 @@ export function patternExamples(d: ToolDeps): ToolDefinition {
 		promptSnippet: "pattern_examples: how accepted code of a kind looks in this codebase",
 		parameters: Type.Object({ kind: Type.String(), limit: Type.Optional(Type.Number()) }),
 		execute: async (_id, p) => {
-			const rows = d.ledger.db.prepare("SELECT path FROM index_symbols WHERE side = 'target' AND kind = ? GROUP BY path ORDER BY MAX(rowid) DESC LIMIT ?").all(p.kind, p.limit ?? 3) as Array<{ path: string }>;
+			const rows = d.ledger.db.prepare("SELECT path FROM index_symbols WHERE side = 'target' AND kind = ? GROUP BY path ORDER BY MAX(path LIKE ?) DESC, MAX(rowid) DESC LIMIT ?").all(p.kind, d.moduleDir ? `%${d.moduleDir}/%` : "", p.limit ?? 3) as Array<{ path: string }>;
 			if (!rows.length) {
-				const idioms = safeRead(join(d.root, ".bigrefactor", "idioms.json"));
+				const idioms = safeRead(join(rulesDir(d.root, d.adapter.id), "idioms.json"));
 				return text(`no accepted ${p.kind} yet. Follow RULES.md and the idiom table${idioms ? `:\n${idioms.slice(0, 3000)}` : ""}.`);
 			}
 			return text(rows.map((r) => `### ${r.path}\n\`\`\`ts\n${safeRead(join(d.targetProjectDir, r.path))?.slice(0, 4000) ?? "(missing)"}\n\`\`\``).join("\n\n"));
@@ -201,11 +213,68 @@ export function ledgerProve(d: ToolDeps): ToolDefinition {
 	});
 }
 
+export function findCapabilityTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "find_capability",
+		label: "Find capability",
+		description: "Search the business logic that already exists in the NEW codebase by meaning: describe what you need in domain words (e.g. \"available screen slots of a flight\", \"agency invoice total\"). Returns capability cards (what it does, inputs → output, legacy origin), best first, across all areas. Call it before implementing any calculation, rule, lookup or workflow; reuse (import/inject) what fits instead of rewriting it.",
+		promptSnippet: "find_capability: existing business logic by meaning (reuse before writing)",
+		parameters: Type.Object({ need: Type.String({ description: "what the code must do, in domain words" }), stack: Type.Optional(Type.String({ description: "limit to one target stack" })) }),
+		execute: async (_id, p) => {
+			const hits = findCapabilities(d.ledger, p.need, { stack: p.stack, limit: 8 });
+			return text(hits.length ? hits.map(renderCapability).join("\n") : `no capability matches "${p.need}" yet — you are the first to implement it; give it a doc comment so others find it`);
+		},
+	});
+}
+
+export function recordQuirkTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "record_quirk",
+		label: "Record quirk",
+		description:
+			"Record an oddity of the OLD code instead of pinning it blindly: a language artifact (loose emptiness/truthiness, implicit coercion), an edge case, a suspected bug, or intentional-looking odd behaviour. Give your opinion: drop (the new code implements the intended behaviour) or keep (callers depend on it). Language artifacts with opinion drop are dropped without asking; everything else is asked to the owner. Write your test cases the way your opinion says.",
+		promptSnippet: "record_quirk: note a legacy oddity with your opinion (drop|keep) instead of pinning it",
+		parameters: Type.Object({
+			symbolId: Type.String({ description: "legacy symbol id from the task card" }),
+			kind: Type.Union(QUIRK_KINDS.map((k) => Type.Literal(k))),
+			behaviour: Type.String({ description: "what the old code does, concretely" }),
+			example: Type.Optional(Type.String({ description: "input → output on the old code" })),
+			opinion: Type.Union([Type.Literal("drop"), Type.Literal("keep")]),
+			why: Type.String({ description: "one or two sentences: who could depend on it, what the intended behaviour is" }),
+		}),
+		execute: async (_id, p) => {
+			const sym = d.ledger.getSymbol(p.symbolId);
+			if (!sym || sym.unit_id !== d.unitId) return text(`${p.symbolId} is not a symbol of ${d.unitId}; use ids from the task card`, { error: true });
+			const r = recordQuirk(d, { unitId: d.unitId, symbolId: p.symbolId, kind: p.kind as QuirkKind, behaviour: p.behaviour, example: p.example, opinion: p.opinion as "drop" | "keep", why: p.why });
+			return text(r.status === "dropped" ? `quirk #${r.id} dropped (language artifact): do not pin it; test the intended behaviour.` : `quirk #${r.id} recorded; the owner will be asked. Write the cases following your opinion (${p.opinion}).`, r);
+		},
+	});
+}
+
+export function proposeRuleTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "propose_rule",
+		label: "Propose rule",
+		description: `Propose an addition or change to the ${d.adapter.id} rules when you learn something other units will need (a convention, a reusable pattern, a pitfall in this codebase, a missing mapping). A curator merges proposals into the next rules version; changes that break already-migrated code are asked to the owner. Not for one-off details of this unit.`,
+		promptSnippet: "propose_rule: suggest a rule the other units of this stack should follow",
+		parameters: Type.Object({
+			kind: Type.Union([Type.Literal("add"), Type.Literal("change")]),
+			text: Type.String({ description: "the rule as it should read, one or two lines" }),
+			why: Type.String(),
+			evidence: Type.Optional(Type.String({ description: "files or symbol ids that show it" })),
+		}),
+		execute: async (_id, p) => {
+			const id = proposeRule(d, { stack: d.adapter.id, unitId: d.unitId, kind: p.kind as "add" | "change", text: p.text, why: p.why, evidence: p.evidence });
+			return text(`proposal #${id} recorded for the ${d.adapter.id} rules; keep following the current rules for this unit.`);
+		},
+	});
+}
+
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d)];
+	return [symbolLookup(d), whoCalls(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d)];
+	return [symbolLookup(d), whoCalls(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d)];
 }
 
 function safeRead(p: string): string | undefined {

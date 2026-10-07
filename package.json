@@ -42,6 +42,7 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@ast-grep/cli": "^0.45.3",
     "@earendil-works/pi-agent-core": "^1.0.4",
     "@earendil-works/pi-ai": "^1.0.4",
     "@earendil-works/pi-coding-agent": "^1.0.4",

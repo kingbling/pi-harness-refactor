@@ -78,7 +78,7 @@ describe("pi extension /br", () => {
 		console.log = (...a: unknown[]) => logs.push(a.join(" "));
 		try {
 			await br!.handler(`onboard --source ${join(ws, "legacy")} --stack php --target ${target} --to nestjs --db keep-schema --no-docs --no-llm`, c1);
-			for (const sub of ["status", "questions", "unaccounted", "frameworks", "order", "decide", "why routes.php"]) await br!.handler(sub, c1);
+			for (const sub of ["status", "questions", "unaccounted", "frameworks", "order", "layout", "decide", "why routes.php"]) await br!.handler(sub, c1);
 		} finally {
 			console.log = origLog;
 		}

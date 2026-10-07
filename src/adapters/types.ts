@@ -127,6 +127,19 @@ export interface SourceAdapter {
 		run(sourceRoot: string, scriptPath: string): { cmd: string; args: string[] };
 		instructions: string;
 	};
+	/**
+	 * Where one source file belongs in the target: its legacy feature `area` (kebab-case, no dots; one area =
+	 * one feature module per target stack) and its `surface` (ui → the UI target, server → the backend).
+	 * `root` (the legacy source root) lets the adapter canonicalize names against the whole tree; callers go
+	 * through placeUnit (src/run/placement.ts), which always passes it. Undefined = not sure: the core falls back to a
+	 * generic guess and lets a model (then a human) decide.
+	 */
+	placeFile?(path: string, root?: string): { area: string; surface: "server" | "ui" } | undefined;
+	/**
+	 * Name parts only legacy file names carry (file kinds, extensions, lowercase). A target file or class name
+	 * containing one is named after a legacy file: structure_ok fails it.
+	 */
+	legacyWords?: string[];
 	/** Official docs to fetch at init (llms.txt style URLs preferred). */
 	docs: Array<{ name: string; url: string }>;
 }
@@ -140,13 +153,41 @@ export interface TargetSymbol {
 	line: number;
 	signature?: string;
 	doc?: string;
+	/** "class", decorators, "shared"; "internal" = not exported/private (reuse check only, never indexed). */
 	tags: string[];
+	/** Normalized body hash (identifiers kept, whitespace/comments dropped) for duplicate detection. */
+	bodyHash?: string;
+}
+
+/** What the gate knows beyond the files when it checks structure. */
+export interface StructureContext {
+	/** The file did not exist before this unit (git: untracked). Without it every file counts as existing. */
+	isNew?(path: string): boolean;
+	/** Paths an approved tidy task names: their shape needs no further reason. */
+	sanctioned?: string[];
+	/** SourceAdapter.legacyWords: name parts of legacy file kinds a target name must not carry. */
+	legacyWords?: string[];
 }
 
 /** Where things live in the target project. Everything path-shaped in the core goes through this. */
 export interface TargetLayout {
-	/** Directory a migration module's code lives in, relative to the project (e.g. "src/invoices"). */
-	moduleDir(module: string): string;
+	/** Feature directory of one legacy area, relative to the project (e.g. "src/features/invoice"). */
+	moduleDir(area: string): string;
+	/** Concrete file-shape rules inside one feature dir (fed verbatim to rules generation and task cards). */
+	structureDoc: string;
+	/**
+	 * Problems with the files a unit wrote (paths relative to the project) against structureDoc; empty = fine.
+	 * Lines starting with "warning:" are shown, never failed. `ctx` (the gate) says which files are new and which a
+	 * tidy task sanctions, so shapes allowed only with a reason (a second file of a kind) can be judged.
+	 */
+	checkStructure?(files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext): string[];
+	/**
+	 * Drift findings of the whole project tree against structureDoc (naming, size cap, one class per responsibility),
+	 * one `<project-relative path>: <finding>` per line; `only` limits them to those files. Without `only`, area-wide
+	 * findings are anchored at `<moduleDir>/` (several same-kind classes in one area). Folders outside the feature
+	 * root and shared dirs are the core's part (it knows the scaffold).
+	 */
+	checkTree?(projectDir: string, only?: string[]): string[];
 	/** Add-only zones for cross-cutting helpers (reuse, never edit from a feature unit). Trailing slash. */
 	sharedDirs: string[];
 	/** Globs (relative to the project) the tester may write ported tests to, for one module dir. */
@@ -194,6 +235,8 @@ export interface TargetAdapter {
 	/** Decisions asked at init; see StackChoice. */
 	stackChoices?: StackChoice[];
 	id: string;
+	/** Which surface this stack owns: placement sends ui units to the first "ui" stack, the rest to the "server" one. */
+	role: "server" | "ui";
 	/** Sub-directory of the target repo this stack lives in when several stacks share one repo (e.g. "api", "web"). */
 	subdir: string;
 	layout: TargetLayout;
@@ -213,7 +256,7 @@ export interface TargetAdapter {
 	detect(root: string): Promise<{ confidence: number; version?: string }>;
 	/** Create the empty target project if missing. */
 	scaffoldProject(root: string): Promise<void>;
-	/** Scaffold one unit: module skeleton + where symbols should land. Returns created paths. */
+	/** Scaffold one unit's area module (`name` = the area, see moduleDir). Returns created paths. */
 	scaffoldUnit(root: string, unit: { id: string; kind: string; name: string }): Promise<string[]>;
 	build(root: string): { cmd: string; args: string[] };
 	lint(root: string, files: string[]): { cmd: string; args: string[] };

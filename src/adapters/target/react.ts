@@ -3,14 +3,20 @@ import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { TargetAdapter } from "../types.ts";
 import { indexTsFile, tsLayoutBase, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
+import { tsCheckStructure, tsCheckTree, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
 
 /** Fresh setup via the official Vite scaffolder (`create vite --template react-ts`), not model-generated. */
 export const reactAdapter: TargetAdapter = {
 	id: "react",
+	role: "ui",
 	subdir: "web",
 	layout: {
 		...tsLayoutBase(),
-		moduleDir: (m) => `src/features/${m}`,
+		// one legacy area = one feature module; units of the same area extend its files, never fork them
+		moduleDir: tsModuleDir,
+		structureDoc: tsStructureDoc("ui"),
+		checkStructure: (files, moduleDir, area, projectDir, ctx) => tsCheckStructure(files, moduleDir, area, projectDir, "ui", ctx),
+		checkTree: (projectDir, only) => tsCheckTree(projectDir, "ui", only),
 		testFileGlobs: (dir) => [`${dir}/**/*.test.tsx`, `${dir}/**/*.test.ts`],
 		testHint: "*.test.tsx files (vitest + @testing-library/react) next to the component",
 	},
@@ -101,7 +107,7 @@ export const reactAdapter: TargetAdapter = {
 	},
 
 	async scaffoldUnit(root, unit) {
-		const dir = join(root, "src", "features", unit.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase());
+		const dir = join(root, reactAdapter.layout.moduleDir(unit.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase()));
 		mkdirSync(dir, { recursive: true });
 		return [dir];
 	},

@@ -32,6 +32,7 @@ export interface Advice {
 
 export async function advise(config: Config, root: string, ledger: Ledger, client: ModelClient, source: SourceAdapter, targets: TargetAdapter[], log: (l: string) => void = console.log): Promise<{ libraries: number; classes: number; decisions: number; costUsd: number }> {
 	const file = loadDecisions(root) as ReturnType<typeof loadDecisions> & { advice?: Record<string, Advice> };
+	// advice sees the code's points, not an earlier phrasing
 	const advice: Record<string, Advice> = (file.advice ??= {});
 	let cost = 0;
 	source.frameworkDirs?.(config.source.path);
@@ -98,7 +99,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 
 	// ---- 3. open decisions: Jev picks among each decision's options, with confidence
 	// libraries/classes were judged above; everything else open gets a Jev pick
-	const jevable = openDecisions(ledger, config, source, targets, root).filter((d) => !advice[d.id] && !d.id.startsWith("lib:") && !d.id.startsWith("fw:") && !d.id.startsWith("stack:") && d.options.length > 1);
+	const jevable = openDecisions(ledger, config, source, targets, root, { raw: true }).filter((d) => !advice[d.id] && !d.id.startsWith("lib:") && !d.id.startsWith("fw:") && !d.id.startsWith("stack:") && d.options.length > 1);
 	if (jevable.length) {
 		// one call per decision, each with its own evidence: a combined call reports the minimum confidence of
 		// unrelated questions and gives Jev no specific facts (observed 0.05–0.14 that way)
@@ -120,6 +121,28 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 		);
 		cost += spent;
 		log(pc.dim(`  advise: ${jevable.length} decisions via Jev, $${spent.toFixed(5)}`));
+	}
+	persist(root, file);
+
+	// ---- 4. every question is phrased for THIS repo by a model that read it; plus decisions code did not foresee
+	const { phraseDecisions, discoverDecisions, pointHash, repoBrief } = await import("../jev/ask.ts");
+	const { toPoint } = await import("../inventory/decisions.ts");
+	const deps = { ledger, config, root, client };
+	const b = await repoBrief(deps);
+	cost += b.costUsd;
+	const raw = openDecisions(ledger, config, source, targets, root, { raw: true });
+	const stale = raw.map(toPoint).filter((p) => file.phrased?.[p.id]?.hash !== pointHash(p));
+	if (stale.length) {
+		const r = await phraseDecisions(deps, stale);
+		file.phrased = { ...file.phrased, ...r.phrased };
+		cost += r.costUsd;
+		log(pc.dim(`  advise: ${Object.keys(r.phrased).length}/${stale.length} questions phrased for this repo, $${r.costUsd.toFixed(4)}`));
+	}
+	if (!file.discovered) {
+		const r = await discoverDecisions(deps, raw.map((d) => ({ id: d.id, question: file.phrased?.[d.id]?.question ?? d.question })));
+		file.discovered = r.discovered;
+		cost += r.costUsd;
+		log(pc.dim(`  advise: ${Object.keys(r.discovered).length} repo-specific decisions found, $${r.costUsd.toFixed(4)}`));
 	}
 	persist(root, file);
 	return { libraries: libs.length, classes: classes.length, decisions: jevable.length, costUsd: cost };

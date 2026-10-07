@@ -88,6 +88,8 @@ export const ConfigSchema = z.object({
 			maxUnitTokens: z.number().int().default(250_000),
 			/** A leaf session with no model/tool activity for this long is aborted (outcome idle_timeout). */
 			idleMs: z.number().int().default(300_000),
+			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
+			sampleSize: z.number().int().min(0).default(10),
 		})
 		.prefault({}),
 	/** Set by `br simulate --level 3`; `br run` refuses to start when missing. */

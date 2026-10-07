@@ -4,6 +4,7 @@ import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE, TRIAGE_TRUTH }
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import type { GateReport } from "./gate.ts";
+import { askViaModel } from "../jev/ask.ts";
 
 /**
  * Jev at the gate. Rules for using Jev well: the state is small and literal (the failing step's output
@@ -27,6 +28,7 @@ export interface TriageDeps {
 	ledger: Ledger;
 	config: Config;
 	client: ModelClient;
+	root?: string;
 }
 
 export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport, previous: GateReport | undefined, attemptNo: number): Promise<Triage> {
@@ -40,7 +42,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		// not the model: stop burning attempts and ask (only this unit waits).
 		const prevFailed = previous?.steps.find((s) => !s.ok);
 		if (prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) {
-			const q = d.ledger.askQuestion({ unitId, point: "gate_env", question: `Anti-gaming fails identically on consecutive attempts for ${unitId}; the implementer cannot fix it. Inspect the gate report, fix the environment or protected globs, then \`br requeue ${unitId}\`.`, context: { output: failed.output.slice(-1500), changed: gate.changedFiles }, blocks: "unit", askedBy: "orchestrator" });
+			const { id: q } = await askViaModel(d, { unitId, point: "gate_env", facts: `The anti-gaming check failed identically on two consecutive attempts of ${unitId}, so the implementer cannot fix it. Output:\n${failed.output.slice(-1500)}\nChanged files: ${gate.changedFiles.join(", ")}\nAfter a fix: br requeue ${unitId}.`, options: [{ value: "fixed", facts: "I fixed the environment / protected globs; requeue the unit" }, { value: "quarantine", facts: "leave the unit quarantined" }], recommended: "fixed", context: { output: failed.output.slice(-1500), changed: gate.changedFiles }, blocks: "unit", askedBy: "orchestrator" });
 			const t = deterministic(d, unitId, "env", "ask_human", "identical anti-gaming failure twice → not the model's fault");
 			return { ...t, questionId: q };
 		}
@@ -113,20 +115,21 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	// nothing waits on that label. Below the check band on a non-retry action we hand over instead.
 	let questionId: number | undefined;
 	if (action === "ask_human" && !questionId) {
-		questionId = d.ledger.askQuestion({ unitId, point: "triage_gate", question: `Gate step ${state.stage} failed (attempt ${attemptNo}): ${reason}. ${cause === "other" ? "" : `Jev says cause=${cause}. `}Fix or advise, then \`br requeue ${unitId}\` if quarantined.`, options: Object.keys(TRIAGE_GATE["cause"]!.criteria ?? {}), context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files }, blocks: "unit", askedBy: "orchestrator", decisionId: dec.decisionId });
+		questionId = (await askViaModel(d, { unitId, point: "triage_gate", facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}: ${reason}.${cause === "other" ? "" : ` The decision model's cause: ${cause}.`}\nGate output tail:\n${state.gate_report.slice(-1500)}\nAfter a fix: br requeue ${unitId}.`, options: causeOptions(), recommended: cause === "other" ? undefined : cause, context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files }, blocks: "unit", askedBy: "orchestrator", decisionId: dec.decisionId })).id;
 	} else if (b !== "act") {
 		const blocks = b === "escalate" && action !== "retry" ? "unit" : "none";
 		if (blocks === "unit") action = "ask_human";
-		questionId = d.ledger.askQuestion({
+		questionId = (await askViaModel(d, {
 			unitId,
 			point: "triage_gate",
-			question: `Gate step ${state.stage} failed (attempt ${attemptNo}). Jev says cause=${cause} (confidence ${dec.confidence.toFixed(2)}), planned action ${action}. What is the real cause?`,
-			options: Object.keys(TRIAGE_GATE["cause"]!.criteria ?? {}),
+			facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}. The decision model says cause=${cause} with low confidence (${dec.confidence.toFixed(2)}); planned action: ${action}. The answer calibrates it.\nGate output tail:\n${state.gate_report.slice(-1200)}`,
+			options: causeOptions(),
+			recommended: cause,
 			context: { gate_tail: state.gate_report.slice(-1200), files: state.diff_stats.files },
 			blocks,
 			askedBy: "orchestrator",
 			decisionId: dec.decisionId,
-		});
+		})).id;
 	}
 	setDecisionAction(d.ledger, dec.decisionId, action);
 	return { action, cause, confidence: dec.confidence, band: b, decisionId: dec.decisionId, questionId, reason };
@@ -135,6 +138,10 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 export async function triageTruth(d: TriageDeps, unitId: string, test: string, failure: string): Promise<{ cause: string; keep: boolean; confidence: number; decisionId: number }> {
 	const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_truth", { test: test.slice(-2000), failure: failure.slice(-2000) }, TRIAGE_TRUTH, ["cause"], unitId);
 	return { cause: choiceOf(dec.answers["cause"]) ?? "other", keep: noulOf(dec.answers["keep_as_known_bug"]) >= 0.5, confidence: dec.confidence, decisionId: dec.decisionId };
+}
+
+function causeOptions(): Array<{ value: string; facts?: string }> {
+	return Object.entries(TRIAGE_GATE["cause"]!.criteria ?? {}).map(([value, facts]) => ({ value, facts: facts ?? undefined }));
 }
 
 function deterministic(d: TriageDeps, unitId: string, cause: string, action: TriageAction, reason: string): Triage {

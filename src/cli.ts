@@ -23,18 +23,21 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br onboard                   same as init (kept for scripts)
   br init --config-only        only write bigrefactor.config.json (no data gathering)
   br setup                     bootstrap target with each stack's official CLI, git init + commit
-  br rules [--force]           generate RULES.md, AGENTS.md chain, idioms.json, ast-grep rules from docs + layout
+  br rules [--force|--relayout]  generate RULES.md, AGENTS.md chain, idioms.json, ast-grep rules per stack; --relayout re-renders only the layout section
   br docs fetch | <query>      refetch official docs / search them
   br inventory                 index source → symbols, units, tiers → ledger (re-run = drift report)
   br index-target              (re)index the new codebase: exports, shared helpers, docs → target_lookup/shared_lookup
   br simulate --level 1|2|3    prove the pipeline before touching the real repo
-  br label                     Jev labels units (difficulty → model routing, kind, needs_db, has_ui), auth slices, unreached units → slices
+  br label                     Jev labels units (difficulty → model routing, kind, needs_db, has_ui), auth slices, unreached units → slices, placement
+  br place [--force]           target stack + legacy area per unit (code → Jev → question); .bigrefactor/placement.json overrides
   br advise                    models judge what tables used to: library successors, unmapped framework classes (escalate model), open decisions (Jev)
   br decide [--json] [--answer id=value ...]   decision gate: everything the inventory cannot decide; run/L3 wait for it
   br profile [--force]         generate the legacy framework profile (loaders, routes-in-code, entry points, concerns) from the framework source; validated against the index
   br frameworks                what the legacy framework/libraries do, app reliance per concern, platform/port/drop verdicts
+  br layout                    layout preflight: units per stack, top areas, shared units, target tree, problems (br run refuses on problems)
   br order                     vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
-  br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit
+  br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
+                               refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
   br sweep                     cluster failures → tune → rerun
   br status                    ledger dashboard
@@ -117,13 +120,14 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { projectDir } = await import("./init/init.ts");
 		const { getTargetAdapter } = await import("./adapters/registry.ts");
 		const { config, ledger } = open();
-		const n = await indexTarget(ledger, await getTargetAdapter(config.target.stacks[0]!), projectDir(config, config.target.stacks[0]!));
+		let n = 0;
+		for (const id of config.target.stacks) n += await indexTarget(ledger, await getTargetAdapter(id), projectDir(config, id));
 		console.log(`indexed ${n} target symbols`);
 	},
 	rules: async (args) => {
 		const { generateRules } = await import("./init/rules.ts");
 		const { config, root, ledger } = open();
-		const r = await generateRules(config, root, ledger, { force: args.includes("--force") });
+		const r = await generateRules(config, root, ledger, { force: args.includes("--force"), relayout: args.includes("--relayout"), client: makeClient() });
 		console.log(`rules: ${r.files.length} files, $${r.costUsd.toFixed(4)}`);
 	},
 	docs: async (args) => {
@@ -158,13 +162,17 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	accept: async (args) => {
 		const id = args[0];
 		if (!id) throw new Error("usage: br accept <unit-id>");
-		const { acceptUnit, moduleName } = await import("./run/unit.ts");
+		const { acceptUnit, afterAccept } = await import("./run/unit.ts");
+		const { getTargetAdapter } = await import("./adapters/registry.ts");
+		const { placeUnit } = await import("./run/placement.ts");
 		const { projectDir } = await import("./init/init.ts");
-		const { config, ledger } = open();
+		const { config, root, ledger } = open();
 		const u = ledger.getUnit(id);
 		if (!u) throw new Error(`unknown unit ${id}`);
 		if (u.state !== "review") throw new Error(`unit ${id} is ${u.state}, not in review`);
-		const sha = acceptUnit({ ledger, config, unitId: id }, projectDir(config, config.target.stacks[0]!), moduleName(u.meta));
+		const { stackId, area } = placeUnit(config, u.meta, root);
+		const sha = acceptUnit({ ledger, config, unitId: id }, projectDir(config, stackId), area);
+		afterAccept(ledger, await getTargetAdapter(stackId), projectDir(config, stackId), stackId, area, (l) => console.log(l));
 		console.log(pc.green(`accepted ${id}${sha ? ` @ ${sha.slice(0, 7)}` : ""}`));
 	},
 	simulate: async (args) => {
@@ -212,7 +220,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	profile: async (args) => {
 		const { generateProfile } = await import("./init/profile.ts");
 		const { config, ledger, root } = open();
-		await generateProfile(config, root, ledger, { force: args.includes("--force") });
+		await generateProfile(config, root, ledger, { force: args.includes("--force"), client: makeClient() });
 	},
 	frameworks: async () => {
 		const { planFrameworks, renderFrameworkPlan } = await import("./inventory/frameworks.ts");
@@ -228,7 +236,20 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { labelUnits } = await import("./init/label.ts");
 		const { config, ledger, root } = open();
 		const r = await labelUnits(config, root, ledger, makeClient());
-		console.log(`labelled ${r.units} units (${r.hard} hard), auth slices: ${r.auth.join(", ") || "none"}, placed ${r.placed}, $${r.costUsd.toFixed(4)}`);
+		console.log(`labelled ${r.units} units (${r.hard} hard), auth slices: ${r.auth.join(", ") || "none"}, placed ${r.placed}, ${r.areas.placed} units placed in areas (${r.areas.asked} asked), $${r.costUsd.toFixed(4)}`);
+	},
+	place: async (args) => {
+		const { resolvePlacements, placeUnit } = await import("./run/placement.ts");
+		const { config, ledger, root } = open();
+		const r = await resolvePlacements({ ledger, config, root, client: makeClient(), force: args.includes("--force"), log: (l) => console.log(l) });
+		const n = new Map<string, number>();
+		for (const u of ledger.listUnits()) {
+			const p = placeUnit(config, u.meta, root);
+			const k = `${p.stackId}:${p.shared ? "shared/" : ""}${p.area}`;
+			n.set(k, (n.get(k) ?? 0) + 1);
+		}
+		console.log(`${r.placed} placed (${r.byModel} by Jev, ${r.shared} shared), ${r.asked} question(s) → br questions; ${n.size} modules:`);
+		console.log([...n].sort((a, b) => b[1] - a[1]).map(([k, c]) => `${k}=${c}`).join("  "));
 	},
 	advise: async () => {
 		const { advise } = await import("./init/advise.ts");
@@ -267,6 +288,13 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 			return console.log(renderDecisions(openDecisions(ledger, open().config, source, targets2, root)));
 		}
 		console.log(renderDecisions(ds));
+	},
+	layout: async () => {
+		const { checkLayout, renderLayout } = await import("./run/layout-check.ts");
+		const { config, root, ledger } = open();
+		const r = await checkLayout(config, root, ledger);
+		for (const l of renderLayout(r)) console.log(l.startsWith("problem:") ? pc.red(l) : l.startsWith("warning:") ? pc.yellow(l) : l);
+		if (r.problems.length) process.exitCode = 1;
 	},
 	order: async () => {
 		const { planSlices, applySlicePlan, renderSlicePlan } = await import("./inventory/slices.ts");

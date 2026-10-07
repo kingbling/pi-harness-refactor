@@ -15,7 +15,12 @@ import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
 import { SYSTEMIC_FAILURE } from "../jev/questions.ts";
-import { envFingerprint, moduleName, runUnit, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
+import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } from "./placement.ts";
+import { maybeCurateRules } from "../rules/living.ts";
+import { answerValue, askViaModel } from "../jev/ask.ts";
+import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
+import { maybeTidyReview } from "./tidy.ts";
+import { afterAccept, envFingerprint, runUnit, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 
 /**
  * The scheduler: many agent sessions, few gate workers, one merge at a time.
@@ -54,6 +59,10 @@ export interface SchedulerOptions {
 	blocked?: () => Map<string, string[]>;
 	/** When only decision-blocked units are left: wait for answers (Pi asks them on the side) instead of ending. */
 	waitForDecisions?: boolean;
+	/** Start despite layout problems (br run --force). The layout preflight is skipped in simulations (spawn injected). */
+	force?: boolean;
+	/** Layout review after this many accepted units (0 = off). Default: config.run.sampleSize, else 10. */
+	sample?: number;
 	/** Injection points (simulation). */
 	spawn?: UnitRunOptions["spawn"];
 	gate?: UnitRunOptions["gate"];
@@ -107,14 +116,27 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 	}
 	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
+	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
+	if (!o.dry) await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) });
+	// ---- layout preflight: one folder per legacy file must be caught before a run scales it
+	if (!o.dry && !o.spawn) {
+		const lr = await checkLayout(config, o.root, ledger);
+		for (const w of lr.warnings) log(pc.yellow(`layout: ${w}`));
+		if (lr.problems.length && !o.force) throw new Error(`bigrefactor: the target layout has ${lr.problems.length} problem(s), a run would multiply them:\n  ${lr.problems.join("\n  ")}\nfix: br layout shows the details; start anyway with --force`);
+		for (const p of lr.problems) log(pc.red(`layout (--force): ${p}`));
+	}
 	// Parked units (state kept, attempt closed, waiting on a question) are resubmitted as soon as the cause is
 	// gone: their question was answered, or — for environment failures — the target project or the stack
 	// config changed since they parked. Checked at start and on every scheduling loop.
 	const resubmitParked = () => resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log);
 
-	const stackId = config.target.stacks[0]!;
-	const mainProject = projectDir(config, stackId);
-	const adapter = await getTargetAdapter(stackId);
+	// Each unit lands in the stack placement picks; a worktree holds the whole target repo, so every stack's
+	// node_modules is linked into it.
+	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
+	const linkAll = (wt: string) => {
+		for (const id of config.target.stacks) linkNodeModules(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))));
+	};
+	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
 	excludeFromGit(config.target.path, ["node_modules", "dist"]);
 	const agents = new Semaphore(config.run.agentConcurrency);
 	const gates = new Semaphore(config.run.gateConcurrency);
@@ -143,6 +165,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 	reloadLanes();
 	const merge = new Semaphore(1);
+	const curate = new Semaphore(1);
 	const ran: UnitRunResult[] = [];
 	const running = new Map<string, Promise<void>>();
 	let acceptedNow = 0;
@@ -168,11 +191,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let decisionBlocked = new Map<string, string[]>();
 	let waitingNote = "";
 	const ready = (): string[] => {
+		applyPlacementAnswers(ledger, config, o.root); // an answered placement question places its unit before it can start
 		const blocked = ledger.blockedUnits();
 		decisionBlocked = o.blocked?.() ?? new Map();
 		for (const u of decisionBlocked.keys()) if (!blocked.has(u)) blocked.set(u, []);
 		// one unit per target module at a time: units sharing a write scope would conflict on merge
-		const busyModules = new Set([...running.keys()].map((id) => moduleName(ledger.getUnit(id)!.meta)));
+		const busyModules = new Set([...running.keys()].map((id) => placementOf(ledger.getUnit(id)!.meta).moduleKey));
 		// One query: planned units whose every dep is accepted (json_each over the deps array), not stale.
 		const rows = ledger.db
 			.prepare(
@@ -184,7 +208,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			.all() as Array<{ id: string; meta: string }>;
 		const units = rows.filter((u) => {
 			if (running.has(u.id) || blocked.has(u.id)) return false;
-			if (busyModules.has(moduleName(u.meta))) return false;
+			// waits for Jev or its placement question, never runs on a guess (a dry run previews before placement ran)
+			if (!o.dry && unplacedReason(config, u.meta, o.root)) return false;
+			if (busyModules.has(placementOf(u.meta).moduleKey)) return false;
 			if (o.units && !o.units.includes(u.id)) return false;
 			if (o.slice && JSON.parse(u.meta).slice !== o.slice) return false;
 			return true;
@@ -218,7 +244,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			};
 			drop();
 			addWorktree(config.target.path, wt, branch);
-			linkNodeModules(mainProject, join(wt, relative(config.target.path, mainProject)));
+			linkAll(wt);
 			log(pc.cyan(`◇ ${unitId}`) + pc.dim("  truth ahead (deps still migrating)"));
 			try {
 				const res = await runUnit({ ledger, config, root: o.root, unitId, client: o.client, accept: false, workDir: wt, truthOnly: true, gateSlot: (fn) => gates.run(fn), log: (l) => log(`  ${l}`), spawn: o.spawn, gate: o.gate });
@@ -264,7 +290,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					/* no branch */
 				}
 				addWorktree(config.target.path, wt, branch);
-				linkNodeModules(mainProject, join(wt, relative(config.target.path, mainProject)));
+				linkAll(wt);
 				ledger.updateUnit(unitId, { worktree: wt, branch });
 			};
 			fresh();
@@ -293,10 +319,14 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					if (res.state !== "review") break;
 					try {
 						await merge.run(async () => {
+							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);
+							const adapter = adapters.get(stackId)!;
+							const mainProject = projectDir(config, stackId);
 							const sha = mergeUnit(config, unitId, wt, branch, mainProject);
 							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${config.target.git.branch}` : "merged (no changes)");
 							if (sha) ledger.updateUnit(unitId, { meta: { ...JSON.parse(ledger.getUnit(unitId)!.meta), commit: sha } });
 							await indexTarget(ledger, adapter, mainProject, res!.gate?.changedFiles).catch(() => 0);
+							afterAccept(ledger, adapter, mainProject, stackId, placementOf(ledger.getUnit(unitId)!.meta).area, (l) => log(`  ${l}`));
 							// Registration/wiring files are generated by the adapter from what landed, never by agents.
 							if (adapter.generateRegistration) {
 								const changed = await adapter.generateRegistration(mainProject, { ledger }).catch((e) => (log(pc.yellow(`  registration generation failed: ${e?.message ?? e}`)), [] as string[]));
@@ -309,6 +339,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						});
 						acceptedNow++;
 						log(pc.green(`✓ ${unitId} accepted ($${res.costUsd.toFixed(4)})`));
+						// living rules: proposals from units are curated into a new rules version once enough piled up
+						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => Object.entries(r.versions).forEach(([s, v]) => log(pc.cyan(`  rules ${s} → v${v}`))), (e) => log(pc.yellow(`  rules curation failed: ${e?.message ?? e}`)));
+						// tidy review: every N accepts of an area a model reads its module; approved changes become tidy tasks
+						const { stackId: tStack, area: tArea } = placementOf(ledger.getUnit(unitId)!.meta);
+						await curate.run(() => maybeTidyReview({ ledger, config, root: o.root, client: o.client }, { stackId: tStack, area: tArea })).then((r) => r.reviewed && log(pc.cyan(`  tidy review ${tStack}:${tArea}: ${r.asked} change(s) asked, ${r.proposals} convention(s) proposed`)), (e) => log(pc.yellow(`  tidy review failed: ${e?.message ?? e}`)));
 						break;
 					} catch (e: any) {
 						if (!/merge conflict/.test(String(e?.message)) || round === 3) {
@@ -350,6 +385,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// root cause (bad rule, broken env, model degradation). Systemic → stop starting units + one ledger question.
 	const recent: Array<{ unit: string; ok: boolean; cause?: string; gate?: string; sig?: string }> = [];
 	let circuitOpen = false;
+	const askSystemic = async (facts: string, decisionId?: number): Promise<number> =>
+		(await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "systemic_failure", facts, options: [{ value: "fixed", facts: "the shared cause is fixed: br requeue the failed units and br run again" }, { value: "investigate", facts: "keep the run stopped until someone has looked at it" }], recommended: "investigate", blocks: "none", askedBy: "orchestrator", decisionId })).id;
 	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined) => {
 		const bad = res?.gate?.steps.find((x) => !x.ok);
 		const gate = bad ? `${bad.name}: ${String(bad.output ?? "").slice(0, 600)}` : undefined;
@@ -363,7 +400,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (!circuitOpen && same) {
 			circuitOpen = true;
 			requestStop(`circuit breaker: same error in ${same[1].length} units`);
-			const q = ledger.askQuestion({ point: "systemic_failure", question: `${same[1].length} units failed with the same error (${same[0]}): ${same[1].join(", ")}. One cause, not ${same[1].length} bugs — fix it once; parked units resubmit themselves when the project or config changes.`, blocks: "none", askedBy: "orchestrator" });
+			const q = await askSystemic(`${same[1].length} units failed with the same error signature (${same[0]}): ${same[1].join(", ")}. The run stopped starting new units; running ones finish. Parked units resubmit themselves when the target project or the config changes.\nGate output of the last failures:\n${failed.filter((f) => f.sig === same[0]).map((f) => `${f.unit}: ${f.gate ?? ""}`).join("\n")}`);
 			log(pc.red(`circuit open: ${same[1].length} units failed with the same error (${same[0]}); running units finish, no new ones start — question #${q}`));
 			return;
 		}
@@ -375,12 +412,75 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			if (sys?.type === "noul" && sys.noul >= 0.75 && kind !== "hard_batch") {
 				circuitOpen = true;
 				requestStop(`circuit breaker: systemic failure`);
-				const q = ledger.askQuestion({ point: "systemic_failure", question: `${failed.length} of the last ${recent.length} units failed with one shared cause (Jev: ${kind}, ${Math.round(sys.noul * 100)}%): ${failed.map((f) => `${f.unit}${f.cause ? ` (${f.cause})` : ""}`).join(", ")}. Fix the cause, then \`br requeue\` and \`br run\`.`, blocks: "none", askedBy: "orchestrator" });
+				const q = await askSystemic(`${failed.length} of the last ${recent.length} units failed; Jev judges one shared cause (${kind}, ${Math.round(sys.noul * 100)}%): ${failed.map((f) => `${f.unit}${f.cause ? ` (${f.cause})` : ""}`).join(", ")}. The run stopped starting new units; running ones finish.\nGate output:\n${failed.map((f) => `${f.unit}: ${f.gate ?? ""}`).join("\n")}`, r.decisionId);
 				log(pc.red(`circuit open: failures look systemic (${kind}); running units finish, no new ones start — question #${q}`));
 			}
 		} catch {
 			/* Jev unavailable: keep running */
 		}
+	};
+
+	// ---- sample pause: after the first N accepted units nothing new starts until a human approved the tree they
+	// produced (one question, phrased by a model; `br run` continues once it is answered "approve").
+	const sampleSize = o.dry ? 0 : (o.sample ?? config.run.sampleSize);
+	type Sample = { question?: number; approved?: string };
+	const sampleState = (): Sample => JSON.parse(ledger.getMeta("layout_sample") ?? "{}") as Sample;
+	const acceptedTotal = () => (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE state = 'accepted'").get() as { n: number }).n;
+	let sampleNote = "";
+	/** Before the sample is approved, at most sampleSize units land: lanes never start more than that. */
+	const sampleRoom = () => !sampleSize || !!sampleState().approved || acceptedTotal() + running.size - aheadRunning.size < sampleSize;
+	/** undefined = go on; otherwise why nothing new starts. Files the review question once the sample has landed. */
+	const samplePause = async (): Promise<string | undefined> => {
+		if (!sampleSize) return undefined;
+		let st = sampleState();
+		if (st.approved) {
+			if (acceptedTotal() >= sampleSize) return undefined;
+			ledger.setMeta("layout_sample", JSON.stringify((st = {}))); // the target was reset since: review the new sample
+		}
+		if (st.question) {
+			const q = ledger.getQuestion(st.question);
+			if (q && q.status !== "open" && q.status !== "withdrawn") {
+				if (answerValue(q.answer) === "approve") {
+					ledger.setMeta("layout_sample", JSON.stringify({ ...st, approved: q.answered_at ?? new Date().toISOString() }));
+					log(pc.green(`layout sample approved (#${q.id}): the run continues`));
+					return undefined;
+				}
+				// not approved: the run stops; the next `br run` asks again on the tree as it is then
+				ledger.setMeta("layout_sample", JSON.stringify({}));
+				requestStop(`layout sample not approved (#${q.id}: ${q.answer})`);
+				return "layout sample not approved";
+			}
+			if (!q || q.status === "withdrawn") (ledger.setMeta("layout_sample", JSON.stringify({})), (st = {}));
+		}
+		const sampleRunning = running.size - aheadRunning.size;
+		const acc = acceptedTotal();
+		if (acc + sampleRunning < sampleSize) return undefined;
+		if (!st.question && sampleRunning === 0 && acc >= sampleSize) {
+			const trees = await Promise.all(config.target.stacks.map(async (id) => scanTree(config, await getTargetAdapter(id))));
+			const landed = ledger.listUnits({ state: "accepted" }).map((u) => {
+				const p = placementOf(u.meta);
+				return `${u.id} → ${p.stackId}:${p.shared ? "shared/" : ""}${p.area}`;
+			});
+			const lr = await checkLayout(config, o.root, ledger).catch(() => undefined);
+			// what a reviewer needs to see reuse: every landed area's files with their classes, and the drift code found
+			const sf = await sampleFacts(config, ledger, ledger.listUnits({ state: "accepted" }).map((u) => placementOf(u.meta))).catch(() => ({ lines: [] as string[], drift: 0 }));
+			const facts = [
+				`The first ${acc} units landed in the target; the run paused before scaling to the remaining ${ledger.listUnits({ state: "planned" }).length} planned units.`,
+				"Intended layout: one legacy area = one feature folder per stack; units of an area extend the same classes; cross-cutting code in the shared dir.",
+				"Target tree now:",
+				...renderTrees(trees, 40),
+				`Units landed (unit → stack:area): ${landed.slice(0, 60).join("; ")}${landed.length > 60 ? " …" : ""}`,
+				"Landed area modules (files [exported classes]):",
+				...sf.lines,
+				...(lr?.problems.length ? [`Layout check problems: ${lr.problems.join(" | ")}`] : ["Layout check: no problems found by code."]),
+			].join("\n");
+			const q = await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "layout_sample", facts, options: [{ value: "approve", facts: "the structure is right: continue the run" }, { value: "stop", facts: "the structure is wrong: keep the run stopped, fix placement/rules, reset the sample" }], recommended: lr?.problems.length || sf.drift ? "stop" : "approve", blocks: "none", askedBy: "orchestrator", context: { sample: acc } });
+			ledger.setMeta("layout_sample", JSON.stringify({ question: q.id }));
+			log(pc.yellow(`layout sample: ${acc} units landed — review the target tree and answer question #${q.id} (br questions); nothing new starts until then`));
+			for (const l of renderTrees(trees, 15)) log(pc.dim(`  ${l}`));
+		}
+		const qid = sampleState().question;
+		return qid ? `layout review: answer question #${qid} to continue` : `layout sample: ${sampleSize} units, waiting for the running ones to land`;
 	};
 
 	const spentToday = () => (ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM attempts WHERE started_at >= date('now')").get() as { c: number }).c + (ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM decisions WHERE created_at >= date('now')").get() as { c: number }).c;
@@ -389,33 +489,40 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// ---- main loop
 	resubmitParked();
 	let lastResubmitCheck = Date.now();
+	let lastPlaceCheck = Date.now();
 	for (;;) {
 		reloadLanes();
 		if (Date.now() - lastResubmitCheck > 5000) {
 			resubmitParked();
 			lastResubmitCheck = Date.now();
 		}
+		// units Jev could not place (call failed, question could not be filed) get another pass
+		if (Date.now() - lastPlaceCheck > 60_000) {
+			lastPlaceCheck = Date.now();
+			await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) }).catch((e) => log(pc.yellow(`placement failed: ${e?.message ?? e}`)));
+		}
 		if (!dayCapHit && spentToday() >= config.run.budgetUsdPerDay) {
 			dayCapHit = true;
-			ledger.askQuestion({ point: "budget", question: `Daily budget $${config.run.budgetUsdPerDay} reached ($${spentToday().toFixed(2)} today). Running units finish; no new ones start. Raise run.budgetUsdPerDay or rerun tomorrow.`, blocks: "none", askedBy: "orchestrator" });
+			await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Spent today: $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
 			log(pc.red(`daily budget cap reached ($${spentToday().toFixed(2)}); not starting new units`));
 		}
 		if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
 		// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
 		const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
+		const sampleReason = stop ? undefined : await samplePause();
 		let readyNow = 0;
-		if (!stop && !dayCapHit && underLimit()) {
+		if (!stop && !dayCapHit && !sampleReason && underLimit()) {
 			const candidates = ready();
 			readyNow = candidates.length;
 			for (const id of candidates) {
-				if (running.size >= laneLimit || !underLimit()) break;
+				if (running.size >= laneLimit || !underLimit() || !sampleRoom()) break;
 				startUnit(id);
 				readyNow--;
 			}
 		}
 		// Lanes stay full while anything is todo: idle lanes capture truth for units still waiting on deps.
 		// Not in a pilot (a limit means "spend on N units"), not while stopping or over budget.
-		if ((o.truthAhead ?? o.limit === undefined) && !stop && !dayCapHit && running.size < laneLimit) {
+		if ((o.truthAhead ?? o.limit === undefined) && !stop && !dayCapHit && !sampleReason && running.size < laneLimit) {
 			for (const id of aheadCandidates()) {
 				if (running.size >= laneLimit) break;
 				startAhead(id);
@@ -427,7 +534,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				? "stopping: running lanes finish, nothing new starts"
 				: dayCapHit
 					? "daily budget cap reached"
-					: o.limit !== undefined && !underLimit()
+					: sampleReason
+						? sampleReason
+						: o.limit !== undefined && !underLimit()
 						? `pilot limit ${o.limit}: ${acceptedNow} accepted + ${running.size} finishing, nothing new starts`
 						: running.size >= max
 							? undefined
@@ -439,6 +548,17 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			o.onLanes?.({ running: running.size, max, ready: readyNow, ahead: aheadRunning.size, reason });
 		}
 		if (running.size === 0) {
+			// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
+			if (sampleReason && !stop && !o.shouldStop?.() && underLimit()) {
+				if (o.waitForDecisions) {
+					if (sampleReason !== sampleNote) log(pc.yellow(sampleReason));
+					sampleNote = sampleReason;
+					await new Promise((r) => setTimeout(r, 3000));
+					continue;
+				}
+				log(pc.yellow(`${sampleReason}; then br run continues`));
+				break;
+			}
 			// only decision-blocked work left: wait for the answers (asked on the side) instead of ending
 			const pendingBlocked = [...decisionBlocked.keys()].filter((id) => ledger.getUnit(id)?.state === "planned");
 			if (o.waitForDecisions && pendingBlocked.length && !stop && !o.shouldStop?.() && !dayCapHit && underLimit()) {
@@ -540,7 +660,7 @@ export async function run(opts: { units?: string[]; slice?: string; limit?: numb
 	const { getSourceAdapter } = await import("../adapters/registry.ts");
 	const blocked = liveBlocks(ledger, config, getSourceAdapter(config.source.stack), await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s))), root);
 	// in a terminal the run waits for answers given with `br decide` elsewhere; in scripts it ends instead
-	const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), units: opts.units, slice: opts.slice, limit: opts.limit, dry: opts.dry, blocked, waitForDecisions: !!process.stdout.isTTY });
+	const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), units: opts.units, slice: opts.slice, limit: opts.limit, dry: opts.dry, force: opts.force, blocked, waitForDecisions: !!process.stdout.isTTY });
 	process.exitCode = r.quarantined && !r.accepted ? 1 : 0;
 }
 
@@ -562,10 +682,11 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 	} catch {
 		/* keep the run's config */
 	}
-	const envNow = envFingerprint(cfg, projectDir(cfg, cfg.target.stacks[0]!));
-	const parkedEnv = ledger.db.prepare("SELECT id, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; q: number | null; env: string }>;
+	// the environment of the stack the unit parked in (its placement)
+	const envNow = (meta: string) => envFingerprint(cfg, projectDir(cfg, placeUnit(cfg, meta, root).stackId));
+	const parkedEnv = ledger.db.prepare("SELECT id, meta, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; meta: string; q: number | null; env: string }>;
 	for (const p of parkedEnv) {
-		if (running.has(p.id) || p.env === envNow) continue;
+		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
 		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (package.json / stack config)", "orchestrator");
 	}
 	const parked = (ledger.db.prepare("SELECT id, state FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.unit_id = units.id AND q.status = 'open')").all() as Array<{ id: string; state: string }>).filter((u) => !running.has(u.id));

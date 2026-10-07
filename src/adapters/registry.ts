@@ -25,5 +25,7 @@ function offerable(t: TargetAdapter): TargetAdapter {
 }
 /** Static mirror of each target adapter's `subdir` (adapters load lazily; init needs this synchronously). */
 export const TARGET_SUBDIRS: Record<string, string> = { nestjs: "api", react: "web" };
+/** Static mirror of each target adapter's `role` (placement is synchronous; adapters load lazily). */
+export const TARGET_ROLES: Record<string, "server" | "ui"> = { nestjs: "server", react: "ui" };
 export const knownSources = () => Object.keys(sources);
 export const knownTargets = () => Object.keys(targets);

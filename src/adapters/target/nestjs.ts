@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { basename, dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../types.ts";
 import { indexTsFile, tsLayoutBase, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
+import { tsCheckStructure, tsCheckTree, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
 
 /**
  * Fresh setup is NOT model-generated: the official Nest CLI bootstraps the project
@@ -12,10 +13,15 @@ import { indexTsFile, tsLayoutBase, tsProjectNotes, tsVerifyChoices, tsDiagnose,
  */
 export const nestjsAdapter: TargetAdapter = {
 	id: "nestjs",
+	role: "server",
 	subdir: "api",
 	layout: {
 		...tsLayoutBase(),
-		moduleDir: (m) => `src/${m}`,
+		// one legacy area = one feature module; units of the same area extend its files, never fork them
+		moduleDir: tsModuleDir,
+		structureDoc: tsStructureDoc("server"),
+		checkStructure: (files, moduleDir, area, projectDir, ctx) => tsCheckStructure(files, moduleDir, area, projectDir, "server", ctx),
+		checkTree: (projectDir, only) => tsCheckTree(projectDir, "server", only),
 		testFileGlobs: (dir) => [`${dir}/**/*.spec.ts`, `${dir}/**/*.test.ts`],
 		testHint: "*.spec.ts files (vitest/jest `describe`/`it`/`expect`) next to the code they test",
 	},
@@ -164,11 +170,12 @@ export const nestjsAdapter: TargetAdapter = {
 
 	async scaffoldUnit(root, unit) {
 		// `nest g module/service/controller` keeps the official layout and registers the module in app.module.ts.
-		const name = unit.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
-		const dir = join(root, "src", name);
+		const rel = nestjsAdapter.layout.moduleDir(unit.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase());
+		const dir = join(root, rel);
 		if (!existsSync(dir)) {
+			// the schematic name carries the path below src/: `features/agency` → src/features/agency/agency.module.ts
 			const kinds = unit.kind === "http_handler" ? ["module", "controller", "service"] : unit.kind === "data_access" ? ["module", "service"] : ["module"];
-			for (const k of kinds) execFileSync("npx", ["nest", "g", k, name, "--no-spec", "--flat=false"], { cwd: root, stdio: "pipe" });
+			for (const k of kinds) execFileSync("npx", ["nest", "g", k, rel.replace(/^src\//, ""), "--no-spec", "--flat=false"], { cwd: root, stdio: "pipe" });
 		}
 		return [dir];
 	},

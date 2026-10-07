@@ -11,7 +11,6 @@ import { makeWriteGate } from "../sessions/spawn.ts";
 import { renderStatus } from "../dashboard/status.ts";
 import type { GateInput, GateReport } from "./gate.ts";
 import { runGate } from "./gate.ts";
-import { moduleName } from "./unit.ts";
 import { lastRun, runScheduler } from "./run.ts";
 import { lanes } from "./lanes.ts";
 import { execFileSync } from "node:child_process";
@@ -199,7 +198,10 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 			async run(prompt) {
 				const unitId = /^# Unit (\S+)/m.exec(prompt)![1]!;
 				const symbols = [...prompt.matchAll(/^- (\S+)  \[/gm)].map((m) => m[1]!);
-				const module = moduleName(ledger.getUnit(unitId)!.meta);
+				// every unit of an area extends the area's one service file (`<area>.service.ts`), as structure_ok demands
+				const moduleOf = (glob: string) => glob.replace(/\/\*\*.*$/, "");
+				const fileIn = (dir: string) => `${dir.split("/").pop()}.service`;
+				const specOf = (dir: string) => `${dir.split("/").pop()}-${unitId.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.service`;
 				const key = `${unitId}:${o.role}`;
 				const n = (attemptsSeen.get(key) ?? 0) + 1;
 				attemptsSeen.set(key, n);
@@ -207,12 +209,13 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 
 				if (o.role === "test") {
 					const truthDir = o.writeGlobs[0]!.replace(/\/\*\*$/, "");
-					const targetDir = o.writeGlobs[1]!.replace(/\/\*\*\/\*\.spec\.ts$/, "");
+					const targetDir = moduleOf(o.writeGlobs[1]!);
+					const file = fileIn(targetDir);
 					const broken = plan.truth === "broken_once" && n === 1;
 					const cases = symbols.map((s) => ({ symbol: s, inputs: null, expected: `value-of-${s.split("::").pop()}` }));
 					write(`${truthDir}/cases.php`, broken ? "<?php\nthrow new RuntimeException('simulated broken truth script');\n" : `<?php\necho <<<'JSON'\n${JSON.stringify(cases)}\nJSON;\n`);
-					write(`${truthDir}/interface.md`, `src/${module}/${module}.ts exports: ${symbols.map((s) => s.split("::").pop()).join(", ")}`);
-					write(`${targetDir}/${module}.spec.ts`, `import { describe, it, expect } from "vitest";\nimport * as m from "./${module}";\ndescribe("${module}", () => { it("exists", () => expect(m).toBeTruthy()); });\n`);
+					write(`${truthDir}/interface.md`, `${targetDir}/${file}.ts exports: ${symbols.map((s) => s.split("::").pop()).join(", ")}`);
+					write(`${targetDir}/${specOf(targetDir)}.spec.ts`, `import { describe, it, expect } from "vitest";\nimport * as m from "./${file}";\ndescribe("${unitId}", () => { it("exists", () => expect(m).toBeTruthy()); });\n`);
 					write(o.config.source.path + "/src/Hack.php", "<?php // must be blocked"); // read-only source
 					return { text: `TESTER DONE ${cases.length} cases`, toolCalls, blocked, usage };
 				}
@@ -220,14 +223,18 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 				// implementer / escalate
 				const outsideScope = plan.implement === "outside_scope_once" && n === 1;
 				if (outsideScope) write("src/other/leak.ts", "export const leak = 1;"); // blocked by the write gate
-				write(`src/${module}/${module}.ts`, `// simulated port of ${unitId} attempt ${n}\n${symbols.map((s) => `export const ${s.split("::").pop()!.replace(/\W/g, "_")} = "value-of-${s.split("::").pop()}";`).join("\n")}\n`);
+				const moduleDir = moduleOf(o.writeGlobs[0]!);
+				const file = fileIn(moduleDir);
+				const existing = existsSync(join(o.cwd, moduleDir, `${file}.ts`)) ? readFileSync(join(o.cwd, moduleDir, `${file}.ts`), "utf8").replace(/\/\/ simulated port of \S+ attempt \d+\n/g, "") : "";
+				const own = symbols.map((s) => `export const ${s.split("::").pop()!.replace(/\W/g, "_")} = "value-of-${s.split("::").pop()}";`).filter((l) => !existing.includes(l));
+				write(`${moduleDir}/${file}.ts`, `// simulated port of ${unitId} attempt ${n}\n${existing}${own.join("\n")}\n`);
 				write("package.json", "{}"); // protected → blocked
 				const prove = o.customTools?.find((t) => t.name === "ledger_prove")!;
 				const skipOne = plan.implement === "unproven_once" && n === 1;
 				for (const [i, s] of symbols.entries()) {
 					if (skipOne && i === 0) continue;
 					toolCalls++;
-					await prove.execute(`sim-${i}`, { srcSymbol: s, op: "moved", targetSymbols: [`src/${module}/${module}.ts::${s.split("::").pop()}`], why: `simulated 1:1 port (attempt ${n})` }, undefined, undefined, {} as any);
+					await prove.execute(`sim-${i}`, { srcSymbol: s, op: "moved", targetSymbols: [`${moduleDir}/${file}.ts::${s.split("::").pop()}`], why: `simulated 1:1 port (attempt ${n})` }, undefined, undefined, {} as any);
 				}
 				return { text: "IMPLEMENTER DONE", toolCalls, blocked, usage };
 			},

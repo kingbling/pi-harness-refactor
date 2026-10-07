@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, normalize, relative } from "node:path";
 import { captures, enclosing, normalizedAst, parse, walk, type Node } from "../../inventory/treesitter.ts";
+import { placePhpFile } from "./php-place.ts";
 import type { ExternalDep, FileIndex, FrameworkConcern, IndexedDep, IndexedQuery, IndexedRoute, IndexedSymbol, SourceAdapter } from "../types.ts";
 
 const SYMBOL_QUERY = `
@@ -565,6 +566,11 @@ export const phpAdapter: SourceAdapter = {
 		}
 		for (const r of [j.entryPoint, j.routeClass]) if (r) { try { new RegExp(r); } catch { problems.push(`bad regex ${r}`); } }
 		return problems;
+	},
+	// gyro/PHP file kinds (x.tpl.php, x.cmd.php, x.cls.php, x.facade.php, x.inc.php): a target name carrying one is a ported file name
+	legacyWords: ["tpl", "cmd", "cls", "facade", "inc", "php", "phtml"],
+	placeFile(path, root) {
+		return placePhpFile(path, root, (r) => PROFILES.some((p) => p.id === "gyro" && p.detect(r)));
 	},
 	unitGroupOf(path) {
 		// model + facade of the same entity are one unit of meaning (gyro: x.model.php / x.facade.php)

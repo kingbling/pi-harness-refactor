@@ -5,6 +5,8 @@ import pc from "picocolors";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
+import { askViaModel } from "../jev/ask.ts";
+import type { ModelClient } from "../models/types.ts";
 
 /**
  * `br profile`: the plugin derives the legacy framework profile itself. The escalate model reads the
@@ -14,7 +16,7 @@ import { spawnLeaf } from "../sessions/spawn.ts";
  * re-running the inventory and comparing: load globs that resolve, routes found, dead-code count.
  * The built-in profile (gyro) is shown to the model as the worked example of the format.
  */
-export async function generateProfile(config: Config, root: string, ledger: Ledger, opts: { force?: boolean } = {}): Promise<void> {
+export async function generateProfile(config: Config, root: string, ledger: Ledger, opts: { force?: boolean; client?: ModelClient } = {}): Promise<void> {
 	const out = join(root, ".bigrefactor", "framework-profile.json");
 	if (existsSync(out) && !opts.force) {
 		console.log(pc.dim(`profile already present at ${relative(root, out)} (use --force to regenerate)`));
@@ -69,7 +71,7 @@ Globs are relative to the legacy root; \`$1\`, \`$2\` are the call's positional 
 	const problems = source.validateProfile?.(json) ?? [];
 	if (problems.length) {
 		console.log(pc.yellow(`profile invalid: ${problems.join("; ")}`));
-		ledger.askQuestion({ point: "profile_review", question: `framework-profile.json has problems: ${problems.join("; ")}. Fix by hand or re-run br profile --force?`, blocks: "none", askedBy: "init" });
+		await askViaModel({ ledger, config, root, client: opts.client }, { point: "profile_review", facts: `The generated framework profile (.bigrefactor/framework-profile.json) has problems: ${problems.join("; ")}.`, options: [{ value: "regenerate", facts: "re-run br profile --force" }, { value: "fix-by-hand", facts: "edit .bigrefactor/framework-profile.json" }], recommended: "regenerate", blocks: "none", askedBy: "init" });
 		return;
 	}
 	source.reloadProfile?.(); // the generated file now wins over the built-in table
@@ -83,7 +85,7 @@ Globs are relative to the legacy root; \`$1\`, \`$2\` are the call's positional 
 	console.log(`  before: ${stats}\n  after:  ${after}`);
 	if (regress.length) {
 		console.log(pc.yellow(`profile lost coverage (${regress.join(", ")}); kept, but review it`));
-		ledger.askQuestion({ point: "profile_review", question: `Generated framework profile lost coverage: ${regress.join(", ")}. Edit .bigrefactor/framework-profile.json or re-run br profile --force.`, blocks: "none", askedBy: "init" });
+		await askViaModel({ ledger, config, root, client: opts.client }, { point: "profile_review", facts: `The generated framework profile lost coverage compared to the built-in one: ${regress.join(", ")}. It was kept.`, options: [{ value: "keep", facts: "keep the generated profile" }, { value: "regenerate", facts: "re-run br profile --force" }, { value: "fix-by-hand", facts: "edit .bigrefactor/framework-profile.json" }], recommended: "fix-by-hand", blocks: "none", askedBy: "init" });
 	} else console.log(pc.green(`profile ok: ${relative(root, out)}`));
 	ledger.setMeta("framework_profile_generated_at", new Date().toISOString());
 }

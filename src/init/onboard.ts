@@ -5,7 +5,7 @@ import pc from "picocolors";
 import { progress } from "../progress.ts";
 import { loadConfig, type Config } from "../config.ts";
 import { Ledger } from "../ledger/db.ts";
-import { type InitPrompter, init, setup, terminalPrompter } from "./init.ts";
+import { type InitPrompter, init, projectDir, setup, terminalPrompter } from "./init.ts";
 
 /**
  * `br onboard`: the whole onboarding as one seamless, resumable flow. Every step is idempotent and
@@ -15,7 +15,7 @@ import { type InitPrompter, init, setup, terminalPrompter } from "./init.ts";
  * model-driven steps (framework profile, rules) for offline/e2e runs.
  *
  *   init → setup (official generators + chosen packages) → docs → inventory → profile → inventory
- *   → frameworks → decide → rules → order → status
+ *   → frameworks → decide → label → rules → order → layout → status
  */
 export interface OnboardOptions {
 	root?: string;
@@ -51,9 +51,10 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		setup: "bootstrap the new codebase with the official generators + chosen packages",
 		docs: "fetch the official docs of every chosen technology for the agents",
 		"inventory (after decisions)": "re-index with the decisions applied",
-		label: "Jev rates every unit (difficulty → model, kind, needs_db, has_ui) and places unreached code",
+		label: "Jev rates every unit (difficulty → model, kind, needs_db, has_ui), places unreached code, gives every unit its stack + area",
 		rules: "a model writes RULES.md, AGENTS.md, idioms and lint rules from the framework mapping",
 		order: "order units into slices: foundation → auth → features",
+		layout: "preflight: placement dry run, rules vs. adapter layout, the target tree as it is (br run refuses on problems)",
 	};
 	progress.plan(ABOUT);
 	const step = async (name: string, skipWhen: () => string | undefined, run: () => Promise<string | void>) => {
@@ -85,6 +86,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		}
 	};
 	const configPath = join(root, "bigrefactor.config.json");
+	let layoutProblems = 0;
 	const has = (...parts: string[]) => existsSync(join(root, ...parts));
 	let config!: Config;
 	const reload = () => (config = loadConfig(configPath).config);
@@ -115,9 +117,10 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 		await step("profile", () => (noLlm ? "skipped (--no-llm)" : !source.profileExample ? "adapter has no framework profiles" : has(".bigrefactor", "framework-profile.json") ? "profile present" : !(source.frameworkDirs?.(config.source.path) ?? []).length && !frameworkDirsLikely(config.source.path) ? "no framework directory detected" : undefined), async () => {
 			const { generateProfile } = await import("./profile.ts");
+			const { OpenRouterClient } = await import("../models/openrouter.ts");
 			const l = ledger();
 			try {
-				await generateProfile(config, root, l);
+				await generateProfile(config, root, l, { client: new OpenRouterClient() });
 			} finally {
 				l.close();
 			}
@@ -215,17 +218,19 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			const l = ledger();
 			try {
 				const r = await labelUnits(config, root, l, new OpenRouterClient(), { log: (x) => log(x) });
-				return `${r.units} units labelled (${r.hard} hard), auth: ${r.auth.join(", ") || "none"}, ${r.placed} unreached units placed, $${r.costUsd.toFixed(3)}`;
+				return `${r.units} units labelled (${r.hard} hard), auth: ${r.auth.join(", ") || "none"}, ${r.placed} unreached units placed, ${r.areas.placed} units placed in areas (${r.areas.asked} asked), $${r.costUsd.toFixed(3)}`;
 			} finally {
 				l.close();
 			}
 		});
 
-		await step("rules", () => (noLlm ? "skipped (--no-llm)" : has(".bigrefactor", "rules", "RULES.md") ? "rules present" : undefined), async () => {
+		const { rulesPresent } = await import("./rules.ts");
+		await step("rules", () => (noLlm ? "skipped (--no-llm)" : rulesPresent(root, config) ? "rules present" : undefined), async () => {
 			const { generateRules } = await import("./rules.ts");
+			const { OpenRouterClient } = await import("../models/openrouter.ts");
 			const l = ledger();
 			try {
-				const r = await generateRules(config, root, l, {});
+				const r = await generateRules(config, root, l, { client: new OpenRouterClient() });
 				return `${r.files.length} files, $${r.costUsd.toFixed(2)}`;
 			} finally {
 				l.close();
@@ -244,13 +249,29 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				l.close();
 			}
 		});
+
+		// shown, never fatal here: `br run` refuses to start while problems are left
+		await step("layout", () => undefined, async () => {
+			const { checkLayout, renderLayout } = await import("../run/layout-check.ts");
+			const l = ledger();
+			try {
+				const r = await checkLayout(config, root, l);
+				for (const x of renderLayout(r, 12)) log(x.startsWith("problem:") ? pc.red(x) : x.startsWith("warning:") ? pc.yellow(x) : pc.dim(x));
+				layoutProblems = r.problems.length;
+				return `${r.summary.modules.length} modules in ${r.summary.areas} areas, ${r.problems.length} problem(s), ${r.warnings.length} warning(s)`;
+			} finally {
+				l.close();
+			}
+		});
 	} catch {
 		/* step already recorded the failure */
 	}
 
 	if (report.ok) log(summary(root));
 	const next = report.ok
-		? report.openDecisions
+		? layoutProblems
+			? `next: fix ${layoutProblems} layout problem(s) (${pc.cyan("br layout")}; ${pc.cyan("br rules --relayout")}, ${pc.cyan("br place --force")}) → ${pc.cyan("br simulate --level 1")} → ${pc.cyan("br run")}`
+			: report.openDecisions
 			? `next: ${pc.cyan("br decide")} (${report.openDecisions} open) → ${pc.cyan("br simulate --level 1")} → ${pc.cyan("br run")}`
 			: `next: ${pc.cyan("br simulate --level 1")} → ${pc.cyan("br run --limit 10")} (pilot) · ${pc.cyan("br status")} any time`
 		: `onboarding stopped at "${report.steps.find((s) => s.status === "failed")?.name}"; fix and run ${pc.cyan("br resume")} — finished steps are skipped`;
@@ -293,8 +314,7 @@ function summary(root: string): string {
 }
 
 function projectReady(config: Config, stackId: string): boolean {
-	const dir = config.target.stacks.length === 1 ? config.target.path : join(config.target.path, stackId === "nestjs" ? "api" : stackId === "react" ? "web" : stackId);
-	return existsSync(join(dir, "package.json"));
+	return existsSync(join(projectDir(config, stackId), "package.json"));
 }
 
 function targetHasCommit(dir: string): boolean {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { captures, parse, type Node } from "../../inventory/treesitter.ts";
@@ -15,7 +16,13 @@ const QUERY = `
 (export_statement declaration: (interface_declaration name: (type_identifier) @iface))
 (export_statement declaration: (enum_declaration name: (identifier) @enum))
 (export_statement declaration: (type_alias_declaration name: (type_identifier) @type))
+(program (function_declaration name: (identifier) @ifn))
+(program (lexical_declaration (variable_declarator name: (identifier) @iconst value: (arrow_function))))
+(program (class_declaration name: (type_identifier) @icls))
 `;
+
+/** Captures of declarations that are not exported (`@ifn` …). */
+const INTERNAL = new Set(["ifn", "iconst", "icls"]);
 
 export interface TsIndexOptions {
 	/** Decorator name → kind (framework specific, e.g. Controller → controller). */
@@ -32,29 +39,52 @@ export async function indexTsFile(projectDir: string, rel: string, opts: TsIndex
 	const out: TargetSymbol[] = [];
 	const shared = opts.sharedDirs.some((d) => rel.startsWith(d));
 	for (const c of await captures(lang, tree, QUERY)) {
-		const decl = c.name === "const" ? c.node.parent!.parent! : c.node.parent!;
+		const internal = INTERNAL.has(c.name);
+		const cap = internal ? c.name.slice(1) : c.name;
+		const decl = cap === "const" ? c.node.parent!.parent! : c.node.parent!;
+		const name = c.node.text;
+		const fnOf = (n: Node | null | undefined) => (n?.type === "arrow_function" || n?.type === "function_declaration" || n?.type === "function_expression" ? n : null);
+		const fn = cap === "fn" ? decl : cap === "const" ? fnOf(c.node.parent!.childForFieldName("value")) : null;
+		const fnHash = fn ? bodyHash(fn.childForFieldName("body"), fn.childForFieldName("parameters") ?? fn.childForFieldName("parameter")) : undefined;
+		// not exported: only its bodies matter (the gate's copy check on fresh files); indexTarget never stores them
+		if (internal) {
+			if (fnHash) out.push({ id: `${rel}::${name}`, path: rel, kind: "function", name, line: c.node.startPosition.row + 1, tags: ["internal"], bodyHash: fnHash });
+			if (cap === "cls") out.push(...methods(rel, decl, name, false, true));
+			continue;
+		}
 		const exportStmt = decl.parent!;
 		const doc = jsdoc(exportStmt);
 		const decorators = exportStmt.namedChildren.filter((n) => n?.type === "decorator").map((n) => n!.text);
-		const name = c.node.text;
 		const tags: string[] = [];
-		let kind: string = c.name === "fn" ? "function" : c.name === "cls" ? "class" : c.name === "iface" ? "interface" : c.name === "enum" ? "enum" : c.name === "type" ? "type" : "const";
+		let kind: string = cap === "fn" ? "function" : cap === "cls" ? "class" : cap === "iface" ? "interface" : cap === "enum" ? "enum" : cap === "type" ? "type" : "const";
 		for (const [deco, k] of Object.entries(opts.decoratorKinds ?? {})) if (decorators.some((d) => d.startsWith(`@${deco}`))) kind = typeof k === "string" ? k : kind;
 		if (kind === "class" || kind === "interface") for (const [re, k] of opts.nameKinds ?? []) if (re.test(name)) kind = k;
 		if (shared && (kind === "function" || kind === "const" || kind === "class")) kind = "helper";
 		if (shared) tags.push("shared");
+		if (cap === "cls") tags.push("class");
 		for (const d of decorators) tags.push(d.replace(/\(.*$/s, ""));
-		const signature = c.name === "fn" ? signatureOf(decl) : c.name === "const" ? decl.text.slice(0, 120).replace(/\s+/g, " ") : undefined;
-		out.push({ id: `${rel}::${name}`, path: rel, kind, name, line: c.node.startPosition.row + 1, signature, doc, tags });
-		if (c.name === "cls") {
-			const body = decl.childForFieldName("body");
-			for (const m of body?.namedChildren ?? []) {
-				if (m?.type !== "method_definition") continue;
-				const mn = m.childForFieldName("name")?.text;
-				if (!mn || mn === "constructor" || /\bprivate\b|\bprotected\b/.test(m.text.slice(0, m.text.indexOf(mn)))) continue;
-				out.push({ id: `${rel}::${name}.${mn}`, path: rel, kind: "method", name: `${name}.${mn}`, line: m.startPosition.row + 1, signature: signatureOf(m), doc: jsdoc(m), tags: shared ? ["shared"] : [] });
-			}
+		const signature = cap === "fn" ? signatureOf(decl) : cap === "const" ? decl.text.slice(0, 120).replace(/\s+/g, " ") : undefined;
+		out.push({ id: `${rel}::${name}`, path: rel, kind, name, line: c.node.startPosition.row + 1, signature, doc, tags, bodyHash: fnHash });
+		if (cap === "cls") out.push(...methods(rel, decl, name, shared, false));
+	}
+	return out;
+}
+
+/** Methods of a class: public ones of an exported class are indexed; private/protected (or all of an internal class) are "internal". */
+function methods(rel: string, decl: Node, cls: string, shared: boolean, internalClass: boolean): TargetSymbol[] {
+	const out: TargetSymbol[] = [];
+	for (const m of decl.childForFieldName("body")?.namedChildren ?? []) {
+		if (m?.type !== "method_definition") continue;
+		const mn = m.childForFieldName("name")?.text;
+		if (!mn || mn === "constructor") continue;
+		const internal = internalClass || /\bprivate\b|\bprotected\b/.test(m.text.slice(0, m.text.indexOf(mn))) || mn.startsWith("#");
+		const accessor = m.children.some((k) => k?.type === "get" || k?.type === "set");
+		const hash = accessor ? undefined : bodyHash(m.childForFieldName("body"), m.childForFieldName("parameters"));
+		if (internal) {
+			if (hash) out.push({ id: `${rel}::${cls}.${mn}`, path: rel, kind: "method", name: `${cls}.${mn}`, line: m.startPosition.row + 1, tags: ["internal"], bodyHash: hash });
+			continue;
 		}
+		out.push({ id: `${rel}::${cls}.${mn}`, path: rel, kind: "method", name: `${cls}.${mn}`, line: m.startPosition.row + 1, signature: signatureOf(m), doc: jsdoc(m), tags: shared ? ["shared"] : [], bodyHash: hash });
 	}
 	return out;
 }
@@ -117,7 +147,7 @@ export function tsVerifyChoices(projectDir: string, chosen: Array<{ key: string;
  */
 export function tsLayoutBase() {
 	return {
-		sharedDirs: ["src/shared/", "src/common/", "src/utils/", "src/lib/"],
+		sharedDirs: ["src/shared/"], // one shared dir: src/shared/<area>/ for code ≥ 2 feature areas use
 		sourceExtensions: [".ts", ".tsx"],
 		isTestFile: (p: string) => /\.(spec|test|e2e-spec)\.[cm]?[jt]sx?$/.test(p) || /\.d\.ts$/.test(p),
 		lang: (p: string) => (/\.tsx$/.test(p) ? "tsx" : /\.[cm]?ts$/.test(p) ? "typescript" : /\.[cm]?jsx?$/.test(p) ? "javascript" : undefined),
@@ -136,6 +166,51 @@ function jsdoc(n: Node): string | undefined {
 	}
 	return undefined;
 }
+
+/**
+ * Duplicate detector: hash of a function body's tokens with whitespace, semicolons, comments and type annotations
+ * dropped and local names (parameters, declared variables) replaced by their order of use, so a copy with other
+ * formatting, types or renamed locals still matches; member and callee names are kept. Bodies under 3 statements
+ * or MIN_TOKENS tokens (getters, delegations, the idiomatic load-or-404 handler) are too common to mean anything.
+ */
+const MIN_TOKENS = 34;
+export function bodyHash(body: Node | null | undefined, params?: Node | null): string | undefined {
+	if (body?.type !== "statement_block") return undefined;
+	if (body.namedChildren.filter((n) => n && n.type !== "comment").length < 3) return undefined;
+	const locals = new Set<string>();
+	const bindAll = (n: Node | null | undefined) => {
+		if (!n || TYPE_NODES.has(n.type)) return;
+		if (BINDING.has(n.type)) locals.add(n.text);
+		for (const k of n.namedChildren) bindAll(k);
+	};
+	bindAll(params);
+	const declare = (n: Node) => {
+		for (const f of DECLARES[n.type] ?? []) bindAll(n.childForFieldName(f));
+		for (const k of n.namedChildren) if (k) declare(k);
+	};
+	declare(body);
+	const order = new Map<string, string>();
+	const toks: string[] = [];
+	const visit = (n: Node) => {
+		if (TYPE_NODES.has(n.type)) return;
+		if (n.type === "as_expression" || n.type === "satisfies_expression") return void (n.namedChildren[0] && visit(n.namedChildren[0]));
+		if (n.childCount === 0) {
+			if (n.text === ";") return; // ASI: optional semicolons are style
+			if (BINDING.has(n.type) || n.type === "shorthand_property_identifier") {
+				if (locals.has(n.text)) return void toks.push(order.get(n.text) ?? (order.set(n.text, `$${order.size}`), order.get(n.text)!));
+			}
+			return void toks.push(n.text);
+		}
+		for (const k of n.children) if (k) visit(k);
+	};
+	visit(body);
+	if (toks.length < MIN_TOKENS) return undefined;
+	return createHash("sha1").update(toks.join(" ")).digest("hex").slice(0, 16);
+}
+const BINDING = new Set(["identifier", "shorthand_property_identifier_pattern"]);
+/** Node type → fields that declare local names. */
+const DECLARES: Record<string, string[]> = { variable_declarator: ["name"], for_in_statement: ["left"], catch_clause: ["parameter"], arrow_function: ["parameter", "parameters"], function_expression: ["parameters"], function_declaration: ["parameters"] };
+const TYPE_NODES = new Set(["comment", "type_annotation", "type_arguments", "type_parameters", "omitting_type_annotation", "opting_type_annotation", "asserts_annotation"]);
 
 function signatureOf(decl: Node): string {
 	const params = decl.childForFieldName("parameters")?.text ?? "()";

@@ -1,10 +1,14 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
-import type { TargetAdapter } from "../adapters/types.ts";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
+import { basename, dirname, join, relative } from "node:path";
+import type { TargetAdapter, TargetSymbol } from "../adapters/types.ts";
+import { targetBodies, targetClasses } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { EvidenceType } from "../ledger/schema.ts";
+import { activeRuleFiles } from "../rules/layout.ts";
+import { checkTree } from "./layout-check.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 
 /**
@@ -23,6 +27,16 @@ export interface GateInput {
 	appendOnlyGlobs?: string[];
 	/** Test files written by the tester, with their hashes at hand-over time. */
 	testFiles: Array<{ path: string; sha1: string }>;
+	/** The unit's placement: module dir (relative to targetProjectDir) and legacy area, for the structure check. */
+	moduleDir?: string;
+	area?: string;
+	/** Workspace root (rules live in .bigrefactor/rules/<stackId>/) and the unit's stack; rules_ok is skipped without root. */
+	root?: string;
+	stackId?: string;
+	/** Paths an approved tidy task names (sanctioned splits, moves, new shared topics). */
+	sanctioned?: string[];
+	/** The source adapter's legacy file kinds (SourceAdapter.legacyWords): no target name may carry one. */
+	legacyWords?: string[];
 	timeoutMs?: number;
 }
 
@@ -46,6 +60,8 @@ export interface GateReport {
 export async function runGate(g: GateInput): Promise<GateReport> {
 	const steps: GateStep[] = [];
 	const changed = changedFiles(g.targetProjectDir);
+	const tracked = new Set(trackedFiles(g.targetProjectDir));
+	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
 	const timeout = g.timeoutMs ?? 240_000;
 	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number }>) => {
 		const t0 = Date.now();
@@ -67,7 +83,6 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const problems: string[] = [];
 		const allow = g.writeGlobs.map(globToRegExp);
 		const appendOnly = (g.appendOnlyGlobs ?? []).map(globToRegExp);
-		const tracked = new Set(trackedFiles(g.targetProjectDir));
 		for (const f of changed) {
 			if (allow.some((r) => r.test(f))) continue;
 			if (appendOnly.some((r) => r.test(f))) {
@@ -82,25 +97,39 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
 			else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
 		}
-		const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
 		if (prodFiles.length === 0) problems.push("no production files were written");
 		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 	});
 	if (!agOk) return done();
 
-	// 3. build (type check)
+	// 3. structure + reuse: files follow the stack layout (one module per area, no per-legacy-file folders) and
+	//    nothing re-creates a class or function body that already exists in the target
+	//    (deleted files are not checked: a sanctioned tidy move removes a misnamed file; the write scope covers deletes)
+	const structureOk = await step("structure_ok", async () => {
+		const present = changed.filter((f) => existsSync(join(g.targetProjectDir, f)));
+		const ctx = { isNew: (f: string) => !tracked.has(f), sanctioned: g.sanctioned ?? [], legacyWords: g.legacyWords };
+		const lines = g.moduleDir && g.adapter.layout.checkStructure ? g.adapter.layout.checkStructure(present, g.moduleDir, g.area ?? "", g.targetProjectDir, ctx) : [];
+		const warnings = lines.filter((l) => l.startsWith("warning:"));
+		// drift checks (size cap, one class per responsibility …) on the touched files; drift elsewhere is reported, not failed
+		const tree = checkTree(g.targetProjectDir, g.adapter, present);
+		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed));
+		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings].join("\n") };
+	});
+	if (!structureOk) return done();
+
+	// 4. build (type check)
 	const b = g.adapter.build(g.targetProjectDir);
 	if (!(await step("build_ok", () => run(b.cmd, b.args, g.targetProjectDir, timeout)))) return done();
 
-	// 4. lint on changed files only
-	const lintFiles = changed.filter((f) => /\.(ts|tsx)$/.test(f));
+	// 5. lint on changed files only
+	const lintFiles = changed.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f)));
 	const l = g.adapter.lint(g.targetProjectDir, lintFiles);
 	if (!(await step("lint_ok", () => (lintFiles.length ? run(l.cmd, l.args, g.targetProjectDir, timeout) : Promise.resolve({ ok: true, output: "no lintable files" }))))) return done();
 
-	// 5. rules (ast-grep / dependency rules) — none configured yet in v1 pilot; recorded explicitly so it is visible
-	if (!(await step("rules_ok", async () => ({ ok: true, output: "no project rules configured (br init --rules pending)" })))) return done();
+	// 6. the stack's ast-grep rules on the changed production files
+	if (!(await step("rules_ok", () => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout)))) return done();
 
-	// 6. the ported characterization tests
+	// 7. the ported characterization tests
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
 	if (!(await step("ported_tests_green", () => run(t.cmd, t.args, g.targetProjectDir, timeout)))) return done();
 
@@ -110,6 +139,116 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const failed = steps.find((s) => !s.ok);
 		return { ok: !failed, steps, changedFiles: changed, failedStep: failed?.name, testFiles: g.testFiles.map((t) => t.path) };
 	}
+}
+
+/**
+ * The shared dir is not a second home for an area: an area unit may add files to an existing shared topic, but a
+ * new topic (or one named after its own area) needs a shared unit (placement) or an approved tidy task.
+ */
+function sharedTopicProblems(g: GateInput, present: string[], tracked: Set<string>): string[] {
+	const dirs = g.adapter.layout.sharedDirs;
+	if (!g.moduleDir || dirs.some((d) => `${g.moduleDir}/`.startsWith(d))) return [];
+	const out: string[] = [];
+	for (const f of present) {
+		const d = dirs.find((x) => f.startsWith(x));
+		if (!d || tracked.has(f) || g.sanctioned?.includes(f) || g.adapter.layout.isTestFile(f)) continue;
+		const topic = f.slice(d.length).split("/")[0]!;
+		if (topic === g.area) out.push(`${f}: the area's code goes in ${g.moduleDir}/, not in a shared topic named after the area`);
+		else if (![...tracked].some((t) => t.startsWith(`${d}${topic}/`))) out.push(`${f}: new shared topic ${d}${topic}/ from an area unit; put the code in ${g.moduleDir}/ (shared units and tidy tasks start shared topics) or import an existing one`);
+	}
+	return out;
+}
+
+/** Canonical class name for the reuse check: aliases of one kind collapse (Repo = Repository, Agency = AgencyEntity). */
+export function classKey(name: string): string {
+	return name
+		.toLowerCase()
+		.replace(/impl$/, "")
+		.replace(/repo$/, "repository")
+		.replace(/(entity|model|record)$/, "");
+}
+
+/**
+ * Reuse, decided by code: a new class whose canonical name already exists in this stack's target index (or in another
+ * changed file), and a function/method whose normalized body equals one in another file, fail with a pointer to the
+ * original. Same-name DTOs/entities in different areas count too: one record = one class; a different record needs
+ * an area-specific name. Files the unit changed are compared against their fresh parse, not the index; fresh bodies
+ * include non-exported functions and private methods (tag "internal"), so a copy hidden there fails too.
+ */
+async function reuseProblems(g: GateInput, prodFiles: string[], allChanged: string[]): Promise<string[]> {
+	if (!g.adapter.indexFile) return [];
+	// every changed path, deleted ones too: a tidy move's old path is still indexed but no original any more
+	const changed = new Set(allChanged);
+	const fresh: TargetSymbol[] = [];
+	for (const f of prodFiles) if (g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))) fresh.push(...(await g.adapter.indexFile(g.targetProjectDir, f).catch(() => [])));
+	const problems: string[] = [];
+	const indexed = targetClasses(g.ledger, g.adapter.id).filter((r) => !changed.has(r.path));
+	for (const s of fresh) {
+		if (s.tags.includes("class")) {
+			const key = classKey(s.name);
+			const dup = !key ? undefined : indexed.find((r) => classKey(r.name) === key) ?? fresh.find((o) => o.path !== s.path && o.tags.includes("class") && classKey(o.name) === key);
+			if (dup) problems.push(`reuse ${dup.path}::${dup.name} — ${s.path} declares ${s.name} again; extend/import the existing class (a different record needs an area-specific name)`);
+		}
+		if (s.bodyHash) {
+			const dup = targetBodies(g.ledger, g.adapter.id, s.bodyHash).find((r) => !changed.has(r.path)) ?? fresh.find((o) => o.path !== s.path && o.bodyHash === s.bodyHash);
+			if (dup) problems.push(`reuse ${dup.path}::${dup.name} — ${s.path}::${s.name} has the same body; call or move it to a shared helper instead of copying`);
+		}
+	}
+	return [...new Set(problems)];
+}
+
+/**
+ * rules_ok: every active ast-grep rule of the stack against the changed files. A match with severity error/warning
+ * fails with rule id + location; hint/info are listed only. No rules, no binary or a broken rule file: ok with the
+ * reason, so a bad rule never blocks every unit.
+ */
+async function checkRules(g: GateInput, files: string[], timeoutMs: number): Promise<{ ok: boolean; output: string }> {
+	if (!g.root) return { ok: true, output: "skipped: no workspace root given" };
+	const stackId = g.stackId ?? g.adapter.id;
+	const rules = activeRuleFiles(g.root, stackId);
+	if (!rules.length) return { ok: true, output: `skipped: no ast-grep rules for ${stackId}` };
+	if (!files.length) return { ok: true, output: "skipped: no changed source files" };
+	const bin = astGrepBin();
+	if (!bin) return { ok: true, output: "skipped: ast-grep is not installed" };
+	const fails: string[] = [];
+	const notes: string[] = [];
+	for (const rule of rules) {
+		const r = await new Promise<{ stdout: string; stderr: string; code: number; spawnError?: string }>((res) =>
+			execFile(bin, ["scan", "--rule", rule, "--json=compact", ...files], { cwd: g.targetProjectDir, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) =>
+				res({ stdout, stderr, code: err ? (typeof (err as any).code === "number" ? (err as any).code : -1) : 0, spawnError: err && (err as any).code === "ENOENT" ? "ENOENT" : undefined }),
+			),
+		);
+		if (r.spawnError) return { ok: true, output: "skipped: ast-grep is not installed" };
+		// exit 0 = no match, 1 = matches; anything else (8: rule does not parse) means the rule never ran
+		if ((r.code !== 0 && r.code !== 1) || (!r.stdout.trim() && r.stderr.trim() && r.code !== 0)) {
+			notes.push(`rule ${basename(rule)} not applied (exit ${r.code}): ${r.stderr.replace(/\[warn\][^\n]*\n(Enable[^\n]*\n)?/g, "").trim().slice(0, 300)}`);
+			continue;
+		}
+		let matches: Array<{ ruleId: string; severity: string; file: string; message: string; range: { start: { line: number; column: number } } }>;
+		try {
+			matches = JSON.parse(r.stdout || "[]");
+		} catch {
+			notes.push(`rule ${basename(rule)} not applied: ${r.stderr.replace(/\[warn\][^\n]*\n(Enable[^\n]*\n)?/g, "").trim().slice(0, 300)}`);
+			continue;
+		}
+		for (const m of matches) {
+			const line = `${m.ruleId} ${m.file}:${m.range.start.line + 1}:${m.range.start.column + 1} ${m.message}`.trim();
+			(m.severity === "error" || m.severity === "warning" ? fails : notes).push(line);
+		}
+	}
+	const head = `${rules.length} rule(s) on ${files.length} file(s)`;
+	return { ok: fails.length === 0, output: [fails.length ? `rule violations (${head}):` : `${head}: no violations`, ...fails, ...notes.map((n) => `note: ${n}`)].join("\n") };
+}
+
+/** The ast-grep CLI this package ships (devDependency @ast-grep/cli), else one on PATH. */
+function astGrepBin(): string | undefined {
+	try {
+		const dir = dirname(createRequire(import.meta.url).resolve("@ast-grep/cli/package.json"));
+		if (existsSync(join(dir, "ast-grep"))) return join(dir, "ast-grep");
+	} catch {
+		/* not installed with this package */
+	}
+	return "ast-grep";
 }
 
 export function run(cmd: string, args: string[], cwd: string, timeoutMs: number): Promise<{ ok: boolean; output: string; exitCode?: number }> {
@@ -132,7 +271,7 @@ export function changedFiles(dir: string): string[] {
 			.split("\n")
 			.filter(Boolean)
 			.map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
-			.map((p) => relative(dir, join(top, p)))
+			.map((p) => relative(realpathSync(dir), join(top, p))) // top is the real path (/var → /private/var on macOS)
 			.filter((p) => !p.startsWith("..") && !/^(node_modules|dist)(\/|$)/.test(p)); // worktrees symlink node_modules (a symlink is not matched by "node_modules/")
 	} catch {
 		return [];

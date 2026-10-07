@@ -1,50 +1,79 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { rulesDir } from "../rules/layout.ts";
 import type { Config } from "../config.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 
 /** Prompts are short. Everything specific comes from the task card and the pull tools. */
 
 /**
- * Rules every leaf sees: global RULES.md + the AGENTS.md chain mirroring the target tree (root → src →
- * module). They live in the workspace (.bigrefactor/rules), never in the target repo, and are injected
- * verbatim so every session works from the same text.
+ * Rules every leaf sees: its stack's living rules (layout from the adapter + curated body) and AGENTS.md,
+ * plus a per-module AGENTS.md when one exists. They live in the workspace (.bigrefactor/rules/<stack>/), never in
+ * the target repo, and are injected verbatim so every session of a stack works from the same version.
  */
-export function rulesText(root: string, _targetProjectDir: string, moduleDir?: string): string {
-	const rulesDir = join(root, ".bigrefactor", "rules");
+export function rulesText(root: string, stackId: string, moduleDir?: string): string {
+	const dir = rulesDir(root, stackId);
 	const parts: string[] = [];
-	if (existsSync(join(rulesDir, "RULES.md"))) parts.push(readFileSync(join(rulesDir, "RULES.md"), "utf8"));
-	const chain = ["AGENTS.md", join("src", "AGENTS.md"), ...(moduleDir ? [join(moduleDir, "AGENTS.md")] : [])];
-	for (const rel of chain) {
-		const p = join(rulesDir, rel);
-		if (existsSync(p)) parts.push(`### ${rel} (applies to the target repo)\n${readFileSync(p, "utf8")}`);
+	if (existsSync(join(dir, "RULES.md"))) parts.push(readFileSync(join(dir, "RULES.md"), "utf8"));
+	for (const rel of ["AGENTS.md", ...(moduleDir ? [join(moduleDir, "AGENTS.md")] : [])]) {
+		const p = join(dir, rel);
+		if (existsSync(p)) parts.push(`### ${rel} (applies to the ${stackId} project)\n${readFileSync(p, "utf8")}`);
 	}
 	return parts.join("\n\n");
 }
 
-export function testerSystemPrompt(config: Config, opts: { truthDir: string; targetProjectDir: string; moduleDir: string; rules: string; source: SourceAdapter; target: TargetAdapter; projectNotes: string[] }): string {
+/**
+ * The migration policy (stack-neutral, decided by the owner): behaviour real callers observe is preserved;
+ * artifacts of the old language are not; every quirk is recorded with an opinion and decided by the owner.
+ */
+const BEHAVIOUR_POLICY = `Behaviour policy:
+- Preserve what real callers observe: outputs, side effects, errors, ordering, for the inputs the callers actually pass (who_calls shows them). Inputs outside the target's types (null where a value is required, numeric strings, wrong shapes) are not pinned — the target's types exclude them.
+- Artifacts of the old language are NOT carried over: loose truthiness/emptiness checks, implicit type coercion, string/number juggling, reference/copy semantics. Write idiomatic typed code instead.
+- Every oddity you notice (surprising output, likely bug, language artifact a caller might depend on) is recorded with record_quirk and your opinion (drop|keep + why). Language artifacts with opinion drop are dropped automatically; the rest are decided by the owner.`;
+
+export interface PlacementPromptOpts {
+	area: string;
+	stackId: string;
+	moduleDir: string;
+	structureDoc: string;
+}
+
+export function testerSystemPrompt(config: Config, opts: PlacementPromptOpts & { truthDir: string; targetProjectDir: string; rules: string; source: SourceAdapter; target: TargetAdapter; projectNotes: string[] }): string {
 	return `You are the TESTER for a legacy migration (${config.source.stack} → ${config.target.stacks.join(" + ")}). You are not the implementer and you never write production code.
 
 Your job for one unit:
 1. Read the legacy symbols in the task card (source files are included; use source_symbol_body / who_calls / symbol_lookup for more).
-2. Write CHARACTERIZATION tests that pin the CURRENT behaviour of the old code — including quirks. Cover every public symbol, every branch you can see, and edge inputs (0, "0", "", null, [], negative, boundaries). Do not fix bugs; record them.
+2. Write CHARACTERIZATION cases that pin the behaviour of the old code for realistic inputs: every public symbol, every branch you can see, boundaries of valid values. Follow the behaviour policy below; record quirks with record_quirk instead of pinning them blindly, and write the cases the way your opinion says (drop → the intended behaviour is expected, the quirk is not pinned; keep → pin it).
 3. Make them run against the OLD code: write ${opts.truthDir}/${opts.source.truth.scriptName} — ${opts.source.truth.instructions} The JSON array has the shape [{"symbol": "<legacy symbol id from the card>", "inputs": <json>, "expected": <json>}]. The legacy repo is read-only.
-4. Draft the TARGET interface the implementer must satisfy: write ${opts.truthDir}/interface.md listing target file paths under ${opts.moduleDir}/, exported names and signatures (${opts.target.layout.interfaceHint}).
+4. Draft the TARGET interface the implementer must satisfy: write ${opts.truthDir}/interface.md listing target file paths, exported names and signatures (${opts.target.layout.interfaceHint}). This unit belongs to area "${opts.area}" on ${opts.stackId}: every path MUST be under ${opts.moduleDir}/ (binding; the orchestrator rejects other paths) and follow the layout below — extend the area's existing files (target_lookup) instead of new ones per legacy file. Signatures use the target's types, not the legacy language's.
 5. Port the cases to target tests: write them under ${opts.targetProjectDir}/${opts.moduleDir}/ as ${opts.target.layout.testHint}, importing from the paths in interface.md, one expectation per case, same expected values. They will fail until the implementer is done — that is correct.${opts.projectNotes.length ? `\n   Target project facts: ${opts.projectNotes.join("; ")}.` : ""}
+If something about the target conventions is missing or wrong in the rules and would matter for other units too, call propose_rule.
 Finish with one line: "TESTER DONE <n> cases".
-${opts.rules ? `\n## Target rules\n${opts.rules}` : ""}`;
+
+${BEHAVIOUR_POLICY}
+
+## Layout of area "${opts.area}" (${opts.stackId})
+${opts.structureDoc}
+${opts.rules ? `\n## Target rules (${opts.stackId})\n${opts.rules}` : ""}`;
 }
 
-export function implementerSystemPrompt(config: Config, opts: { moduleDir: string; sharedDirs: string[]; rules: string; attempt: number }): string {
+export function implementerSystemPrompt(config: Config, opts: PlacementPromptOpts & { sharedDirs: string[]; rules: string; attempt: number; quirks?: string }): string {
 	return `You are the IMPLEMENTER for a legacy migration (${config.source.stack} → ${config.target.stacks.join(" + ")}). You write the new code for ONE unit in ONE pass, then stop. You do not run builds or tests (a gate does that after you finish) and you cannot edit tests.
 
 Rules of the pass:
-- Port the WHOLE unit now: move functions into the right target module/class, extract helpers, deduplicate (the card lists duplicate candidates; use target_lookup before creating anything that might exist). Prefer small, idiomatic, typed code over faithful transliteration — but behaviour must match the truth cases exactly (truth_lookup).
+- Port the WHOLE unit now: move functions into the right target module/class, extract helpers, deduplicate (the card lists duplicate candidates; use target_lookup before creating anything that might exist). Prefer small, idiomatic, typed code over faithful transliteration — behaviour must match the truth cases (truth_lookup), which pin only what callers observe.
 - Satisfy the drafted interface in the task card (file paths, exported names, signatures) so the ported tests can import it. If it is wrong, implement the closest correct thing and say why in your final message.
+- This unit belongs to area "${opts.area}" on ${opts.stackId}. ${opts.moduleDir}/ is the area's module, shared with every other unit of the area: extend the existing classes/files listed in the task card first (target_lookup), never add a parallel class or a folder per legacy file.
 - Write only inside ${opts.moduleDir}/. Cross-cutting code (errors, logging, money/number formatting, dates, validation, pagination) belongs in ${opts.sharedDirs[0] ?? "the shared dir"}<area>/: call shared_lookup first and REUSE what exists; you may ADD a new file there (with a doc comment) but never edit an existing shared file — other units depend on it; say in your final message if one needs a change. Registration/wiring files are generated — never edit them.
 - Call ledger_prove for EVERY legacy symbol in the card (moved / extracted / merged_into / inlined / split / dropped + why). The unit fails the gate otherwise.
-- Pull context with tools (symbol_lookup, who_calls, source_symbol_body, target_lookup, pattern_examples, docs_lookup); do not ask questions.
+- Pull context with tools (symbol_lookup, who_calls, source_symbol_body, target_lookup, pattern_examples, docs_lookup); do not ask questions. If a convention is missing from the rules and other units will need it, call propose_rule.
 ${opts.attempt > 1 ? `- This is attempt ${opts.attempt}. The gate output is in the task; fix exactly what failed, keep what passed.` : ""}
 Finish with one line: "IMPLEMENTER DONE" plus anything the reviewer must know.
-${opts.rules ? `\n## Target rules\n${opts.rules}` : ""}`;
+
+${BEHAVIOUR_POLICY.replace("record_quirk", "your final message (the tester records quirks)")}
+${opts.quirks ? `\n## Quirks of this unit (decided)\n${opts.quirks}\nKept quirks get a \`// LEGACY: <why>\` comment; dropped ones are not reproduced.` : ""}
+
+## Layout of area "${opts.area}" (${opts.stackId})
+${opts.structureDoc}
+${opts.rules ? `\n## Target rules (${opts.stackId})\n${opts.rules}` : ""}`;
 }

@@ -6,17 +6,23 @@ import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { planFrameworks } from "./frameworks.ts";
 import { TARGET_SUBDIRS } from "../adapters/registry.ts";
+import { pointHash, type DecisionPoint, type PhrasedQuestion } from "../jev/ask.ts";
 
 /**
  * Decision gate. Everything the inventory cannot decide from code alone is derived here as a typed
  * question with options and a recommendation; `br run` and `br simulate --level 3` refuse while any is
  * open (nothing is silently defaulted). Answers live in `.bigrefactor/decisions.json` (workspace, never
  * in a repo), are mirrored into the ledger `questions` table (point `decision:<id>`, blocks nothing), and
- * are applied to config / slices / framework plan by `applyDecision`. Pure code: same inventory → same list.
+ * are applied to config / slices / framework plan by `applyDecision`.
+ *
+ * Code only detects WHAT is undecided (`question` here is the code's intent, never shown as-is once a model
+ * ran): `br advise` has a model that read the repo phrase every point for this repo (`phrased`, keyed by a
+ * hash of the facts so changed facts are re-phrased) and add decision points the code did not foresee
+ * (`discovered`, ids `repo:<slug>`; their answers are binding context for rules generation).
  */
 export interface Decision {
 	id: string;
-	topic: "data" | "frontend" | "framework" | "library" | "slicing" | "truth" | "target" | "budget";
+	topic: "data" | "frontend" | "framework" | "library" | "slicing" | "truth" | "target" | "budget" | "repo";
 	question: string;
 	options: Array<{ value: string; label: string; hint?: string }>;
 	recommended?: string;
@@ -28,7 +34,7 @@ export interface Decision {
 }
 
 export interface DecisionAnswer { answer: string; by: string; at: string }
-export type DecisionFile = { survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
+export type DecisionFile = { phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
 
 export function decisionsPath(root: string): string {
 	return join(root, ".bigrefactor", "decisions.json");
@@ -58,7 +64,8 @@ export function recordEarlyDecision(root: string, id: string, answer: string, by
 	saveDecisions(root, d);
 }
 
-export function openDecisions(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string): Decision[] {
+/** `raw` = the code's points without the model's phrasing (input for `br advise`). */
+export function openDecisions(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string, opts: { raw?: boolean } = {}): Decision[] {
 	process.env["BR_WORKSPACE"] = root; // the generated framework profile lives in this workspace
 	const answered = loadDecisions(root).answers;
 	const out: Decision[] = [];
@@ -102,7 +109,7 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 
 	// --- cycles: forward references vs merging pairs
 	const cutUnits = (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE json_array_length(json_extract(meta,'$.cutDeps')) > 0").get() as { n: number }).n;
-	if (cutUnits > 0 && source.unitGroupOf) out.push({ id: "cycle-cuts", topic: "slicing", question: `${cutUnits} units carry forward references from cycle cutting. Strategy?`, evidence: "model ↔ facade ↔ command cycles", recommended: "merge-groups", options: [{ value: "merge-groups", label: "merge natural pairs (model+facade) into one unit, cut the rest", hint: "fewer forward references; units up to ~2× bigger" }, { value: "forward-refs", label: "keep whole-file units; implementer codes against interfaces", hint: "more units touch an interface twice" }] });
+	if (cutUnits > 0 && source.unitGroupOf) out.push({ id: "cycle-cuts", topic: "slicing", question: `${cutUnits} units carry forward references from cycle cutting. Strategy?`, evidence: `${cutUnits} units with cut dependency edges`, recommended: "merge-groups", options: [{ value: "merge-groups", label: "merge naturally paired files into one unit, cut the rest", hint: "fewer forward references; units up to ~2× bigger" }, { value: "forward-refs", label: "keep whole-file units; implementer codes against interfaces", hint: "more units touch an interface twice" }] });
 
 	// --- dynamic slice
 	const slicePlan = ledger.getMeta("slice_plan");
@@ -111,7 +118,7 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 
 	// --- truth environment
 	const compose = findCompose(config.source.path);
-	out.push({ id: "truth-env", topic: "truth", question: "Truth needs the legacy app runnable. What exists?", evidence: compose ? `docker compose found: ${compose}` : "no docker compose found", recommended: compose ? "docker-dump" : "none", options: [{ value: "docker-dump", label: "docker compose + a DB dump I can provide", hint: "HTTP goldens + PHPUnit on old code" }, { value: "docker-only", label: "docker compose, schema only (no data dump yet)", hint: "unit truth now, goldens later" }, { value: "none", label: "nothing runnable locally", hint: "tester-written characterization tests on pure code only" }] });
+	out.push({ id: "truth-env", topic: "truth", question: "Truth needs the legacy app runnable. What exists?", evidence: compose ? `docker compose found: ${compose}` : "no docker compose found", recommended: compose ? "docker-dump" : "none", options: [{ value: "docker-dump", label: "docker compose + a DB dump I can provide", hint: "recorded HTTP responses + the legacy test suite on the old code" }, { value: "docker-only", label: "docker compose, schema only (no data dump yet)", hint: "unit truth now, goldens later" }, { value: "none", label: "nothing runnable locally", hint: "tester-written characterization tests on pure code only" }] });
 
 	// --- target location
 	if (/\/\.sim\//.test(config.target.path)) out.push({ id: "target-location", topic: "target", question: `Target is ${relative(root, config.target.path) || config.target.path} (simulation dir). Fine for L3 sampling?`, evidence: "L3 never merges into a real repo", recommended: "sim-ok", options: [{ value: "sim-ok", label: "yes, decide the real location after L3" }, { value: "set-now", label: "set the real path now (answer `set:<absolute path>`)" }] });
@@ -144,9 +151,31 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 			d.reason ??= "no stronger evidence; safest option";
 		}
 	}
+	// the model's phrasing for this repo replaces the code's intent text; facts changed since → code text stays until re-advised
+	const file = loadDecisions(root);
+	const ids = new Set(out.map((d) => d.id));
+	if (!opts.raw) for (const d of out) {
+		const ph = file.phrased?.[d.id];
+		if (!ph || ph.hash !== pointHash(toPoint(d))) continue;
+		const labels = new Map(ph.options.map((o) => [o.value, o]));
+		// the model may omit options that make no sense here; the recommended one always stays
+		d.options = d.options.filter((o) => labels.has(o.value) || o.value === d.recommended).map((o) => ({ value: o.value, label: labels.get(o.value)?.label ?? o.label, hint: labels.get(o.value)?.hint ?? o.hint }));
+		d.question = ph.question;
+		if (!advice[d.id] && ph.recommended && d.options.some((o) => o.value === ph.recommended)) d.recommended = ph.recommended;
+		d.reason = d.reason && advice[d.id] ? `${d.reason}. ${ph.opinion}` : ph.opinion;
+	}
+	for (const [id, q] of Object.entries(file.discovered ?? {})) {
+		if (ids.has(id) || opts.raw) continue;
+		out.push({ id, topic: "repo", question: q.question, evidence: q.evidence, options: q.options, recommended: q.recommended ?? q.options[0]?.value, reason: q.opinion });
+	}
 	// recommended option first: in a multiple-choice prompt, Enter takes it
 	for (const d of out) d.options.sort((a, b) => Number(b.value === d.recommended) - Number(a.value === d.recommended));
 	return out.filter((d) => !answered[d.id]);
+}
+
+/** The code's view of a decision, as the phrasing model gets it. */
+export function toPoint(d: Decision): DecisionPoint {
+	return { id: d.id, topic: d.topic, intent: d.question, evidence: d.evidence, options: d.options.map((o) => ({ value: o.value, facts: `${o.label}${o.hint ? ` — ${o.hint}` : ""}` })), recommended: d.recommended };
 }
 
 /** api target alone, or api + each web target: the options for the "targets" decision. */
@@ -214,6 +243,8 @@ export function applyDecision(ledger: Ledger, config: Config, root: string, id: 
 			raw.target.path = m[1]!.trim();
 			note = `config.target.path = ${raw.target.path}`;
 		}
+	} else if (kind === "repo") {
+		note = `${id} = ${answer} (binding for rules)`;
 	} else if (id === "budget") {
 		const m = /^raise:(\d+)$/.exec(answer);
 		if (m) {

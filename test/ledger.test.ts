@@ -53,7 +53,7 @@ describe("ledger invariants", () => {
 		const l = seed();
 		l.createUnit({ id: "U1", tier: "T1", symbolIds: ["src/A.php::A::calc", "src/A.php::A::fmt"] });
 		l.prove({ unitId: "U1", srcSymbol: "src/A.php::A::calc", op: "moved", targetSymbols: ["src/a.ts::calc"], why: "port" });
-		for (const t of ["symbolproof_ok", "build_ok", "lint_ok", "rules_ok", "antigaming_ok", "ported_tests_green", "truth_green_on_old"] as const) l.addEvidence("U1", t);
+		for (const t of ["symbolproof_ok", "build_ok", "lint_ok", "rules_ok", "antigaming_ok", "structure_ok", "ported_tests_green", "truth_green_on_old"] as const) l.addEvidence("U1", t);
 		// A::fmt is still only clustered → unproven
 		expect(() => l.transitionUnit("U1", "accepted")).toThrow(/unproven symbols/);
 		l.prove({ unitId: "U1", srcSymbol: "src/A.php::A::fmt", op: "dropped", why: "formatting now done by Intl in the view layer" });

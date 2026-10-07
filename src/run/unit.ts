@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { diagnoseFailure } from "./doctor.ts";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join, relative } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
@@ -10,14 +10,20 @@ import type { Config } from "../config.ts";
 import { commitAll } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { syntaxErrors } from "../inventory/treesitter.ts";
+import { describeCapabilities } from "../inventory/capabilities.ts";
 import { indexTarget } from "../inventory/target.ts";
+import { askViaModel } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, testerTools } from "../sessions/tools.ts";
 import { renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+import { recordDrift } from "./layout-check.ts";
+import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
+import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
+import { completeTidyTasks, tidyTaskCard, tidyTasks, type TidyTask } from "./tidy.ts";
 import { triageGate, type Triage } from "./triage.ts";
 
 /**
@@ -82,28 +88,45 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const blocked = o.ledger.blockedUnits().get(o.unitId);
 	if (blocked?.length) throw new Error(`unit ${o.unitId} waits for human question(s) #${blocked.join(", #")} (br questions)`);
 
-	const stackId = o.config.target.stacks[0]!; // v1: the backend stack owns units; UI units arrive with the React adapter
+	// never on code's unsure guess: an unplaced unit waits for Jev or its placement question (br place)
+	const unplaced = unplacedReason(o.config, unit.meta, o.root);
+	if (unplaced) throw new Error(`unit ${o.unitId} has no placement yet (code unsure: ${unplaced}); br place`);
+	const place = placeUnit(o.config, unit.meta, o.root);
+	const { stackId, area } = place;
 	const adapter = await getTargetAdapter(stackId);
 	const targetProjectDir = o.workDir ? join(o.workDir, relative(o.config.target.path, projectDir(o.config, stackId))) : projectDir(o.config, stackId);
 	if (!existsSync(join(targetProjectDir, "package.json"))) throw new Error(`target project missing at ${targetProjectDir}; run br setup`);
 	const sourceAdapter = getSourceAdapter(o.config.source.stack);
-	const module = moduleName(unit.meta);
-	const moduleDir = adapter.layout.moduleDir(module);
-	const writeGlobs = [`${moduleDir}/**`];
+	// one legacy area = one feature module (or, for code ≥ 2 areas use, the shared dir + area)
+	const moduleDir = placementDir(adapter.layout, place);
+	// approved tidy tasks of the area: their files are in scope (existing shared ones too); 1:1 moves are done by code
+	tidyTaskCard(o.ledger, stackId, area); // syncs answered tidy questions first: scope, moves and the card read the same tasks
+	const tidy = tidyTasks(o.ledger, stackId, area).filter((t) => t.status === "approved");
+	const tidyMoved = tidyMoves(targetProjectDir, tidy, adapter.layout.isTestFile);
+	if (tidyMoved.length) log(pc.dim(`  tidy: moved ${tidyMoved.join(", ")} (imports are the implementer's job)`));
+	const tidyPaths = [...new Set(tidy.flatMap((t) => [...t.from, ...t.to]))];
+	const writeGlobs = [`${moduleDir}/**`, ...tidyPaths];
 	const appendOnlyGlobs = adapter.layout.sharedDirs.map((d) => `${d.replace(/\/$/, "")}/**`); // cross-cutting helpers: add new files, never edit
 	const truthDirAbs = join(o.root, ".bigrefactor", "truth", o.unitId);
 	mkdirSync(truthDirAbs, { recursive: true });
 	const truthDirRel = relative(o.root, truthDirAbs);
 	const targetRel = relative(o.root, targetProjectDir);
-	const rules = rulesText(o.root, targetProjectDir, moduleDir);
+	const rules = rulesText(o.root, stackId, moduleDir);
+	const placeOpts = { area, stackId, moduleDir, structureDoc: adapter.layout.structureDoc };
 	const gateSlot = o.gateSlot ?? (<T>(fn: () => Promise<T>) => fn());
 	const spawn = o.spawn ?? spawnLeaf;
 	const gateFn = o.gate ?? runGate;
 	let cost = 0;
 	let providerErrors = 0;
+	const askDeps = { ledger: o.ledger, config: o.config, root: o.root, client: o.client };
+	const ask = async (q: Pick<Parameters<typeof askViaModel>[1], "point" | "facts" | "options" | "context">): Promise<number> => {
+		const r = await askViaModel(askDeps, { unitId: o.unitId, askedBy: "orchestrator", blocks: "unit", ...q });
+		cost += r.costUsd;
+		return r.id;
+	};
 
-	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter };
-	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter });
+	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir };
+	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 
 	// ---- truth ----------------------------------------------------------------------------------
@@ -117,7 +140,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			config: o.config,
 			writeGlobs: [`${truthDirRel}/**`, ...adapter.layout.testFileGlobs(moduleDir).map((g) => `${targetRel}/${g}`)],
 			protectedGlobs: [],
-			systemPrompt: testerSystemPrompt(o.config, { truthDir: truthDirRel, targetProjectDir: targetRel, moduleDir, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
+			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, truthDir: truthDirRel, targetProjectDir: targetRel, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
 			customTools: testerTools({ ...deps, attemptId: attempt }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && log(pc.dim(`  tester blocked: ${e.blocked}`)),
@@ -158,20 +181,54 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			if (!truthOk) lastErr = (o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string } | undefined)?.gate_report ?? "";
 		}
 		if (!truthOk) {
-			const q = o.ledger.askQuestion({ unitId: o.unitId, point: "truth_env", question: `The tester could not get characterization cases green on the old code for ${o.unitId} after 2 passes. Is the legacy code runnable here (deps, autoload, DB)? Fix the environment or mark the unit for goldens instead.`, context: { error: lastErr?.slice(-1500) }, blocks: "unit", askedBy: "orchestrator" });
+			const q = await ask({
+				point: "truth_env",
+				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time. Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
+				options: [
+					{ value: "fixed", facts: "the legacy environment (deps, autoload, DB) is fixed now: the tester runs again" },
+					{ value: "goldens", facts: "the code cannot run here: capture golden outputs another way, then rerun" },
+				],
+				context: { error: lastErr?.slice(-1500) },
+			});
 			log(pc.yellow(`  truth still red; asked question #${q} — only this unit waits`));
 			return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 2, costUsd: cost };
 		}
 	}
 
-	if (o.truthOnly) {
-		// keep the ported tests: the worktree is thrown away until the deps land
+	// The drafted interface must stay inside the unit's placement (code checks, the tester fixes): never a
+	// folder per legacy file, never another area's module.
+	const allowedDirs = place.shared ? adapter.layout.sharedDirs : [`${moduleDir}/`];
+	const outside = () => draftedOutside(existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "", allowedDirs, targetRel, [targetProjectDir, o.config.source.path, o.root]);
+	for (let i = 0, bad = outside(); bad.length; i++, bad = outside()) {
+		if (i === 2) {
+			// two retests did not fix it: never implement against an interface outside the placement
+			o.ledger.transitionUnit(o.unitId, "quarantined", `interface.md still drafts files outside ${moduleDir}/ after 2 retests: ${bad.join(", ")}`);
+			log(pc.red(`  interface.md still outside the placement after 2 retests; quarantined`));
+			return { unitId: o.unitId, state: "quarantined", attempts: 0, costUsd: cost };
+		}
+		log(pc.yellow(`  interface.md drafts files outside ${moduleDir}/: ${bad.join(", ")} — retest`));
+		await runTruth(`interface.md drafts files outside this unit's placement: ${bad.join(", ")}. Every file this unit creates lives under ${moduleDir}/ (area "${area}"), shaped as below; extend the files already there instead of creating parallel ones. Fix interface.md and the ported tests' imports.\n${adapter.layout.structureDoc}`);
+	}
+
+	// keep the ported tests: the worktree is thrown away until the unit runs again (deps landed, question answered)
+	const savePorted = () => {
 		const files = findTests(targetProjectDir, moduleDir, adapter.layout);
 		for (const f of files) {
 			mkdirSync(dirname(join(portedDir, f)), { recursive: true });
 			copyFileSync(join(targetProjectDir, f), join(portedDir, f));
 		}
 		o.ledger.addEvidence(o.unitId, "truth_ahead", { files });
+		return files;
+	};
+	// quirks the tester recorded become questions (phrased by a model); only this unit waits for them
+	cost += (await askPendingQuirks({ ...askDeps, root: o.root }, o.unitId)).costUsd;
+	if (o.ledger.blockedUnits().has(o.unitId)) {
+		const files = savePorted();
+		log(pc.yellow(`  quirk question(s) #${o.ledger.blockedUnits().get(o.unitId)!.join(", #")} open; ${files.length} ported test file(s) saved — only this unit waits`));
+		return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 0, costUsd: cost };
+	}
+	if (o.truthOnly) {
+		const files = savePorted();
 		log(pc.dim(`  truth ahead: ${files.length} ported test file(s) saved; implementing starts once the deps are accepted`));
 		return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 0, costUsd: cost };
 	}
@@ -188,6 +245,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	}
 
 	const loadTests = () => findTests(targetProjectDir, moduleDir, adapter.layout).map((p) => ({ path: p, sha1: sha1(readFileSync(join(targetProjectDir, p))) }));
+	// answered quirks the tests do not follow yet: the tester rewrites them first
+	const quirkNote = quirkRetestNote({ ledger: o.ledger, root: o.root }, o.unitId);
+	if (quirkNote) {
+		log(pc.dim("  quirk answers differ from the ported tests: retest"));
+		await runTruth(quirkNote);
+	}
 	let testFiles = loadTests();
 	if (!testFiles.length) log(pc.yellow("  no ported test files found — the gate cannot prove behaviour"));
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");
@@ -210,7 +273,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// Budget per unit is a hard cap enforced by code: spend so far (all roles, all attempts) vs config.
 		const spent = (o.ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM attempts WHERE unit_id = ?").get(o.unitId) as { c: number }).c;
 		if (spent >= o.config.run.budgetUsdPerUnit) {
-			const q = o.ledger.askQuestion({ unitId: o.unitId, point: "budget", question: `${o.unitId} has spent $${spent.toFixed(2)} (cap $${o.config.run.budgetUsdPerUnit}). Raise run.budgetUsdPerUnit, or \`br requeue\` after a fix.`, blocks: "unit", askedBy: "orchestrator" });
+			const q = await ask({
+				point: "budget",
+				facts: `${o.unitId} has spent $${spent.toFixed(2)} over ${attemptNo} implement attempt(s); the per-unit cap run.budgetUsdPerUnit is $${o.config.run.budgetUsdPerUnit}. The unit is quarantined now.${lastGateText ? `\nLast gate failure:\n${lastGateText.slice(0, 800)}` : ""}`,
+				options: [
+					{ value: "raise", facts: "raise run.budgetUsdPerUnit in bigrefactor.config.json, then br requeue the unit" },
+					{ value: "leave", facts: "leave the unit quarantined for a human to port" },
+				],
+			});
 			o.ledger.transitionUnit(o.unitId, "quarantined", `budget cap $${o.config.run.budgetUsdPerUnit} reached ($${spent.toFixed(2)})`);
 			log(pc.red(`  budget cap reached ($${spent.toFixed(2)}); quarantined, question #${q}`));
 			break;
@@ -227,11 +297,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs,
 			appendOnlyGlobs,
 			protectedGlobs: adapter.protectedGlobs,
-			systemPrompt: implementerSystemPrompt(o.config, { moduleDir, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo }),
+			systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined }),
 			customTools: implementerTools({ ...deps, attemptId: attempt }),
 			transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
 			validateWrite: async (path, content) => {
-				if (!/\.(ts|tsx)$/.test(path)) return undefined;
 				const lang = adapter.layout.lang(path);
 				if (!lang) return undefined;
 				const errs = await syntaxErrors(lang, content);
@@ -249,6 +318,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			...testFiles.map((t) => `### ${t.path}\n\`\`\`ts\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
 			lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
 			o.retryNote && attemptNo === 1 ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
+			tidyMoved.length ? `\n## Tidy moves already done by the orchestrator\n${tidyMoved.join("\n")}\nUpdate every import of the moved files; keep behaviour identical.` : "",
 		].join("\n");
 		let res;
 		try {
@@ -263,15 +333,24 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			o.ledger.endAttempt(attempt, { outcome: "session_error", costUsd: res.usage.cost, gateReport: { error: res.error } });
 			attemptNo--;
 			if (++providerErrors >= 3) {
-				const q = o.ledger.askQuestion({ unitId: o.unitId, point: "env", question: `Model sessions keep failing for ${o.unitId}: ${res.error}. Continue when the provider is back?`, blocks: "unit", askedBy: "orchestrator" });
+				const q = await ask({
+					point: "env",
+					facts: `Model sessions for ${o.unitId} failed ${providerErrors} times in a row before doing any work (provider error after tier fallback, model ${modelRole.id}): ${res.error}`,
+					options: [
+						{ value: "retry", facts: "the provider works again: run the unit again" },
+						{ value: "wait", facts: "keep the unit waiting; the rest of the run goes on" },
+					],
+				});
 				log(pc.red(`  provider failing repeatedly; asked question #${q} (only this unit waits)`));
 				break;
 			}
 			continue;
 		}
 
+		// merged tidy sources go once every target exists (a missed move breaks the build, the gate says so)
+		for (const f of tidyLeftovers(targetProjectDir, tidy, tidyMoved)) rmSync(join(targetProjectDir, f));
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
-		gate = await gateSlot(() => gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles }));
+		gate = await gateSlot(() => gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: tidyPaths, legacyWords: sourceAdapter.legacyWords }));
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
 		if (gate.ok) break;
@@ -281,7 +360,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		// Jev picks the next step; code enforces caps and acts.
 		if (o.client) {
-			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client }, o.unitId, gate, previousGate, attemptNo);
+			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo);
 			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)} ${triage.band})`));
 			if (triage.action === "quarantine") break;
 			if (triage.action === "ask_human") {
@@ -290,7 +369,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				const failedOut = gate.steps.find((x) => !x.ok)?.output ?? "";
 				const dx = await diagnoseFailure({ config: o.config, adapter, projectDir: targetProjectDir, failedStep: gate.failedStep ?? "", output: failedOut, client: o.client });
 				log(pc.dim(`  doctor (${dx.by}): ${dx.action} — ${dx.summary}`));
-				const qid = triage.questionId;
+				let qid = triage.questionId;
 				if ((dx.action === "retest" || dx.action === "reimplement") && doctorActions < 2) {
 					doctorActions++;
 					if (qid) o.ledger.answerQuestion(qid, `auto: ${dx.action} (${dx.summary})`, "doctor");
@@ -302,10 +381,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					continue;
 				}
 				if (qid) {
-					const text = dx.action === "fix"
-						? `Easily fixable: ${dx.summary}. Run \`${dx.command}\` in ${targetRel || "."}; the unit resubmits itself when the project changes.`
-						: `${o.unitId}: gate step ${gate.failedStep} failed — ${dx.summary}${dx.by === "model" ? " (model diagnosis)" : ""}. Fix the environment; the unit resubmits itself when the project or config changes.`;
-					o.ledger.db.prepare("UPDATE questions SET question = ? WHERE id = ?").run(text, qid);
+					// the doctor knows more than triage did: the question is asked again with the diagnosis (phrased by a model)
+					o.ledger.withdrawQuestion(qid, `diagnosed: ${dx.summary}`);
+					qid = await ask({
+						point: "gate_env",
+						facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
+						options: [
+							{ value: "fixed", facts: dx.command ? `ran ${dx.command}; the unit runs again` : "the environment is fixed; the unit runs again" },
+							{ value: "quarantine", facts: "leave the unit quarantined for a human" },
+						],
+						context: { diagnosis: dx, failedStep: gate.failedStep },
+					});
 				}
 				// remember the environment the failure happened in: a change (package.json/config) resubmits the unit
 				o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId)), diagnosis: dx } } });
@@ -314,7 +400,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			}
 			if (triage.action === "escalate") forceEscalate = true;
 			if (triage.action === "retest") {
-				const ok = await runTruth(`The gate failed with ${gate.failedStep}; Jev judged the cause as ${triage.cause}. Re-check interface.md and the ported tests against the legacy behaviour and the implementation at ${targetRel}/src/${module}/; fix the TESTS/INTERFACE, not production code.\n${lastGateText}`);
+				const ok = await runTruth(`The gate failed with ${gate.failedStep}; Jev judged the cause as ${triage.cause}. Re-check interface.md and the ported tests against the legacy behaviour and the implementation at ${targetRel}/${moduleDir}/; fix the TESTS/INTERFACE, not production code.\n${lastGateText}`);
 				if (ok) testFiles = loadTests();
 			}
 		}
@@ -325,8 +411,15 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// The new code is now part of what later units can reuse: index it (exports, helpers, docs).
 		const indexed = await indexTarget(o.ledger, adapter, targetProjectDir, gate.changedFiles).catch((e) => (log(pc.yellow(`  target index failed: ${e?.message ?? e}`)), 0));
 		log(pc.dim(`  indexed ${indexed} target symbols`));
+		// reusable logic becomes findable by meaning (capability cards; no-op without a client)
+		const caps = await describeCapabilities(askDeps, { unitId: o.unitId, stack: stackId, area, files: gate.changedFiles, projectDir: targetProjectDir }).catch((e) => (log(pc.yellow(`  capability cards failed: ${e?.message ?? e}`)), { cards: 0, costUsd: 0 }));
+		cost += caps.costUsd;
+		if (caps.cards) log(pc.dim(`  ${caps.cards} capability card(s)`));
 		o.ledger.transitionUnit(o.unitId, "review", "gate green");
-		if (o.accept) acceptUnit(o, targetProjectDir, module);
+		if (o.accept) {
+			acceptUnit(o, targetProjectDir, area);
+			afterAccept(o.ledger, adapter, targetProjectDir, stackId, area, log);
+		}
 	} else if (attemptNo >= maxTotal || triage?.action === "quarantine") {
 		o.ledger.transitionUnit(o.unitId, "quarantined", `gate still red after ${attemptNo} attempts (${gate?.failedStep}); ${triage?.reason ?? ""}`.trim());
 	}
@@ -334,11 +427,42 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	return { unitId: o.unitId, state: final.state, attempts: attemptNo, gate, triage, costUsd: cost };
 }
 
-export function acceptUnit(o: { ledger: Ledger; config: Config; unitId: string }, targetProjectDir: string, module: string): string | undefined {
-	const sha = commitAll(o.config.target.path, `feat(${module}): migrate ${o.unitId}\n\n${o.ledger.symbolsOfUnit(o.unitId).map((s) => `- ${s.id} → ${s.state}`).join("\n")}\n\nbigrefactor: unit ${o.unitId}, target ${relative(o.config.target.path, targetProjectDir) || "."}`);
+export function acceptUnit(o: { ledger: Ledger; config: Config; unitId: string }, targetProjectDir: string, area: string): string | undefined {
+	const sha = commitAll(o.config.target.path, `feat(${area}): migrate ${o.unitId}\n\n${o.ledger.symbolsOfUnit(o.unitId).map((s) => `- ${s.id} → ${s.state}`).join("\n")}\n\nbigrefactor: unit ${o.unitId}, target ${relative(o.config.target.path, targetProjectDir) || "."}`);
 	o.ledger.transitionUnit(o.unitId, "accepted", sha ? `committed ${sha.slice(0, 7)}` : "accepted (nothing new to commit)");
 	if (sha) o.ledger.updateUnit(o.unitId, { branch: o.config.target.git.branch, meta: { ...JSON.parse(o.ledger.getUnit(o.unitId)!.meta), commit: sha } });
 	return sha;
+}
+
+/** After a unit landed in `projectDir`: close tidy tasks the tree shows done, record the stack's drift report. */
+export function afterAccept(ledger: Ledger, adapter: TargetAdapter, projectDirAbs: string, stackId: string, area: string, log: (l: string) => void): void {
+	const done = completeTidyTasks(ledger, projectDirAbs, stackId, area);
+	if (done.length) log(pc.dim(`  tidy done: ${done.join(", ")}`));
+	const drift = recordDrift(ledger, adapter, projectDirAbs);
+	if (drift.length) log(pc.dim(`  drift ${stackId}: ${drift.length} finding(s) (br layout)`));
+}
+
+/** 1:1 moves/renames of approved tidy tasks, done by code before the sessions (source present, target free). */
+export function tidyMoves(dir: string, tasks: TidyTask[], isTest: (p: string) => boolean): string[] {
+	const out: string[] = [];
+	for (const t of tasks) {
+		if ((t.op !== "move" && t.op !== "rename") || t.from.length !== t.to.length) continue;
+		t.from.forEach((f, i) => {
+			const to = t.to[i]!;
+			if (f === to || isTest(f) || !existsSync(join(dir, f)) || existsSync(join(dir, to))) return;
+			mkdirSync(dirname(join(dir, to)), { recursive: true });
+			renameSync(join(dir, f), join(dir, to));
+			out.push(`${f} → ${to}`);
+		});
+	}
+	return out;
+}
+
+/** Sources of approved merges (and n:m moves) still present although every target exists. */
+export function tidyLeftovers(dir: string, tasks: TidyTask[], moved: string[]): string[] {
+	return tasks
+		.filter((t) => t.op !== "split" && t.to.every((f) => existsSync(join(dir, f))) && !t.from.every((f) => moved.some((m) => m.startsWith(`${f} → `))))
+		.flatMap((t) => t.from.filter((f) => !t.to.includes(f) && existsSync(join(dir, f))));
 }
 
 /** What a parked environment failure depends on: the target's package.json and the workspace config. */
@@ -359,12 +483,20 @@ function transcriptPath(root: string, unitId: string, role: string, attemptId: n
 	return join(dir, `${unitId}.${role}.${attemptId}.jsonl`);
 }
 
-/** `src/controllers/InvoiceController.php` → `invoices`; `src/Pricing.php` → `pricing`; `src/Config.php` → `config`. */
-export function moduleName(metaJson: string): string {
-	const files = (JSON.parse(metaJson).files ?? []) as string[];
-	const base = basename(files[0] ?? "unit").replace(/\.[a-z]+$/, "").replace(/(Controller|Repo|Repository|Service|Model)$/, "");
-	const kebab = base.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
-	return kebab === "invoice" ? "invoices" : kebab;
+/**
+ * Paths drafted in interface.md that are neither inside the allowed dirs nor existing files (an existing file is
+ * something to import or a legacy/workspace reference, not something to create). Paths may carry any prefix
+ * before the project-relative part (workspace, worktree).
+ */
+export function draftedOutside(md: string, allowedDirs: string[], targetRel: string, existingRoots: string[]): string[] {
+	const out = new Set<string>();
+	for (const m of md.matchAll(/(?:^|[\s`'"(\[])((?:\.\/)?(?:[\w@.-]+\/)+[\w.-]+\.[A-Za-z]{1,5})(?=$|[\s`'"),:\]#])/gm)) {
+		let p = m[1]!.replace(/^\.\//, "");
+		if (targetRel && p.startsWith(`${targetRel}/`)) p = p.slice(targetRel.length + 1);
+		if (p.startsWith("..") || allowedDirs.some((d) => p.startsWith(d) || p.includes(`/${d}`)) || existingRoots.some((r) => existsSync(join(r, p)) || existsSync(join(r, m[1]!)))) continue;
+		out.add(p);
+	}
+	return [...out];
 }
 
 function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter): { ok: boolean; cases: Array<{ symbol: string; inputs: unknown; expected: unknown }>; error?: string } {

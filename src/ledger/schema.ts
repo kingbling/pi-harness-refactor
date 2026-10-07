@@ -61,6 +61,8 @@ export const EVIDENCE_TYPES = [
 	"human_approval",
 	// tester ran before the deps landed; ported tests are saved under truth/<unit>/ported/
 	"truth_ahead",
+	// written files match the stack layout (area module, no per-legacy-file folders, no duplicate classes)
+	"structure_ok",
 ] as const;
 export type EvidenceType = (typeof EVIDENCE_TYPES)[number];
 
@@ -72,6 +74,7 @@ export const REQUIRED_FOR_ACCEPTED: readonly EvidenceType[] = [
 	"lint_ok",
 	"rules_ok",
 	"antigaming_ok",
+	"structure_ok",
 	"ported_tests_green",
 ];
 
@@ -243,6 +246,59 @@ CREATE TABLE IF NOT EXISTS index_literal_refs (
 CREATE TABLE IF NOT EXISTS index_queries (
   id INTEGER PRIMARY KEY AUTOINCREMENT, symbol_id TEXT NOT NULL, kind TEXT NOT NULL, tables TEXT NOT NULL DEFAULT '[]', text TEXT
 );
+
+-- Legacy quirks the tester noticed instead of pinning them blindly. Each carries the tester's opinion;
+-- language artifacts with opinion drop are dropped without asking, the rest become questions (via a model).
+CREATE TABLE IF NOT EXISTS quirks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+  symbol_id TEXT NOT NULL,
+  kind TEXT NOT NULL,                 -- language_artifact|edge_case|suspected_bug|intentional
+  behaviour TEXT NOT NULL,            -- what the old code does, concretely
+  example TEXT,                       -- input → output on the old code
+  opinion TEXT NOT NULL,              -- drop|keep (the tester's)
+  why TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|asked|dropped|kept
+  decided_by TEXT,                    -- auto|human|...
+  applied TEXT,                       -- drop|keep: what the unit's tests currently follow
+  question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS quirks_unit ON quirks(unit_id);
+
+-- Living rules: units propose additions/changes to a stack's rules; a curator merges them into a new version.
+CREATE TABLE IF NOT EXISTS rule_proposals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stack TEXT NOT NULL,
+  unit_id TEXT,
+  kind TEXT NOT NULL,                 -- add|change
+  text TEXT NOT NULL,
+  why TEXT NOT NULL,
+  evidence TEXT,                      -- file path(s) or symbol ids
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|merged|rejected|asked
+  version INTEGER,                    -- rules version it was merged into
+  question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rule_proposals_status ON rule_proposals(stack, status);
+
+-- Capability cards: what accepted target code DOES, in domain words, written by a model after each accepted
+-- unit; searched with FTS5 (porter stemming, bm25) by find_capability and the task card's reuse candidates.
+CREATE TABLE IF NOT EXISTS capabilities (
+  id TEXT PRIMARY KEY,                -- target symbol id
+  stack TEXT NOT NULL,
+  area TEXT,
+  path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  summary TEXT NOT NULL,              -- one sentence, domain language
+  terms TEXT NOT NULL,                -- domain words + synonyms, space separated
+  io TEXT,                            -- inputs → outputs
+  legacy TEXT NOT NULL DEFAULT '[]',  -- JSON legacy symbol ids it came from
+  unit_id TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS capabilities_fts USING fts5(id UNINDEXED, name, summary, terms, tokenize = 'porter unicode61');
 
 CREATE TABLE IF NOT EXISTS truth_cases (
   id TEXT PRIMARY KEY, unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,

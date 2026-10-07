@@ -1,9 +1,12 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
 import type { Config } from "../config.ts";
 import type { Ledger, UnitRow } from "../ledger/db.ts";
-import { sharedSymbols, similarTargetSymbols } from "../inventory/target.ts";
+import { renderCapability, reuseCandidates, type Capability } from "../inventory/capabilities.ts";
+import { sharedSymbols, similarTargetSymbols, stackTagLike } from "../inventory/target.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
+import { placeUnit, type Placement } from "../run/placement.ts";
+import { tidyTaskCard } from "../run/tidy.ts";
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -31,12 +34,43 @@ export interface TaskCard {
 	sharedHelpers: Array<{ id: string; kind: string; signature: string | null; doc: string | null }>;
 	/** Target symbols whose names resemble this unit's legacy symbols — check before creating. */
 	reuseHints: Array<{ legacy: string; id: string; kind: string }>;
+	/** Capability cards (by meaning) that may already cover this unit's legacy symbols: import/inject, never rewrite. */
+	reuseCandidates: Array<{ legacy: string; capability: Capability }>;
+	/** Approved tidy tasks of the unit's area (rendered list; empty = none). */
+	tidyTasks: string;
 	targetProjectDir: string;
 	writeGlobs: string[];
 	sharedDirs: string[];
+	/** Where the unit lands (stack, legacy area, shared or not) and its module dir in the target project. */
+	place?: Placement;
+	moduleDir?: string;
+	/** The area's module as it is now (binding dir, contents, sibling units): units of one area extend it, never fork it. */
+	areaModule?: AreaModule;
 }
 
-export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter }): TaskCard {
+export interface AreaModule {
+	area: string;
+	stackId: string;
+	moduleDir: string;
+	shared: boolean;
+	structureDoc: string;
+	/** Non-test files in moduleDir (relative to it) with the exported symbols the target index has for them. */
+	files: Array<{ path: string; symbols: Array<{ name: string; kind: string; signature: string | null }> }>;
+	testFiles: number;
+	/** Classes already in the module: new behaviour becomes methods on these. */
+	classes: string[];
+	/** Other units placed in the same module; accepted ones with the target files they produced. */
+	siblings: Array<{ id: string; state: string; targetFiles: string[] }>;
+}
+
+/** Render bounds; every cut is announced with an "N more omitted" line. */
+const MAX_AREA_FILES = 40;
+const MAX_AREA_SYMBOLS = 80;
+const MAX_ACCEPTED = 15;
+const MAX_OTHER_SIBLINGS = 40;
+const MAX_SIBLING_FILES = 6;
+
+export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): TaskCard {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
 	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[] };
@@ -97,9 +131,78 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 			fwRefs.push({ cls, refs: n, verdict: c?.verdict ?? "review", platform: c?.platform ?? "see RULES.md → Legacy framework mapping" });
 		}
 	}
-	const sharedHelpers = sharedSymbols(ledger, opts.adapter.layout.sharedDirs, undefined, 30);
-	const reuseHints = similarTargetSymbols(ledger, symbols.map((s) => s.name));
-	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, truthCases, sharedHelpers, reuseHints, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs };
+	const stackId = opts.place?.stackId ?? opts.adapter.id;
+	const sharedHelpers = sharedSymbols(ledger, opts.adapter.layout.sharedDirs, undefined, 30, stackId);
+	const reuseHints = similarTargetSymbols(ledger, symbols.map((s) => s.name), 15, stackId);
+	const candidates = reuseCandidates(ledger, unitId, { stack: stackId, limit: 8 });
+	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
+	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, truthCases, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+}
+
+/** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
+function areaModule(ledger: Ledger, config: Config, unitId: string, place: Placement, moduleDir: string, opts: { targetProjectDir: string; adapter: TargetAdapter; root?: string }): AreaModule {
+	const dir = moduleDir.replace(/\/$/, "");
+	const onDisk = filesUnder(opts.targetProjectDir, dir);
+	const rels = onDisk.filter((f) => !opts.adapter.layout.isTestFile(`${dir}/${f}`));
+	// index paths are project-relative (stacks can collide): trust only rows for files this project has
+	const byPath = new Map<string, AreaModule["files"][number]["symbols"]>();
+	for (const r of ledger.db.prepare("SELECT path, kind, name, signature FROM index_symbols WHERE side = 'target' AND path LIKE ? AND (tags IS NULL OR tags NOT LIKE '%\"stack:%' OR tags LIKE ?) ORDER BY path, line").all(`${dir}/%`, stackTagLike(place.stackId)) as Array<{ path: string; kind: string; name: string; signature: string | null }>) {
+		const list = byPath.get(r.path) ?? [];
+		list.push({ name: r.name, kind: r.kind, signature: r.signature });
+		byPath.set(r.path, list);
+	}
+	const files = rels.map((f) => ({ path: f, symbols: byPath.get(`${dir}/${f}`) ?? [] }));
+	const syms = files.flatMap((f) => f.symbols);
+	const owners = new Set(syms.filter((s) => s.kind === "method").map((s) => s.name.split(".")[0]!));
+	const classes = syms.filter((s) => !s.name.includes(".") && (s.kind === "class" || owners.has(s.name))).map((s) => s.name);
+
+	const siblings: AreaModule["siblings"] = [];
+	const moves = ledger.db.prepare("SELECT target_symbols FROM moves WHERE unit_id = ?");
+	for (const u of ledger.listUnits()) {
+		if (u.id === unitId) continue;
+		let p: Placement;
+		try {
+			p = placeUnit(config, u.meta, opts.root);
+		} catch {
+			continue;
+		}
+		if (p.stackId !== place.stackId || p.area !== place.area || p.shared !== place.shared) continue;
+		const targetFiles = u.state === "accepted" ? [...new Set((moves.all(u.id) as Array<{ target_symbols: string }>).flatMap((m) => (JSON.parse(m.target_symbols) as string[]).map((t) => t.split("::")[0]!)))].sort() : [];
+		siblings.push({ id: u.id, state: u.state, targetFiles });
+	}
+	return { area: place.area, stackId: place.stackId, moduleDir: dir, shared: place.shared, structureDoc: opts.adapter.layout.structureDoc, files, testFiles: onDisk.length - rels.length, classes, siblings };
+}
+
+function renderAreaModule(a: AreaModule, L: string[]): void {
+	L.push("", `## Area module (binding): ${a.area} on ${a.stackId} → ${a.moduleDir}/${a.shared ? " (shared: used by several areas; add new files, never edit existing ones)" : ""}`);
+	L.push(`One legacy area = one module per stack. Everything this unit writes goes under ${a.moduleDir}/, and every unit of the area extends the same classes instead of adding parallel ones.`);
+	if (a.shared) L.push(`This unit is shared (used by several areas): its files are ${a.moduleDir}/<name> (kebab-case topic files); the feature-dir shapes below are for the code that imports it.`);
+	L.push("File shape inside the module:", a.structureDoc);
+	if (!a.files.length) L.push("", `### ${a.moduleDir}/ is empty: this unit creates the area's first files; later units of the area will extend them.`);
+	else {
+		L.push("", `### Current contents of ${a.moduleDir}/ — extend these${a.classes.length ? `: add methods to ${a.classes.slice(0, 4).join(", ")} rather than new classes` : ""}`);
+		let budget = MAX_AREA_SYMBOLS;
+		for (const f of a.files.slice(0, MAX_AREA_FILES)) {
+			L.push(`- ${f.path}`);
+			const shown = f.symbols.slice(0, Math.max(0, budget));
+			for (const s of shown) L.push(`  - ${s.name.includes(".") ? "" : `${s.kind} `}${s.name}${s.signature ?? ""}`);
+			budget -= shown.length;
+			if (f.symbols.length > shown.length) L.push(`  - (${f.symbols.length - shown.length} more exports omitted; target_lookup)`);
+		}
+		if (a.files.length > MAX_AREA_FILES) L.push(`- (${a.files.length - MAX_AREA_FILES} more files omitted; target_lookup)`);
+	}
+	if (a.testFiles) L.push(`(${a.testFiles} test files in the module not listed)`);
+	if (!a.siblings.length) return;
+	L.push("", "### Same-area units (they share this module: reuse what accepted ones built, leave room for the planned ones)");
+	const accepted = a.siblings.filter((s) => s.state === "accepted");
+	for (const s of accepted.slice(0, MAX_ACCEPTED)) L.push(`- accepted ${s.id}${s.targetFiles.length ? ` → ${s.targetFiles.slice(0, MAX_SIBLING_FILES).join(", ")}${s.targetFiles.length > MAX_SIBLING_FILES ? ` (+${s.targetFiles.length - MAX_SIBLING_FILES} more)` : ""}` : ""}`);
+	if (accepted.length > MAX_ACCEPTED) L.push(`- (${accepted.length - MAX_ACCEPTED} more accepted units omitted)`);
+	const others = a.siblings.filter((s) => s.state !== "accepted");
+	const shown = others.slice(0, MAX_OTHER_SIBLINGS);
+	const byState = new Map<string, string[]>();
+	for (const s of shown) byState.set(s.state, [...(byState.get(s.state) ?? []), s.id]);
+	for (const [state, ids] of byState) L.push(`- ${state}: ${ids.join(", ")}`);
+	if (others.length > shown.length) L.push(`- (${others.length - shown.length} more units omitted)`);
 }
 
 /** Markdown rendering of the card for the prompt. Source files are appended in full (whole file in one pass). */
@@ -107,7 +210,9 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	const L: string[] = [];
 	L.push(`# Unit ${card.unit.id}  (tier ${card.unit.tier}${card.unit.kind ? `, kind ${card.unit.kind}` : ""})`);
 	L.push(`Source files (${config.source.stack}, read-only): ${card.files.join(", ")}`);
-	L.push(`Target: ${config.target.stacks.join(" + ")} project at ${card.targetProjectDir}. You may write only: ${card.writeGlobs.join(", ")}`);
+	L.push(`Target: ${card.place?.stackId ?? config.target.stacks.join(" + ")} project at ${card.targetProjectDir}. You may write only: ${card.writeGlobs.join(", ")}`);
+	if (card.areaModule) renderAreaModule(card.areaModule, L);
+	if (card.tidyTasks) L.push("", "## Tidy tasks for this area (do these too)", card.tidyTasks, "Moves whose source is already gone were done by the orchestrator: update the imports. Merged sources are removed once every target exists.");
 	L.push("");
 	L.push("## Symbols you must account for (every one needs a ledger_prove call)");
 	for (const s of card.symbols) L.push(`- ${s.id}  [${s.kind}${s.exported ? "" : ", private"}]${s.signature ? ` ${s.signature}` : ""}`);
@@ -140,9 +245,13 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	}
 	if (card.dynamicMarkers.length) L.push("", `## Dynamic constructs found (handle explicitly): ${card.dynamicMarkers.join(", ")}`);
 	if (card.sharedHelpers.length) {
-		L.push("", `## Shared helpers that already exist (reuse; add new ones under ${card.sharedDirs[0] ?? "the shared dir"}, never edit existing)`);
+		L.push("", `## Shared helpers that already exist (reuse; new files only inside these existing topics of ${card.sharedDirs[0] ?? "the shared dir"}, never edit existing ones, never start a topic)`);
 		for (const h of card.sharedHelpers) L.push(`- ${h.id} [${h.kind}]${h.signature ? ` ${h.signature}` : ""}${h.doc ? ` — ${h.doc}` : ""}`);
-	} else L.push("", `## Shared helpers: none yet. Cross-cutting code (errors, logging, money, dates, validation) goes to ${card.sharedDirs[0] ?? "the shared dir"}<area>/ with a doc comment so later units find it via shared_lookup.`);
+	} else L.push("", `## Shared helpers: none yet. Code of this unit goes in its module; shared topics (${card.sharedDirs[0] ?? "the shared dir"}<topic>/) are started by shared units and tidy tasks, never named after an area.`);
+	if (card.reuseCandidates.length) {
+		L.push("", "## Reuse candidates — this logic may already exist (found by meaning): import/inject it instead of rewriting; find_capability for more");
+		for (const c of card.reuseCandidates) L.push(`- for ${c.legacy}: ${renderCapability(c.capability)}`);
+	}
 	if (card.reuseHints.length) {
 		L.push("", "## Possibly already migrated elsewhere (target_lookup before creating)");
 		for (const h of card.reuseHints) L.push(`- ${h.legacy} ~ ${h.id} [${h.kind}]`);
@@ -156,4 +265,20 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		}
 	}
 	return L.join("\n");
+}
+
+/** Files under `dir` of the project (relative to `dir`), tests included. Uncapped: the renderer bounds and says so. */
+function filesUnder(projectDir: string, dir: string): string[] {
+	const root = join(projectDir, dir);
+	const out: string[] = [];
+	const visit = (d: string) => {
+		if (!existsSync(d)) return;
+		for (const n of readdirSync(d).sort()) {
+			const p = join(d, n);
+			if (statSync(p).isDirectory()) visit(p);
+			else out.push(relative(root, p));
+		}
+	};
+	visit(root);
+	return out;
 }

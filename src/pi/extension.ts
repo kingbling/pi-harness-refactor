@@ -50,11 +50,12 @@ const SUBCOMMANDS: Record<string, string> = {
 	resume: "resume: continue onboarding where it stopped, then the migration if it already started",
 	progress: "progress: what the running onboarding is doing right now (full activity log)",
 	stop: "stop: stop the running job (a run lets running units finish; stop twice to abort them)",
-	run: "run [--limit N] [--slice S] [--units a,b] [--dry]: migrate units in the background (live panel, /br stop)",
+	run: "run [--limit N] [--slice S] [--units a,b] [--dry] [--force]: migrate units in the background (live panel, /br stop); --force starts despite layout problems",
 	onboard: "onboard [init flags] [--yes] [--no-llm]: whole onboarding, resumable (init → setup → docs → inventory → profile → frameworks → decide → rules → order)",
 	decide: "decide [id=value ...]: open decisions the inventory could not make; run/L3 wait for them",
 	frameworks: "frameworks: legacy framework & library mapping (platform | port | drop)",
 	order: "order: vertical slice plan (foundation → auth → features)",
+	layout: "layout: preflight — units per stack, top areas, target tree, problems (run refuses on problems)",
 };
 
 interface BrEntry {
@@ -393,7 +394,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 				else if ((m = /^⏸ ([^:\s]+): (.*)$/.exec(t))) progress.stepEnd(m[1]!, "skipped", m[2]!);
 				else if ((m = /^[■✗] ([^:\s]+): (.*)$/.exec(t))) progress.stepEnd(m[1]!, "failed", m[2]!);
 			};
-			const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), limit, slice: flag("--slice"), units: flag("--units")?.split(","), dry: flags.includes("--dry"), log, onLanes: (l) => progress.setLanes(l), shouldStop: () => progress.stopping, handleSigint: false, blocked, waitForDecisions: ctx.hasUI });
+			const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), limit, slice: flag("--slice"), units: flag("--units")?.split(","), dry: flags.includes("--dry"), force: flags.includes("--force"), log, onLanes: (l) => progress.setLanes(l), shouldStop: () => progress.stopping, handleSigint: false, blocked, waitForDecisions: ctx.hasUI });
 			const questions = ledger.openQuestions().length;
 			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };
 		} finally {
@@ -622,6 +623,11 @@ export default function (pi: ExtensionAPI) {
 					const rows = ledger.unaccounted();
 					text = rows.length ? truncate(rows.map((r) => `${r.state.padEnd(12)} ${r.id}`).join("\n"), "full list: `br status` in a terminal, or ask for ledger_query preset=unaccounted") : "all symbols accounted";
 				} else if (sub === "forecast") text = renderForecast(forecast(ledger));
+				else if (sub === "layout") {
+					const { checkLayout, renderLayout } = await import("../run/layout-check.ts");
+					const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
+					text = await checkLayout(config, root, ledger).then((r) => renderLayout(r).join("\n"), (e) => `layout check failed: ${e?.message ?? e}`);
+				}
 				else text = renderStatus(ledger, { color: false });
 				show(ctx, sub, text);
 			} finally {
