@@ -6,6 +6,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { openDecisions } from "../src/inventory/decisions.ts";
 import { planFrameworks } from "../src/inventory/frameworks.ts";
 import { inventory } from "../src/inventory/run.ts";
+import { exampleProfileJson } from "../src/adapters/source/php.ts";
 import { Ledger } from "../src/ledger/db.ts";
 
 /**
@@ -25,6 +26,9 @@ describe("framework profile is loaded wherever decisions are computed", () => {
 		writeFileSync(join(ws, "legacy", "src", "boot.php"), `<?php\nfunction boot() {\n${calls}\n}\n`);
 		writeFileSync(join(ws, "legacy", "index.php"), `<?php\nrequire 'src/boot.php';\nboot();\n`); // live entry point
 		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		// the profile `br profile` writes (here: the worked example); without one no framework conventions are known
+		writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify(exampleProfileJson()));
+		process.env["BR_WORKSPACE"] = ws;
 		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
 		writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config));
 		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
@@ -34,12 +38,12 @@ describe("framework profile is loaded wherever decisions are computed", () => {
 
 		// simulate a fresh process: profile cache dropped, nobody calls frameworkDirs() first
 		source.reloadProfile?.();
-		delete process.env["BR_WORKSPACE"];
 		const ids = openDecisions(ledger, config, source, targets, ws).map((d) => d.id);
 		expect(ids).not.toContain("fw:Load");
 		source.reloadProfile?.();
 		const plan = planFrameworks(ledger, source, targets, config.source.path);
 		expect(plan.concerns.some((c) => c.concern === "loading" && c.appRefs > 0)).toBe(true);
 		ledger.close();
+		delete process.env["BR_WORKSPACE"];
 	});
 });

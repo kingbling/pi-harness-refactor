@@ -75,7 +75,7 @@ Globs are relative to the legacy root; \`$1\`, \`$2\` are the call's positional 
 		await askViaModel({ ledger, config, root, client: opts.client }, { point: "profile_review", facts: `The generated framework profile (.bigrefactor/framework-profile.json) has problems: ${problems.join("; ")}.`, options: [{ value: "regenerate", facts: "re-run br profile --force" }, { value: "fix-by-hand", facts: "edit .bigrefactor/framework-profile.json" }], recommended: "regenerate", blocks: "none", askedBy: "init" });
 		return;
 	}
-	source.reloadProfile?.(); // the generated file now wins over the built-in table
+	source.reloadProfile?.(); // the adapter reads the new file
 	const { inventory } = await import("../inventory/run.ts");
 	await inventory(config, root, ledger);
 	const after = indexStats(ledger);

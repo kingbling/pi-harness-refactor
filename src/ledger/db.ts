@@ -67,24 +67,6 @@ export class Ledger {
 	constructor(path: string) {
 		this.db = new DatabaseSync(path);
 		this.db.exec(DDL);
-		// attempts.unit_id used to be NOT NULL; system sessions (rules/init) have no unit → rebuild once
-		const attemptsSql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'attempts'").get() as { sql: string } | undefined)?.sql ?? "";
-		if (/unit_id TEXT NOT NULL/.test(attemptsSql)) {
-			this.db.exec(`PRAGMA foreign_keys = OFF;
-				CREATE TABLE attempts_new (id INTEGER PRIMARY KEY AUTOINCREMENT, unit_id TEXT REFERENCES units(id) ON DELETE CASCADE, role TEXT NOT NULL, model TEXT, tier_served TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0, outcome TEXT, gate_report TEXT, started_at TEXT NOT NULL, ended_at TEXT);
-				INSERT INTO attempts_new SELECT id, unit_id, role, model, tier_served, tokens_in, tokens_out, cost_usd, outcome, gate_report, started_at, ended_at FROM attempts;
-				DROP TABLE attempts; ALTER TABLE attempts_new RENAME TO attempts;
-				CREATE INDEX IF NOT EXISTS attempts_unit ON attempts(unit_id);
-				PRAGMA foreign_keys = ON;`);
-		}
-		// additive migrations for existing ledgers
-		for (const sql of ["ALTER TABLE index_symbols ADD COLUMN doc TEXT", "ALTER TABLE index_symbols ADD COLUMN tags TEXT", "ALTER TABLE files ADD COLUMN disposition TEXT", "ALTER TABLE decisions ADD COLUMN latency_ms INTEGER", "ALTER TABLE index_symbols ADD COLUMN end_line INTEGER"]) {
-			try {
-				this.db.exec(sql);
-			} catch {
-				/* column exists */
-			}
-		}
 	}
 
 	close(): void {

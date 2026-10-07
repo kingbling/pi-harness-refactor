@@ -119,7 +119,8 @@ describe("durable totals in the TUI", () => {
 		ledger.db.prepare("UPDATE units SET state='accepted' WHERE id=?").run(a!.id);
 		ledger.db.prepare("UPDATE units SET state='quarantined' WHERE id=?").run(b!.id);
 		ledger.db.prepare("INSERT INTO attempts(unit_id, role, model, cost_usd, started_at, ended_at, outcome) VALUES (?, 'implement', 'm', 0.5, '2026-10-01T10:00:00Z', '2026-10-01T10:10:00Z', 'gate_green')").run(a!.id);
-		// onboarding spend that is not in the ledger: backfill + this call = 0.5 + 0.25
+		// every paid call is in the spend log (the attempt above and an onboarding chat): 0.5 + 0.25
+		recordSpend(0.5, "session: implement", "m", ws);
 		recordSpend(0.25, "api: chat", "m", ws);
 		expect(totalSpend(ws).usd).toBeCloseTo(0.75);
 

@@ -228,12 +228,6 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		tierOf.set(f.path, tier);
 	}
 
-	// ---- self-heal: symbols of started units always point at them (older ledgers could lose the link)
-	for (const u of ledger.listUnits().filter((x) => x.state !== "planned")) {
-		const files = (JSON.parse(u.meta).files ?? []) as string[];
-		if (!files.length) continue;
-		ledger.db.prepare(`UPDATE symbols SET unit_id = ? WHERE unit_id IS NULL AND state NOT IN ('discovered','dropped') AND path IN (${files.map(() => "?").join(",")})`).run(u.id, ...files);
-	}
 	// ---- revive: files an earlier run marked dead/framework/regenerated that are alive now
 	{
 		const regenSet = new Set(regenerated);

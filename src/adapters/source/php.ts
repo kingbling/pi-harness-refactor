@@ -60,110 +60,11 @@ interface PhpFrameworkProfile {
 	concerns: FrameworkConcern[];
 }
 
-const GYRO: PhpFrameworkProfile = {
-	id: "gyro",
-	detect: (root) => existsSync(join(root, "gyro-php")) || existsSync(join(root, "gyro")),
-	frameworkDirs: ["gyro-php/"],
-	loaders(scope, method, args) {
-		const lits = args.filter((a): a is string => typeof a === "string");
-		const tpl = (name: string) => [`**/view/templates/**/${name}.tpl.php`, `**/view/templates/**/${name}`];
-		if (scope === null) {
-			if (method === "include_template" && args[0]) return tpl(args[0]);
-			return [];
-		}
-		if (scope === "Load") {
-			switch (method) {
-				case "models": return lits.flatMap((m) => [`**/model/**/${m}.model.php`, `**/model/**/${m}.facade.php`]);
-				case "components": return lits.flatMap((c) => [`**/lib/components/**/${c}.cls.php`, `**/lib/components/**/${c}.inc.php`]);
-				case "interfaces": return lits.map((c) => `**/lib/interfaces/**/${c}.cls.php`);
-				case "commands": return lits.map((c) => `**/behaviour/commands/${c}.cmd.php`);
-				case "tools": return lits.map((t) => `**/controller/tools/${t}.cls.php`);
-				case "controllers": return lits.map((c) => `**/controller/**/${c}.controller.php`);
-				case "directories": return lits.map((d) => `**/${d}/*.php`);
-				case "enable_module": return lits.flatMap((m) => [`**/modules/${m}/**/*.php`, `**/contributions/${m}/**/*.php`]);
-				case "files": return lits.map((f) => `**/${f}`);
-				default: return [];
-			}
-		}
-		if (scope === "CommandsFactory" && method === "create_command" && typeof args[1] === "string") {
-			const cmd = args[1];
-			const inst = typeof args[0] === "string" ? [args[0] === "" ? "app" : args[0]] : ["*"]; // object → its table name: any model's command dir
-			return [...inst.map((i) => `**/behaviour/commands/${i}/${cmd}.cmd.php`), `**/behaviour/commands/generics/${cmd}.cmd.php`];
-		}
-		if (scope === "ViewFactory" && method === "create_view" && typeof args[1] === "string") return tpl(args[1]);
-		return [];
-	},
-	impliedDeps(relPath) {
-		// generic model actions (edit/delete/create/status…) resolve commands by the model's table name at runtime
-		const m = /(^|\/)model\/classes\/([a-z0-9_]+)\.model\.php$/.exec(relPath);
-		return m ? [`**/behaviour/commands/${m[2]}/*.cmd.php`] : [];
-	},
-	entryPoint: /(^|\/)controller\/[^/]+\.controller\.php$|(^|\/)behaviour\/accesscontrol\/[^/]+\.access\.php$|(^|\/)enabled\.inc\.php$/,
-	routeClass: /Route$/,
-	concerns: [
-		{ match: /^(Load|Config|Constants?)$/i, concern: "loading", legacy: "convention loader (Load::models/components/commands) + constants", verdict: "platform" },
-		{ match: /^(DB|DBQuery|DBDriver|DBField|DataObjectBase|DAO|DBTable|DBWhere|DBJoin|IDataObject|Query|DBSql|DBResult)/i, concern: "orm", legacy: "DataObject ORM, query builder, drivers", verdict: "platform" },
-		{ match: /^(RouterBase|.*Route|Url|PageData|Dispatcher|RequestInfo|ControllerBase|IController|ControllerDefaultClassInstantiater|IRoute)$/i, concern: "routing", legacy: "routes declared in controllers (get_routes), PageData request bag", verdict: "platform" },
-		{ match: /^(AccessControl|AccessControlBase|Users|Session|UserRoles?|Permissions?|Login|Password|Authenticat|IAccessControl)/i, concern: "auth", legacy: "session login, roles, per-route access checks", verdict: "port" },
-		{ match: /^(View|ViewBase|ViewFactory|IView|IViewFactory|Template|Templater|.*View|.*Renderer|RenderDecorator|Widget.*|Form.*|Html|Formatter|IWidget|IRenderDecorator)$/i, concern: "rendering", legacy: "server-side PHP templates, widgets, render decorators", verdict: "platform" },
-		{ match: /^(CommandsFactory|CommandBase|ICommand|.*Command|CommandChain|CommandComposite|CommandsFactoryBase)$/i, concern: "commands", legacy: "command objects for writes (create/update/delete/…)", verdict: "port" },
-		{ match: /^(.*CacheManager|Cache|CacheBase|.*Cache|ICacheManager)$/i, concern: "cache", legacy: "page cache managers", verdict: "platform" },
-		{ match: /^(Mail|MailMessage|Mailer|.*Mail)$/i, concern: "mail", legacy: "mail messages", verdict: "platform" },
-		{ match: /^(Scheduler|Cron|Console|Task.*|Job.*|Queue)/i, concern: "jobs", legacy: "console runner, scheduled tasks", verdict: "platform" },
-		{ match: /^(EventSource|Event.*|.*EventSink|Hook|IEventSink)/i, concern: "events", legacy: "event source / sinks", verdict: "platform" },
-		{ match: /^(Arr|String|Str|Common|Date|DateTime|GyroDate|Number|Math|Util|Helpers?|Validation|Validator|Input|Sanitizer|Convert|Converter|ConverterFactory|IConverter|Filter.*)/i, concern: "helpers", legacy: "array/string/date helpers, validation, converters", verdict: "platform" },
-		{ match: /^(Translator|Translation|I18n|Locale|GyroLocale|tr)$/i, concern: "i18n", legacy: "translation helper", verdict: "platform" },
-		{ match: /^(Logger|Log|Debug|Sentry|ILogger)/i, concern: "logging", legacy: "file logger", verdict: "platform" },
-		{ match: /^(Http|HttpRequest|HttpResponse|Response|Status|Url.*|Cookie|Header)/i, concern: "http", legacy: "HTTP primitives", verdict: "platform" },
-		{ match: /^(Install|Systemupdate|SystemUpdate|Update|Migration|.*Update)/i, concern: "install", legacy: "install scripts & system updates (schema versioning)", verdict: "drop" },
-		{ match: /^(Simpletest|.*Test|Mock.*|GyroUnitTestCase)/i, concern: "tests", legacy: "SimpleTest unit tests", verdict: "drop" },
-		{ match: /^(Doxygen|Tidy|Phpinfo|Robots|Gsitemap|Mime|Offline|StaticPage|Json|Ajax|Status)/i, concern: "misc", legacy: "misc framework modules", verdict: "review" },
-	],
-};
-
-/** composer package → successor on a TypeScript platform (stack-neutral key: what the lib does). */
-const COMPOSER_SUCCESSORS: Record<string, { successor: string; verdict: ExternalDep["verdict"]; note?: string }> = {
-	"phpoffice/phpspreadsheet": { successor: "exceljs", verdict: "replace" },
-	"phpoffice/phpexcel": { successor: "exceljs", verdict: "replace" },
-	"tecnickcom/tcpdf": { successor: "pdfkit / puppeteer (HTML→PDF)", verdict: "replace" },
-	"dompdf/dompdf": { successor: "puppeteer (HTML→PDF)", verdict: "replace" },
-	"mpdf/mpdf": { successor: "puppeteer (HTML→PDF)", verdict: "replace" },
-	"symfony/http-foundation": { successor: "platform HTTP layer", verdict: "platform" },
-	"symfony/yaml": { successor: "yaml", verdict: "replace" },
-	"symfony/console": { successor: "nest-commander / commander", verdict: "replace" },
-	"guzzlehttp/guzzle": { successor: "fetch / axios", verdict: "replace" },
-	"monolog/monolog": { successor: "platform logger (pino)", verdict: "platform" },
-	"sentry/sentry": { successor: "@sentry/node", verdict: "replace" },
-	"sentry/sdk": { successor: "@sentry/node", verdict: "replace" },
-	"ramsey/uuid": { successor: "crypto.randomUUID", verdict: "replace" },
-	"nesbot/carbon": { successor: "date-fns / luxon", verdict: "replace" },
-	"league/csv": { successor: "csv-parse / csv-stringify", verdict: "replace" },
-	"phpmailer/phpmailer": { successor: "nodemailer", verdict: "replace" },
-	"swiftmailer/swiftmailer": { successor: "nodemailer", verdict: "replace" },
-	"predis/predis": { successor: "ioredis", verdict: "replace" },
-	"aws/aws-sdk-php": { successor: "@aws-sdk/*", verdict: "replace" },
-	"google/apiclient": { successor: "googleapis", verdict: "replace" },
-	"firebase/php-jwt": { successor: "jose / @nestjs/jwt", verdict: "replace" },
-	"intervention/image": { successor: "sharp", verdict: "replace" },
-	"phpunit/phpunit": { successor: "vitest", verdict: "drop", note: "legacy tests are the truth oracle; not ported as-is" },
-	"phpstan/phpstan": { successor: "tsc + oxlint", verdict: "drop" },
-	"rector/rector": { successor: "—", verdict: "drop" },
-	"squizlabs/php_codesniffer": { successor: "oxlint / biome", verdict: "drop" },
-	"friendsofphp/php-cs-fixer": { successor: "biome / prettier", verdict: "drop" },
-	"vlucas/phpdotenv": { successor: "platform config (dotenv)", verdict: "platform" },
-	"triagens/arangodb": { successor: "arangojs", verdict: "review", note: "second data store: see the store decision" },
-	"james-heinrich/getid3": { successor: "music-metadata", verdict: "review", note: "audio/video metadata" },
-	"setasign/fpdf": { successor: "pdfkit", verdict: "review", note: "PDF generation; puppeteer if layouts are HTML-like" },
-	"phpfastcache/phpfastcache": { successor: "platform cache (cache-manager)", verdict: "review" },
-	"phpseclib/phpseclib": { successor: "node:crypto / ssh2", verdict: "review", note: "depends on which parts are used (RSA? SFTP?)" },
-};
-
-const PROFILES: PhpFrameworkProfile[] = [GYRO];
 let activeProfile: PhpFrameworkProfile | undefined | null = null; // null = not detected yet
 let activeKey = ""; // workspace|source root|profile mtime the cached profile belongs to
 /**
- * Profile resolution: a generated `.bigrefactor/framework-profile.json` in the workspace (written by
- * `br profile`, data not code) wins; the built-in tables are the fallback and the worked example.
+ * The framework profile is the generated `.bigrefactor/framework-profile.json` of the workspace (written by
+ * `br profile`, data not code). Without it no framework conventions are known.
  */
 function profileFor(root: string): PhpFrameworkProfile | undefined {
 	// The cache follows the workspace and the profile file: a long-lived process (Pi) may serve several
@@ -183,33 +84,16 @@ function profileFor(root: string): PhpFrameworkProfile | undefined {
 		activeProfile = null;
 	}
 	if (activeProfile === null) {
-		const builtin = PROFILES.find((p) => p.detect(root));
+		activeProfile = undefined;
 		if (file && existsSync(file)) {
-			let generated: PhpFrameworkProfile;
 			try {
-				generated = profileFromJson(JSON.parse(readFileSync(file, "utf8")) as FrameworkProfileJson);
+				activeProfile = profileFromJson(JSON.parse(readFileSync(file, "utf8")) as FrameworkProfileJson);
 			} catch (e) {
 				throw new Error(`invalid ${file}: ${(e as Error).message}`);
 			}
-			// the generated profile augments a matching built-in one: union of conventions, generated concerns first
-			activeProfile = builtin && builtin.id === generated.id ? mergeProfiles(generated, builtin) : generated;
-		} else activeProfile = builtin;
+		}
 	}
 	return activeProfile;
-}
-
-function mergeProfiles(a: PhpFrameworkProfile, b: PhpFrameworkProfile): PhpFrameworkProfile {
-	const either = (x?: RegExp, y?: RegExp) => (x && y ? new RegExp(`(?:${x.source})|(?:${y.source})`, "i") : x ?? y);
-	return {
-		id: a.id,
-		detect: () => true,
-		frameworkDirs: [...new Set([...a.frameworkDirs, ...b.frameworkDirs])],
-		loaders: (scope, method, args) => [...new Set([...a.loaders(scope, method, args), ...b.loaders(scope, method, args)])],
-		impliedDeps: (p) => [...new Set([...(a.impliedDeps?.(p) ?? []), ...(b.impliedDeps?.(p) ?? [])])],
-		entryPoint: either(a.entryPoint, b.entryPoint),
-		routeClass: either(a.routeClass, b.routeClass),
-		concerns: [...a.concerns, ...b.concerns],
-	};
 }
 
 /** Serializable profile (what `br profile` generates). `$1`, `$2`… in globs are the call's positional string arguments. */
@@ -247,8 +131,8 @@ export function profileFromJson(j: FrameworkProfileJson): PhpFrameworkProfile {
 	};
 }
 
-/** The built-in profile as data: the example `br profile` shows the model, and the proof that JSON expresses everything the code path needs. */
-export function builtinProfileJson(): FrameworkProfileJson {
+/** A worked gyro profile: the example `br profile` shows the model (never used as a profile itself). */
+export function exampleProfileJson(): FrameworkProfileJson {
 	return {
 		id: "gyro",
 		frameworkDirs: ["gyro-php/"],
@@ -269,7 +153,25 @@ export function builtinProfileJson(): FrameworkProfileJson {
 		impliedDeps: [{ match: "(^|/)model/classes/([a-z0-9_]+)\\.model\\.php$", globs: ["**/behaviour/commands/$2/*.cmd.php"] }],
 		entryPoint: "(^|/)controller/[^/]+\\.controller\\.php$|(^|/)behaviour/accesscontrol/[^/]+\\.access\\.php$|(^|/)enabled\\.inc\\.php$",
 		routeClass: "Route$",
-		concerns: GYRO.concerns.map((c) => ({ match: c.match.source, concern: c.concern, legacy: c.legacy, verdict: c.verdict })),
+		concerns: [
+			{ match: "^(Load|Config|Constants?)$", concern: "loading", legacy: "convention loader (Load::models/components/commands) + constants", verdict: "platform" },
+			{ match: "^(DB|DBQuery|DBDriver|DBField|DataObjectBase|DAO|DBTable|DBWhere|DBJoin|IDataObject|Query|DBSql|DBResult)", concern: "orm", legacy: "DataObject ORM, query builder, drivers", verdict: "platform" },
+			{ match: "^(RouterBase|.*Route|Url|PageData|Dispatcher|RequestInfo|ControllerBase|IController|ControllerDefaultClassInstantiater|IRoute)$", concern: "routing", legacy: "routes declared in controllers (get_routes), PageData request bag", verdict: "platform" },
+			{ match: "^(AccessControl|AccessControlBase|Users|Session|UserRoles?|Permissions?|Login|Password|Authenticat|IAccessControl)", concern: "auth", legacy: "session login, roles, per-route access checks", verdict: "port" },
+			{ match: "^(View|ViewBase|ViewFactory|IView|IViewFactory|Template|Templater|.*View|.*Renderer|RenderDecorator|Widget.*|Form.*|Html|Formatter|IWidget|IRenderDecorator)$", concern: "rendering", legacy: "server-side PHP templates, widgets, render decorators", verdict: "platform" },
+			{ match: "^(CommandsFactory|CommandBase|ICommand|.*Command|CommandChain|CommandComposite|CommandsFactoryBase)$", concern: "commands", legacy: "command objects for writes (create/update/delete/…)", verdict: "port" },
+			{ match: "^(.*CacheManager|Cache|CacheBase|.*Cache|ICacheManager)$", concern: "cache", legacy: "page cache managers", verdict: "platform" },
+			{ match: "^(Mail|MailMessage|Mailer|.*Mail)$", concern: "mail", legacy: "mail messages", verdict: "platform" },
+			{ match: "^(Scheduler|Cron|Console|Task.*|Job.*|Queue)", concern: "jobs", legacy: "console runner, scheduled tasks", verdict: "platform" },
+			{ match: "^(EventSource|Event.*|.*EventSink|Hook|IEventSink)", concern: "events", legacy: "event source / sinks", verdict: "platform" },
+			{ match: "^(Arr|String|Str|Common|Date|DateTime|GyroDate|Number|Math|Util|Helpers?|Validation|Validator|Input|Sanitizer|Convert|Converter|ConverterFactory|IConverter|Filter.*)", concern: "helpers", legacy: "array/string/date helpers, validation, converters", verdict: "platform" },
+			{ match: "^(Translator|Translation|I18n|Locale|GyroLocale|tr)$", concern: "i18n", legacy: "translation helper", verdict: "platform" },
+			{ match: "^(Logger|Log|Debug|Sentry|ILogger)", concern: "logging", legacy: "file logger", verdict: "platform" },
+			{ match: "^(Http|HttpRequest|HttpResponse|Response|Status|Url.*|Cookie|Header)", concern: "http", legacy: "HTTP primitives", verdict: "platform" },
+			{ match: "^(Install|Systemupdate|SystemUpdate|Update|Migration|.*Update)", concern: "install", legacy: "install scripts & system updates (schema versioning)", verdict: "drop" },
+			{ match: "^(Simpletest|.*Test|Mock.*|GyroUnitTestCase)", concern: "tests", legacy: "SimpleTest unit tests", verdict: "drop" },
+			{ match: "^(Doxygen|Tidy|Phpinfo|Robots|Gsitemap|Mime|Offline|StaticPage|Json|Ajax|Status)", concern: "misc", legacy: "misc framework modules", verdict: "review" },
+		],
 	};
 }
 const CONTAINER_TYPES = ["class_declaration", "interface_declaration", "trait_declaration", "enum_declaration", "anonymous_class"];
@@ -483,20 +385,19 @@ export const phpAdapter: SourceAdapter = {
 
 	async detect(root) {
 		if (!existsSync(root) || !statSync(root).isDirectory()) return { confidence: 0 };
-		// Not profileFor(): that memoises the indexing run's profile; detect must judge this root alone.
-		const profile = PROFILES.find((p) => p.detect(root));
+		const fw = isGyroRoot(root) ? "gyro" : undefined;
 		const composer = join(root, "composer.json");
 		if (existsSync(composer)) {
 			try {
 				const c = JSON.parse(readFileSync(composer, "utf8"));
 				const req = { ...(c.require ?? {}), ...(c["require-dev"] ?? {}) } as Record<string, string>;
-				const framework = req["laravel/framework"] ? "laravel" : req["symfony/framework-bundle"] ? "symfony" : req["slim/slim"] ? "slim" : profile?.id;
+				const framework = req["laravel/framework"] ? "laravel" : req["symfony/framework-bundle"] ? "symfony" : req["slim/slim"] ? "slim" : fw;
 				return { confidence: 0.95, framework, version: req["php"] };
 			} catch {
-				return { confidence: 0.8, framework: profile?.id };
+				return { confidence: 0.8, framework: fw };
 			}
 		}
-		if (profile) return { confidence: 0.9, framework: profile.id };
+		if (fw) return { confidence: 0.9, framework: fw };
 		// No manifest: look at the files themselves (bounded walk, vendor-ish dirs skipped).
 		const n = countFiles(root, /\.(php|phtml|inc)$/, 4, 200);
 		if (n >= 20) return { confidence: 0.85 };
@@ -721,7 +622,7 @@ export const phpAdapter: SourceAdapter = {
 	},
 	profileExample() {
 		return {
-			example: builtinProfileJson(),
+			example: exampleProfileJson(),
 			schemaDoc: `The file is JSON with: id (string); frameworkDirs (string[] path prefixes of the framework, relative to the legacy root, trailing slash); loaders (array of {scope: string|null, method: string, globs: string[], each?: boolean}) — scope is the class of a static call (null for plain functions), method its name; impliedDeps (array of {match: regex over a file path, globs: string[] with $1… from the match groups}); entryPoint (regex over file paths discovered by directory scan at boot); routeClass (regex over class names whose constructor takes the URL as first string literal and the handler method name as the next string literal); concerns (array of {match: regex over class/interface/function names, concern: one of loading|orm|routing|auth|rendering|commands|cache|mail|jobs|events|helpers|i18n|logging|http|install|tests|misc, legacy: short description, verdict: platform|port|drop|review}).`,
 		};
 	},
@@ -745,7 +646,7 @@ export const phpAdapter: SourceAdapter = {
 	// gyro/PHP file kinds (x.tpl.php, x.cmd.php, x.cls.php, x.facade.php, x.inc.php): a target name carrying one is a ported file name
 	legacyWords: ["tpl", "cmd", "cls", "facade", "inc", "php", "phtml"],
 	placeFile(path, root) {
-		return placePhpFile(path, root, (r) => PROFILES.some((p) => p.id === "gyro" && p.detect(r)));
+		return placePhpFile(path, root, isGyroRoot);
 	},
 	unitGroupOf(path) {
 		// model + facade of the same entity are one unit of meaning (gyro: x.model.php / x.facade.php)
@@ -772,10 +673,7 @@ export const phpAdapter: SourceAdapter = {
 		for (const [dev, block] of [[false, c.require ?? {}], [true, c["require-dev"] ?? {}]] as Array<[boolean, Record<string, string>]>) {
 			for (const [name, version] of Object.entries(block)) {
 				if (name === "php" || name.startsWith("ext-")) continue;
-				const norm = (n: string) => n.split("/")[1]!.replace(/[-_]?php$/i, "").replace(/^php[-_]?/i, "");
-				const fork = name.includes("/") && !(name in COMPOSER_SUCCESSORS) ? Object.keys(COMPOSER_SUCCESSORS).find((k) => norm(k) === norm(name)) : undefined;
-				const hit = COMPOSER_SUCCESSORS[name] ?? (fork ? COMPOSER_SUCCESSORS[fork] : undefined);
-				out.push({ name, version, dev, successor: hit?.successor, verdict: hit?.verdict ?? "review", note: hit?.note ?? (fork ? `fork of ${fork}` : undefined) });
+				out.push({ name, version, dev, verdict: "review" });
 			}
 		}
 		return out;
@@ -798,4 +696,9 @@ function resolveInclude(root: string, fromRel: string, expr: string): string | u
 	if (!m) return undefined;
 	const target = normalize(join(dirname(join(root, fromRel)), m[1]!));
 	return existsSync(target) ? relative(root, target) : basename(m[1]!);
+}
+
+/** A gyro checkout: the framework vendored next to the app. */
+function isGyroRoot(root: string): boolean {
+	return existsSync(join(root, "gyro-php")) || existsSync(join(root, "gyro"));
 }

@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS files (
   tier TEXT,
   dead_code INTEGER NOT NULL DEFAULT 0,
   dead_code_reason TEXT,
+  disposition TEXT,                   -- framework|regenerated|… (not ported as a unit)
   updated_at TEXT NOT NULL
 );
 
@@ -189,6 +190,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   action TEXT,
   label TEXT,                         -- human/pilot ground truth for calibration
   cost_usd REAL NOT NULL DEFAULT 0,
+  latency_ms INTEGER,
   created_at TEXT NOT NULL
 );
 
@@ -228,7 +230,7 @@ CREATE INDEX IF NOT EXISTS transitions_entity ON transitions(entity, entity_id);
 -- code index (source and target)
 CREATE TABLE IF NOT EXISTS index_symbols (
   id TEXT PRIMARY KEY, side TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
-  line INTEGER, signature TEXT, exported INTEGER NOT NULL DEFAULT 1, ast_hash TEXT
+  line INTEGER, end_line INTEGER, signature TEXT, exported INTEGER NOT NULL DEFAULT 1, ast_hash TEXT, doc TEXT, tags TEXT
 );
 CREATE INDEX IF NOT EXISTS index_symbols_name ON index_symbols(side, name);
 CREATE TABLE IF NOT EXISTS index_deps (
