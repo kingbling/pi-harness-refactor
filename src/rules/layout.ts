@@ -67,6 +67,10 @@ export async function validateRulesLayout(root: string, config: Config): Promise
 		for (const m of body.matchAll(/(?:^|[\s`("'./])((?:[\w-]+\/)?src\/[\w.<>-]+\/)/gm)) {
 			const dir = m[1]!.replace(new RegExp(`^${adapter.subdir}/`), "");
 			if (!dir.startsWith("src/")) continue;
+			// a path of the OLD codebase (a legacy file the rules quote as evidence) is no module root of the new one
+			const full = m[1]! + (/^[^\s`'"),;]*/.exec(body.slice(m.index! + m[0].length))?.[0] ?? "");
+			const ext = /\.[A-Za-z0-9]+$/.exec(full)?.[0];
+			if ((ext && !adapter.layout.sourceExtensions.includes(ext)) || existsSync(join(config.source.path, full))) continue;
 			if (!allowed.some((a) => dir.startsWith(a) || a.startsWith(dir))) problems.push(`${stackId}: RULES.md names module root ${dir} outside ${allowed.join(", ")}`);
 		}
 		// file shapes under the module root must be ones the adapter's structureDoc lists (by suffix)

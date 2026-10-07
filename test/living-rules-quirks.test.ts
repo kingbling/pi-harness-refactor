@@ -92,7 +92,7 @@ describe("living rules", () => {
 	it("layout is code-rendered per stack; validator and ast-grep listing agree", async () => {
 		const { root, config, ledger } = setup();
 		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
-		await saveRulesVersion({ ledger, root }, "react", "## UI\n- put pages in `src/list.tpl/`", { version: 1 });
+		await saveRulesVersion({ ledger, root }, "react", "## UI\n- put pages in `src/list.tpl/`\n- evidence from the old code: `src/controllers/InvoiceController.php` (a legacy file, not a folder of the new project)", { version: 1 });
 		const nest = await getTargetAdapter("nestjs");
 		expect(readFileSync(join(rulesDir(root, "nestjs"), "RULES.md"), "utf8")).toContain(renderLayoutSection(nest));
 		const problems = await validateRulesLayout(root, config);
