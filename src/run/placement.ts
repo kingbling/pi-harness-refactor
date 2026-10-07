@@ -9,6 +9,7 @@ import { noulConfidence, type Battery } from "../jev/questions.ts";
 import type { Ledger, UnitRow } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { genericArea, kebab, SHARED_AREA } from "./areas.ts";
+import { curateAreas, syncTaxonomyAnswers, taxonomyHold } from "./taxonomy.ts";
 
 /**
  * Where a unit lands in the target: which stack, which legacy area (one area = one feature module per stack),
@@ -25,7 +26,7 @@ import { genericArea, kebab, SHARED_AREA } from "./areas.ts";
  *
  * Results are persisted in unit `meta.place`; placeUnit reads them first.
  */
-export type PlaceSource = "override" | "code" | "model" | "answer";
+export type PlaceSource = "override" | "code" | "model" | "answer" | "taxonomy";
 export interface Placement {
 	stackId: string;
 	area: string;
@@ -69,6 +70,8 @@ export function placementDir(layout: TargetLayout, p: Placement): string {
 
 /** Why a unit may not run yet: no persisted placement and code is unsure (the model/question step has not placed it). */
 export function unplacedReason(config: Config, metaJson: string, root?: string): string | undefined {
+	const hold = taxonomyHold(metaJson); // open area question or excluded by the owner: never runs on a guess
+	if (hold) return hold;
 	const meta = JSON.parse(metaJson) as UnitMeta;
 	if (meta.place?.area && config.target.stacks.includes(meta.place.stack)) return undefined;
 	return codePlace(config, meta, root).unsure;
@@ -147,6 +150,8 @@ export interface PlacementDeps {
 	log?: (l: string) => void;
 	/** Recompute units that already have a placement (planned ones only). */
 	force?: boolean;
+	/** Curate the whole area set (escalate model, taxonomy.ts) between the code and the model pass: label / br place only. */
+	curate?: boolean;
 	concurrency?: number;
 }
 
@@ -159,12 +164,15 @@ export interface Planned {
 	stored: boolean;
 }
 
-/** Code + shared placement of every unit (nothing written); persisted placements win (with force: only answers). */
+/** Sources a forced re-placement keeps: decided by the owner or the curated area set, not recomputed by code. */
+const KEPT = new Set<PlaceSource>(["answer", "taxonomy"]);
+
+/** Code + shared placement of every unit (nothing written); persisted placements win (with force: answers + taxonomy). */
 export function planPlacements(config: Config, units: Array<Pick<UnitRow, "id" | "meta" | "deps">>, root?: string, force = false): Map<string, Planned> {
 	const out = new Map<string, Planned>();
 	for (const u of units) {
 		const meta = JSON.parse(u.meta) as UnitMeta;
-		if (meta.place && (!force || meta.place.source === "answer")) out.set(u.id, { place: placeUnit(config, u.meta, root), surfaceKnown: true, stored: true });
+		if (meta.place && (!force || KEPT.has(meta.place.source))) out.set(u.id, { place: placeUnit(config, u.meta, root), surfaceKnown: true, stored: true });
 		else out.set(u.id, { ...codePlace(config, meta, root), stored: false });
 	}
 	// shared: dependents in the same stack span ≥ 2 feature areas other than the unit's own, and its own area is
@@ -193,11 +201,12 @@ export function planPlacements(config: Config, units: Array<Pick<UnitRow, "id" |
 export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: number; byModel: number; asked: number; shared: number; costUsd: number }> {
 	const log = d.log ?? (() => {});
 	applyPlacementAnswers(d.ledger, d.config, d.root);
+	syncTaxonomyAnswers({ ledger: d.ledger, root: d.root });
 	const all = d.ledger.listUnits();
 	const plan = planPlacements(d.config, all, d.root, d.force);
 	const todo = all.filter((u) => {
 		const m = JSON.parse(u.meta) as UnitMeta;
-		return u.state === "planned" && !plan.get(u.id)!.stored && !openQuestion(d.ledger, m.placeQuestion);
+		return u.state === "planned" && !plan.get(u.id)!.stored && !openQuestion(d.ledger, m.placeQuestion) && !taxonomyHold(u.meta);
 	});
 	const res = { placed: 0, byModel: 0, asked: 0, shared: 0, costUsd: 0 };
 	const save = (id: string, p: Placement, extra: Partial<StoredPlace> = {}) => {
@@ -205,11 +214,27 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 		res.placed++;
 		if (p.shared) res.shared++;
 	};
-	const unsure: UnitRow[] = [];
+	let unsure: UnitRow[] = [];
 	for (const u of todo) {
 		const p = plan.get(u.id)!;
-		if (p.unsure) unsure.push(u);
-		else save(u.id, p.place);
+		if (!p.unsure) save(u.id, p.place);
+		else {
+			unsure.push(u);
+			if (d.force) d.ledger.updateUnit(u.id, { meta: { place: undefined } }); // a stale guess must not feed the taxonomy
+		}
+	}
+	if (d.curate && d.client && todo.length) {
+		// only when this pass placed something (re-runs stay free); the whole area set at once: business areas per stack; its rules may now place units code was unsure about
+		const t = await curateAreas({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { log });
+		res.costUsd += t.costUsd;
+		unsure = unsure.filter((u) => {
+			const row = d.ledger.getUnit(u.id)!;
+			if ((JSON.parse(row.meta) as UnitMeta).place || taxonomyHold(row.meta)) return false;
+			const c = codePlace(d.config, JSON.parse(row.meta) as UnitMeta, d.root);
+			if (c.unsure) return true;
+			save(u.id, c.place);
+			return false;
+		});
 	}
 	if (unsure.length) {
 		const ctx = candidateContext(all, plan);

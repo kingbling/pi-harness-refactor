@@ -7,6 +7,7 @@ import { getSourceAdapter } from "../adapters/registry.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { buildGraph, condense, cutLargeCycles, tarjanScc } from "./scc.ts";
 import { headOf, isRepo } from "../git.ts";
+import { loadDecisions } from "./decisions.ts";
 
 export type Tier = "T0" | "T1" | "T2" | "T3";
 
@@ -150,6 +151,9 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 
 	// ---- registration files: not units; the target adapter regenerates them from the ledger
 	const regenerated = indexes.filter((f) => adapter.isRegistrationFile?.(f.path)).map((f) => f.path);
+	// owner-confirmed exclusions (area questions → decisions.json `excluded`): same disposition, kept across re-inventories
+	const excluded = (loadDecisions(_root) as { excluded?: Record<string, string> }).excluded ?? {};
+	for (const f of indexes) if (excluded[f.path] && !regenerated.includes(f.path)) regenerated.push(f.path);
 	// ---- framework files: indexed so names resolve, mapped per concern (br frameworks), never units
 	const framework = indexes.filter((f) => isFramework(f.path)).map((f) => f.path);
 	const frameworkSet = new Set(framework);
@@ -304,7 +308,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	}
 	for (const p of dead) ledger.markDeadCode(p, referrers.get(p)?.size ? `only referenced from dead code (${[...referrers.get(p)!].slice(0, 3).join(", ")})` : "no inbound references and no string-literal mentions of its symbols");
 	for (const p of framework) ledger.markFramework(p, "legacy framework: mapped per concern to the target platform (br frameworks), not migrated file by file");
-	for (const p of regenerated) ledger.markRegenerated(p, `registration file; the ${config.target.stacks.join("/")} adapter regenerates module/route wiring from the ledger (index_routes)`);
+	for (const p of regenerated) ledger.markRegenerated(p, excluded[p] ?? `registration file; the ${config.target.stacks.join("/")} adapter regenerates module/route wiring from the ledger (index_routes)`);
 	// planned units from an earlier inventory that this run did not produce (files regrouped, now dead,
 	// framework or regenerated) are no longer units; their symbols already point at the new unit
 	const produced = new Set(unitIds);

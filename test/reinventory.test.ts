@@ -57,6 +57,15 @@ describe("re-inventory", () => {
 		await inventory(config, ws, ledger);
 		expect(ledger.listUnits().map((u) => u.id).sort()).toEqual([...after].sort());
 		expect(ledger.checkInvariants().ok).toBe(true);
+
+		// an owner-excluded file (decisions.json `excluded`, from an area question) stays out across re-inventories
+		const unitFile = (JSON.parse(ledger.getUnit(after.find((id) => id !== started)!)!.meta).files as string[])[0]!;
+		writeFileSync(join(ws, ".bigrefactor", "decisions.json"), JSON.stringify({ excluded: { [unitFile]: "excluded by the owner (question #3): dead admin page" } }));
+		await inventory(config, ws, ledger);
+		const f = ledger.db.prepare("SELECT disposition, dead_code_reason r FROM files WHERE path = ?").get(unitFile) as { disposition: string; r: string };
+		expect(f).toMatchObject({ disposition: "regenerated", r: expect.stringMatching(/excluded by the owner/) });
+		expect(ledger.listUnits().some((u) => (JSON.parse(u.meta).files as string[]).includes(unitFile))).toBe(false);
+		expect(ledger.checkInvariants().ok).toBe(true);
 		ledger.close();
 	}, 60_000);
 });

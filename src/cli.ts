@@ -241,7 +241,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	place: async (args) => {
 		const { resolvePlacements, placeUnit } = await import("./run/placement.ts");
 		const { config, ledger, root } = open();
-		const r = await resolvePlacements({ ledger, config, root, client: makeClient(), force: args.includes("--force"), log: (l) => console.log(l) });
+		const r = await resolvePlacements({ ledger, config, root, client: makeClient(), force: args.includes("--force"), curate: !args.includes("--no-curate"), log: (l) => console.log(l) });
 		const n = new Map<string, number>();
 		for (const u of ledger.listUnits()) {
 			const p = placeUnit(config, u.meta, root);

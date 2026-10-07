@@ -16,6 +16,7 @@ import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
 import { SYSTEMIC_FAILURE } from "../jev/questions.ts";
 import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } from "./placement.ts";
+import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel } from "../jev/ask.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
@@ -192,6 +193,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let waitingNote = "";
 	const ready = (): string[] => {
 		applyPlacementAnswers(ledger, config, o.root); // an answered placement question places its unit before it can start
+		syncTaxonomyAnswers({ ledger, root: o.root }); // answered area questions: new area, or the owner excluded the unit
 		const blocked = ledger.blockedUnits();
 		decisionBlocked = o.blocked?.() ?? new Map();
 		for (const u of decisionBlocked.keys()) if (!blocked.has(u)) blocked.set(u, []);

@@ -169,7 +169,7 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 	const placed = Object.keys(advised.units ?? {}).length - placedBefore;
 	if (features.length) log(`  slices: auth = ${auth.join(", ") || "none"}; ${placed}/${dyn.length} unreached units placed (${byCode} by folder neighbours, ${placed - byCode} by Jev)`);
 	// after the labels: Jev's has_ui decides the surface where the source adapter cannot tell
-	const areas = await resolvePlacements({ ledger, config, root, client, log, concurrency: opts.concurrency });
+	const areas = await resolvePlacements({ ledger, config, root, client, log, concurrency: opts.concurrency, curate: true });
 	cost += areas.costUsd;
 	return { units: units.length, hard, auth, placed, areas: { placed: areas.placed, asked: areas.asked }, costUsd: cost };
 }

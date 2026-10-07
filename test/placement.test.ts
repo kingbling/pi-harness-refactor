@@ -6,7 +6,7 @@ import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { draftedOutside, runUnit } from "../src/run/unit.ts";
 import { getTargetAdapter, knownTargets, TARGET_ROLES } from "../src/adapters/registry.ts";
-import { applyPlacementAnswers, codePlace, placeUnit, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
+import { applyPlacementAnswers, codePlace, placeUnit, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
  * Placement: one legacy area → one feature module per stack. Code places clear cases (gyro layout), placement.json
@@ -186,5 +186,30 @@ describe("placement", () => {
 	it("drafted interface paths must stay inside the unit's placement", () => {
 		const md = "- `api/src/features/agency/agency.service.ts` exports AgencyService\n- src/features/list.tpl/list.ts\n- ported from app/model/classes/agency.model.php";
 		expect(draftedOutside(md, ["src/features/agency/"], "api", [join(ws, "migrated"), config.source.path])).toEqual(["src/features/list.tpl/list.ts"]);
+	});
+});
+
+describe("placement + taxonomy", () => {
+	it("taxonomy holds keep a unit from running; forced re-placement keeps taxonomy and answers", () => {
+		ledger.updateUnit("agency_cmd", { meta: { place: { stack: "nestjs", area: "accounts", shared: false, source: "taxonomy" } } });
+		ledger.updateUnit("agency_list", { meta: { taxonomyQuestion: 7 } });
+		ledger.updateUnit("campaign_list", { meta: { exclude: { question: 8, why: "dead admin page" } } });
+		expect(unplacedReason(config, ledger.getUnit("agency_list")!.meta, ws)).toMatch(/area question #7/);
+		expect(unplacedReason(config, ledger.getUnit("campaign_list")!.meta, ws)).toMatch(/excluded/);
+		expect(unplacedReason(config, ledger.getUnit("agency_cmd")!.meta, ws)).toBeUndefined();
+		const plan = planPlacements(config, ledger.listUnits(), ws, true);
+		expect(plan.get("agency_cmd")).toMatchObject({ stored: true, place: { area: "accounts", source: "taxonomy" } });
+	});
+
+	it("curation runs between the code and the model pass, only when something was placed", async () => {
+		const client = new FakeModelClient({
+			decide: () => ({ area: "shared" }),
+			chat: () => ({ json: { areas: [], mappings: [] } }),
+		});
+		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		const first = client.calls.length;
+		expect(first).toBeGreaterThan(0);
+		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		expect(client.calls.length).toBe(first); // nothing new to place: no curation, no Jev
 	});
 });
