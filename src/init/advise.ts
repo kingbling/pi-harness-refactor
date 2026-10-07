@@ -21,7 +21,7 @@ import { planFrameworks } from "../inventory/frameworks.ts";
  * recommendation with its reason and confidence; a human (or `--yes`) still decides. Static tables in the
  * adapters remain only as the offline fallback (`--no-llm`).
  */
-const ADVICE_VERSION = 2;
+const ADVICE_VERSION = 3;
 
 export interface Advice {
 	value: string;
@@ -30,20 +30,21 @@ export interface Advice {
 	by: string;
 }
 
-export async function advise(config: Config, root: string, ledger: Ledger, client: ModelClient, source: SourceAdapter, targets: TargetAdapter[], log: (l: string) => void = console.log): Promise<{ libraries: number; classes: number; decisions: number; costUsd: number }> {
+export async function advise(config: Config, root: string, ledger: Ledger, client: ModelClient, source: SourceAdapter, targets: TargetAdapter[], log: (l: string) => void = console.log): Promise<{ libraries: number; classes: number; decisions: number; costUsd: number; implied: Array<{ id: string; value: string; reason: string }> }> {
 	const file = loadDecisions(root) as ReturnType<typeof loadDecisions> & { advice?: Record<string, Advice>; adviceVersion?: number; adviceBasis?: string };
 	// advice from before v2 was anchored on code defaults and provisional targets: judged again (answers stay)
 	if ((file.adviceVersion ?? 1) < ADVICE_VERSION) {
 		delete file.advice;
 		delete file.phrased;
 		delete file.discovered;
+		delete file.dimensions;
 		file.adviceVersion = ADVICE_VERSION;
 	}
 	// advice sees the code's points, not an earlier phrasing
 	const advice: Record<string, Advice> = (file.advice ??= {});
-	// library successors, class verdicts and stack choices are judged FOR a target stack: when the stacks
-	// change (the owner decided another one) they are judged again, and the questions re-phrased
-	const basis = config.target.stacks.join("+");
+	// library successors, class verdicts and stack choices are judged FOR a target: when the stacks or the
+	// owner's dimension answers change they are judged again, and the questions re-phrased
+	const basis = [config.target.stacks.join("+"), ...Object.entries(file.answers).filter(([k]) => k.startsWith("target:")).map(([k, a]) => `${k}=${a.answer}`).sort()].join("|");
 	if (file.adviceBasis && file.adviceBasis !== basis) {
 		for (const k of Object.keys(advice)) if (/^(lib|fw|stack|concern):/.test(k)) delete advice[k];
 		delete file.phrased;
@@ -55,35 +56,43 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 	const plan = planFrameworks(ledger, source, targets, config.source.path, file, config.target.choices);
 	// only what the owner decided is stated as fact; provisional config values would anchor every judgment
 	const decidedChoices = Object.fromEntries(Object.entries(file.answers).filter(([k]) => k.startsWith("stack:")).map(([k, a]) => [k.slice(6), a.answer]));
-	const decidedTargets = file.answers["targets"]?.answer.replace(/\+/g, " + ");
+	const decidedTargets = file.answers["targets"]?.answer.replace(/\+/g, " + ") ?? (file.answers["target:server"] ? config.target.stacks.join(" + ") : undefined);
 	const { phraseDecisions, discoverDecisions, pointHash, repoBrief } = await import("../jev/ask.ts");
 	const deps = { ledger, config, root, client };
-	// every judgment below reads the repo: the brief is what a model understood of it. Until the target
-	// stack is decided, a brief written while provisional targets were stated as fact is rewritten.
-	const targetsOpen = !file.answers["targets"] && !advice["targets"];
+	// every judgment below reads the repo: the brief is what a model understood of it. Until the target is
+	// decided, a brief written while provisional targets were stated as fact is rewritten.
+	const targetsOpen = !file.answers["targets"] && !file.answers["target:server"] && !file.dimensions;
 	const b = await repoBrief(deps, { force: targetsOpen });
 	cost += b.costUsd;
-	const { surveySource, adviseStack, adviseTargets } = await import("./survey.ts");
+	const { surveySource, adviseStack, adviseDimensions } = await import("./survey.ts");
 	const survey = await surveySource(config.source.path, source);
 
-	// ---- 0. the target stack itself, judged from the repo (adapters are a fact shown to the owner, not the option space)
-	if (targetsOpen) {
-		const { TARGET_SUBDIRS } = await import("../adapters/registry.ts");
-		const r = await adviseTargets(survey, b.brief, client, config.models.escalate.id, { legacyLibraries: plan.libraries.map((l) => l.name), adapters: Object.entries(TARGET_SUBDIRS).map(([id, role]) => ({ id, role })) });
-		if (r) {
-			cost += r.costUsd;
-			advice["targets"] = { value: r.value, reason: r.reason, by: config.models.escalate.id };
-			(file as { targetOptions?: Array<{ value: string; reason: string }> }).targetOptions = r.alternatives;
-			log(pc.dim(`  advise: target stack ${r.value} (+${r.alternatives.length} alternatives), $${r.costUsd.toFixed(4)}`));
+	// ---- 0. where each part of the app goes (server, ui, every data store, …), rated from the repo
+	if (!file.dimensions) {
+		const { TARGET_ROLES } = await import("../adapters/registry.ts");
+		const r = await adviseDimensions(survey, b.brief, client, config.models.escalate.id, { legacyLibraries: plan.libraries.map((l) => l.name), dataStores: config.db.from, adapters: Object.entries(TARGET_ROLES).map(([id, role]) => ({ id, role })) });
+		cost += r.costUsd;
+		if (r.dimensions.length) {
+			file.dimensions = r.dimensions;
+			for (const d of r.dimensions) advice[`target:${d.key}`] = { value: d.candidates[0]!.id, reason: d.candidates[0]!.reason, by: config.models.escalate.id };
+			log(pc.dim(`  advise: rated ${r.dimensions.length} dimensions (${r.dimensions.map((d) => `${d.key} → ${d.candidates[0]!.id} ${d.candidates[0]!.score}`).join(", ")}), $${r.costUsd.toFixed(4)}`));
 		}
 	}
+	const implied: Array<{ id: string; value: string; reason: string }> = [];
+	// what the owner decided about the dimensions: binding for every judgment below
+	const decidedDims = Object.entries(file.answers).filter(([k]) => k.startsWith("target:")).map(([k, a]) => `${k.slice(7)} → ${a.answer}`);
 
 	// ---- 1. target stack choices: the escalate model picks among each adapter's options from the repo
 	const stackOpen = targets.some((t) => (t.stackChoices ?? []).some((c) => !file.answers[`stack:${t.id}.${c.key}`] && !advice[`stack:${t.id}.${c.key}`]));
 	if (stackOpen) {
-		const r = await adviseStack(survey, targets, client, config.models.escalate.id, { dbTo: config.db.to, legacyLibraries: plan.libraries.map((l) => l.name), brief: b.brief });
+		const r = await adviseStack(survey, targets, client, config.models.escalate.id, { dbTo: config.db.to, legacyLibraries: plan.libraries.map((l) => l.name), brief: b.brief, decided: decidedDims });
 		cost += r.costUsd;
-		for (const [t, picks] of Object.entries(r.picks)) for (const [k, v] of Object.entries(picks)) advice[`stack:${t}.${k}`] = { value: v.id, reason: v.reason, by: config.models.escalate.id };
+		for (const [t, picks] of Object.entries(r.picks))
+			for (const [k, v] of Object.entries(picks)) {
+				advice[`stack:${t}.${k}`] = { value: v.id, reason: v.reason, by: config.models.escalate.id };
+				// settled by what the owner decided (e.g. the data dimension fixes the database): not asked
+				if (v.implied && !file.answers[`stack:${t}.${k}`]) implied.push({ id: `stack:${t}.${k}`, value: v.id, reason: v.reason });
+			}
 		log(pc.dim(`  advise: ${Object.values(r.picks).reduce((a, x) => a + Object.keys(x).length, 0)} stack choices, $${r.costUsd.toFixed(4)}`));
 	}
 	persist(root, file);
@@ -153,7 +162,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 
 	// ---- 3. open decisions: Jev picks among each decision's options, with confidence
 	// libraries/classes were judged above; everything else open gets a Jev pick
-	const jevable = openDecisions(ledger, config, source, targets, root, { raw: true }).filter((d) => !advice[d.id] && !d.id.startsWith("lib:") && !d.id.startsWith("fw:") && !d.id.startsWith("stack:") && d.options.length > 1);
+	const jevable = openDecisions(ledger, config, source, targets, root, { raw: true }).filter((d) => !advice[d.id] && !d.id.startsWith("lib:") && !d.id.startsWith("fw:") && !d.id.startsWith("stack:") && !d.id.startsWith("target:") && d.options.length > 1);
 	if (jevable.length) {
 		// one call per decision, each with its own evidence: a combined call reports the minimum confidence of
 		// unrelated questions and gives Jev no specific facts (observed 0.05–0.14 that way)
@@ -165,10 +174,12 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 			jevable.map(async (d) => {
 				const battery: Battery = { choice: { type: "choice", instructions: `${d.question} Use \`evidence\` and \`repo\`. Pick the option a careful migration lead would choose for this repo.`, criteria: { ...Object.fromEntries(d.options.filter((o) => !o.value.includes("?")).map((o) => [o.value, `${o.label}${o.hint ? ` — ${o.hint}` : ""}`])), other: null } } };
 				try {
-					const r = await decide({ client, ledger, model: config.models.decide.id }, `advise:${d.id}`, { evidence: d.evidence, repo, ...(d.topic === "slicing" || d.topic === "budget" ? facts : {}) }, battery, ["choice"]);
+					const r = await decide({ client, ledger, model: config.models.decide.id, second: config.models.escalate.id }, `advise:${d.id}`, { evidence: d.evidence, repo, ...(d.topic === "slicing" ? facts : {}) }, battery, ["choice"]);
 					spent += r.costUsd;
 					const a = r.answers["choice"];
-					if (a?.type === "choice" && a.choice !== "other") advice[d.id] = { value: a.choice, confidence: a.confidence, reason: `decision model, ${Math.round(a.confidence * 100)}% confident`, by: `jev:${r.decisionId}` };
+					// kept with its confidence: below JEV_ACT (after a second opinion) it is shown as doubt, never used as
+					// the recommendation (openDecisions); the phrasing model, which read the brief, recommends instead
+					if (a?.type === "choice" && a.choice !== "other") advice[d.id] = { value: a.choice, confidence: r.confidence, reason: `decision model, ${Math.round(r.confidence * 100)}% confident${r.secondOpinion === "agreed" ? " (a second model agreed)" : ""}`, by: `jev:${r.decisionId}` };
 				} catch {
 					/* no advice: the code recommendation stands */
 				}
@@ -196,7 +207,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 		log(pc.dim(`  advise: ${Object.keys(r.discovered).length} repo-specific decisions found, $${r.costUsd.toFixed(4)}`));
 	}
 	persist(root, file);
-	return { libraries: libs.length, classes: classes.length, decisions: jevable.length, costUsd: cost };
+	return { libraries: libs.length, classes: classes.length, decisions: jevable.length, costUsd: cost, implied };
 }
 
 function persist(root: string, d: unknown): void {

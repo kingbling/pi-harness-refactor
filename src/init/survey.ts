@@ -81,7 +81,7 @@ export async function surveySource(root: string, adapter: SourceAdapter): Promis
 
 /**
  * Provisional values only, so inventory can run before anything is decided: the first adapters that
- * fit. Never a recommendation: `adviseTargets` judges the target stack from the analyzed repo.
+ * fit. Never a recommendation: `adviseDimensions` rates where each part goes, from the analyzed repo.
  */
 export function recommend(s: Survey, sourcePath: string): Recommendation {
 	const why: string[] = [];
@@ -121,8 +121,8 @@ export async function adviseStack(
 	targets: Array<{ id: string; stackChoices?: Array<{ key: string; question: string; default: string; options: Array<{ id: string; label: string; hint?: string }> }> }>,
 	client: import("../models/types.ts").ModelClient,
 	model: string,
-	extra: { dbTo?: string; legacyLibraries?: string[]; brief?: string } = {},
-): Promise<{ picks: Record<string, Record<string, { id: string; reason: string }>>; costUsd: number }> {
+	extra: { dbTo?: string; legacyLibraries?: string[]; brief?: string; decided?: string[] } = {},
+): Promise<{ picks: Record<string, Record<string, { id: string; reason: string; implied?: boolean }>>; costUsd: number }> {
 	const items = targets.flatMap((t) => (t.stackChoices ?? []).map((c) => ({ t: t.id, c })));
 	if (!items.length) return { picks: {}, costUsd: 0 };
 	const key = (t: string, k: string) => `${t}__${k}`;
@@ -130,63 +130,68 @@ export async function adviseStack(
 		type: "object",
 		additionalProperties: false,
 		required: items.map((i) => key(i.t, i.c.key)),
-		properties: Object.fromEntries(items.map((i) => [key(i.t, i.c.key), { type: "object", additionalProperties: false, required: ["id", "reason"], properties: { id: { type: "string", enum: i.c.options.map((o) => o.id) }, reason: { type: "string" } } }])),
+		properties: Object.fromEntries(items.map((i) => [key(i.t, i.c.key), { type: "object", additionalProperties: false, required: ["id", "reason", "implied"], properties: { id: { type: "string", enum: i.c.options.map((o) => o.id) }, reason: { type: "string" }, implied: { type: "boolean", description: "true only when the owner decisions fully determine this choice (nothing left to ask)" } } }])),
 	};
 	const prompt = [
 		extra.brief ? `Repo brief:\n${extra.brief.slice(0, 4000)}\n` : "",
 		`Legacy repo survey: framework ${s.framework ?? "unknown"}${s.version ? ` ${s.version}` : ""}; data stores ${s.engines.map((e) => `${e.engine} (${e.evidence})`).join("; ") || "none"}; files by extension ${Object.entries(s.files).map(([k, v]) => `${k}=${v}`).join(", ")}; tests ${s.tests ?? "none found"}.`,
 		extra.dbTo ? `The data will move to ${extra.dbTo}.` : "",
+		extra.decided?.length ? `Owner decisions (binding): ${extra.decided.join("; ")}.` : "",
 		extra.legacyLibraries?.length ? `Legacy libraries: ${extra.legacyLibraries.join(", ")}.` : "",
 		"Pick, for each stack decision of the new codebase, the option that fits THIS repo best (team continuity, data model, UI style, what the legacy code already does). One sentence reason each, grounded in the survey.",
 		...items.map((i) => `\n${key(i.t, i.c.key)} — ${i.t}: ${i.c.question}\n${i.c.options.map((o) => `  - ${o.id}: ${o.label}${o.hint ? ` (${o.hint})` : ""}`).join("\n")}`),
 	].join("\n");
 	const res = await client.chat({ model, messages: [{ role: "system", content: "You are a senior architect choosing a target stack for a legacy migration. Answer only with the JSON object." }, { role: "user", content: prompt }], schema, effort: "low" });
-	const out = (res.json ?? {}) as Record<string, { id: string; reason: string }>;
-	const picks: Record<string, Record<string, { id: string; reason: string }>> = {};
+	const out = (res.json ?? {}) as Record<string, { id: string; reason: string; implied?: boolean }>;
+	const picks: Record<string, Record<string, { id: string; reason: string; implied?: boolean }>> = {};
 	for (const i of items) {
 		const a = out[key(i.t, i.c.key)];
-		if (a && i.c.options.some((o) => o.id === a.id)) (picks[i.t] ??= {})[i.c.key] = a;
+		if (a && i.c.options.some((o) => o.id === a.id)) (picks[i.t] ??= {})[i.c.key] = { ...a, implied: !!(a.implied && extra.decided?.length) };
 	}
 	return { picks, costUsd: res.usage.costUsd };
 }
 
-export interface TargetAdvice {
-	/** `<server>[+<ui>]` stack ids, e.g. the model's own kebab-case names. */
-	value: string;
-	reason: string;
-	alternatives: Array<{ value: string; reason: string }>;
-	costUsd: number;
+/** One part of the app the rewrite has to land somewhere, with every candidate rated for THIS repo. */
+export interface Dimension {
+	/** "server", "ui", "data:<legacy engine>" per data store, or another part the repo has (queue, search, …). */
+	key: string;
+	/** What the legacy app uses for it today. */
+	now: string;
+	candidates: Array<{ id: string; score: number; reason: string }>;
 }
 
 /**
- * The target stack judged from the repo: a model reads the repo brief (what the app does, its UI, data,
- * odd patterns) plus the survey and libraries and says what the new codebase should be built on, with
- * alternatives. It names stacks freely; which ones bigrefactor has adapters for is listed as a fact the
- * owner must know, never as the space to choose from.
+ * Where to bring each part of the app, judged from the repo: a model reads the brief (what the app does, its
+ * UI, data, odd patterns), the survey and the libraries, and rates candidates per dimension 0–100. It names
+ * stacks freely; which ones bigrefactor has adapters for is information for the owner (a missing one is
+ * generated on choice), never the space to choose from.
  */
-export async function adviseTargets(
+export async function adviseDimensions(
 	s: Survey,
 	brief: string,
 	client: import("../models/types.ts").ModelClient,
 	model: string,
-	extra: { legacyLibraries?: string[]; adapters: Array<{ id: string; role: string }> },
-): Promise<TargetAdvice | undefined> {
-	const pick = { type: "object", additionalProperties: false, required: ["server", "ui", "reason"], properties: { server: { type: "string", description: "kebab-case id of the server/API stack" }, ui: { type: "string", description: "kebab-case id of the UI stack, or \"none\" when the app needs no separate UI codebase" }, reason: { type: "string", description: "1–2 sentences grounded in THIS repo (its UI, data, team code, patterns)" } } };
-	const schema = { type: "object", additionalProperties: false, required: ["recommended", "alternatives"], properties: { recommended: pick, alternatives: { type: "array", items: pick, description: "1–3 other serious options" } } };
+	extra: { legacyLibraries?: string[]; dataStores: string[]; adapters: Array<{ id: string; role: string }> },
+): Promise<{ dimensions: Dimension[]; costUsd: number }> {
+	const cand = { type: "object", additionalProperties: false, required: ["id", "score", "reason"], properties: { id: { type: "string", description: "short kebab-case id of the stack / engine / product" }, score: { type: "integer", minimum: 0, maximum: 100, description: "fit for THIS repo" }, reason: { type: "string", description: "1–2 sentences grounded in the repo" } } };
+	const dim = { type: "object", additionalProperties: false, required: ["key", "now", "candidates"], properties: { key: { type: "string" }, now: { type: "string" }, candidates: { type: "array", items: cand, minItems: 2, maxItems: 4 } } };
+	const schema = { type: "object", additionalProperties: false, required: ["dimensions"], properties: { dimensions: { type: "array", items: dim } } };
 	const prompt = [
 		`Repo brief:\n${brief.slice(0, 6000)}`,
 		`\nSurvey: framework ${s.framework ?? "unknown"}${s.version ? ` ${s.version}` : ""}; data stores ${s.engines.map((e) => `${e.engine} (${e.evidence})`).join("; ") || "none"}; files by extension ${Object.entries(s.files).map(([k, v]) => `${k}=${v}`).join(", ")}; tests ${s.tests ?? "none found"}.`,
 		extra.legacyLibraries?.length ? `Legacy libraries: ${extra.legacyLibraries.join(", ")}.` : "",
-		"\nThis legacy app is being rewritten into a new codebase. Which server stack and which UI stack should the new codebase use? Judge from what this repo is and does (how its UI is built, how much client code exists and in what, data access, size, odd patterns), not from fashion. Use short kebab-case stack ids.",
-		`For information only (do NOT let it steer the pick): the migration tool currently has target adapters for ${extra.adapters.map((a) => `${a.id} (${a.role})`).join(", ")}; others would need an adapter first.`,
+		"\nThis legacy app is rewritten into a new codebase. For each part of it, rate where it should go: 2–4 candidates, each scored 0–100 for fit with THIS repo (how its UI is built, how much client code exists and in what, data access, size, team code, odd patterns), not for fashion. Include keeping the legacy technology as a candidate where that is a serious option.",
+		"Dimensions (keys exactly):",
+		"- server: the backend / API stack",
+		`- ui: the frontend stack; candidate id "none" when the app needs no separate UI codebase`,
+		...extra.dataStores.map((d) => `- data:${d}: where the data in ${d} goes; candidate ids are engine ids (${d} itself = keep it), or "drop"`),
+		"- any other part with a real choice for this repo (e.g. background jobs, search, file storage, auth), key = short kebab-case name; skip parts without a real choice",
+		`For information only (do NOT let it steer the scores): the migration tool has target adapters for ${extra.adapters.map((a) => `${a.id} (${a.role})`).join(", ")}; for other stacks it generates one.`,
 	].join("\n");
-	const res = await client.chat({ model, messages: [{ role: "system", content: "You are a senior architect choosing the target stack for a legacy rewrite. Answer only with the JSON object." }, { role: "user", content: prompt }], schema, effort: "medium" });
-	type Pick = { server?: string; ui?: string; reason?: string };
-	const j = (res.json ?? {}) as { recommended?: Pick; alternatives?: Pick[] };
-	const id = (x?: string) => (x ?? "").trim().toLowerCase().replace(/[^a-z0-9.+-]+/g, "-").replace(/^-+|-+$/g, "");
-	const value = (p?: Pick) => (p && id(p.server) ? [id(p.server), ...(id(p.ui) && id(p.ui) !== "none" ? [id(p.ui)] : [])].join("+") : "");
-	const rec = value(j.recommended);
-	if (!rec) return undefined;
-	const alternatives = (j.alternatives ?? []).map((p) => ({ value: value(p), reason: p.reason ?? "" })).filter((a, i, all) => a.value && a.value !== rec && all.findIndex((b) => b.value === a.value) === i);
-	return { value: rec, reason: j.recommended!.reason ?? "", alternatives, costUsd: res.usage.costUsd };
+	const res = await client.chat({ model, messages: [{ role: "system", content: "You are a senior architect planning a legacy rewrite. Answer only with the JSON object." }, { role: "user", content: prompt }], schema, effort: "medium" });
+	const id = (x?: string) => (x ?? "").trim().toLowerCase().replace(/[^a-z0-9.:-]+/g, "-").replace(/^-+|-+$/g, "");
+	const dims = (((res.json ?? {}) as { dimensions?: Dimension[] }).dimensions ?? [])
+		.map((d) => ({ key: id(d.key), now: d.now ?? "", candidates: (d.candidates ?? []).map((c) => ({ id: id(c.id), score: Math.max(0, Math.min(100, Math.round(c.score ?? 0))), reason: c.reason ?? "" })).filter((c, i, all) => c.id && all.findIndex((x) => x.id === c.id) === i).sort((a, b) => b.score - a.score) }))
+		.filter((d, i, all) => d.key && d.candidates.length && all.findIndex((x) => x.key === d.key) === i);
+	return { dimensions: dims, costUsd: res.usage.costUsd };
 }

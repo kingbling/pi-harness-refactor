@@ -4,6 +4,7 @@ import { join } from "node:path";
 import pc from "picocolors";
 import { findConfigPath, loadConfig, statePath, type Config } from "./config.ts";
 import { Ledger } from "./ledger/db.ts";
+import { registerGeneratedTargets } from "./adapters/registry.ts";
 import { renderStatus, renderWhy } from "./dashboard/status.ts";
 import { OpenRouterClient } from "./models/openrouter.ts";
 import type { ModelClient } from "./models/types.ts";
@@ -332,6 +333,7 @@ function flag(args: string[], name: string): string | undefined {
 export function open(): { config: Config; root: string; ledger: Ledger } {
 	const { config, root } = loadConfig();
 	process.env["BR_WORKSPACE"] = root; // adapters find generated artifacts (framework profile) here
+	registerGeneratedTargets(root);
 	return { config, root, ledger: new Ledger(statePath(root, "ledger.sqlite")) };
 }
 

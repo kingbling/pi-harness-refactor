@@ -5,6 +5,7 @@ import pc from "picocolors";
 import { progress } from "../progress.ts";
 import { loadConfig, type Config } from "../config.ts";
 import { Ledger } from "../ledger/db.ts";
+import { registerGeneratedTargets } from "../adapters/registry.ts";
 import { type InitPrompter, init, projectDir, setup, terminalPrompter } from "./init.ts";
 
 /**
@@ -40,6 +41,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 	const noLlm = args.includes("--no-llm");
 	const report: OnboardReport = { steps: [], openDecisions: 0, ok: true };
 	process.env["BR_WORKSPACE"] = root;
+	registerGeneratedTargets(root);
 
 	const ABOUT: Record<string, string> = {
 		init: "survey the old codebase: framework, data stores, UI, tests",
@@ -163,27 +165,73 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 					if (v === undefined) throw new Error("onboarding cancelled");
 					if (v === LATER) return undefined;
 					if (v !== OTHER) return v;
-					const typed = (await ui.text(`${d.id}: your answer${d.id === "targets" ? " (stack ids joined by +, e.g. server+ui)" : ""}`, ""))?.trim();
+					const typed = (await ui.text(`${d.id}: your answer${d.id.startsWith("target:") ? " (a stack / engine id; a stack without an adapter gets one generated)" : ""}`, ""))?.trim();
 					return typed || undefined;
 				};
-				// the target stack first: every other question (stack choices, platform concerns) depends on it
-				const tq = openDecisions(l, config, source, targets, root).find((d) => d.id === "targets");
-				if (tq) {
-					const v = yes ? tq.recommended : await askOne(tq);
-					if (v) {
-						applyDecision(l, config, root, "targets", v, yes ? "onboard --yes" : "human (onboard)");
-						reload();
-						const missing = config.target.stacks.filter((s) => !knownTargets().includes(s));
-						if (missing.length) throw new Error(`target stack decided: ${config.target.stacks.join(" + ")}. bigrefactor has no ${missing.join("/")} target adapter yet; add one under src/adapters/target/ (registry.ts), or change it with br decide --answer targets=<stacks>, then br resume`);
-						const now = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
-						const changed = now.map((t) => t.id).join("+") !== targets.map((t) => t.id).join("+");
-						targets.splice(0, targets.length, ...now);
-						// stack choices of a newly chosen target get the same repo-based advice as the rest
-						if (changed && !noLlm) {
-							const { advise } = await import("./advise.ts");
-							const { OpenRouterClient } = await import("../models/openrouter.ts");
-							await advise(config, root, l, new OpenRouterClient(), source, targets, (x) => log(x));
+				// a picked server/ui stack without an adapter: a model writes one from the stack's official tooling,
+				// proven on a scratch project (scaffold, build, probe test) after the owner saw the commands
+				const ensureAdapter = async (id: string, role: "server" | "ui", why: string): Promise<boolean> => {
+					if (noLlm) throw new Error(`${id} has no bigrefactor adapter and --no-llm cannot generate one`);
+					if (!yes) {
+						const go = await ui.select(`bigrefactor has no ${id} adapter yet. Generate one now?\n   A model writes it from ${id}'s official tooling; it is verified on a scratch project (official generator, build, probe test) before anything uses it.`, [{ value: "generate", label: "generate and verify it (recommended)" }, { value: "other", label: "pick another option" }], "generate");
+						if (go === undefined) throw new Error("onboarding cancelled");
+						if (go !== "generate") return false;
+					}
+					const { generateAdapter } = await import("../adapters/target/generated.ts");
+					const { OpenRouterClient } = await import("../models/openrouter.ts");
+					try {
+						await generateAdapter({
+							id,
+							role,
+							why,
+							root,
+							client: new OpenRouterClient(),
+							model: config.models.escalate.id,
+							log: (x) => log(pc.dim(x)),
+							confirm: async (cmds) => {
+								if (yes) return (log(pc.dim(`  ${id} commands: ${cmds.join(" · ")}`)), true);
+								const v = await ui.select(`Verifying the ${id} adapter runs these commands in a scratch directory (nothing touches your repos):\n   ${cmds.join("\n   ")}`, [{ value: "run", label: "run them" }, { value: "stop", label: "don't run; pick another option" }], "run");
+								return v === "run";
+							},
+						});
+					} catch (e: any) {
+						log(pc.yellow(`  ${e?.message ?? e}`));
+						if (yes) throw e;
+						return false;
+					}
+					registerGeneratedTargets(root);
+					return true;
+				};
+				// where each part of the app goes, first: every later question (stack choices, libraries, framework
+				// concerns) depends on it. server, ui, data stores, then whatever else the analysis rated.
+				const rank = (id: string) => (id === "target:server" ? 0 : id === "target:ui" ? 1 : id.startsWith("target:data:") ? 2 : 3);
+				const tqs = openDecisions(l, config, source, targets, root).filter((d) => d.id.startsWith("target:")).sort((a, b) => rank(a.id) - rank(b.id));
+				let decidedTargets = false;
+				for (const tq of tqs) {
+					let v = yes ? tq.recommended : await askOne(tq);
+					const role = tq.id === "target:server" ? "server" : tq.id === "target:ui" ? "ui" : undefined;
+					while (v && role && v !== "none" && !knownTargets().includes(v)) {
+						if (await ensureAdapter(v, role, tq.options.find((o) => o.value === v)?.hint ?? tq.reason ?? "")) break;
+						v = yes ? undefined : await askOne(tq);
+					}
+					if (!v) continue;
+					applyDecision(l, config, root, tq.id, v, yes ? "onboard --yes" : "human (onboard)");
+					decidedTargets = true;
+				}
+				if (decidedTargets) {
+					reload();
+					targets.splice(0, targets.length, ...(await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)))));
+					// everything judged FOR the target is judged again with the owner's answers; choices those
+					// answers already settle (e.g. the database once the data dimension is decided) are not asked
+					if (!noLlm) {
+						const { advise } = await import("./advise.ts");
+						const { OpenRouterClient } = await import("../models/openrouter.ts");
+						const r = await advise(config, root, l, new OpenRouterClient(), source, targets, (x) => log(x));
+						for (const i of r.implied) {
+							applyDecision(l, config, root, i.id, i.value, "implied by your target decisions");
+							log(pc.dim(`  ${i.id} = ${i.value} (follows from your answers: ${i.reason})`));
 						}
+						reload();
 					}
 				}
 				let ds = openDecisions(l, config, source, targets, root);

@@ -142,10 +142,10 @@ describe("advice hygiene", () => {
 	});
 });
 
-describe("target stack: judged from the analyzed repo, not from the adapters we have", () => {
-	it("a model reading the brief recommends the stack; adapter gaps are flagged, never dropped; nothing anchors on code defaults", async () => {
+describe("where each part goes: rated from the analyzed repo, not from the adapters we have", () => {
+	it("every dimension is a decision with scored options; adapter gaps are flagged, never dropped; nothing anchors on code defaults", async () => {
 		const ws = legacyWithData("advise-targets");
-		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs", "react"] }, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" }, models: {} });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs", "react"] }, db: { strategy: "keep-schema", from: ["mariadb", "arangodb"], to: "postgresql" }, models: {} });
 		writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config));
 		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
 		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
@@ -155,9 +155,19 @@ describe("target stack: judged from the analyzed repo, not from the adapters we 
 			chat: (req) => {
 				prompts.push(req.messages.map((m) => m.content).join("\n"));
 				const props = (req.schema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
-				if ("alternatives" in props) return { json: { recommended: { server: "nestjs", ui: "vue", reason: "Vue islands already carry the interactive UI" }, alternatives: [{ server: "nestjs", ui: "react", reason: "larger hiring pool" }] } };
+				if ("dimensions" in props)
+					return {
+						json: {
+							dimensions: [
+								{ key: "server", now: "PHP framework", candidates: [{ id: "symfony", score: 82, reason: "stays in PHP" }, { id: "nestjs", score: 64, reason: "typed rewrite" }] },
+								{ key: "ui", now: "server templates + Vue islands", candidates: [{ id: "vue", score: 78, reason: "Vue islands already carry the interactive UI" }, { id: "react", score: 60, reason: "larger hiring pool" }] },
+								{ key: "data:mariadb", now: "MariaDB", candidates: [{ id: "mariadb", score: 70, reason: "keep" }, { id: "postgresql", score: 65, reason: "JSONB" }] },
+								{ key: "data:arangodb", now: "ArangoDB", candidates: [{ id: "arangodb", score: 75, reason: "graph queries" }, { id: "drop", score: 10, reason: "used" }] },
+							],
+						},
+					};
 				// the phrasing model returns a single option: the question must still offer every option
-				if ("questions" in props) return { json: { questions: [{ id: "targets", question: "Which stack for the rewrite?", options: [{ value: "nestjs+vue", label: "NestJS + Vue", hint: "" }], recommended: "nestjs+vue", opinion: "keeps the component model" }] } };
+				if ("questions" in props) return { json: { questions: [{ id: "target:ui", question: "Which UI?", options: [{ value: "vue", label: "Vue", hint: "" }], recommended: "vue", opinion: "keeps the component model" }] } };
 				return req.schema ? { json: { libraries: [], classes: [], decisions: [] } } : { text: "brief" };
 			},
 			decide: () => ({ choice: "other" }),
@@ -165,20 +175,34 @@ describe("target stack: judged from the analyzed repo, not from the adapters we 
 		const source = getSourceAdapter("php");
 		const targets = await Promise.all(["nestjs", "react"].map((t) => getTargetAdapter(t)));
 		await advise(config, ws, ledger, client, source, targets, () => {});
-		const t = openDecisions(ledger, config, source, targets, ws).find((d) => d.id === "targets")!;
-		expect(t.recommended).toBe("nestjs+vue");
-		expect(t.options.map((o) => o.value)).toEqual(expect.arrayContaining(["nestjs+vue", "nestjs+react", "nestjs"]));
-		expect(t.options.find((o) => o.value === "nestjs+vue")!.hint).toMatch(/no vue adapter/);
+		const all = openDecisions(ledger, config, source, targets, ws);
+		const ui = all.find((d) => d.id === "target:ui")!;
+		expect(ui.recommended).toBe("vue");
+		expect(ui.options.map((o) => o.value)).toEqual(expect.arrayContaining(["vue", "react", "none"]));
+		expect(ui.options.find((o) => o.value === "vue")!.hint).toMatch(/no bigrefactor adapter yet/);
+		expect(ui.options.find((o) => o.value === "vue")!.label).toMatch(/78\/100/);
+		expect(all.find((d) => d.id === "target:server")!.recommended).toBe("symfony");
+		expect(all.find((d) => d.id === "target:data:mariadb")!.recommended).toBe("mariadb");
+		expect(all.some((d) => d.id === "store:arangodb")).toBe(false); // rated as a dimension instead
 		// no model was told the provisional targets as fact, nor a code default to agree with
 		expect(prompts.join("\n")).not.toMatch(/targets: nestjs \+ react|code_default/);
-		expect(prompts.join("\n")).toMatch(/target stack: not decided yet/);
+		expect(prompts.join("\n")).toMatch(/target: not decided yet/);
 		for (const c of client.calls.filter((c) => c.kind === "decide")) expect(JSON.stringify((c.req as { state: unknown }).state)).not.toMatch(/current_recommendation/);
-		// no decision without a choice; sharing an options list across decisions must not reorder another's
-		const all = openDecisions(ledger, config, source, targets, ws);
 		for (const d of all) expect(d.options.length, d.id).toBeGreaterThan(1);
 		const { pointHash } = await import("../src/jev/ask.ts");
 		const p = { id: "x", topic: "t", intent: "i", evidence: "e", options: [{ value: "a" }, { value: "b" }] };
 		expect(pointHash(p)).toBe(pointHash({ ...p, options: [{ value: "b" }, { value: "a" }] }));
+		// answers land in config: server first, the data dimension sets the engine / store verdict
+		const { applyDecision } = await import("../src/inventory/decisions.ts");
+		applyDecision(ledger, config, ws, "target:server", "symfony");
+		applyDecision(ledger, config, ws, "target:ui", "none");
+		applyDecision(ledger, config, ws, "target:data:mariadb", "postgresql");
+		applyDecision(ledger, config, ws, "target:data:arangodb", "arangodb");
+		const cfg = JSON.parse(readFileSync(join(ws, "bigrefactor.config.json"), "utf8"));
+		expect(cfg.target.stacks).toEqual(["symfony"]);
+		expect(cfg.target.choices.react).toBeUndefined(); // no longer targeted: its choices are gone
+		expect(cfg.db.to).toBe("postgresql");
+		expect(cfg.db.stores.arangodb).toBe("keep");
 		ledger.close();
 	});
 });

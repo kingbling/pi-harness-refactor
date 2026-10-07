@@ -540,7 +540,8 @@ export default function (pi: ExtensionAPI) {
 					if (!cp) return warn(ctx, "no bigrefactor.config.json here: run /br onboard first");
 					const { config, root } = loadConfig(cp);
 					process.env["BR_WORKSPACE"] = root;
-					const { getSourceAdapter, getTargetAdapter } = await import("../adapters/registry.ts");
+					const { getSourceAdapter, getTargetAdapter, registerGeneratedTargets } = await import("../adapters/registry.ts");
+					registerGeneratedTargets(root);
 					const source = getSourceAdapter(config.source.stack);
 					source.frameworkDirs?.(config.source.path);
 					const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));

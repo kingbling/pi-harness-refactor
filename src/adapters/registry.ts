@@ -1,16 +1,17 @@
 import type { SourceAdapter, TargetAdapter } from "./types.ts";
 import { phpAdapter } from "./source/php.ts";
+import { fromManifest, loadManifests } from "./target/generated.ts";
 
 const sources: Record<string, SourceAdapter> = { php: phpAdapter };
 /**
  * Target adapters load lazily; what init and placement need synchronously is declared next to the loader.
  * A test asserts every manifest matches its adapter (role, subdir, aliases).
  */
-const targetManifest: Record<string, { role: "server" | "ui"; subdir: string; aliases: string[]; load: () => Promise<TargetAdapter> }> = {
+const targetManifest: Record<string, { role: "server" | "ui"; subdir: string; aliases: string[]; generated?: boolean; load: () => Promise<TargetAdapter> }> = {
 	nestjs: { role: "server", subdir: "api", aliases: ["nest"], load: async () => (await import("./target/nestjs.ts")).nestjsAdapter },
 	react: { role: "ui", subdir: "web", aliases: ["reactjs"], load: async () => (await import("./target/react.ts")).reactAdapter },
 };
-const targets = Object.fromEntries(Object.entries(targetManifest).map(([id, m]) => [id, m.load]));
+const targets: Record<string, () => Promise<TargetAdapter>> = Object.fromEntries(Object.entries(targetManifest).map(([id, m]) => [id, m.load]));
 
 export function getSourceAdapter(id: string): SourceAdapter {
 	const a = sources[id];
@@ -18,6 +19,7 @@ export function getSourceAdapter(id: string): SourceAdapter {
 	return a;
 }
 export async function getTargetAdapter(id: string): Promise<TargetAdapter> {
+	if (!targets[id] && process.env["BR_WORKSPACE"]) registerGeneratedTargets(process.env["BR_WORKSPACE"]);
 	const f = targets[id];
 	if (!f) throw new Error(`unknown target adapter "${id}" (have: ${Object.keys(targets).join(", ")})`);
 	return offerable(await f());
@@ -39,3 +41,21 @@ export function targetIdFor(name: string): string | undefined {
 }
 export const knownSources = () => Object.keys(sources);
 export const knownTargets = () => Object.keys(targets);
+
+/**
+ * Adapters a model wrote for this workspace (`.bigrefactor/adapters/*.json`, verified before they were saved)
+ * join the registry; hand-written adapters keep precedence. Idempotent; returns the ids added.
+ */
+export function registerGeneratedTargets(root: string): string[] {
+	const added: string[] = [];
+	for (const m of loadManifests(root)) {
+		if (targetManifest[m.id] && !targetManifest[m.id]!.generated) continue;
+		const adapter = fromManifest(m);
+		targetManifest[m.id] = { role: m.role, subdir: m.subdir, aliases: m.aliases, generated: true, load: async () => adapter };
+		targets[m.id] = targetManifest[m.id]!.load;
+		TARGET_SUBDIRS[m.id] = m.subdir;
+		TARGET_ROLES[m.id] = m.role;
+		added.push(m.id);
+	}
+	return added;
+}

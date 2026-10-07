@@ -28,6 +28,7 @@ describe("model judgments", () => {
 				if (!req.schema) return undefined;
 				const props = (req.schema as any).properties as Record<string, any>;
 				if (props["libraries"]) return { json: { libraries: [], classes: [] } };
+				if (props["dimensions"]) return { json: { dimensions: [] } };
 				if (props["questions"] || props["decisions"]) return { json: { questions: [], decisions: [] } };
 				const out: Record<string, { id: string; reason: string }> = {};
 				for (const [k, v] of Object.entries(props)) {

@@ -7,6 +7,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { planFrameworks } from "./frameworks.ts";
 import { TARGET_ROLES } from "../adapters/registry.ts";
 import { pointHash, type DecisionPoint, type PhrasedQuestion } from "../jev/ask.ts";
+import { JEV_ACT } from "../jev/questions.ts";
 
 /**
  * Decision gate. Everything the inventory cannot decide from code alone is derived here as a typed
@@ -22,7 +23,7 @@ import { pointHash, type DecisionPoint, type PhrasedQuestion } from "../jev/ask.
  */
 export interface Decision {
 	id: string;
-	topic: "data" | "frontend" | "framework" | "library" | "slicing" | "truth" | "target" | "budget" | "repo";
+	topic: "data" | "frontend" | "framework" | "library" | "slicing" | "truth" | "target" | "repo";
 	question: string;
 	options: Array<{ value: string; label: string; hint?: string }>;
 	recommended?: string;
@@ -36,7 +37,7 @@ export interface Decision {
 }
 
 export interface DecisionAnswer { answer: string; by: string; at: string }
-export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; targetOptions?: Array<{ value: string; reason: string }>; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
+export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; dimensions?: import("../init/survey.ts").Dimension[]; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
 
 export function decisionsPath(root: string): string {
 	return join(root, ".bigrefactor", "decisions.json");
@@ -75,15 +76,28 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 	const platform = Object.assign({}, ...targets.map((t) => effectivePlatform(t, config.target.choices))) as Record<string, string>;
 	const concernOptions = [...Object.keys(platform).map((k) => ({ value: `platform:${k}`, label: `platform → ${k}`, hint: platform[k] })), { value: "port", label: "port: application logic, becomes units' responsibility (service/helper in target)" }, { value: "drop", label: "drop: obsolete in the target" }];
 
-	// --- the stack itself: judged from the analyzed repo (advise → advice.targets + targetOptions); the code adds
-	// every combination it has adapters for. A pick without an adapter stays a valid answer, flagged as such.
-	// The survey's provisional targets are only the offline fallback.
+	// --- where each part of the app goes: one decision per dimension the model rated from the repo (advise →
+	// dimensions), candidates by score. The code adds the adapters it has for server/ui; a pick without one gets
+	// an adapter generated at onboarding. Without a model run (offline) only server/ui, from the adapters.
 	const file0 = loadDecisions(root);
 	const survey = file0.survey;
-	const advisedTargets = file0.advice?.["targets"]?.value;
-	const stackValues = [...new Set([...(advisedTargets ? [advisedTargets] : []), ...(file0.targetOptions ?? []).map((o) => o.value), ...targetCombos()])];
-	const missing = (v: string) => v.split("+").filter((id) => !(id in TARGET_ROLES));
-	out.push({ id: "targets", topic: "target", question: "Which target stacks should the new codebase use?", evidence: survey?.why.join("; ") ?? `config: ${config.target.stacks.join("+")}`, recommended: survey?.targets.join("+") ?? config.target.stacks.join("+"), options: stackValues.map((v) => ({ value: v, label: v.replace(/\+/g, " + "), hint: [file0.targetOptions?.find((o) => o.value === v)?.reason, missing(v).length ? `bigrefactor has no ${missing(v).join("/")} adapter yet: setup and run wait until one is added` : ""].filter(Boolean).join(" · ") || undefined })) });
+	const dims = file0.dimensions ?? [];
+	const byRole = (role: string) => Object.keys(TARGET_ROLES).filter((k) => TARGET_ROLES[k] === role);
+	const adapterNote = (id: string) => (id === "none" || id in TARGET_ROLES ? "" : "no bigrefactor adapter yet: one is generated and verified when you pick it");
+	const legacyTargets = file0.answers["targets"]?.answer.split("+"); // given as a flag at init
+	for (const key of ["server", "ui"]) {
+		if (dims.some((d) => d.key === key) || legacyTargets) continue;
+		const ids = key === "ui" ? [...byRole("ui"), "none"] : byRole("server");
+		const provisional = config.target.stacks.find((s) => TARGET_ROLES[s] === key) ?? (key === "ui" ? "none" : ids[0]);
+		out.push({ id: `target:${key}`, topic: "target", question: `Which ${key} stack should the new codebase use?`, evidence: survey?.why.join("; ") ?? `config: ${config.target.stacks.join("+")}`, recommended: provisional, options: ids.map((v) => ({ value: v, label: v })) });
+	}
+	for (const d of dims) {
+		if (legacyTargets && (d.key === "server" || d.key === "ui")) continue;
+		const options = d.candidates.map((c) => ({ value: c.id, label: `${c.id} — ${c.score}/100`, hint: [c.reason, d.key === "server" || d.key === "ui" ? adapterNote(c.id) : ""].filter(Boolean).join(" · ") }));
+		if (d.key === "server" || d.key === "ui") for (const id of [...byRole(d.key), ...(d.key === "ui" ? ["none"] : [])]) if (!options.some((o) => o.value === id)) options.push({ value: id, label: `${id} — not rated`, hint: "bigrefactor adapter available" });
+		const top = d.candidates[0]!;
+		out.push({ id: `target:${d.key}`, topic: "target", question: `${d.key}: where should it go? (today: ${d.now})`, evidence: `rated from the repo: ${d.candidates.map((c) => `${c.id} ${c.score}`).join(", ")}`, recommended: top.id, reason: top.reason, advised: true, options });
+	}
 	out.push({ id: "db-strategy", topic: "data", question: "Database strategy?", evidence: survey?.dbFrom.length ? `data stores found: ${survey.dbFrom.join(", ")}` : "no data store found", recommended: survey?.dbStrategy ?? config.db.strategy, options: [{ value: "keep-schema", label: "keep the schema", hint: "introspect the existing DB, generate DTOs, translate types" }, { value: "new-schema", label: "new schema", hint: "design a target schema per module after keep-schema is accepted" }, { value: "none", label: "no database" }] });
 	for (const t of targets)
 		for (const c of t.stackChoices ?? []) if (c.options.length > 1) out.push({ id: `stack:${t.id}.${c.key}`, topic: "target", question: `${t.id}: ${c.question}`, evidence: `${c.options.length} options from the ${t.id} adapter`, recommended: c.options.some((o) => o.id === config.target.choices[t.id]?.[c.key]) ? config.target.choices[t.id]![c.key]! : c.default, options: c.options.map((o) => ({ value: o.id, label: o.label, hint: o.hint })) });
@@ -92,6 +106,7 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 	const target = (config.db.to ?? "").toLowerCase();
 	const sameFamily = (a: string, b: string) => /mysql|maria/.test(a) && /mysql|maria/.test(b) || /postgres|pg/.test(a) && /postgres|pg/.test(b) || a === b;
 	for (const store of config.db.from) {
+		if (dims.some((d) => d.key === `data:${store}`)) continue; // rated as a dimension: target:data:<store>
 		if (sameFamily(store.toLowerCase(), target)) continue;
 		if (store.toLowerCase() === "mariadb" || store.toLowerCase() === "mysql") continue; // relational → relational is the keep-schema translation path, not a decision
 		out.push({ id: `store:${store}`, topic: "data", question: `${store} is a second data store. What happens to it?`, evidence: `config.db.from includes ${store}; target engine ${config.db.to ?? "unset"}`, recommended: "keep", options: [{ value: "keep", label: `keep ${store}, new client library`, hint: "lowest risk; its commands port as services" }, { value: "fold", label: `fold into ${config.db.to ?? "the target DB"}`, hint: "new-schema path (JSONB tables + ETL); larger scope" }, { value: "drop", label: "drop: its features are dead", hint: "only if the inventory shows no live referrers" }] });
@@ -125,18 +140,15 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 	// --- target location
 	if (/\/\.sim\//.test(config.target.path)) out.push({ id: "target-location", topic: "target", question: `Target is ${relative(root, config.target.path) || config.target.path} (simulation dir). Fine for L3 sampling?`, evidence: "L3 never merges into a real repo", recommended: "sim-ok", options: [{ value: "sim-ok", label: "yes, decide the real location after L3" }, { value: "set-now", label: "set the real path now (answer `set:<absolute path>`)" }] });
 
-	// --- budget for very large units
-	const huge = (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE json_extract(meta,'$.loc') > 3000").get() as { n: number }).n;
-	if (huge > 0 && config.run.budgetUsdPerUnit <= 5) out.push({ id: "budget", topic: "budget", question: `${huge} units exceed 3,000 LOC; the per-unit budget is $${config.run.budgetUsdPerUnit}. Keep?`, evidence: "big controllers escalate to the expensive model", recommended: "keep", options: [{ value: "keep", label: `keep $${config.run.budgetUsdPerUnit}/unit; big units quarantine on overrun` }, { value: "raise:15", label: "raise to $15/unit for this repo" }, { value: "raise:30", label: "raise to $30/unit" }] });
 
 	// model advice (br advise) replaces the static defaults; an advised value outside the options is added as one
 	const advice = (loadDecisions(root) as { advice?: Record<string, { value: string; reason?: string; confidence?: number }> }).advice ?? {};
 	for (const d of out) {
 		const a = advice[d.id];
 		if (!a) continue;
-		// an unsure Jev pick (< 50%) is no recommendation, even when it matches the code's fallback: the
+		// an unsure Jev pick (below the act line, after a second opinion) is no recommendation, even when it matches the code's fallback: the
 		// phrasing model (which read the repo brief) recommends instead; the doubt stays visible
-		if (a.confidence !== undefined && a.confidence < 0.5) {
+		if (a.confidence !== undefined && a.confidence < JEV_ACT) {
 			d.reason = `decision model unsure (${Math.round(a.confidence * 100)}% for ${a.value})`;
 			d.confidence = a.confidence;
 			continue;
@@ -164,7 +176,12 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 		if (!ph || ph.hash !== pointHash(toPoint(d))) continue;
 		const labels = new Map(ph.options.map((o) => [o.value, o]));
 		// relabelled in the repo's words; every option stays (a one-option question is no question)
-		d.options = d.options.map((o) => ({ value: o.value, label: labels.get(o.value)?.label ?? o.label, hint: labels.get(o.value)?.hint ?? o.hint }));
+		// a rating (" — 82/100", " — not rated") is a fact, not wording: it survives the relabel
+		const rating = (l: string) => / — (\d+\/100|not rated)$/.exec(l)?.[0] ?? "";
+		d.options = d.options.map((o) => {
+			const label = labels.get(o.value)?.label;
+			return { value: o.value, label: label ? label + (rating(label) ? "" : rating(o.label)) : o.label, hint: labels.get(o.value)?.hint ?? o.hint };
+		});
 		d.question = ph.question;
 		// the phrasing model read the repo: its pick replaces the code fallback, not a confident analysis
 		if (!d.advised && ph.recommended && d.options.some((o) => o.value === ph.recommended)) {
@@ -188,11 +205,6 @@ export function toPoint(d: Decision): DecisionPoint {
 	return { id: d.id, topic: d.topic, intent: d.question, evidence: d.evidence, options: d.options.map((o) => ({ value: o.value, facts: `${o.label}${o.hint ? ` — ${o.hint}` : ""}` })), ...(d.advised ? { recommended: d.recommended, reason: d.reason } : {}) };
 }
 
-/** server target alone, or server + each ui target: the options the code adds to the "targets" decision. */
-function targetCombos(): string[] {
-	const ids = (role: string) => Object.keys(TARGET_ROLES).filter((k) => TARGET_ROLES[k] === role);
-	return ids("server").flatMap((a) => [...ids("ui").map((w) => `${a}+${w}`), a]);
-}
 
 export function applyDecision(ledger: Ledger, config: Config, root: string, id: string, answer: string, by = "human"): string {
 	const d = loadDecisions(root);
@@ -207,6 +219,31 @@ export function applyDecision(ledger: Ledger, config: Config, root: string, id: 
 		raw.db.stores ??= {};
 		raw.db.stores[key] = answer;
 		note = `config.db.stores.${key} = ${answer}`;
+	} else if (kind === "target") {
+		// server/ui → the target stacks (server first); data:<store> → target engine / store verdict; other
+		// dimensions are binding facts for advice and rules
+		const roleOf = (sid: string) => TARGET_ROLES[sid] ?? (d.answers["target:server"]?.answer === sid ? "server" : d.answers["target:ui"]?.answer === sid ? "ui" : undefined);
+		if (key === "server" || key === "ui") {
+			const keep = (raw.target.stacks as string[]).filter((sid) => roleOf(sid) !== key && sid !== answer);
+			const server = key === "server" ? answer : keep.find((sid) => roleOf(sid) === "server");
+			const ui = key === "ui" ? (answer === "none" ? undefined : answer) : keep.find((sid) => roleOf(sid) === "ui");
+			raw.target.stacks = [server, ui].filter(Boolean);
+			// choices of a stack no longer targeted go with it (their packages would otherwise be installed)
+			for (const sid of Object.keys(raw.target.choices ?? {})) if (!raw.target.stacks.includes(sid)) delete raw.target.choices[sid];
+			note = `config.target.stacks = ${raw.target.stacks.join(", ")}`;
+		} else if (key.startsWith("data:")) {
+			const store = key.slice(5);
+			raw.db ??= {};
+			const primary = (raw.db.from ?? [])[0];
+			if (store === primary) {
+				raw.db.to = answer === "drop" ? raw.db.to : answer;
+				note = `config.db.to = ${raw.db.to}`;
+			} else {
+				raw.db.stores ??= {};
+				raw.db.stores[store] = answer === "drop" ? "drop" : answer === store ? "keep" : answer === raw.db.to ? "fold" : "keep";
+				note = `config.db.stores.${store} = ${raw.db.stores[store]}${raw.db.stores[store] === "keep" && answer !== store ? ` (moves to ${answer}: binding for rules)` : ""}`;
+			}
+		} else note = `${id} = ${answer} (binding for advice and rules)`;
 	} else if (id === "targets") {
 		raw.target.stacks = answer.split("+").filter(Boolean);
 		note = `config.target.stacks = ${raw.target.stacks.join(", ")}`;
@@ -248,13 +285,6 @@ export function applyDecision(ledger: Ledger, config: Config, root: string, id: 
 		}
 	} else if (kind === "repo") {
 		note = `${id} = ${answer} (binding for rules)`;
-	} else if (id === "budget") {
-		const m = /^raise:(\d+)$/.exec(answer);
-		if (m) {
-			raw.run ??= {};
-			raw.run.budgetUsdPerUnit = Number(m[1]);
-			note = `run.budgetUsdPerUnit = ${m[1]}`;
-		}
 	}
 	writeFileSync(configPath, JSON.stringify(raw, null, 2) + "\n");
 	saveDecisions(root, d);
