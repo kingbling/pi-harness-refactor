@@ -134,6 +134,8 @@ export function loadConfig(path = findConfigPath()): { config: Config; path: str
 	const root = dirname(path);
 	config.source.path = resolve(root, config.source.path);
 	config.target.path = resolve(root, config.target.path);
+	// the workspace's own files (generated stack adapters, layout rules) are found from here, on every path that loads a config
+	process.env["BR_WORKSPACE"] = root;
 	return { config, path, root };
 }
 

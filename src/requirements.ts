@@ -59,15 +59,17 @@ export async function checkRequirements(o: { cwd: string; tools?: string[] }): P
 		try {
 			const { config } = loadConfig(configPath);
 			const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
-			const needs = new Map<string, string>();
+			const needs = new Map<string, { why: string; dir?: string }>();
+			const { projectDir } = await import("./init/init.ts");
 			const source = getSourceAdapter(config.source.stack);
-			needs.set(source.truth.run(config.source.path, "x").cmd, `${source.id}: runs the legacy code for truth`);
+			needs.set(source.truth.run(config.source.path, "x").cmd, { why: `${source.id}: runs the legacy code for truth`, dir: config.source.path });
 			for (const id of config.target.stacks) {
 				const t = await getTargetAdapter(id);
-				const dir = config.target.path;
-				for (const c of [t.build(dir).cmd, t.test(dir, []).cmd, t.toolchain.addPackages(dir, []).cmd]) if (!needs.has(c)) needs.set(c, `${id}: build, test and packages`);
+				// project tools (vendor/bin/…, node_modules/.bin/…) live in that stack's own project folder
+				const dir = projectDir(config, id);
+				for (const c of [t.build(dir).cmd, t.test(dir, []).cmd, t.toolchain.addPackages(dir, []).cmd]) if (!needs.has(c)) needs.set(c, { why: `${id}: build, test and packages`, dir });
 			}
-			for (const [cmd, why] of needs) out.push(command(cmd, why, `install ${cmd}`));
+			for (const [cmd, n] of needs) out.push(command(cmd, n.why, `install ${cmd}`, n.dir));
 		} catch (e) {
 			out.push({ name: "workspace config", status: "missing", why: String((e as Error)?.message ?? e).slice(0, 200), fix: "fix bigrefactor.config.json (br init)" });
 		}
@@ -75,8 +77,8 @@ export async function checkRequirements(o: { cwd: string; tools?: string[] }): P
 	return out;
 }
 
-function command(cmd: string, why: string, fix: string): Requirement {
-	const ok = /^[\w.+-]+$/.test(cmd) ? onPath(cmd) : existsSync(cmd);
+function command(cmd: string, why: string, fix: string, dir?: string): Requirement {
+	const ok = /^[\w.+-]+$/.test(cmd) ? onPath(cmd) : existsSync(dir && !cmd.startsWith("/") ? join(dir, cmd) : cmd);
 	return { name: cmd, status: ok ? "ok" : "missing", why, fix: ok ? undefined : fix };
 }
 

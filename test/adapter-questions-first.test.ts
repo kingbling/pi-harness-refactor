@@ -89,4 +89,15 @@ describe("adapter generation: questions first, build once", () => {
 		expect(seen[1]).toMatch(/Verification failed:\nbuild failed on the fresh project \(false/);
 		expect(JSON.parse(readFileSync(join(root, ".bigrefactor", "adapters", `${id}.json`), "utf8")).verified).toBeUndefined();
 	});
+
+	it("after a restart, loading the workspace config is enough to find its generated stacks (run start, /br check)", async () => {
+		const { saveConfig, loadConfig } = await import("../src/config.ts");
+		const root = mkdtempSync(join(tmpdir(), "br-qf-"));
+		const id = "qfirst-c";
+		await generateAdapter({ id, role: "server", why: "test", client: new FakeModelClient({ chat: () => ({ json: manifest(id) }) }), model: "m", root, deferVerify: true });
+		saveConfig(root, ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: join(root, "new"), stacks: [id] }, models: {} }));
+		delete process.env["BR_WORKSPACE"];
+		loadConfig(join(root, "bigrefactor.config.json"));
+		expect((await getTargetAdapter(id)).id).toBe(id);
+	});
 });
