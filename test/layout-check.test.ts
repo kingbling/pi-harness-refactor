@@ -140,3 +140,25 @@ describe("checkLayout", () => {
 		expect(f.drift).toBeGreaterThan(0);
 	});
 });
+
+describe("tree scan with PascalCase areas", () => {
+	it("src/{Area} and a shared dir written without a slash: area folders and the shared dir are no strangers", async () => {
+		const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { checkTree, moduleRootOf, isAreaFolder } = await import("../src/run/layout-check.ts");
+		const dir = mkdtempSync(join(tmpdir(), "br-pascal-"));
+		for (const f of ["src/Metadata/MetadataBundle.php", "src/Shared/http/Client.php", "src/Kernel.php", "src/Legacy/old.php"]) {
+			mkdirSync(join(dir, f, ".."), { recursive: true });
+			writeFileSync(join(dir, f), "<?php\n");
+		}
+		const pascal = (a: string) => a.split(/[-_]/).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("");
+		const a = { id: "sym", generatedFiles: [], layout: { moduleDir: (area: string) => `src/${pascal(area)}`, sharedDirs: ["src/Shared"], ignoreDirs: [], sourceExtensions: [".php"], isTestFile: () => false } } as never;
+		expect(moduleRootOf({ moduleDir: (area: string) => `src/${pascal(area)}` })).toBe("src/");
+		const pl = { moduleDir: (area: string) => `src/${pascal(area)}` };
+		expect([isAreaFolder(pl, "Metadata"), isAreaFolder(pl, "AuditHistory"), isAreaFolder(pl, "metadata"), isAreaFolder(pl, "Old.tpl")]).toEqual([true, true, false, false]);
+		expect(isAreaFolder({ moduleDir: (a: string) => `src/${a}` }, "audit-history")).toBe(true);
+		// every folder under src/ is an area folder or the shared dir: nothing is out of place
+		expect(checkTree(dir, a)).toEqual([]);
+	});
+});

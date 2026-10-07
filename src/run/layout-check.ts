@@ -126,9 +126,9 @@ export async function checkLayout(config: Config, root: string, ledger: Ledger):
 
 	// ---- (c) the target tree as it is now
 	const trees = adapters.map((a) => scanTree(config, a));
-	for (const t of trees) {
+	for (const [i, t] of trees.entries()) {
 		if (t.stray.length) problems.push(`${t.stackId}: ${t.stray.length} folder(s) under ${t.srcRoot}/ outside ${t.moduleRoot} and the shared dirs: ${examples(t.stray.map((d) => `${d}/`))}`);
-		const bad = t.features.filter((f) => !AREA.test(f.area)).map((f) => f.area);
+		const bad = t.features.filter((f) => !isAreaFolder(adapters[i]!.layout, f.area)).map((f) => f.area);
 		if (bad.length) problems.push(`${t.stackId}: ${bad.length} feature folder(s) under ${t.moduleRoot} are not area names: ${examples(bad)}`);
 	}
 
@@ -158,6 +158,19 @@ function stems(file: string): string[] {
 }
 
 /** One stack's project as it is: feature dirs with file counts, shared files, and dirs that are no module root. */
+/** A feature folder is an area when the layout writes some kebab-case area that way (Metadata ← metadata, audit_history ← audit-history). */
+export function isAreaFolder(l: { moduleDir(area: string): string }, folder: string): boolean {
+	const area = folder.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/_/g, "-").toLowerCase();
+	return AREA.test(area) && l.moduleDir(area) === `${moduleRootOf(l)}${folder}`;
+}
+
+/** The feature root: what comes before the area in moduleDir, in whatever case the layout writes the area ({area}, {Area}, {area_snake}). */
+export function moduleRootOf(l: { moduleDir(area: string): string }): string {
+	const probe = l.moduleDir("brprobe");
+	const at = probe.toLowerCase().lastIndexOf("brprobe");
+	return at >= 0 ? probe.slice(0, at) : probe.replace(/[^/]*$/, "");
+}
+
 export function scanTree(config: Config, a: TargetAdapter): StackTree {
 	return scanDir(projectDir(config, a.id), a);
 }
@@ -165,7 +178,7 @@ export function scanTree(config: Config, a: TargetAdapter): StackTree {
 function scanDir(dir: string, a: TargetAdapter): StackTree {
 	const l = a.layout;
 	const ig = l.ignoreDirs;
-	const moduleRoot = l.moduleDir("x").replace(/x$/, "");
+	const moduleRoot = moduleRootOf(l);
 	const parts = moduleRoot.split("/").filter(Boolean);
 	const srcRoot = parts.slice(0, -1).join("/");
 	// feature folders straight under the source root (src/{area}): the shared, data and scaffold folders there are no areas
@@ -180,7 +193,12 @@ function scanDir(dir: string, a: TargetAdapter): StackTree {
 	if (srcRoot) {
 		const top = (p: string) => (p.startsWith(`${srcRoot}/`) ? p.slice(srcRoot.length + 1).split("/") : []);
 		const allowed = new Set<string>([parts.at(-1)!, ...scaffoldDirs(dir, srcRoot)]);
-		for (const p of [...l.sharedDirs, ...a.generatedFiles]) {
+		// shared dirs are dirs with or without a trailing slash; generated entries are files (their folder counts)
+		for (const p of l.sharedDirs) {
+			const t = top(p.replace(/\/?$/, "/"));
+			if (t[0]) allowed.add(t[0]);
+		}
+		for (const p of a.generatedFiles) {
 			const t = top(p);
 			if (t.length > 1 && t[0]) allowed.add(t[0]);
 		}
@@ -208,7 +226,7 @@ export function checkTree(dir: string, a: TargetAdapter, only?: string[]): strin
 export function recordDrift(ledger: Ledger, a: TargetAdapter, dir: string): string[] {
 	const lines = checkTree(dir, a);
 	ledger.setMeta(`drift:${a.id}`, lines.join("\n"));
-	ledger.setMeta(`drift_dirs:${a.id}`, JSON.stringify({ moduleRoot: a.layout.moduleDir("x").replace(/x$/, ""), sharedDirs: a.layout.sharedDirs }));
+	ledger.setMeta(`drift_dirs:${a.id}`, JSON.stringify({ moduleRoot: moduleRootOf(a.layout), sharedDirs: a.layout.sharedDirs }));
 	return lines;
 }
 
