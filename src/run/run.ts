@@ -468,9 +468,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const sampleState = (): Sample => JSON.parse(ledger.getMeta("layout_sample") ?? "{}") as Sample;
 	const acceptedTotal = () => (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE state = 'accepted'").get() as { n: number }).n;
 	let sampleNote = "";
-	/** Before the sample is approved, at most sampleSize units land: lanes never start more than that. */
-	const sampleRoom = () => !sampleSize || !!sampleState().approved || acceptedTotal() + running.size - aheadRunning.size < sampleSize;
-	/** undefined = go on; otherwise why nothing new starts. Files the review question once the sample has landed. */
+	/**
+	 * undefined = go on; otherwise why nothing new starts — only after the owner answered "stop". Files the review
+	 * question once the sample has landed; an open (or unanswered) review never stops lanes.
+	 */
 	const samplePause = async (): Promise<string | undefined> => {
 		if (!sampleSize) return undefined;
 		let st = sampleState();
@@ -493,10 +494,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			}
 			if (!q || q.status === "withdrawn") (ledger.setMeta("layout_sample", JSON.stringify({})), (st = {}));
 		}
-		const sampleRunning = running.size - aheadRunning.size;
 		const acc = acceptedTotal();
-		if (acc + sampleRunning < sampleSize) return undefined;
-		if (!st.question && sampleRunning === 0 && acc >= sampleSize) {
+		if (!st.question && acc >= sampleSize) {
 			const trees = await Promise.all(config.target.stacks.map(async (id) => scanTree(config, await getTargetAdapter(id))));
 			const landed = ledger.listUnits({ state: "accepted" }).map((u) => {
 				const p = placementOf(u.meta);
@@ -517,11 +516,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			].join("\n");
 			const q = await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "layout_sample", facts, options: [{ value: "approve", facts: "the structure is right: continue the run" }, { value: "stop", facts: "the structure is wrong: keep the run stopped, fix placement/rules, reset the sample" }], recommended: lr?.problems.length || sf.drift ? "stop" : "approve", blocks: "none", askedBy: "orchestrator", context: { sample: acc } });
 			ledger.setMeta("layout_sample", JSON.stringify({ question: q.id }));
-			log(pc.yellow(`layout sample: ${acc} units landed — review the target tree and answer question #${q.id} (br questions); nothing new starts until then`));
+			log(pc.yellow(`layout sample: ${acc} units landed — review the target tree (question #${q.id}, br questions); the run goes on, an answer "stop" stops it`));
 			for (const l of renderTrees(trees, 15)) log(pc.dim(`  ${l}`));
 		}
-		const qid = sampleState().question;
-		return qid ? `layout review: answer question #${qid} to continue` : `layout sample: ${sampleSize} units, waiting for the running ones to land`;
+		return undefined;
 	};
 
 	const spentToday = () => (ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM attempts WHERE started_at >= date('now')").get() as { c: number }).c + (ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM decisions WHERE created_at >= date('now')").get() as { c: number }).c;
@@ -556,7 +554,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const candidates = ready();
 			readyNow = candidates.length;
 			for (const id of candidates) {
-				if (running.size >= laneLimit || !underLimit() || !sampleRoom()) break;
+				if (running.size >= laneLimit || !underLimit()) break;
 				startUnit(id);
 				readyNow--;
 			}
