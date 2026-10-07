@@ -231,6 +231,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	}
 
 	const aheadRunning = new Set<string>();
+	/** Truth-ahead attempts that ended without truth in this run: never retried in a tight loop. */
+	const aheadDone = new Set<string>();
 	/** Tester-only lane for a unit whose deps are not accepted yet (see UnitRunOptions.truthOnly). */
 	const startAhead = (unitId: string) => {
 		aheadRunning.add(unitId);
@@ -259,7 +261,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				drop();
 			}
 		});
-		running.set(unitId, p.finally(() => (running.delete(unitId), aheadRunning.delete(unitId))));
+		running.set(unitId, p.finally(() => (running.delete(unitId), aheadRunning.delete(unitId), aheadDone.add(unitId))));
 	};
 	/** Planned units waiting only on deps (not on questions), without truth yet: closest to ready first. */
 	const aheadCandidates = (): string[] => {
@@ -275,7 +277,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			)
 			.all() as Array<{ id: string; meta: string; open: number }>;
 		return rows
-			.filter((u) => u.open > 0 && !running.has(u.id) && !blocked.has(u.id) && !decisionBlocked.has(u.id))
+			// a unit still waiting for its placement (an area question) cannot start, not even its tester
+			.filter((u) => u.open > 0 && !running.has(u.id) && !aheadDone.has(u.id) && !blocked.has(u.id) && !decisionBlocked.has(u.id) && !unplacedReason(config, u.meta, o.root))
 			.filter((u) => (!o.units || o.units.includes(u.id)) && (!o.slice || JSON.parse(u.meta).slice === o.slice))
 			.map((u) => ({ id: u.id, open: u.open, rank: (JSON.parse(u.meta) as { sliceRank?: number }).sliceRank ?? 99 }))
 			.sort((a, b) => a.open - b.open || a.rank - b.rank || a.id.localeCompare(b.id))
@@ -587,6 +590,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		// wake at least every 2 s: lane changes, resubmits and stops apply without waiting for a unit to end
 		await Promise.race([...running.values(), new Promise((r) => setTimeout(r, 2000))]);
+		// a lane that ends at once (nothing to do) must not starve the event loop: the UI redraws, /br stop is heard
+		await new Promise((r) => setImmediate(r));
 	}
 	process.off("SIGINT", onSigint);
 
