@@ -126,7 +126,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 
 	let questionId: number | undefined;
 	if (action === "ask_human") {
-		questionId = (await askViaModel(d, {
+		const asked = await askViaModel(d, {
 			unitId,
 			point: "triage_gate",
 			facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}: ${reason}.${cause === "other" ? "" : ` Likely cause: ${cause}.`} Only this unit waits; the answer is applied when it arrives. Any other text you type is handed to the next attempt as a hint.\nGate output tail:\n${state.gate_report.slice(-1500)}`,
@@ -136,7 +136,13 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 			blocks: "unit",
 			askedBy: "orchestrator",
 			decisionId: dec.decisionId,
-		})).id;
+		});
+		questionId = asked.id;
+		// the run answered it itself (model and triage agree on a plain retry): nobody waits
+		if (asked.decided === "retry") {
+			action = "retry";
+			reason = `${reason}; retried without asking (question #${asked.id})`;
+		}
 	}
 	setDecisionAction(d.ledger, dec.decisionId, action);
 	return { action, cause, confidence: dec.confidence, band: b, decisionId: dec.decisionId, questionId, reason };

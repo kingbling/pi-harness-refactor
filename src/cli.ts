@@ -103,6 +103,12 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	questions: async () => {
 		const { ledger } = open();
 		const qs = ledger.openQuestions();
+		const own = ledger.ownDecisions();
+		if (own.length) {
+			console.log(pc.dim(`decided by the run from your goals (${own.length}; set run.ask to "all" to be asked instead):`));
+			for (const q of own.slice(0, 10)) console.log(pc.dim(`  #${q.id} [${q.point}]${q.unit_id ? ` ${q.unit_id}` : ""} → ${q.answer}`));
+			console.log("");
+		}
 		if (!qs.length) return console.log(pc.green("no open questions"));
 		const blocked = ledger.blockedUnits();
 		for (const q of qs) {

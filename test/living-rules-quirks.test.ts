@@ -164,6 +164,7 @@ describe("capability cards", () => {
 describe("tidy review", () => {
 	it("every N accepts of an area a model reviews it; approved moves become tasks for the next unit, closed when the tree shows them", async () => {
 		const { root, config, ledger } = setup();
+		config.run.ask = "all"; // this test answers the question itself; the run's own pick is tested below
 		const { maybeTidyReview, tidyTaskCard, completeTidyTasks } = await import("../src/run/tidy.ts");
 		const { projectDir } = await import("../src/init/init.ts");
 		const proj = projectDir(config, "nestjs");
@@ -188,6 +189,37 @@ describe("tidy review", () => {
 		(await import("node:fs")).rmSync(join(proj, "src/features/flights/helper2.ts"));
 		expect(completeTidyTasks(ledger, proj, "nestjs", "flights")).toHaveLength(1);
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
+	});
+});
+
+describe("the run decides routine questions itself", () => {
+	const phrase = (recommended: string) => new FakeModelClient({ chat: () => ({ json: { id: "x", question: "Keep the quirk?", options: [{ value: "drop", label: "Drop it", hint: "" }, { value: "keep", label: "Keep it", hint: "" }], recommended, opinion: "Your goals say same behaviour." } }) });
+
+	it("model and agent agree on a routine point: stored answered, nobody waits; the quirk follows it", async () => {
+		const { root, config, ledger } = setup();
+		const d = { ledger, config, root, client: phrase("keep") };
+		recordQuirk({ ...d }, { unitId: "U1", symbolId: "total", kind: "intentional", behaviour: "returns '0' for empty", opinion: "keep", why: "callers compare strings" });
+		await askPendingQuirks(d, "U1");
+		const q = ledger.db.prepare("SELECT * FROM questions WHERE point = 'quirk'").get() as { status: string; answer: string; answered_by: string };
+		expect(q).toMatchObject({ status: "auto", answer: "keep — Keep it (recommended)" });
+		expect(q.answered_by).toMatch(/^auto/);
+		expect(ledger.blockedUnits().has("U1")).toBe(false);
+		expect(quirkRetestNote({ ledger, root }, "U1")).toBeUndefined(); // the tests already follow the decision
+		expect(quirksOf({ ledger }, "U1")[0]!.status).toBe("kept");
+		expect(ledger.ownDecisions()).toHaveLength(1);
+	});
+
+	it("asks when the model disagrees, when there is no model, for points that need a human, and with run.ask all", async () => {
+		const { root, config, ledger } = setup();
+		const ask = (client: FakeModelClient | undefined, point: string, recommended: string) =>
+			askViaModel({ ledger, config, root, client }, { point, unitId: "U1", facts: "f", options: [{ value: "drop" }, { value: "keep" }, { value: "fixed" }], recommended, askedBy: "t" });
+		expect((await ask(phrase("drop"), "quirk", "keep")).decided).toBeUndefined(); // disagreement
+		expect((await ask(undefined, "quirk", "keep")).decided).toBeUndefined(); // no second opinion
+		expect((await ask(phrase("keep"), "systemic_failure", "keep")).decided).toBeUndefined(); // not routine
+		expect((await ask(phrase("keep"), "quirk", "keep")).decided).toBe("keep");
+		config.run.ask = "all";
+		expect((await ask(phrase("keep"), "quirk", "keep")).decided).toBeUndefined();
+		expect(ledger.openQuestions()).toHaveLength(4);
 	});
 });
 

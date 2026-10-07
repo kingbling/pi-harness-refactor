@@ -37,6 +37,8 @@ export interface PhrasedQuestion {
 	/** The model's opinion: one or two sentences why, grounded in the repo. */
 	opinion: string;
 	by: string;
+	/** The phrasing model's own pick (not the code's pick it fell back to). */
+	modelPick?: string;
 }
 
 export interface AskDeps {
@@ -274,8 +276,35 @@ export interface AskRequest {
 	decisionId?: number;
 }
 
-/** Phrase one question with a model and store it in the ledger. Options are stored as "value — label", recommendation first. */
-export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: number; phrased: PhrasedQuestion; costUsd: number }> {
+/**
+ * Points the run decides on its own (run.ask "unsure", the default): the model that read the repo and the owner's
+ * goals picks the same option as the code or agent that raised the question. Only options that keep work going;
+ * "fixed" (a human did something), "quarantine", "exclude", "stop" and the like are always asked.
+ */
+const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
+	placement: () => true,
+	quirk: () => true,
+	tidy: (v) => v === "apply" || v === "skip",
+	area_taxonomy: (v) => v === "apply" || v === "keep",
+	triage_gate: (v) => v === "retry",
+};
+
+/** The value the run picks itself, or undefined when the owner must answer. */
+export function ownPick(config: Config, q: AskRequest, phrased: PhrasedQuestion): string | undefined {
+	const v = phrased.modelPick;
+	if (config.run.ask === "all" || phrased.by === "code") return undefined; // no second opinion: ask
+	if (!v || (q.recommended && q.recommended !== v)) return undefined; // the model disagrees with the code/agent: ask
+	return DECIDES_ITSELF[q.point]?.(v) ? v : undefined;
+}
+
+/** Answer given by the run itself (status "auto"); the owner sees these in br questions. */
+export const OWN_ANSWER = "auto (your goals)";
+
+/**
+ * Phrase one question with a model and store it in the ledger. Options are stored as "value — label", recommendation
+ * first. When the run can decide it itself (ownPick), the question is stored already answered and nobody waits.
+ */
+export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: number; phrased: PhrasedQuestion; costUsd: number; decided?: string }> {
 	const phrased = d.client ? await phraseOne(d, q) : unphrased(q);
 	const id = d.ledger.askQuestion({
 		unitId: q.unitId,
@@ -287,7 +316,12 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 		askedBy: q.askedBy,
 		decisionId: q.decisionId,
 	});
-	return { id, phrased, costUsd: (phrased as { costUsd?: number }).costUsd ?? 0 };
+	const costUsd = (phrased as { costUsd?: number }).costUsd ?? 0;
+	const own = ownPick(d.config, q, phrased);
+	if (!own) return { id, phrased, costUsd };
+	const label = phrased.options.find((o) => o.value === own)?.label ?? own;
+	d.ledger.answerQuestion(id, `${own} — ${label} (recommended)`, OWN_ANSWER, "auto");
+	return { id, phrased, costUsd, decided: own };
 }
 
 /** The machine value of an answer given to an askViaModel question ("drop — remove it" → "drop"). */
@@ -337,7 +371,7 @@ async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & {
 		for (const o of q.options) if (!options.some((x) => x.value === o.value)) options.push({ value: o.value, label: o.facts ?? o.value, hint: undefined });
 		if (!j.question) return { ...unphrased(q), costUsd: res.usage.costUsd };
 		const recommended = known.has(j.recommended ?? "") ? j.recommended : q.recommended;
-		return { question: j.question, options: recommendedFirst(options, recommended), recommended, opinion: j.opinion ?? q.agentOpinion ?? "", by: res.usage.model, costUsd: res.usage.costUsd };
+		return { question: j.question, options: recommendedFirst(options, recommended), recommended, opinion: j.opinion ?? q.agentOpinion ?? "", by: res.usage.model, modelPick: known.has(j.recommended ?? "") ? j.recommended : undefined, costUsd: res.usage.costUsd };
 	} catch {
 		return { ...unphrased(q), costUsd: 0 };
 	}

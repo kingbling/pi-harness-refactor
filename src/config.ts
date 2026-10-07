@@ -106,6 +106,8 @@ export const ConfigSchema = z.object({
 			idleMs: z.number().int().default(300_000),
 			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
 			sampleSize: z.number().int().min(0).default(10),
+			/** "unsure": the run decides routine questions itself when the model and the code agree (your goals guide both); "all": ask every one. */
+			ask: z.enum(["unsure", "all"]).default("unsure"),
 		})
 		.prefault({}),
 	/** Set by `br simulate --level 3`; `br run` refuses to start when missing. */

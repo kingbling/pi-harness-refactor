@@ -314,6 +314,10 @@ export class Ledger {
 	getQuestion(id: number): QuestionRow | undefined {
 		return this.db.prepare("SELECT * FROM questions WHERE id = ?").get(id) as unknown as QuestionRow | undefined;
 	}
+	/** Questions the run answered itself (askViaModel's own pick), newest first; `since` = ISO time. */
+	ownDecisions(since = ""): QuestionRow[] {
+		return this.db.prepare("SELECT * FROM questions WHERE status = 'auto' AND answered_by LIKE 'auto%' AND answered_at >= ? ORDER BY id DESC").all(since) as unknown as QuestionRow[];
+	}
 	openQuestions(): QuestionRow[] {
 		return this.db.prepare("SELECT * FROM questions WHERE status = 'open' ORDER BY id").all() as unknown as QuestionRow[];
 	}

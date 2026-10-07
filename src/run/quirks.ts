@@ -87,7 +87,7 @@ export async function askPendingQuirks(d: AskDeps & { root: string }, unitId?: s
 async function precedentFor(d: AskDeps, q: QuirkRow): Promise<{ id?: number; decision?: "drop" | "keep"; costUsd: number }> {
 	syncQuirkAnswers({ ...d, root: d.root ?? "" });
 	const decided = d.ledger.db
-		.prepare("SELECT * FROM quirks WHERE status IN ('kept','dropped') AND question_id IS NOT NULL AND decided_by NOT LIKE 'precedent%' ORDER BY (kind = ?) DESC, id DESC LIMIT 25")
+		.prepare("SELECT * FROM quirks WHERE status IN ('kept','dropped') AND question_id IS NOT NULL AND decided_by NOT LIKE 'precedent%' AND decided_by NOT LIKE 'auto%' ORDER BY (kind = ?) DESC, id DESC LIMIT 25")
 		.all(q.kind) as unknown as QuirkRow[];
 	if (!decided.length || !d.client) return { costUsd: 0 };
 	const criteria: Record<string, string> = Object.fromEntries(decided.map((p) => [`p${p.id}`, `${p.kind}: ${p.behaviour} → the owner chose ${p.status === "kept" ? "keep" : "drop"}`]));
