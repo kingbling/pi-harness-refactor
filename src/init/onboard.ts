@@ -148,7 +148,8 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		// only when the survey found a data store: where its schema, data and connection are
 		const { dbDetected, askDbInputs } = await import("../inventory/db.ts");
 		await step("database", () => (!dbDetected(config) ? "no database detected" : config.db.inputsAt && !args.includes("--force-db") ? `asked ${config.db.inputsAt.slice(0, 10)} (${config.db.schemaFiles.length} schema input(s))` : undefined), async () => {
-			const got = await askDbInputs(config, ui, yes);
+			const { OpenRouterClient } = await import("../models/openrouter.ts");
+			const got = await askDbInputs(config, ui, yes, { client: noLlm ? undefined : new OpenRouterClient(), model: config.models.escalate.id });
 			const { saveConfig } = await import("../config.ts");
 			const raw = loadConfig(configPath).config;
 			raw.db = { ...raw.db, ...got, inputsAt: new Date().toISOString() };

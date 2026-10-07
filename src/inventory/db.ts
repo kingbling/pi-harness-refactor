@@ -4,6 +4,7 @@ import { basename, extname, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
+import type { ModelClient } from "../models/types.ts";
 import { TARGET_ROLES } from "../adapters/registry.ts";
 import { progress } from "../progress.ts";
 
@@ -85,24 +86,37 @@ export interface DbPrompter {
 export const RELATIONAL = new Set(["mariadb", "mysql", "postgresql", "sqlite", "sqlserver", "oracle"]);
 const BIG = 50_000_000;
 
+/** Many files shown as their folders: "app/install/old/ (77 .sql files)"; few files as they are. */
+export function summarizePaths(paths: string[], max = 6): string {
+	const byDir = new Map<string, string[]>();
+	for (const p of paths) {
+		const d = p.endsWith("/") ? p : p.includes("/") ? p.slice(0, p.lastIndexOf("/") + 1) : "";
+		byDir.set(d, [...(byDir.get(d) ?? []), p]);
+	}
+	const parts = [...byDir.entries()].flatMap(([d, ps]) => (ps.length > 2 && d ? [`${d} (${ps.length} files)`] : ps));
+	return parts.length > max ? `${parts.slice(0, max).join(", ")}, … (${paths.length} in all)` : parts.join(", ");
+}
+
+type DbInputs = Pick<Config["db"], "schemaFiles" | "snapshot" | "url" | "exports">;
+
 /**
- * Ask for the DB inputs once, per database (only when a store was detected). SQL databases: schema files or
- * dirs (detected ones prefilled) and an optional data dump; other stores (ArangoDB, MongoDB …): an optional
- * export. Every path must exist (relative to the old codebase, or absolute); a wrong one is asked again. The
- * connection is `env:VAR` only (a URL with a password is never stored). `--yes` takes what was detected.
+ * Ask for the DB inputs once, in one question for every detected store. What code found is shown short; Enter
+ * takes it. Otherwise the owner says it in their own words ("use the dump in ~/dumps/prod.sql", "connect with
+ * env:DATABASE_URL", plain paths): plain paths are read by code, anything else by a model that maps it onto
+ * schema files, data dump, connection and per-store exports. Code checks every path (a mistyped one is
+ * suggested) and keeps passwords out of the config. `--yes` takes what was detected.
  */
-export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean): Promise<Pick<Config["db"], "schemaFiles" | "snapshot" | "url" | "exports">> {
+export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean, o: { client?: ModelClient; model?: string } = {}): Promise<DbInputs> {
 	const found = findDbFiles(config.source.path);
 	const sql = config.db.from.filter((e) => RELATIONAL.has(e.toLowerCase()));
 	const docs = config.db.from.filter((e) => !RELATIONAL.has(e.toLowerCase()));
-	if (yes) return { schemaFiles: sql.length ? found.schema : [], snapshot: sql.length ? found.dumps[0] : undefined, url: config.db.url, exports: {} };
+	const detected: DbInputs = { schemaFiles: sql.length ? found.schema : [], snapshot: sql.length ? found.dumps[0] : undefined, url: config.db.url, exports: {} };
+	if (yes) return detected;
 	const exists = (p: string) => existsSync(abs(config, p.replace(/\/$/, "")));
-	const split = (s: string | undefined) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-	// ask until every given path exists; empty = none; undefined = cancelled
 	// a mistyped path is often the right file under another top folder (php/gyro/… → gyro-php/gyro/…)
 	const top = (() => {
 		try {
-			return readdirSync(config.source.path).filter((n) => !n.startsWith(".") && n !== "node_modules" && n !== "vendor");
+			return readdirSync(config.source.path).filter((n) => !n.startsWith(".") && !SKIP_DIRS.has(n));
 		} catch {
 			return [];
 		}
@@ -117,42 +131,79 @@ export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean):
 		}
 		return undefined;
 	};
-	const askPaths = async (message: string, initial: string, many: boolean): Promise<string[]> => {
-		let problem = "";
-		for (;;) {
-			// the problem comes first (bold), the typed text stays in the field to correct it
-			const v = await ui.text(`${problem}${message}`, initial);
-			if (v === undefined) throw new Error("onboarding cancelled");
-			const paths = many ? split(v) : split(v).slice(0, 1);
-			const bad = paths.filter((p) => !exists(p));
-			if (!bad.length) return paths;
-			const fixes = bad.map((b) => [b, suggest(b)] as const);
-			problem = `Not found in ${config.source.path}: ${fixes.map(([b, f]) => (f ? `${b} (did you mean ${f}?)` : b)).join(", ")}. Fix it below (empty = none).\n`;
-			// found suggestions are filled in; the rest stays as typed so it can be corrected
-			initial = paths.map((p) => fixes.find(([b]) => b === p)?.[1] ?? p).join(", ");
+	const foundText = [
+		detected.schemaFiles.length ? `schema: ${summarizePaths(detected.schemaFiles)}` : sql.length ? "no schema files found" : "",
+		detected.snapshot ? `data dump: ${detected.snapshot}` : "",
+		detected.url ? `connection: ${detected.url}` : "",
+	].filter(Boolean).join("\n");
+	const question = `${config.db.from.join(" + ")}: what should the migration read for the database? Enter takes what was found; or say it in your own words (files, folders, a data dump, a connection as env:VAR${docs.length ? `, an export folder for ${docs.join(", ")}` : ""}).`;
+	let problem = "";
+	let initial = "";
+	for (;;) {
+		const v = await ui.text(`${problem}${question}\n${foundText}`, initial);
+		if (v === undefined) throw new Error("onboarding cancelled");
+		const said = v.trim();
+		if (!said) return detected;
+		const got = plainPaths(said, exists) ?? (o.client ? await readWords(config, o.client, o.model ?? config.models.escalate.id, said, found, sql, docs) : undefined);
+		if (!got) {
+			problem = "Without a model only paths (comma-separated) or env:VAR can be read. ";
+			initial = said;
+			continue;
 		}
-	};
-	let schemaFiles: string[] = [];
-	let snapshot: string | undefined;
-	if (sql.length) {
-		const engines = sql.join(" + ");
-		ui.log(`SQL database detected: ${engines}${found.schema.length ? ` · schema candidates: ${found.schema.join(", ")}` : " · no schema files found in the repo"}`);
-		schemaFiles = await askPaths(`${engines}: schema files or folders (comma-separated: .sql dump, migrations/, .sqlite, schema.prisma …). A full dump works too: only its table definitions are read.`, found.schema.join(", "), true);
-		// a big schema file is a dump: offered as the data dump too
-		const bigOne = schemaFiles.find((p) => exists(p) && statSync(abs(config, p)).isFile() && statSync(abs(config, p)).size > BIG);
-		snapshot = (await askPaths(`${engines}: data dump for the data migration (optional, empty = none)`, bigOne ?? found.dumps[0] ?? "", false))[0];
+		const all = [...got.schemaFiles, ...(got.snapshot ? [got.snapshot] : []), ...Object.values(got.exports)];
+		const bad = all.filter((p) => !exists(p));
+		const issues = bad.map((b) => (suggest(b) ? `${b} (did you mean ${suggest(b)}?)` : b));
+		const url = got.url?.trim();
+		const secret = !!url && /:\/\/[^/@]*:[^/@]+@/.test(url);
+		if (!bad.length && !secret) {
+			const out = { ...got, url: url || undefined };
+			ui.log(`database inputs: ${[out.schemaFiles.length ? `schema ${summarizePaths(out.schemaFiles)}` : "", out.snapshot ? `dump ${out.snapshot}` : "", out.url ? `connection ${out.url}` : "", ...Object.entries(out.exports).map(([e, p]) => `${e} export ${p}`)].filter(Boolean).join(" · ") || "none"}`);
+			return out;
+		}
+		problem = [issues.length ? `Not found in ${config.source.path}: ${issues.join(", ")}.` : "", secret ? "The connection holds a password, which is never stored: put the URL in an env var (export DATABASE_URL=…) and write env:DATABASE_URL." : ""].filter(Boolean).join(" ") + " Correct it below.\n";
+		initial = said;
 	}
-	const exports: Record<string, string> = {};
-	for (const e of docs) {
-		const p = (await askPaths(`${e}: export of its collections/documents (optional, empty = none; e.g. an arangodump or mongodump folder)`, "", false))[0];
-		if (p) exports[e] = p;
+}
+
+/** "a.sql, migrations/, env:DB_URL" → inputs, when every part looks like a path or env:VAR (checked later); else undefined (words). */
+function plainPaths(text: string, exists: (p: string) => boolean): DbInputs | undefined {
+	const parts = text.split(/\s*,\s*|\s+/).filter(Boolean);
+	const pathLike = (p: string) => /^env:\w+$/.test(p) || exists(p) || /^[\w.~\/@+-]*(\/|\.[a-z0-9]{1,8})$/i.test(p);
+	if (!parts.length || !parts.every(pathLike)) return undefined;
+	const url = parts.find((p) => p.startsWith("env:"));
+	const files = parts.filter((p) => !p.startsWith("env:"));
+	const dump = files.find((p) => DUMP_RE.test(p));
+	return { schemaFiles: files.filter((p) => p !== dump), snapshot: dump, url, exports: {} };
+}
+
+/** The owner's words → DB inputs (a model reads them with what code found); paths are checked by the caller. */
+async function readWords(config: Config, client: ModelClient, model: string, said: string, found: { schema: string[]; dumps: string[] }, sql: string[], docs: string[]): Promise<DbInputs | undefined> {
+	try {
+		const r = await client.chat({
+			model,
+			effort: "low",
+			schema: {
+				type: "object",
+				additionalProperties: false,
+				required: ["schemaFiles", "snapshot", "url", "exports"],
+				properties: {
+					schemaFiles: { type: "array", items: { type: "string" }, description: "schema files or folders (DDL, migrations dirs, .sqlite, schema.prisma); a full dump also works here" },
+					snapshot: { type: "string", description: "data dump for the data migration, or empty" },
+					url: { type: "string", description: "connection: env:VAR or a URL exactly as the owner gave it, or empty" },
+					exports: { type: "array", items: { type: "object", additionalProperties: false, required: ["engine", "path"], properties: { engine: { type: "string" }, path: { type: "string" } } } },
+				},
+			},
+			messages: [
+				{ role: "system", content: "You turn what the owner of a legacy app said about its database into inputs for a migration tool. Paths are relative to the legacy repo or absolute; keep them exactly as said (or as found when the owner refers to found files, e.g. 'the found ones plus …'). Never invent a path." },
+				{ role: "user", content: `Stores: ${[...sql, ...docs].join(", ")}\nFound by code — schema: ${found.schema.join(", ") || "none"}; dumps: ${found.dumps.join(", ") || "none"}\nThe owner said: ${said}` },
+			],
+		});
+		const j = r.json as { schemaFiles?: string[]; snapshot?: string; url?: string; exports?: Array<{ engine: string; path: string }> } | undefined;
+		if (!j) return undefined;
+		return { schemaFiles: j.schemaFiles ?? [], snapshot: j.snapshot || undefined, url: j.url || undefined, exports: Object.fromEntries((j.exports ?? []).filter((e) => e.path && docs.includes(e.engine)).map((e) => [e.engine, e.path])) };
+	} catch {
+		return undefined;
 	}
-	let url = (await ui.text(`${config.db.from.join(" + ")}: connection for introspection (optional): env:VAR naming an env var that holds the URL`, config.db.url ?? ""))?.trim() || undefined;
-	if (url && !url.startsWith("env:")) {
-		ui.log(/:\/\/[^/@]*:[^/@]+@/.test(url) ? "the URL holds a password: not stored. Put it in an env var and enter env:VAR instead." : "a connection is given as env:VAR (the env var holds the URL): not stored.");
-		url = undefined;
-	}
-	return { schemaFiles, snapshot, url, exports };
 }
 
 export interface DbTable {
@@ -162,6 +213,7 @@ export interface DbTable {
 	/** Where it was defined. */
 	from: string;
 }
+
 
 const abs = (config: Config, p: string) => (p.startsWith("/") ? p : join(config.source.path, p));
 

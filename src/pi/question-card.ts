@@ -139,7 +139,11 @@ export class QuestionCard implements Component {
 		const L: string[] = [];
 		if (this.q.text) {
 			L.push(...this.input.render(w));
-			if (this.q.text.initial) L.push(...wrap(pc.dim(`recommended: ${this.q.text.initial}`), "  "));
+			if (this.q.text.initial) {
+				// a long prefill (many paths) never pushes the field off the screen: 3 lines at most
+				const rec = wrap(pc.dim(`recommended: ${this.q.text.initial}`), "  ");
+				L.push(...rec.slice(0, 3), ...(rec.length > 3 ? [pc.dim(`  … (${rec.length - 3} more lines; the field holds all of it)`)] : []));
+			}
 			L.push(pc.dim("  Enter sends · Esc cancels"));
 		} else {
 			const opts = this.q.options ?? [];

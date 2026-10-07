@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ConfigSchema, type Config } from "../src/config.ts";
+import { FakeModelClient } from "../src/models/fake.ts";
 import { askDbInputs, dbDetected, findDbFiles, groupTables, planDbLane, readSchema } from "../src/inventory/db.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
@@ -43,26 +44,34 @@ describe("DB lane", () => {
 		expect(dbDetected(cfg({ from: ["mysql"] }))).toBe(true);
 	});
 
-	it("asks per database, detected files prefilled; a path that does not exist is asked again; a URL with a password is not stored", async () => {
+	it("one question for every store: Enter takes what was found; plain paths are read by code, own words by a model; paths are checked", async () => {
 		mkdirSync(join(ws, "legacy", "database", "migrations"), { recursive: true });
 		write(join(ws, "legacy", "dumps", "arango"), "x");
 		expect(findDbFiles(join(ws, "legacy")).schema).toEqual(["database/migrations/", "db/schema.sql"]);
-		const asked: Array<[string, string]> = [];
-		// schema · dump: free text first ("mariadb for now" is no file → asked again) · arangodb export · connection
-		const answers = ["db/schema.sql", "mariadb for now", "", "dumps/arango", "mysql://root:secret@localhost/app"];
-		const got = await askDbInputs(cfg({ from: ["mariadb", "arangodb"] }), { text: async (m, i) => (asked.push([m, i]), answers.shift()), log: () => {} }, false);
-		expect(asked[0]![0]).toMatch(/^mariadb: schema files/);
-		expect(asked[0]![1]).toBe("database/migrations/, db/schema.sql");
-		expect(asked[2]![0]).toMatch(/^Not found in .*: mariadb for now\./);
-		expect(asked[2]![1]).toBe("mariadb for now"); // what was typed stays, to be corrected
-		expect(asked[3]![0]).toMatch(/^arangodb: export/);
-		expect(got).toEqual({ schemaFiles: ["db/schema.sql"], snapshot: undefined, url: undefined, exports: { arangodb: "dumps/arango" } });
-		// a path under the wrong top folder is suggested and filled in
-		const typo: Array<[string, string]> = [];
-		const fixed = ["schema.sql", undefined];
-		await askDbInputs(cfg({ from: ["mysql"] }), { text: async (m, i) => (typo.push([m, i]), typo.length === 2 ? i : fixed.shift() ?? ""), log: () => {} }, false);
-		expect(typo[1]![0]).toContain("schema.sql (did you mean db/schema.sql?)");
-		expect(typo[1]![1]).toBe("db/schema.sql");
+		const ask = async (answers: Array<string | undefined>, o = {}) => {
+			const asked: Array<[string, string]> = [];
+			const got = await askDbInputs(cfg({ from: ["mariadb", "arangodb"] }), { text: async (m, i) => (asked.push([m, i]), answers.shift()), log: () => {} }, false, o);
+			return { asked, got };
+		};
+		// Enter: what code found
+		const a = await ask([""]);
+		expect(a.asked[0]![0]).toMatch(/^mariadb \+ arangodb: what should the migration read/);
+		expect(a.asked[0]![0]).toContain("schema: database/migrations/, db/schema.sql");
+		expect(a.got.schemaFiles).toEqual(["database/migrations/", "db/schema.sql"]);
+		// plain paths, a mistyped one is suggested; the typed text stays to be corrected
+		const b = await ask(["schema.sql, env:DB_URL", "db/schema.sql, env:DB_URL"]);
+		expect(b.asked[1]![0]).toMatch(/^Not found in .*: schema.sql \(did you mean db\/schema.sql\?\)/);
+		expect(b.asked[1]![1]).toBe("schema.sql, env:DB_URL");
+		expect(b.got).toEqual({ schemaFiles: ["db/schema.sql"], snapshot: undefined, url: "env:DB_URL", exports: {} });
+		// own words without a model: asked again; with a model: mapped, a password is refused
+		const c = await ask(["use the arango dump please", ""]);
+		expect(c.asked[1]![0]).toMatch(/^Without a model only paths/);
+		const client = new FakeModelClient({ chat: () => ({ json: { schemaFiles: ["db/schema.sql"], snapshot: "", url: "mysql://root:secret@localhost/app", exports: [{ engine: "arangodb", path: "dumps/arango" }] } }) });
+		const d = await ask(["the schema file, the arango dump, and mysql://root:secret@localhost/app", ""], { client, model: "m" });
+		expect(d.asked[1]![0]).toMatch(/password, which is never stored/);
+		const client2 = new FakeModelClient({ chat: () => ({ json: { schemaFiles: ["db/schema.sql"], snapshot: "", url: "env:DATABASE_URL", exports: [{ engine: "arangodb", path: "dumps/arango" }] } }) });
+		const e = await ask(["the schema file, the arango dump, connect with env:DATABASE_URL"], { client: client2, model: "m" });
+		expect(e.got).toEqual({ schemaFiles: ["db/schema.sql"], snapshot: undefined, url: "env:DATABASE_URL", exports: { arangodb: "dumps/arango" } });
 		const yes = await askDbInputs(cfg({ from: ["mysql"] }), { text: async () => { throw new Error("--yes asks nothing"); }, log: () => {} }, true);
 		expect(yes.schemaFiles).toEqual(["database/migrations/", "db/schema.sql"]);
 	});
