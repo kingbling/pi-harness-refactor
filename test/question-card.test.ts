@@ -113,3 +113,12 @@ describe("question card", () => {
 		expect(a.got).toEqual(["a"]);
 	});
 });
+
+describe("question card width", () => {
+	it("never draws a line wider than the terminal (Pi stops drawing then), even with a long prefilled path", async () => {
+		const { visibleWidth } = await import("@earendil-works/pi-tui");
+		const long = "app/install/install.sql, app/install/old/0001_uuid.sql, app/install/old/0002_more.sql, tests/ci/seed.sql";
+		const c = new QuestionCard({ message: `mariadb: schema files or folders\nNot found: php/gyro/x.sql (did you mean gyro-php/gyro/x.sql?)`, text: { initial: long } }, () => {});
+		for (const width of [20, 40, 80]) for (const l of c.render(width)) expect(visibleWidth(l)).toBeLessThanOrEqual(width);
+	});
+});

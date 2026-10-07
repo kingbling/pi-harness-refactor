@@ -99,16 +99,37 @@ export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean):
 	const exists = (p: string) => existsSync(abs(config, p.replace(/\/$/, "")));
 	const split = (s: string | undefined) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 	// ask until every given path exists; empty = none; undefined = cancelled
+	// a mistyped path is often the right file under another top folder (php/gyro/… → gyro-php/gyro/…)
+	const top = (() => {
+		try {
+			return readdirSync(config.source.path).filter((n) => !n.startsWith(".") && n !== "node_modules" && n !== "vendor");
+		} catch {
+			return [];
+		}
+	})();
+	const suggest = (p: string): string | undefined => {
+		const segs = p.replace(/\/$/, "").split("/").filter(Boolean);
+		for (let k = 0; k < segs.length; k++) {
+			const tail = segs.slice(k).join("/");
+			if (k && exists(tail)) return tail;
+			const hit = top.find((d) => exists(`${d}/${tail}`));
+			if (hit) return `${hit}/${tail}`;
+		}
+		return undefined;
+	};
 	const askPaths = async (message: string, initial: string, many: boolean): Promise<string[]> => {
-		let hint = "";
+		let problem = "";
 		for (;;) {
-			const v = await ui.text(`${message}${hint}`, initial);
+			// the problem comes first (bold), the typed text stays in the field to correct it
+			const v = await ui.text(`${problem}${message}`, initial);
 			if (v === undefined) throw new Error("onboarding cancelled");
 			const paths = many ? split(v) : split(v).slice(0, 1);
 			const bad = paths.filter((p) => !exists(p));
 			if (!bad.length) return paths;
-			hint = `\n   not found: ${bad.join(", ")} (a path relative to ${config.source.path}, or absolute; empty = none)`;
-			initial = paths.filter((p) => exists(p)).join(", ");
+			const fixes = bad.map((b) => [b, suggest(b)] as const);
+			problem = `Not found in ${config.source.path}: ${fixes.map(([b, f]) => (f ? `${b} (did you mean ${f}?)` : b)).join(", ")}. Fix it below (empty = none).\n`;
+			// found suggestions are filled in; the rest stays as typed so it can be corrected
+			initial = paths.map((p) => fixes.find(([b]) => b === p)?.[1] ?? p).join(", ");
 		}
 	};
 	let schemaFiles: string[] = [];

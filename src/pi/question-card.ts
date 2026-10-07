@@ -109,8 +109,13 @@ export class QuestionCard implements Component {
 		this.input.focused = this.onOther;
 	}
 
+	/** Pi stops drawing when a line is wider than the terminal: every line is cut to fit, whatever produced it. */
 	render(width: number): string[] {
-		const w = Math.max(30, width - 2);
+		return this.lines(width).map((l) => truncateToWidth(l, Math.max(1, width)));
+	}
+
+	private lines(width: number): string[] {
+		const w = Math.max(10, width - 2);
 		const wrap = (x: string, indent = "") => wrapTextWithAnsi(x, Math.max(10, w - indent.length)).map((l) => indent + l);
 		const [question = "", ...context] = this.q.message.split("\n").map((l) => l.trim());
 		const head = [pc.dim("─".repeat(w)), ...wrap(pc.bold(question))];
@@ -134,7 +139,8 @@ export class QuestionCard implements Component {
 		const L: string[] = [];
 		if (this.q.text) {
 			L.push(...this.input.render(w));
-			L.push(pc.dim(this.q.text.initial ? `  recommended: ${this.q.text.initial} (prefilled) · Enter sends · Esc cancels` : "  Enter sends · Esc cancels"));
+			if (this.q.text.initial) L.push(...wrap(pc.dim(`recommended: ${this.q.text.initial}`), "  "));
+			L.push(pc.dim("  Enter sends · Esc cancels"));
 		} else {
 			const opts = this.q.options ?? [];
 			opts.forEach((o, i) => {
