@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ChatRequest, ChatResponse, DecisionRequest, DecisionResponse, ModelClient, Usage } from "./types.ts";
 
+import { codexChat } from "./codex.ts";
+
 const BASE = "https://openrouter.ai/api";
 const CHAT_URL = `${BASE}/v1/chat/completions`;
 const DECISIONS_URL = `${BASE}/alpha/decisions`;
@@ -35,6 +37,8 @@ export interface OpenRouterOptions {
 	idleTimeoutMs?: number;
 	fetchImpl?: typeof fetch;
 	onUsage?: (u: Usage & { kind: "chat" | "decide" }) => void;
+	/** Try the Codex login in Pi first for openai/* models (default: on, unless a fetch is injected). */
+	codex?: boolean;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -46,6 +50,7 @@ export class OpenRouterClient implements ModelClient {
 	private readonly fetchImpl: typeof fetch;
 	private readonly onUsage?: OpenRouterOptions["onUsage"];
 	private catalog?: Map<string, any>;
+	private readonly codex: boolean;
 
 	constructor(opts: OpenRouterOptions = {}) {
 		this.key = opts.apiKey ?? resolveOpenRouterKey();
@@ -53,6 +58,7 @@ export class OpenRouterClient implements ModelClient {
 		this.idleTimeoutMs = opts.idleTimeoutMs ?? 10 * 60_000;
 		this.fetchImpl = opts.fetchImpl ?? fetch;
 		this.onUsage = opts.onUsage;
+		this.codex = opts.codex ?? !opts.fetchImpl;
 	}
 
 	private headers() {
@@ -93,6 +99,13 @@ export class OpenRouterClient implements ModelClient {
 	}
 
 	async chat(req: ChatRequest): Promise<ChatResponse> {
+		if (this.codex) {
+			const viaCodex = await codexChat(req);
+			if (viaCodex) {
+				this.onUsage?.({ ...viaCodex.usage, kind: "chat" });
+				return viaCodex;
+			}
+		}
 		let tier = req.tier ?? "default";
 		let flexFails = 0;
 		let attempt = 0;

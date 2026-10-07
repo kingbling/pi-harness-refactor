@@ -1,9 +1,10 @@
 import { getSourceAdapter } from "../adapters/registry.ts";
+import { CODEX_PROVIDER, modelRuntime, resolveCodexModel } from "../models/codex.ts";
 import { recordSpend } from "../spend.ts";
 import { describeArgs, progress } from "../progress.ts";
 import { mkdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
@@ -70,10 +71,11 @@ const ROLE_TOOLS: Record<Role, string[]> = {
 	setup: ["read", "edit", "write", "grep", "find", "ls", "bash"],
 };
 
-let runtime: Promise<ModelRuntime> | undefined;
-export function modelRuntime(): Promise<ModelRuntime> {
-	runtime ??= ModelRuntime.create();
-	return runtime;
+export { modelRuntime };
+
+/** The first model a session runs on: Codex when it serves the role's model, else OpenRouter. */
+export async function resolveSessionModel(role: ModelRole): Promise<Model<Api>> {
+	return (await resolveCodexModel(role.id)) ?? resolveRoleModel(role);
 }
 
 /** OpenRouter model with the configured service tier baked in as a default sampling param. */
@@ -112,6 +114,8 @@ export async function promptWithRecovery(o: {
 	send: (prompt: string) => Promise<void>;
 	takeError: () => string | undefined;
 	toDefaultTier?: () => Promise<void>;
+	/** Switch from the first provider (Codex) to the fallback one (OpenRouter); undefined when already there. */
+	toFallbackProvider?: () => Promise<void>;
 	tier?: string;
 	record: (e: object) => void;
 	sleep?: (ms: number) => Promise<void>;
@@ -123,6 +127,14 @@ export async function promptWithRecovery(o: {
 	const backoff = o.backoffMs ?? [15_000, 60_000];
 	await o.send(o.prompt);
 	let error = o.takeError();
+	// Codex failed for any reason but a network drop (usage limit, auth, capacity, model missing): OpenRouter takes
+	// over in the same session, same prompt — with its own tier recovery below.
+	if (error && o.toFallbackProvider && !isTransientError(error)) {
+		o.record({ type: "provider_fallback", from: "openai-codex", to: "openrouter", error });
+		await o.toFallbackProvider();
+		await o.send(o.prompt);
+		error = o.takeError();
+	}
 	// Flex capacity errors surface as an assistant error message, not an exception. The provider never
 	// falls back on its own, so the orchestrator does: same session, same prompt, standard tier, once.
 	if (error && o.toDefaultTier && isCapacityError(error)) {
@@ -185,7 +197,7 @@ export interface LeafSession {
 
 export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	const role = opts.modelOverride ?? opts.config.models[opts.role === "setup" ? "escalate" : opts.role];
-	const model = await resolveRoleModel(role);
+	const model = await resolveSessionModel(role);
 	const gate = makeWriteGate({ cwd: opts.cwd, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], appendOnlyGlobs: opts.appendOnlyGlobs });
 	let toolCalls = 0;
 	let blocked = 0;
@@ -296,6 +308,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 						error = undefined;
 						return e;
 					},
+					toFallbackProvider: model.provider === CODEX_PROVIDER ? async () => session.setModel(await resolveRoleModel(role)) : undefined,
 					toDefaultTier: role.tier !== "default" ? async () => session.setModel(await resolveRoleModel({ ...role, tier: "default" })) : undefined,
 					tier: role.tier,
 					record,

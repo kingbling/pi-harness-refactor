@@ -44,6 +44,24 @@ describe("session error recovery", () => {
 		expect(isTransientError("Invalid API key")).toBe(false);
 	});
 
+	it("Codex first: a usage limit moves the same prompt to OpenRouter flex, then its capacity error to the default tier", async () => {
+		const s = scripted(["You have hit your ChatGPT usage limit (plus plan). Try again later.", "Flex processing is temporarily unavailable.", undefined]);
+		let providerSwitches = 0;
+		const err = await promptWithRecovery({ prompt: "TASK", ...s.opts, toFallbackProvider: async () => void providerSwitches++ });
+		expect(err).toBeUndefined();
+		expect(providerSwitches).toBe(1);
+		expect(s.tierSwitches()).toBe(1);
+		expect(s.sent).toEqual(["TASK", "TASK", "TASK"]);
+		expect(s.events.map((e) => e.type)).toEqual(["provider_fallback", "tier_fallback"]);
+	});
+
+	it("a network drop on Codex is retried there, not moved to OpenRouter", async () => {
+		const s = scripted(["terminated", undefined]);
+		let providerSwitches = 0;
+		expect(await promptWithRecovery({ prompt: "TASK", ...s.opts, toFallbackProvider: async () => void providerSwitches++ })).toBeUndefined();
+		expect(providerSwitches).toBe(0);
+	});
+
 	it("continues the same session after a drop, with backoff, without a tier fallback", async () => {
 		const s = scripted(["terminated", "Connection error.", undefined]);
 		const err = await promptWithRecovery({ prompt: "TASK", ...s.opts });
