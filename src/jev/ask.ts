@@ -5,6 +5,7 @@ import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { QuestionBlocks, QuestionRow } from "../ledger/schema.ts";
 import type { ModelClient } from "../models/types.ts";
+import { PLAIN_LANGUAGE } from "../policy.ts";
 
 /**
  * Every question a human sees is phrased by a model that has read the source repo. Code only says WHAT is
@@ -187,7 +188,7 @@ export async function phraseDecisions(d: AskDeps, points: DecisionPoint[]): Prom
 			effort: "medium",
 			schema: PHRASE_SCHEMA,
 			messages: [
-				{ role: "system", content: "You turn migration decision points into questions for the person who owns this legacy app. Each question must be answerable by someone who knows the app but not this tool. Use the repo brief; mention concrete files, features or counts. Keep every option value exactly as given; relabel options in plain words, never drop or invent values. Always recommend one option and give your opinion; where an analysis already advised one (advised, advised_because), agree or disagree with it on the evidence." },
+				{ role: "system", content: `You turn migration decision points into questions for the person who owns this legacy app. Each question must be answerable by someone who knows the app but not this tool. Use the repo brief; mention concrete files, features or counts. Keep every option value exactly as given; relabel options in plain words, never drop or invent values. Always recommend one option and give your opinion; where an analysis already advised one (advised, advised_because), agree or disagree with it on the evidence.\n\n${PLAIN_LANGUAGE}` },
 				{ role: "user", content: `Repo brief:\n${brief}\n\nDecision points (JSON):\n${JSON.stringify(batch.map((p) => ({ id: p.id, topic: p.topic, intent: p.intent, evidence: p.evidence, options: p.options, ...(p.reason ? { advised: p.recommended, advised_because: p.reason } : {}) })), null, 1)}` },
 			],
 		});
@@ -239,7 +240,7 @@ export async function discoverDecisions(d: AskDeps, covered: Array<{ id: string;
 			},
 		},
 		messages: [
-			{ role: "system", content: "You plan the migration of the legacy app described in the brief. Find decisions a human owner must make BEFORE agents migrate code, that are not already covered. Only decisions with real consequences for many files (behaviour, data, UX, scope). At most 6; none if nothing is missing. 2–4 options each, recommendation + opinion always." },
+			{ role: "system", content: `You plan the migration of the legacy app described in the brief. Find decisions a human owner must make BEFORE agents migrate code, that are not already covered. Only decisions with real consequences for many files (behaviour, data, UX, scope). At most 6; none if nothing is missing. 2–4 options each, recommendation + opinion always.\n\n${PLAIN_LANGUAGE}` },
 			{ role: "user", content: `Repo brief:\n${brief}\n\nTarget: ${d.config.target.stacks.join(" + ")} with ${JSON.stringify(d.config.target.choices)}.\n\nAlready asked:\n${covered.map((c) => `- ${c.id}: ${c.question}`).join("\n")}` },
 		],
 	});
@@ -326,7 +327,7 @@ async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & {
 			effort: "low",
 			schema: { type: "object", additionalProperties: false, required: PHRASE_SCHEMA.properties.questions.items.required, properties: PHRASE_SCHEMA.properties.questions.items.properties },
 			messages: [
-				{ role: "system", content: "You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion (agree or disagree with the agent's, with a reason)." },
+				{ role: "system", content: `You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion (agree or disagree with the agent's, with a reason).\n\n${PLAIN_LANGUAGE}` },
 				{ role: "user", content: `${brief ? `Repo brief:\n${brief.slice(0, 4000)}\n\n` : ""}Point: ${q.point}${q.unitId ? ` (unit ${q.unitId})` : ""}\nFacts:\n${q.facts}\n\nOptions: ${JSON.stringify(q.options)}\n${q.recommended ? `Current pick: ${q.recommended}\n` : ""}${q.agentOpinion ? `Agent's opinion: ${q.agentOpinion}\n` : ""}\nReturn id "${q.point}".` },
 			],
 		});

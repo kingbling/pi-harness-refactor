@@ -4,6 +4,7 @@ import { resolveChoices } from "../init/stack.ts";
 import type { ModelClient } from "../models/types.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { PLAIN_LANGUAGE } from "../policy.ts";
 
 /**
  * Environment doctor: when triage says a gate failure is not the code's fault, find out why before asking a
@@ -37,7 +38,7 @@ export async function diagnoseFailure(o: { config: Config; adapter: TargetAdapte
 			effort: "low",
 			schema,
 			messages: [
-				{ role: "system", content: "You diagnose why a migration gate step failed. retest = the generated tests are wrong; reimplement = the generated code is wrong; fix = the project setup is missing something one command fixes; unknown = you cannot tell. Never propose editing tests to pass or skipping checks." },
+				{ role: "system", content: `You diagnose why a migration gate step failed. retest = the generated tests are wrong; reimplement = the generated code is wrong; fix = the project setup is missing something one command fixes; unknown = you cannot tell. Never propose editing tests to pass or skipping checks. The summary is shown to the owner.\n\n${PLAIN_LANGUAGE}` },
 				{ role: "user", content: `Failed step: ${o.failedStep}\nInstalled packages: ${deps}\nStack choices: ${JSON.stringify(o.config.target.choices)}\nOutput:\n${o.output.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 4000)}` },
 			],
 		});

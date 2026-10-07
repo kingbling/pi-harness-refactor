@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { rulesDir } from "../rules/layout.ts";
 import type { Config } from "../config.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
+import { CODE_QUALITY } from "../policy.ts";
 
 /** Prompts are short. Everything specific comes from the task card and the pull tools. */
 
@@ -53,6 +54,9 @@ Your job for one unit:
 If something about the target conventions is missing or wrong in the rules and would matter for other units too, call propose_rule.
 Finish with one line: "TESTER DONE <n> cases".
 
+The interface you draft follows the code quality policy (names, typed input validation at the boundary, no extra layers):
+${CODE_QUALITY}
+
 ${behaviourPolicy(opts.source)}
 
 ${opts.rules ? `## Target rules (${opts.stackId}; the layout section is binding)\n${opts.rules}` : `## Layout of area "${opts.area}" (${opts.stackId})\n${opts.structureDoc}`}`;
@@ -70,6 +74,8 @@ Rules of the pass:
 - Pull context with tools (read_function for callees on the card, symbol_lookup, who_calls, source_symbol_body, target_lookup, pattern_examples, docs_lookup); do not ask questions. If a convention is missing from the rules and other units will need it, call propose_rule.
 ${opts.attempt > 1 ? `- This is attempt ${opts.attempt}. The gate output is in the task; fix exactly what failed, keep what passed.` : ""}
 Finish with one line: "IMPLEMENTER DONE" plus anything the reviewer must know.
+
+${CODE_QUALITY}
 
 ${behaviourPolicy(opts.source, "your final message (the tester records quirks)")}
 ${opts.quirks ? `\n## Quirks of this unit (decided)\n${opts.quirks}\nKept quirks get a \`${opts.target.layout.legacyMarker("<why>")}\` comment; dropped ones are not reproduced.` : ""}
