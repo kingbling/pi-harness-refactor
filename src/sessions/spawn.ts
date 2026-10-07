@@ -99,6 +99,48 @@ export function isCapacityError(msg: string): boolean {
 	return /flex processing is temporarily unavailable|service tier.*unavailable|\b429\b|rate limit|capacity|overloaded/i.test(msg);
 }
 
+/** Network drops that outlived Pi's own quick retries: continue the same session later, never a triage round or a tier change. */
+export function isTransientError(msg: string): boolean {
+	return !isCapacityError(msg) && /\bterminated\b|connection error|request timed out|timed out|ECONNRESET|socket hang up|fetch failed|other side closed/i.test(msg);
+}
+
+/** Orchestrator-level recovery after a prompt: capacity → standard tier once; transient → continue the same session (cap, backoff). */
+export async function promptWithRecovery(o: {
+	prompt: string;
+	send: (prompt: string) => Promise<void>;
+	takeError: () => string | undefined;
+	toDefaultTier?: () => Promise<void>;
+	tier?: string;
+	record: (e: object) => void;
+	sleep?: (ms: number) => Promise<void>;
+	transientRetries?: number;
+	backoffMs?: number[];
+	aborting?: () => boolean;
+}): Promise<string | undefined> {
+	const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+	const backoff = o.backoffMs ?? [15_000, 60_000];
+	await o.send(o.prompt);
+	let error = o.takeError();
+	// Flex capacity errors surface as an assistant error message, not an exception. The provider never
+	// falls back on its own, so the orchestrator does: same session, same prompt, standard tier, once.
+	if (error && o.toDefaultTier && isCapacityError(error)) {
+		o.record({ type: "tier_fallback", from: o.tier ?? "flex", to: "default", error });
+		await o.toDefaultTier();
+		await o.send(o.prompt);
+		error = o.takeError();
+	}
+	for (let i = 0; error && isTransientError(error) && i < (o.transientRetries ?? 2) && !o.aborting?.(); i++) {
+		const ms = backoff[Math.min(i, backoff.length - 1)]!;
+		o.record({ type: "transient_retry", attempt: i + 1, delayMs: ms, error });
+		await sleep(ms);
+		await o.send(CONTINUE_AFTER_DROP);
+		error = o.takeError();
+	}
+	return error;
+}
+
+const CONTINUE_AFTER_DROP = "Your previous response was cut off by a network error. Continue exactly where you left off; do not redo finished tool calls.";
+
 export function globToRegExp(glob: string): RegExp {
 	let out = "";
 	for (let i = 0; i < glob.length; i++) {
@@ -244,15 +286,19 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 			const handle = { abort: () => session.abort() };
 			progress.agentAbortable(agentId, handle);
 			try {
-				await session.prompt(prompt);
-				// Flex capacity errors surface as an assistant error message, not an exception. The provider never
-				// falls back on its own, so the orchestrator does: same session, same prompt, standard tier, once.
-				if (error && role.tier !== "default" && isCapacityError(error)) {
-					record({ type: "tier_fallback", from: role.tier, to: "default", error });
-					error = undefined;
-					await session.setModel(await resolveRoleModel({ ...role, tier: "default" }));
-					await session.prompt(prompt);
-				}
+				error = await promptWithRecovery({
+					prompt,
+					send: (p) => session.prompt(p),
+					takeError: () => {
+						const e = error;
+						error = undefined;
+						return e;
+					},
+					toDefaultTier: role.tier !== "default" ? async () => session.setModel(await resolveRoleModel({ ...role, tier: "default" })) : undefined,
+					tier: role.tier,
+					record,
+					aborting: () => progress.aborting,
+				});
 			} catch (e: any) {
 				error = e?.message ?? String(e);
 				record({ type: "prompt_error", error });
