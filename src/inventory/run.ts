@@ -9,6 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { buildGraph, condense, cutLargeCycles, tarjanScc } from "./scc.ts";
 import { headOf, isRepo } from "../git.ts";
 import { loadDecisions } from "./decisions.ts";
+import { isDbUnitKind, wireDbDeps } from "./db.ts";
 import { resolveCodeMap, writeCodeMap } from "./codemap.ts";
 
 export type Tier = "T0" | "T1" | "T2" | "T3";
@@ -310,7 +311,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// framework or regenerated) are no longer units; their symbols already point at the new unit
 	const produced = new Set(unitIds);
 	for (const u of ledger.listUnits({ state: "planned" })) {
-		if (produced.has(u.id)) continue;
+		if (produced.has(u.id) || isDbUnitKind(u.kind)) continue; // DB units come from the schema (planDbLane), not from files
 		ledger.db.prepare("UPDATE symbols SET unit_id = NULL WHERE unit_id = ?").run(u.id);
 		ledger.db.prepare("DELETE FROM units WHERE id = ?").run(u.id);
 	}
@@ -321,6 +322,9 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 			ledger.db.prepare("DELETE FROM units WHERE id = ?").run(u.id);
 		}
 	}
+
+	// code units' deps were rewritten above: their DB deps (tables their SQL names) are wired again
+	wireDbDeps(ledger, config);
 
 	// Drift: units already past planning whose source files changed upstream are flagged stale (not reset —
 	// a human decides whether to redo them). Removed files stay in the ledger with a note.

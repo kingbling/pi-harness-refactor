@@ -52,8 +52,8 @@ export function currentAreas(ledger: Ledger): Array<{ key: string; stack: string
 	const rows = ledger.db.prepare("SELECT state, meta FROM units").all() as Array<{ state: string; meta: string }>;
 	const by = new Map<string, { key: string; stack: string; area: string; shared: boolean; units: number; files: string[]; fixed?: string }>();
 	for (const r of rows) {
-		const m = JSON.parse(r.meta) as Meta;
-		if (!m.place?.area || m.exclude) continue;
+		const m = JSON.parse(r.meta) as Meta & { lane?: string };
+		if (!m.place?.area || m.exclude || m.lane === "db") continue; // the DB lane is no feature area
 		const key = `${m.place.stack}:${m.place.shared ? "shared/" : ""}${m.place.area}`;
 		const e = by.get(key) ?? by.set(key, { key, stack: m.place.stack, area: m.place.area, shared: m.place.shared, units: 0, files: [] }).get(key)!;
 		e.units++;

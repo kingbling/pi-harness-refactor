@@ -269,6 +269,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				   (SELECT COUNT(*) FROM json_each(u.deps) d LEFT JOIN units du ON du.id = d.value WHERE du.state IS NULL OR du.state != 'accepted') AS open
 				 FROM units u
 				 WHERE u.state = 'planned' AND COALESCE(json_extract(u.meta, '$.stale'), 0) = 0
+				   AND substr(COALESCE(u.kind, ''), 1, 3) != 'db_' -- the DB lane has no tester truth to capture ahead
 				   AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type IN ('truth_ahead', 'truth_green_on_old'))`,
 			)
 			.all() as Array<{ id: string; meta: string; open: number }>;

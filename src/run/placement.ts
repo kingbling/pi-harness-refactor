@@ -306,8 +306,9 @@ function curatedAreas(root: string): Map<string, Map<string, string>> | undefine
 function outsideCurated(ledger: Ledger, curated: Map<string, Map<string, string>>): string[] {
 	const out = new Set<string>();
 	for (const u of ledger.listUnits()) {
-		const p = (JSON.parse(u.meta) as UnitMeta).place;
-		if (p && !p.shared && !curated.get(p.stack)?.has(p.area)) out.add(`${p.stack}:${p.area}`);
+		const m = JSON.parse(u.meta) as UnitMeta & { lane?: string };
+		const p = m.place;
+		if (p && !p.shared && m.lane !== "db" && !curated.get(p.stack)?.has(p.area)) out.add(`${p.stack}:${p.area}`);
 	}
 	return [...out];
 }

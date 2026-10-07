@@ -59,8 +59,16 @@ export const ConfigSchema = z.object({
 			to: z.string().optional(),
 			/** Decision per extra store (br decide): keep | fold | drop. */
 			stores: z.record(z.string(), z.enum(["keep", "fold", "drop"])).default({}),
+			/** Schema inputs (files or dirs, relative to the old codebase): SQL dumps, migrations/, .sqlite, schema.prisma … */
+			schemaFiles: z.array(z.string()).default([]),
+			/** Connection for introspection as `env:VAR` (the URL itself, with its password, is never stored). */
 			url: z.string().optional(),
+			/** Exports of non-SQL stores (ArangoDB, MongoDB …), per engine: dump folders or files. */
+			exports: z.record(z.string(), z.string()).default({}),
+			/** Data dump the data-migration unit loads and verifies against. */
 			snapshot: z.string().optional(),
+			/** When onboarding asked for the DB inputs (asked once; `br onboard --force-db` asks again). */
+			inputsAt: z.string().optional(),
 		})
 		.prefault({ strategy: "keep-schema" }),
 	models: z.object({

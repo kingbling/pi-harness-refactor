@@ -298,6 +298,8 @@ export interface TargetLayout {
 	checkTree?(projectDir: string, only?: string[]): string[];
 	/** Add-only zones for cross-cutting helpers (reuse, never edit from a feature unit). Trailing slash. */
 	sharedDirs: string[];
+	/** Where the database lives in the project (schema, entities, migrations, data scripts): the DB lane writes only here. Trailing slash. */
+	dataDirs?: string[];
 	/** Globs (relative to the project) the tester may write ported tests to, for one module dir. */
 	testFileGlobs(moduleDir: string): string[];
 	isTestFile(path: string): boolean;
@@ -355,6 +357,8 @@ export interface TargetAdapter {
 	role: "server" | "ui";
 	/** Sub-directory of the target repo this stack lives in when several stacks share one repo (e.g. "api", "web"). */
 	subdir: string;
+	/** A project already built and tested for this stack (generated adapters): setup moves it into place instead of building again. */
+	seedProject?: string;
 	layout: TargetLayout;
 	toolchain: TargetToolchain;
 	/** Other names users and docs use for this stack (lowercase), e.g. "nest". */

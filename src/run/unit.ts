@@ -21,6 +21,7 @@ import { implementerTools, testerTools } from "../sessions/tools.ts";
 import { renderGate, runGate, sha1, type GateReport } from "./gate.ts";
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
+import { isDbUnitKind } from "../inventory/db.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
@@ -88,6 +89,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const blocked = o.ledger.blockedUnits().get(o.unitId);
 	if (blocked?.length) throw new Error(`unit ${o.unitId} waits for human question(s) #${blocked.join(", #")} (br questions)`);
 
+	// the DB lane: schema / design / data units run their own loop (no legacy symbols, the schema is the truth)
+	if (isDbUnitKind(unit.kind)) {
+		if (o.truthOnly) return { unitId: o.unitId, state: unit.state, attempts: 0, costUsd: 0 };
+		const { runDbUnit } = await import("./db-unit.ts");
+		return runDbUnit(o, placeUnit(o.config, unit.meta, o.root));
+	}
 	// never on code's unsure guess: an unplaced unit waits for Jev or its placement question (br place)
 	const unplaced = unplacedReason(o.config, unit.meta, o.root);
 	if (unplaced) throw new Error(`unit ${o.unitId} has no placement yet (code unsure: ${unplaced}); br place`);

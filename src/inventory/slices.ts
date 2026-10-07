@@ -16,7 +16,7 @@ import type { Ledger } from "../ledger/db.ts";
  */
 export interface Slice {
 	name: string;
-	kind: "foundation" | "auth" | "feature" | "dynamic";
+	kind: "foundation" | "data" | "auth" | "feature" | "dynamic";
 	rank: number;
 	entryPoints: string[];
 	units: string[];
@@ -45,9 +45,10 @@ const AUTH_RE = /login|logout|auth|session|csrf|guard|password/i;
 
 export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): SlicePlan {
 	const units = ledger.listUnits().map((u) => {
-		const meta = JSON.parse(u.meta) as { files?: string[]; loc?: number; softDeps?: string[] };
-		return { id: u.id, tier: u.tier, deps: JSON.parse(u.deps) as string[], soft: meta.softDeps ?? [], meta };
+		const meta = JSON.parse(u.meta) as { files?: string[]; loc?: number; softDeps?: string[]; lane?: string };
+		return { id: u.id, tier: u.tier, deps: JSON.parse(u.deps) as string[], soft: meta.softDeps ?? [], meta, db: meta.lane === "db" };
 	});
+	const hasData = units.some((u) => u.db);
 	const byId = new Map(units.map((u) => [u.id, u]));
 	const unitOfFile = new Map<string, string>();
 	for (const u of units) for (const f of u.meta.files ?? []) unitOfFile.set(f, u.id);
@@ -108,11 +109,13 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 		const shared = rb >= threshold || (u.tier === "T0" && (dependents.get(u.id)?.size ?? 0) >= 2) || (nFeatures === 1 && rb === 1 && u.tier === "T0");
 		if (shared) unitSlice.set(u.id, "foundation");
 	}
+	// the DB lane is its own slice, whatever reaches it (every feature reading a table would make it foundation)
+	for (const u of units) if (u.db) unitSlice.set(u.id, "data");
 	// model advice for units no entry point reaches, then explicit overrides naming foundation/any slice
 	for (const [k, v] of Object.entries(overrides.advised?.units ?? {})) if (byId.has(k) && (v === "foundation" || featureOf.has(v)) && !(reachedBy.get(k)?.size)) unitSlice.set(k, v);
 	for (const [k, v] of Object.entries(overrides.overrides ?? {})) {
 		const id = byId.has(k) ? k : unitOfFile.get(k);
-		if (id) unitSlice.set(id, v);
+		if (id && !byId.get(id)!.db) unitSlice.set(id, v);
 	}
 	// each remaining reached unit → its lowest-ranked feature (decided after ranking); first pass: owner = unique feature or deferred
 	const pending: string[] = [];
@@ -145,9 +148,12 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	}
 	if (overrides.order?.length) ranked.sort((a, b) => idx(overrides.order!, a) - idx(overrides.order!, b));
 	const order = [...authFeatures, ...ranked];
+	// foundation 0, data 1 (when there is a DB lane), auth next, then the features
 	const rankOf = new Map<string, number>([["foundation", 0]]);
-	let r = 1;
-	for (const n of order) rankOf.set(n, authFeatures.includes(n) ? 1 : ++r);
+	const shift = hasData ? 1 : 0;
+	if (hasData) rankOf.set("data", 1);
+	let r = 1 + shift;
+	for (const n of order) rankOf.set(n, authFeatures.includes(n) ? 1 + shift : ++r);
 	rankOf.set("dynamic", r + 1);
 	for (const u of pending) {
 		const owner = [...reachedBy.get(u)!].sort((a, b) => rankOf.get(a)! - rankOf.get(b)!)[0]!;
@@ -155,11 +161,11 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	}
 
 	const slices: Slice[] = [];
-	const names = ["foundation", ...order, "dynamic"];
+	const names = ["foundation", ...(hasData ? ["data"] : []), ...order, "dynamic"];
 	for (const name of names) {
 		const members = units.filter((u) => unitSlice.get(u.id) === name).map((u) => u.id);
 		if (!members.length && name !== "foundation") continue;
-		slices.push({ name, kind: name === "foundation" ? "foundation" : name === "dynamic" ? "dynamic" : authFeatures.includes(name) ? "auth" : "feature", rank: rankOf.get(name)!, entryPoints: [...(featureOf.get(name)?.entryPoints ?? [])].sort(), units: members.sort((a, b) => (depth.get(b)! - depth.get(a)!) || a.localeCompare(b)), loc: members.reduce((a, u) => a + locOf(u), 0) });
+		slices.push({ name, kind: name === "foundation" ? "foundation" : name === "data" ? "data" : name === "dynamic" ? "dynamic" : authFeatures.includes(name) ? "auth" : "feature", rank: rankOf.get(name)!, entryPoints: [...(featureOf.get(name)?.entryPoints ?? [])].sort(), units: members.sort((a, b) => (depth.get(b)! - depth.get(a)!) || a.localeCompare(b)), loc: members.reduce((a, u) => a + locOf(u), 0) });
 	}
 	const totalLoc = units.reduce((a, u) => a + locOf(u.id), 0) || 1;
 	return {

@@ -152,6 +152,7 @@ export function tsVerifyChoices(projectDir: string, chosen: Array<{ key: string;
 export function tsLayoutBase() {
 	return {
 		sharedDirs: ["src/shared/"], // one shared dir: src/shared/<area>/ for code ≥ 2 feature areas use
+		dataDirs: ["src/db/", "prisma/", "drizzle/", "migrations/"], // the DB lane: schema, entities, migrations, data scripts
 		sourceExtensions: [".ts", ".tsx"],
 		isTestFile: (p: string) => /\.(spec|test|e2e-spec)\.[cm]?[jt]sx?$/.test(p) || /\.d\.ts$/.test(p),
 		lang: (p: string) => (/\.tsx$/.test(p) ? "tsx" : /\.[cm]?ts$/.test(p) ? "typescript" : /\.[cm]?jsx?$/.test(p) ? "javascript" : undefined),
