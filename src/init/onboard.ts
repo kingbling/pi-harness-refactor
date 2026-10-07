@@ -45,6 +45,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 	const ABOUT: Record<string, string> = {
 		init: "survey the old codebase: framework, data stores, UI, tests",
+		database: "a database was detected: point to its schema files, a data dump and a connection",
 		inventory: "index every file and symbol, find dead code, cut cycles, build migration units",
 		profile: "a model reads the legacy framework source and writes its conventions (loaders, routes, concerns)",
 		frameworks: "map every legacy framework concern to the new platform (port / platform / drop)",
@@ -55,7 +56,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		"inventory (after decisions)": "re-index with the decisions applied",
 		label: "Jev rates every unit (difficulty → model, kind, needs_db, has_ui), places unreached code, gives every unit its stack + area",
 		rules: "a model writes RULES.md, AGENTS.md, idioms and lint rules from the framework mapping",
-		order: "order units into slices: foundation → auth → features",
+		order: "order units into slices: foundation → data (DB lane) → auth → features",
 		layout: "preflight: placement dry run, rules vs. adapter layout, the target tree as it is (br run refuses on problems)",
 	};
 	progress.plan(ABOUT);
@@ -92,6 +93,23 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 	const has = (...parts: string[]) => existsSync(join(root, ...parts));
 	let config!: Config;
 	const reload = () => (config = loadConfig(configPath).config);
+	/** Build and test the adapters written during the questions (questions first, slow work after); true = any proven. */
+	const verifyAdapters = async (): Promise<boolean> => {
+		const { loadManifests, verifyPendingAdapters } = await import("../adapters/target/generated.ts");
+		if (!loadManifests(root).some((m) => m.verified === false)) return false;
+		const { OpenRouterClient } = await import("../models/openrouter.ts");
+		const done = await verifyPendingAdapters(root, {
+			client: noLlm ? undefined : new OpenRouterClient(),
+			model: config.models.escalate.id,
+			log: (x) => log(pc.dim(x)),
+			ensureTools: async (missing, stack) => {
+				const { ensureTools } = await import("./toolchain-install.ts");
+				return ensureTools({ stack, tools: missing, ui, yes, log: (x) => progress.log(x), client: noLlm ? undefined : new OpenRouterClient(), model: config.models.escalate.id });
+			},
+		});
+		registerGeneratedTargets(root);
+		return done.length > 0;
+	};
 	const ledger = () => {
 		mkdirSync(join(root, ".bigrefactor"), { recursive: true });
 		return new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
@@ -102,6 +120,28 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			await init(args.filter((a) => a !== "--no-llm"), { root, prompter: ui, embedded: true });
 		});
 		reload();
+
+		// submodules never downloaded (a framework kept as one looks absent): checked on every start, before anything reads the code
+		{
+			const { ensureSubmodules, emptySubmodules } = await import("./submodules.ts");
+			const missing = emptySubmodules(config.source.path);
+			if (missing.length) {
+				const r = await ensureSubmodules(config.source.path, ui, yes);
+				log(r === "ok" ? pc.green(`✓ submodules present: ${missing.map((s) => s.path).join(", ")}`) : pc.yellow(`– continuing without submodules: ${missing.map((s) => s.path).join(", ")}`));
+			}
+		}
+
+		// only when the survey found a data store: where its schema, data and connection are
+		const { dbDetected, askDbInputs } = await import("../inventory/db.ts");
+		await step("database", () => (!dbDetected(config) ? "no database detected" : config.db.inputsAt && !args.includes("--force-db") ? `asked ${config.db.inputsAt.slice(0, 10)} (${config.db.schemaFiles.length} schema input(s))` : undefined), async () => {
+			const got = await askDbInputs(config, ui, yes);
+			const { saveConfig } = await import("../config.ts");
+			const raw = loadConfig(configPath).config;
+			raw.db = { ...raw.db, ...got, inputsAt: new Date().toISOString() };
+			saveConfig(root, raw);
+			reload();
+			return `${got.schemaFiles?.length ?? 0} schema input(s)${got.snapshot ? `, dump ${got.snapshot}` : ""}${Object.keys(got.exports ?? {}).length ? `, exports: ${Object.keys(got.exports!).join(", ")}` : ""}${got.url ? `, connection ${got.url}` : ""}`;
+		});
 		const { getSourceAdapter, getTargetAdapter } = await import("../adapters/registry.ts");
 		const source = getSourceAdapter(config.source.stack);
 		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
@@ -160,8 +200,8 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				const { knownTargets } = await import("../adapters/registry.ts");
 				// one dialog per decision; besides the options: type another answer, or leave it open for later
 				const OTHER = "\0other", LATER = "\0later";
-				const askOne = async (d: (typeof ds)[number]): Promise<string | undefined> => {
-					const v = await ui.select(`${d.question}\n   ${d.evidence}${d.reason ? `\n   why ${d.recommended}: ${d.reason}` : ""}`, [...d.options.map((o) => ({ value: o.value, label: o.value === d.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), { value: OTHER, label: "something else (type it)" }, { value: LATER, label: "decide later", hint: "stays open; br decide asks again" }], d.recommended);
+				const askOne = async (d: (typeof ds)[number], count?: string): Promise<string | undefined> => {
+					const v = await ui.select(`${count ? `(${count}) ` : ""}${d.question}\n   ${d.evidence}${d.reason ? `\n   why ${d.recommended}: ${d.reason}` : ""}`, [...d.options.map((o) => ({ value: o.value, label: o.value === d.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), { value: OTHER, label: "something else (type it)" }, { value: LATER, label: "decide later", hint: "stays open; br decide asks again" }], d.recommended);
 					if (v === undefined) throw new Error("onboarding cancelled");
 					if (v === LATER) return undefined;
 					if (v !== OTHER) return v;
@@ -188,10 +228,17 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 							client: new OpenRouterClient(),
 							model: config.models.escalate.id,
 							log: (x) => log(pc.dim(x)),
+							// questions first: only the manifest is written now; the slow trial build runs after the last question
+							deferVerify: true,
 							confirm: async (cmds) => {
 								if (yes) return (log(pc.dim(`  ${id} commands: ${cmds.join(" · ")}`)), true);
-								const v = await ui.select(`Verifying the ${id} adapter runs these commands in a scratch directory (nothing touches your repos):\n   ${cmds.join("\n   ")}`, [{ value: "run", label: "run them" }, { value: "stop", label: "don't run; pick another option" }], "run");
+								const v = await ui.select(`To check the ${id} setup, these commands run once all questions are answered (in the workspace; the project they build becomes your new ${id} project):\n   ${cmds.join("\n   ")}`, [{ value: "run", label: "OK, run them after the questions" }, { value: "stop", label: "don't run; pick another option" }], "run");
 								return v === "run";
+							},
+							// php, composer, … missing here: offer the install (owner's go), then generation continues
+							ensureTools: async (missing) => {
+								const { ensureTools } = await import("./toolchain-install.ts");
+								return ensureTools({ stack: id, tools: missing, ui, yes, log: (x) => progress.log(x), client: new OpenRouterClient(), model: config.models.escalate.id });
 							},
 						});
 					} catch (e: any) {
@@ -207,8 +254,8 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				const rank = (id: string) => (id === "target:server" ? 0 : id === "target:ui" ? 1 : id.startsWith("target:data:") ? 2 : 3);
 				const tqs = openDecisions(l, config, source, targets, root).filter((d) => d.id.startsWith("target:")).sort((a, b) => rank(a.id) - rank(b.id));
 				let decidedTargets = false;
-				for (const tq of tqs) {
-					let v = yes ? tq.recommended : await askOne(tq);
+				for (const [ti, tq] of tqs.entries()) {
+					let v = yes ? tq.recommended : await askOne(tq, `part ${ti + 1} of ${tqs.length}`);
 					const role = tq.id === "target:server" ? "server" : tq.id === "target:ui" ? "ui" : undefined;
 					while (v && role && v !== "none" && !knownTargets().includes(v)) {
 						if (await ensureAdapter(v, role, tq.options.find((o) => o.value === v)?.hint ?? tq.reason ?? "")) break;
@@ -247,11 +294,13 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 					if (accept === "accept") for (const d of withRec) applyDecision(l, config, root, d.id, d.recommended!, "human (accepted recommendations)");
 					reload();
 					ds = openDecisions(l, config, source, targets, root);
-					for (const d of ds) {
-						const v = await askOne(d);
+					for (const [di, d] of ds.entries()) {
+						const v = await askOne(d, `decision ${di + 1} of ${ds.length}`);
 						if (v) applyDecision(l, config, root, d.id, v, "human (onboard)");
 					}
 				}
+				// every question is answered: now the adapters written meanwhile are built and tested (the slow part)
+				await verifyAdapters();
 				reload();
 				const left = openDecisions(l, config, source, targets, root);
 				report.openDecisions = left.length;
@@ -267,6 +316,11 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		// Bootstrapped = every project exists AND setup's final commit landed. An interrupted setup (half a
 		// generator run, chosen packages not added) has files but no commit, so a resume redoes it idempotently.
 		await step("setup", () => (targets.every((t) => t.toolchain.isProjectReady(projectDir(config, t.id))) && targetHasCommit(config.target.path) ? "target already bootstrapped" : undefined), async () => {
+			// an adapter whose check failed or was interrupted earlier is proven first
+			if (await verifyAdapters()) {
+				registerGeneratedTargets(root);
+				targets.splice(0, targets.length, ...(await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)))));
+			}
 			await setup(config, root);
 		});
 
@@ -319,10 +373,14 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			const { planSlices, applySlicePlan } = await import("../inventory/slices.ts");
 			const l = ledger();
 			try {
+				// the DB lane (migration for keep-schema, refactor for new-schema): units from the schema, wired to code units
+				const { planDbLane } = await import("../inventory/db.ts");
+				const dbl = await planDbLane(l, config);
+				if (dbl.units.length) log(pc.dim(`  db lane (${config.db.strategy === "new-schema" ? "refactor" : "migration"}): ${dbl.units.length} unit(s) for ${dbl.tables} table(s), ${dbl.wired} code unit(s) wait on their tables`));
 				const p = join(root, ".bigrefactor", "slices.json");
 				const plan = planSlices(l, existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {});
 				applySlicePlan(l, plan);
-				return `${plan.slices.length} slices, foundation ${plan.foundationSharePct}%`;
+				return `${plan.slices.length} slices, foundation ${plan.foundationSharePct}%${dbl.units.length ? `, db lane ${dbl.units.length} unit(s)` : ""}`;
 			} finally {
 				l.close();
 			}
