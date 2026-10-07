@@ -1,5 +1,5 @@
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -48,7 +48,8 @@ export function changedFiles(path: string, fromCommit: string, toCommit = "HEAD"
 }
 
 export function ensureRepo(path: string, defaultBranch = "main"): void {
-	if (isRepo(path)) return;
+	// a target nested inside another checkout (a workspace under a repo) gets its own repo: commits must never land in the parent
+	if (isRepo(path) && realpathSync(git(path, ["rev-parse", "--show-toplevel"])) === realpathSync(path)) return;
 	git(path, ["init", "-b", defaultBranch]);
 	if (!existsSync(join(path, ".gitignore"))) {
 		execFileSync("sh", ["-c", `printf 'node_modules/\\ndist/\\n.env\\n' > .gitignore`], { cwd: path });
