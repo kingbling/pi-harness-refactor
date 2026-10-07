@@ -100,14 +100,17 @@ describe("placement", () => {
 				const s = req.state as { path?: string };
 				if (s.path?.includes("fpdf")) return { area: "campaign", ui: false };
 				if (s.path?.includes("uuid")) return { area: "other", ui: false };
-				if (s.path?.includes("money")) return { area: "shared" };
+				if (s.path?.includes("money")) return { area: "agency" };
 				return {};
 			},
 			chat: () => ({ json: { id: "placement", question: "Where does the uuid helper belong?", options: [], recommended: "", opinion: "It has no feature of its own." } }),
 		});
 		const r = await resolvePlacements({ ledger, config, root: ws, client });
-		// money matches no feature of the app: never an area named after the file by code; Jev calls it cross-cutting
-		expect(place("money")).toMatchObject({ stackId: "nestjs", area: "money", shared: true, source: "model" });
+		// money matches no feature of the app: Jev may only pick a known area, never one named after the file
+		expect(place("money")).toMatchObject({ stackId: "nestjs", area: "agency", shared: false, source: "model" });
+		const offered = JSON.stringify(client.calls.filter((c: any) => JSON.stringify(c).includes("money.controller")));
+		expect(offered).not.toMatch(/feature \\"money\\"/);
+		expect(offered).toMatch(/feature \\"agency\\"/); // the known areas are what it chooses from
 		// the agency entity is used by campaign too, but agency is a feature module: it stays there
 		expect(place("agency_model")).toMatchObject({ area: "agency", shared: false });
 		expect(place("fpdf")).toMatchObject({ stackId: "nestjs", area: "campaign", source: "model" });
