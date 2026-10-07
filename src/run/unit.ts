@@ -344,7 +344,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// merged tidy sources go once every target exists (a missed move breaks the build, the gate says so)
 		for (const f of tidyLeftovers(targetProjectDir, tidy, tidyMoved)) rmSync(join(targetProjectDir, f));
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
-		gate = await gateSlot(() => gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: tidyPaths, legacyWords: sourceAdapter.legacyWords }));
+		gate = await gateSlot(() => gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: tidyPaths, legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) }));
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
 		if (gate.ok) break;
@@ -526,4 +526,10 @@ function findTests(targetProjectDir: string, rel: string, layout: TargetAdapter[
 	};
 	visit(dir);
 	return out.sort();
+}
+
+/** The old code's file kinds a new name must not carry, minus the new stack's own file types (php in a PHP → Symfony migration). */
+export function legacyWordsFor(words: string[] | undefined, target: TargetAdapter): string[] | undefined {
+	const own = new Set(target.layout.sourceExtensions.map((e) => e.replace(/^\./, "").toLowerCase()));
+	return words?.filter((w) => !own.has(w));
 }

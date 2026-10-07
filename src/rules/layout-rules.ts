@@ -434,7 +434,8 @@ export function scaffoldDirs(dir: string, srcRoot: string): string[] {
 
 function legacyWord(f: string, words?: string[]): string | undefined {
 	if (!words?.length) return undefined;
-	const parts = f.split(/[^A-Za-z0-9]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])/)).map((p) => p.toLowerCase());
+	// the file's own extension is the target language (a PHP → Symfony migration writes .php files), never a legacy kind
+	const parts = f.replace(/\.[A-Za-z0-9]+$/, "").split(/[^A-Za-z0-9]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])/)).map((p) => p.toLowerCase());
 	return words.find((w) => parts.includes(w));
 }
 

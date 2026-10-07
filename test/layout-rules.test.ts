@@ -149,3 +149,18 @@ describe("review fixes: what an agent can no longer slip through, and what keeps
 		expect(checkLayoutTree(project({ "src/Campaign_Old/x.ts": "x\n" }), rules, opts)).toContainEqual(expect.stringMatching(/^src\/Campaign_Old\/: folder "Campaign_Old" does not follow src\/\{area\}/));
 	});
 });
+
+describe("PHP → PHP (Symfony): the new stack's own file type is no legacy file kind", () => {
+	it("src/Sim/CsvExport.php passes the legacy-name check; x.facade.php and Foo.cmd.php still fail", async () => {
+		const { legacyWordsFor } = await import("../src/run/unit.ts");
+		const symfony = { layout: { sourceExtensions: [".php"] } } as never;
+		const words = legacyWordsFor(["tpl", "cmd", "cls", "facade", "inc", "php", "phtml"], symfony)!;
+		expect(words).not.toContain("php");
+		const sym = normalize({ moduleDir: "src/{Area}", files: [{ path: "{Name}.php", doc: "" }], require: [] });
+		const run = (f: string, w: string[]) => checkLayoutRules([f], "src/Sim", "sim", "/nonexistent", sym, { sharedDirs: [], isTestFile: () => false }, { legacyWords: w });
+		expect(run("src/Sim/CsvExport.php", words)).toEqual([]);
+		expect(run("src/Sim/CsvExport.php", ["php"])).toEqual([]); // even with php in the list: the extension itself is never judged
+		expect(run("src/Sim/AgencyFacade.php", words)).toEqual([expect.stringMatching(/"facade" is a legacy file kind/)]);
+		expect(run("src/Sim/Create.cmd.php", words)).toEqual([expect.stringMatching(/"cmd" is a legacy file kind/)]);
+	});
+});
