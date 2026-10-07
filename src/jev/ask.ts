@@ -267,6 +267,8 @@ export interface AskRequest {
 	options: AskOption[];
 	/** Code's or an agent's pick; the model may disagree and says so in its opinion. */
 	recommended?: string;
+	/** `recommended` is only a guess (a first option, a decision model below its confidence): the phrasing model's pick may overrule it without asking. */
+	guess?: boolean;
 	/** An agent's opinion to carry along (e.g. the tester's on a quirk). */
 	agentOpinion?: string;
 	blocks?: QuestionBlocks;
@@ -293,7 +295,7 @@ const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
 export function ownPick(config: Config, q: AskRequest, phrased: PhrasedQuestion): string | undefined {
 	const v = phrased.modelPick;
 	if (config.run.ask === "all" || phrased.by === "code") return undefined; // no second opinion: ask
-	if (!v || (q.recommended && q.recommended !== v)) return undefined; // the model disagrees with the code/agent: ask
+	if (!v || (q.recommended && !q.guess && q.recommended !== v)) return undefined; // the model disagrees with the code/agent: ask
 	return DECIDES_ITSELF[q.point]?.(v) ? v : undefined;
 }
 
@@ -311,7 +313,7 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 		point: q.point,
 		question: phrased.question + (phrased.opinion ? `\nOpinion: ${phrased.opinion}` : ""),
 		options: phrased.options.map((o) => `${o.value} — ${o.label}${o.value === phrased.recommended ? " (recommended)" : ""}`),
-		context: { ...q.context, facts: q.facts, recommended: phrased.recommended, opinion: phrased.opinion, phrasedBy: phrased.by },
+		context: { ...q.context, facts: q.facts, recommended: phrased.recommended, codePick: q.recommended, modelPick: phrased.modelPick, opinion: phrased.opinion, phrasedBy: phrased.by },
 		blocks: q.blocks ?? "unit",
 		askedBy: q.askedBy,
 		decisionId: q.decisionId,

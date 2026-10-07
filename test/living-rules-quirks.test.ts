@@ -217,6 +217,10 @@ describe("the run decides routine questions itself", () => {
 		expect((await ask(undefined, "quirk", "keep")).decided).toBeUndefined(); // no second opinion
 		expect((await ask(phrase("keep"), "systemic_failure", "keep")).decided).toBeUndefined(); // not routine
 		expect((await ask(phrase("keep"), "quirk", "keep")).decided).toBe("keep");
+		// a guessed pick (first option, Jev below its confidence) does not hold the model back
+		const guessed = await askViaModel({ ledger, config, root, client: phrase("keep") }, { point: "placement", unitId: "U1", facts: "f", options: [{ value: "drop" }, { value: "keep" }], recommended: "drop", guess: true, askedBy: "t" });
+		expect(guessed.decided).toBe("keep");
+		expect(JSON.parse(ledger.getQuestion(guessed.id)!.context!)).toMatchObject({ codePick: "drop", modelPick: "keep" });
 		config.run.ask = "all";
 		expect((await ask(phrase("keep"), "quirk", "keep")).decided).toBeUndefined();
 		expect(ledger.openQuestions()).toHaveLength(4);

@@ -415,7 +415,7 @@ async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Re
 		`areas of files in the same folder: ${JSON.stringify(Object.fromEntries(neighbours))}; it uses: ${JSON.stringify(Object.fromEntries(uses))}; used by: ${JSON.stringify(Object.fromEntries(usedBy))}`,
 		`options are the curated business areas (<stack>:<area>) and the shared topics in use (<stack>:shared/<topic>); a typed area name is taken as a new area on ${stackId}`,
 	].join("\n");
-	const q = await askViaModel({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { point: POINT, unitId: u.id, facts, options: options.slice(0, 10), recommended, blocks: "unit", askedBy: "placement", context: { files, defaultStack: stackId }, decisionId: pick?.decision });
+	const q = await askViaModel({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { point: POINT, unitId: u.id, facts, options: options.slice(0, 10), recommended, guess: true, blocks: "unit", askedBy: "placement", context: { files, defaultStack: stackId }, decisionId: pick?.decision });
 	d.ledger.updateUnit(u.id, { meta: { placeQuestion: q.id } });
 	return q.costUsd;
 }
