@@ -20,6 +20,7 @@ import { lanes, parseLanesArgs } from "../run/lanes.ts";
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { QuestionCard, type CardQuestion } from "./question-card.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
@@ -29,7 +30,7 @@ import type { InitPrompter, PromptOption } from "../init/init.ts";
 import { Ledger } from "../ledger/db.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { groupQuestions, optionFor } from "../jev/ask.ts";
-import { progress, short, StoppedError, type AgentState, type ProgressSnapshot } from "../progress.ts";
+import { fmtUsage, progress, short, StoppedError, type AgentState, type ProgressSnapshot, type StepState } from "../progress.ts";
 import pc from "picocolors";
 
 /** Strip ANSI codes: init reuses the CLI's picocolors output, the transcript wants plain text. */
@@ -64,25 +65,52 @@ const SUBCOMMANDS: Record<string, string> = {
 interface BrEntry {
 	title: string;
 	text: string;
+	/** Text carries its own ANSI colors (live job progress): rendered as is, not re-themed. */
+	colored?: boolean;
 }
 
 /**
  * The init interview on Pi dialogs. Collected log lines end up in one transcript entry so the
  * result is persisted with the session.
  */
-function piPrompter(ctx: ExtensionContext, lines: string[]): InitPrompter {
+/** A question card (options with descriptions, recommendation preselected, or a prefilled text field); undefined = cancelled. */
+function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<string | undefined> {
+	return ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) => {
+		const card = new QuestionCard(q, done);
+		const handle = card.handleInput.bind(card);
+		card.handleInput = (data: string) => {
+			handle(data);
+			tui.requestRender();
+		};
+		return card;
+	});
+}
+
+function piPrompter(ctx: ExtensionContext, lines: string[], hooks: { asking?: () => void; answered?: () => void } = {}): InitPrompter {
 	const byLabel = (options: PromptOption[], label: string | undefined) => options.find((o) => (o.hint ? `${o.label} — ${o.hint}` : o.label) === label)?.value;
 	const labels = (options: PromptOption[]) => options.map((o) => (o.hint ? `${o.label} — ${o.hint}` : o.label));
 	return {
 		text: async (message, initial) => {
-			const v = await ctx.ui.input(message, initial);
+			hooks.asking?.();
+			// the card shows the recommended value prefilled (Pi's own input shows neither placeholder nor initial value)
+			const v = ctx.hasUI ? await askCard(ctx, { message, text: { initial } }) : await ctx.ui.input(message, initial);
+			hooks.answered?.();
 			if (v === undefined) return undefined;
 			return v.trim() || initial;
 		},
 		select: async (message, options, initial) => {
+			hooks.asking?.();
+			if (ctx.hasUI) {
+				// one card: question, context lines, every option with its hint, the recommendation marked and preselected
+				const v = await askCard(ctx, { message, recommended: initial, options: options.map((o) => ({ value: o.value, label: o.label.replace(/\s*\(recommended\)\s*$/, ""), description: o.hint })) });
+				hooks.answered?.();
+				return v;
+			}
 			// Put the suggested value first: Pi's select has no initialValue.
 			const ordered = initial ? [...options.filter((o) => o.value === initial), ...options.filter((o) => o.value !== initial)] : options;
-			return byLabel(ordered, await ctx.ui.select(message, labels(ordered)));
+			const v = await ctx.ui.select(message, labels(ordered));
+			hooks.answered?.();
+			return byLabel(ordered, v);
 		},
 		log: (line) => lines.push(plain(line)),
 	};
@@ -152,11 +180,16 @@ function warn(ctx: ExtensionContext, message: string): void {
 const WIDGET_MAX_LINES = 10;
 const ELAPSED = (ms: number) => (ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.floor(ms / 60_000)}m${String(Math.round((ms % 60_000) / 1000)).padStart(2, "0")}s`);
 
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/** Spinner frame for running things: advances every SPIN_MS, the same frame everywhere in one paint. */
+const SPIN_MS = 150;
+export const spinner = (now = Date.now()) => SPINNER[Math.floor(now / SPIN_MS) % SPINNER.length]!;
+
 /** "U004_interfaces_… tester luna · 23 calls · $0.004 · 1m02s · bash ls …" */
 function agentLine(a: AgentState, now: number, width: number): string {
 	const model = (a.model ?? "").split("/").pop() ?? "";
-	const head = `${pc.magenta("●")} ${short(a.label, 26)} ${pc.bold(a.role)} ${pc.dim(model)}`;
-	const stats = ` · ${a.toolCalls} calls${a.blocked ? pc.yellow(` · ${a.blocked} blocked`) : ""} · $${a.costUsd.toFixed(3)} · ${ELAPSED(now - a.since)}`;
+	const head = `${pc.magenta(spinner(now))} ${short(a.label, 26)} ${pc.bold(a.role)} ${pc.dim(model)}`;
+	const stats = ` · ${a.toolCalls} calls${a.blocked ? pc.yellow(` · ${a.blocked} blocked`) : ""} · ${fmtUsage(a, 3)} · ${ELAPSED(now - a.since)}`;
 	const last = a.lastTool ? pc.dim(` · ${a.lastTool}`) : "";
 	const line = head + stats + last;
 	return plain(line).length > width ? line.slice(0, line.length - (plain(line).length - width)) : line;
@@ -166,13 +199,13 @@ function agentLine(a: AgentState, now: number, width: number): string {
 export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durable): string[] {
 	const now = Date.now();
 	const L: string[] = [];
-	const state = s.stopping ? pc.yellow("stopping…") : s.running ? pc.cyan("running") : s.error ? pc.red("stopped") : pc.green("finished");
-	L.push(`${pc.bold("bigrefactor")} ${s.job ?? ""} · ${state} · ${ELAPSED(now - (s.startedAt ?? now))} · $${s.costUsd.toFixed(3)}${s.running ? pc.dim("   /br stop · /br progress · chat works meanwhile") : ""}`);
+	const state = s.stopping ? pc.yellow(`${spinner(now)} stopping…`) : s.running ? pc.cyan(`${spinner(now)} running`) : s.error ? pc.red("stopped") : pc.green("finished");
+	L.push(`${pc.bold("bigrefactor")} ${s.job ?? ""} · ${state} · ${ELAPSED(now - (s.startedAt ?? now))} · ${fmtUsage(s, 3)}${s.running ? pc.dim("   /br stop · /br progress · chat works meanwhile") : ""}`);
 	const names = [...s.plan, ...s.steps.map((x) => x.name).filter((n) => !s.plan.includes(n))];
 	const icon = (n: string) => {
 		const st = [...s.steps].reverse().find((x) => x.name === n);
 		if (!st) return pc.dim(`○ ${n}`);
-		if (st.status === "running") return pc.cyan(pc.bold(`▶ ${n}`));
+		if (st.status === "running") return pc.cyan(pc.bold(`${spinner(now)} ${n}`));
 		if (st.status === "done") return pc.green(`✓ ${n}`);
 		if (st.status === "skipped") return pc.dim(`– ${n}`);
 		return pc.red(`✗ ${n}`);
@@ -186,7 +219,7 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 		const acc = totals ? totals.accepted : n("done");
 		const qua = totals ? totals.quarantined : n("failed");
 		const wai = totals ? totals.waiting : n("skipped");
-		L.push(`${pc.green(`✓ ${acc} accepted`)}${run("done")}  ${qua ? pc.red(`■ ${qua} quarantined`) : pc.dim("■ 0 quarantined")}${run("failed")}${wai ? `  ${pc.yellow(`⏸ ${wai} waiting on ${totals?.questions ? `${totals.questions} question${totals.questions > 1 ? "s" : ""} for you: ${pc.bold("/br answer")}` : "a question"}`)}` : ""}  ${pc.cyan(`▶ ${runningNow.length} running`)}${runningNow.length ? pc.dim(`: ${runningNow.map((x) => `${x.name} ${ELAPSED(now - x.startedAt)}`).join(", ")}`) : ""}`.slice(0, width + 60));
+		L.push(`${pc.green(`✓ ${acc} accepted`)}${run("done")}  ${qua ? pc.red(`■ ${qua} quarantined`) : pc.dim("■ 0 quarantined")}${run("failed")}${wai ? `  ${pc.yellow(`⏸ ${wai} waiting on ${totals?.questions ? `${totals.questions} question${totals.questions > 1 ? "s" : ""} for you: ${pc.bold("/br answer")}` : "a question"}`)}` : ""}  ${pc.cyan(`${runningNow.length ? spinner(now) : "▶"} ${runningNow.length} running`)}${runningNow.length ? pc.dim(`: ${runningNow.map((x) => `${x.name} ${ELAPSED(now - x.startedAt)}`).join(", ")}`) : ""}`.slice(0, width + 60));
 		if (s.lanes) {
 			const free = s.lanes.max - s.lanes.running;
 			L.push(`${pc.bold(`lanes ${s.lanes.running}/${s.lanes.max}`)}${s.lanes.ahead ? pc.cyan(` · ${s.lanes.running - s.lanes.ahead} migrating, ${s.lanes.ahead} capturing truth ahead`) : ""}${s.lanes.reason ? pc.yellow(` · ${s.lanes.reason}`) : free === 0 ? pc.dim(" · all busy: a new unit starts as soon as one finishes") : pc.dim(` · ${s.lanes.ready} more ready`)}`.slice(0, width + 40));
@@ -219,7 +252,7 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 	}
 	if (row) L.push(row);
 	const cur = [...s.steps].reverse().find((x) => x.status === "running");
-	if (cur) L.push(`${pc.bold(cur.name)} ${pc.dim(`(${ELAPSED(now - cur.startedAt)})`)}: ${s.about[cur.name] ?? ""}`.slice(0, width + 20));
+	if (cur) L.push(`${pc.cyan(spinner(now))} ${pc.bold(cur.name)} ${pc.dim(`(${ELAPSED(now - cur.startedAt)})`)}: ${s.about[cur.name] ?? ""}`.slice(0, width + 20));
 	const failed = [...s.steps].reverse().find((x) => x.status === "failed");
 	if (!s.running && failed) {
 		const byUser = /stopped by the user/.test(failed.note ?? "");
@@ -231,6 +264,22 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 	const room = Math.max(1, WIDGET_MAX_LINES - L.length);
 	for (const a of s.activity.slice(-room)) L.push(pc.dim(a.slice(0, width)));
 	return L;
+}
+
+/** One chat line per step transition: "▶ advise — models judge …", "✓ advise 2m35s  13 libraries …". */
+export function stepEntry(st: StepState, s: Pick<ProgressSnapshot, "about">): string {
+	const took = st.endedAt ? pc.dim(` ${ELAPSED(st.endedAt - st.startedAt)}`) : "";
+	const note = st.note ? pc.dim(`  ${st.note}`) : "";
+	switch (st.status) {
+		case "running":
+			return `${pc.cyan(pc.bold(`▶ ${st.name}`))}${s.about[st.name] ? pc.dim(` — ${s.about[st.name]}`) : ""}`;
+		case "done":
+			return `${pc.green(`✓ ${st.name}`)}${took}${note}`;
+		case "skipped":
+			return `${pc.yellow(`– ${st.name}`)}${note}`;
+		default:
+			return `${pc.red(`✗ ${st.name}`)}${took}${st.note ? pc.red(`  ${st.note}`) : ""}`;
+	}
 }
 
 interface JobOutcome {
@@ -253,6 +302,7 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 	let pending: NodeJS.Timeout | undefined;
 	let footerAt = 0;
 	let seenQuestions = 0; // toast once for questions already open at start, then for every new one
+	let lastWidget = "";
 	const paint = () => {
 		pending = undefined;
 		// the footer (durable totals, spend, forecast) follows the run too, at most every 10 s
@@ -267,10 +317,32 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 		const totals = durableFor(ctx.cwd);
 		if (totals && totals.questions > seenQuestions && ctx.hasUI) ctx.ui.notify(`bigrefactor: ${totals.questions} question${totals.questions > 1 ? "s" : ""} for you, units wait on them: /br answer`, "warning");
 		if (totals) seenQuestions = totals.questions;
-		if (ctx.hasUI) ctx.ui.setWidget("br-progress", renderProgress(progress.snapshot(), width(), totals), { placement: "aboveEditor" } as any);
+		if (!ctx.hasUI) return;
+		// the spinner ticks every SPIN_MS: repaint only when the panel actually changed (frame, timers, content)
+		const lines = renderProgress(progress.snapshot(), width(), totals);
+		const key = lines.join("\n");
+		if (key === lastWidget) return;
+		lastWidget = key;
+		ctx.ui.setWidget("br-progress", lines, { placement: "aboveEditor" } as any);
 	};
-	const unsub = progress.subscribe(() => (pending ??= setTimeout(paint, 150)));
-	const tick = setInterval(paint, 1000); // elapsed timers move even when nothing is reported
+	// step transitions go into the chat as they happen (one entry each; activity lines stay in the panel)
+	const posted = new Map<number, string>();
+	const postSteps = (s: ProgressSnapshot) => {
+		if (!ctx.hasUI) return;
+		s.steps.forEach((st, i) => {
+			if (posted.get(i) === st.status) return;
+			posted.set(i, st.status);
+			// a migration run has one step per unit: only outcomes, not every start
+			if (!s.plan.length && st.status === "running") return;
+			pi.appendEntry<BrEntry>("br", { title: s.job ?? "job", text: stepEntry(st, s), colored: true });
+		});
+	};
+	const unsub = progress.subscribe((s) => {
+		postSteps(s);
+		pending ??= setTimeout(paint, 150);
+	});
+	// fast while something runs (spinner), slow otherwise; elapsed timers move even when nothing is reported
+	const tick = setInterval(() => (progress.running ? paint() : undefined), SPIN_MS);
 	const orig = { log: console.log, error: console.error, warn: console.warn };
 	const capture = (...a: unknown[]) => progress.log(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" "));
 	console.log = capture;
@@ -286,13 +358,14 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 		} finally {
 			Object.assign(console, orig);
 			clearInterval(tick);
-			unsub();
 			progress.end(out.error);
+			postSteps(progress.snapshot());
+			unsub();
 			paint();
 		}
 		const snap = progress.snapshot();
 		const summary = [
-			out.error ? `${job} stopped: ${out.error}` : `${job} finished in ${ELAPSED(Date.now() - (snap.startedAt ?? Date.now()))}, $${snap.costUsd.toFixed(3)}`,
+			out.error ? `${job} stopped: ${out.error}` : `${job} finished in ${ELAPSED(Date.now() - (snap.startedAt ?? Date.now()))}, ${fmtUsage(snap, 3)}`,
 			...snap.steps.map((x) => `${{ done: "✓", skipped: "–", failed: "✗", running: "▶" }[x.status]} ${x.name}${x.note ? `  ${x.note}` : ""}`),
 			...(out.lines?.length ? ["", ...out.lines.map(plain)] : []),
 		].join("\n");
@@ -309,7 +382,20 @@ function startOnboarding(pi: ExtensionAPI, ctx: ExtensionContext, sub: string, f
 	startJob(pi, ctx, sub === "resume" ? "onboarding (resume)" : "onboarding", async () => {
 		const lines: string[] = [];
 		const { onboard } = await import("../init/onboard.ts");
-		const r = await onboard({ root: ctx.cwd, args: ctx.hasUI ? flags : [...flags, "--yes"], prompter: piPrompter(ctx, lines), log: (l) => progress.log(l) });
+		// after the owner answered (and no next dialog follows within a moment), the chat says what runs now
+		let resumeNote: NodeJS.Timeout | undefined;
+		const hooks = {
+			asking: () => clearTimeout(resumeNote),
+			answered: () => {
+				clearTimeout(resumeNote);
+				resumeNote = setTimeout(() => {
+					const s = progress.snapshot();
+					const cur = [...s.steps].reverse().find((x) => x.status === "running");
+					if (s.running && cur && ctx.hasUI) pi.appendEntry<BrEntry>("br", { title: s.job ?? "onboarding", text: `${pc.cyan("↳ answers received, working:")} ${pc.bold(cur.name)}${s.about[cur.name] ? pc.dim(` — ${s.about[cur.name]}`) : ""}`, colored: true });
+				}, 1500);
+			},
+		};
+		const r = await onboard({ root: ctx.cwd, args: ctx.hasUI ? flags : [...flags, "--yes"], prompter: piPrompter(ctx, lines, hooks), log: (l) => progress.log(l) }).finally(() => clearTimeout(resumeNote));
 		if (!r.ok) return { error: r.steps.find((x) => x.status === "failed")?.note ?? "a step failed", lines: [...lines, "", "resume with /br resume (finished steps are skipped)"] };
 		// Onboarding ends where migrating begins: offer the pilot right here instead of a terminal command.
 		return {
@@ -448,7 +534,7 @@ export default function (pi: ExtensionAPI) {
 		if (!d) return undefined;
 		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(theme.fg("accent", `[br ${d.title}]`), 0, 0));
-		box.addChild(new Text(theme.fg("customMessageText", d.text), 0, 0));
+		box.addChild(new Text(d.colored ? d.text : theme.fg("customMessageText", d.text), 0, 0));
 		return box;
 	});
 
@@ -602,14 +688,25 @@ export default function (pi: ExtensionAPI) {
 						const members = differ ? `\n\n${qs.length} questions, one answer for all:\n${qs.slice(0, 12).map((x) => `· ${x.unit_id ?? x.point}: ${x.question.split("\n")[0]!.slice(0, 140)}`).join("\n")}${qs.length > 12 ? `\n· … ${qs.length - 12} more` : ""}` : "";
 						const head = `${label}${qs.length > 1 && !differ ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}${members}`;
 						const options = q.options ? (JSON.parse(q.options) as string[]) : [];
-						const pick = await ctx.ui.select(head, [...options, ...(differ ? [SPLIT] : []), TYPE, SKIP, QUIT]);
+						const recommended = q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined;
+						const pick = await askCard(ctx, {
+							message: head,
+							recommended,
+							options: [
+								...options.map((o) => ({ value: o, label: o })),
+								...(differ ? [{ value: SPLIT, label: SPLIT, description: "the texts differ: decide each one on its own" }] : []),
+								{ value: TYPE, label: "Type an answer", description: "your own answer, in your words" },
+								{ value: SKIP, label: SKIP, description: "stays open; only the code waiting on it waits" },
+								{ value: QUIT, label: QUIT },
+							],
+						});
 						if (pick === undefined || pick === QUIT) return "quit";
 						if (pick === SKIP) return;
 						if (pick === SPLIT) {
 							for (const [j, x] of qs.entries()) if ((await ask([x], `${label}.${j + 1}`)) === "quit") return "quit";
 							return;
 						}
-						const answer = pick === TYPE ? (await ctx.ui.input(q.question))?.trim() : pick;
+						const answer = pick === TYPE ? (await askCard(ctx, { message: q.question, text: { initial: "" } }))?.trim() : pick;
 						if (!answer) return;
 						for (const x of qs) ledger.answerQuestion(x.id, pick === TYPE ? answer : optionFor(x, answer), "human (pi)");
 						done.push(`#${qs.map((x) => x.id).join(", #")} = ${answer}`);

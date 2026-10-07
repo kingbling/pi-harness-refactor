@@ -95,7 +95,17 @@ describe("/br answer applies every question type", () => {
 				},
 				input: async () => "",
 				confirm: async () => true,
-				custom: async (factory: any) => factory({ requestRender() {} }, () => {}),
+				// the question card: answered like the select above, through the card's own options
+				custom: (factory: any) =>
+					new Promise((resolve) => {
+						const card = factory({ requestRender() {} }, {}, {}, resolve);
+						const { message, options } = card.q as { message: string; options?: Array<{ value: string }> };
+						if (!options) return resolve("");
+						titles.push(message);
+						const values = options.map((o) => o.value);
+						if (values.includes(SPLIT) && message.includes("QUIRK-A")) return resolve(SPLIT);
+						resolve(values.find((o) => answerValue(o) === want(message.split("\n").slice(1).join("\n"))) ?? "Stop answering");
+					}),
 			},
 			sessionManager: { getBranch: () => [] },
 		};
