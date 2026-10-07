@@ -402,3 +402,37 @@ function isDir(p: string): boolean {
 		return false;
 	}
 }
+
+/**
+ * Many open questions as one short summary for the owner (grouped by what they decide, with the recommended
+ * answers), plus the ids the model thinks the owner should look at one by one. Without a model: counts by point.
+ */
+export async function summarizeQuestions(d: { config: Config; client?: ModelClient }, rows: QuestionRow[]): Promise<{ summary: string[]; lookAt: number[]; costUsd: number }> {
+	const rec = (q: QuestionRow) => (q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined);
+	const byCode = () => {
+		const m = new Map<string, number>();
+		for (const q of rows) m.set(`${q.point}${rec(q) ? ` → ${rec(q)}` : " (no recommendation)"}`, (m.get(`${q.point}${rec(q) ? ` → ${rec(q)}` : " (no recommendation)"}`) ?? 0) + 1);
+		return [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n}× ${k}`);
+	};
+	if (!d.client) return { summary: byCode(), lookAt: rows.filter((q) => !rec(q)).map((q) => q.id), costUsd: 0 };
+	const role = d.config.models.implement;
+	try {
+		const res = await d.client.chat({
+			model: role.id,
+			tier: role.tier as "default" | "flex" | "priority",
+			effort: "low",
+			schema: { type: "object", additionalProperties: false, required: ["summary", "lookAt"], properties: { summary: { type: "array", items: { type: "string" }, description: "at most 8 short lines: what the questions decide, grouped, with the recommended answers and counts" }, lookAt: { type: "array", items: { type: "integer" }, description: "ids of questions the owner should decide one by one: no recommendation, or real consequences (drops work, changes behaviour, needs something only a human can do)" } } },
+			messages: [
+				{ role: "system", content: `You summarize open questions of an automated migration for the app's owner, so they can accept the recommended answers in one go. Group what belongs together; name counts and the recommended answers. Mark only what really needs the owner.\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
+				{ role: "user", content: JSON.stringify(rows.map((q) => ({ id: q.id, point: q.point, unit: q.unit_id, question: q.question.slice(0, 400), recommended: rec(q) ?? null }))) },
+			],
+		});
+		const j = (res.json ?? {}) as { summary?: string[]; lookAt?: number[] };
+		const ids = new Set(rows.map((q) => q.id));
+		// no recommendation = always one by one, whatever the model says
+		const lookAt = [...new Set([...(j.lookAt ?? []).filter((id) => ids.has(id)), ...rows.filter((q) => !rec(q)).map((q) => q.id)])];
+		return { summary: j.summary?.length ? j.summary.slice(0, 8) : byCode(), lookAt, costUsd: res.usage.costUsd };
+	} catch {
+		return { summary: byCode(), lookAt: rows.filter((q) => !rec(q)).map((q) => q.id), costUsd: 0 };
+	}
+}

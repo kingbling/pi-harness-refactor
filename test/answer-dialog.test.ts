@@ -117,8 +117,9 @@ describe("/br answer applies every question type", () => {
 		await commands.get("br")!.handler("answer", ctx);
 
 		expect(entries.join("\n")).toMatch(/no open questions left/);
-		// 5 groups, the U1 quirk group split into 2 → 7 dialogs; U2's quirks shared one
-		expect(titles).toHaveLength(7);
+		// first the summary card (7 open questions; going one by one), then 5 groups, the U1 quirk group split into 2 → 1 + 7 dialogs; U2's quirks shared one
+		expect(titles[0]).toMatch(/^7 open questions/);
+		expect(titles).toHaveLength(8);
 		expect(titles.find((t) => t.includes("QUIRK-C"))).toMatch(/2 questions, one answer for all/);
 
 		const l2 = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
@@ -134,6 +135,49 @@ describe("/br answer applies every question type", () => {
 			expect(tidyTasks(l2, "nestjs", "flights").map((t) => t.status)).toEqual(["approved"]);
 			expect(syncTaxonomyAnswers(d2)).toBe(1);
 			expect(taxonomyHold(l2.getUnit("A4")!.meta)).toMatch(/excluded/);
+		} finally {
+			l2.close();
+		}
+	});
+});
+
+describe("/br answer: many questions summed up in one card", () => {
+	it("taking the recommended answers answers every question that has one; the rest come one by one", async () => {
+		const root = mkdtempSync(join(tmpdir(), "br-sum-"));
+		mkdirSync(join(root, "legacy"), { recursive: true });
+		writeFileSync(join(root, "bigrefactor.config.json"), JSON.stringify({ version: 1, source: { path: join(root, "legacy"), stack: "php" }, target: { path: join(root, "new"), stacks: ["nestjs"] }, models: {} }));
+		mkdirSync(join(root, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
+		const q = (rec: string | undefined, n: number) => ledger.askQuestion({ point: "placement", question: `Where does file ${n} go?`, options: ["nestjs:shared/http — Shared HTTP", "nestjs:campaigns — Campaigns"], context: { recommended: rec }, blocks: "none", askedBy: "t" });
+		const ids = [q("nestjs:shared/http", 1), q("nestjs:shared/http", 2), q("nestjs:campaigns", 3), q(undefined, 4)];
+		ledger.close();
+		const titles: string[] = [];
+		const ctx = {
+			cwd: root,
+			hasUI: true,
+			ui: {
+				notify: () => {},
+				setStatus: () => {},
+				custom: (factory: any) =>
+					new Promise((resolve) => {
+						const card = factory({ requestRender() {} }, {}, {}, resolve);
+						const { message, options } = card.q as { message: string; options: Array<{ value: string }> };
+						titles.push(message);
+						resolve(options.some((o) => o.value === "accept") ? "accept" : "Stop answering");
+					}),
+			},
+			sessionManager: { getBranch: () => [] },
+		};
+		const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+		const pi = { appendEntry: () => {}, registerCommand: (n: string, def: any) => commands.set(n, def), registerTool: () => {}, registerEntryRenderer: () => {}, registerMessageRenderer: () => {}, on: () => {}, sendMessage: () => {} };
+		((await import("../src/pi/extension.ts")).default as (p: any) => void)(pi as any);
+		await commands.get("br")!.handler("answer", ctx);
+		expect(titles[0]).toMatch(/^4 open questions · 1 need you\n.*2× placement → nestjs:shared\/http/s);
+		expect(titles[1]).toMatch(/Where does file 4 go/); // no recommendation: the owner decides it
+		const l2 = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
+		try {
+			expect(ids.slice(0, 3).map((id) => l2.getQuestion(id)!.answer)).toEqual(["nestjs:shared/http — Shared HTTP", "nestjs:shared/http — Shared HTTP", "nestjs:campaigns — Campaigns"]);
+			expect(l2.getQuestion(ids[3]!)!.status).toBe("open");
 		} finally {
 			l2.close();
 		}

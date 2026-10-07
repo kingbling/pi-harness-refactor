@@ -721,9 +721,35 @@ export default function (pi: ExtensionAPI) {
 				// Interactive: one dialog per decision; questions that ask the same decision (groupQuestions) share one answer,
 				// each stored as that question's own option. A group with differing texts lists its members and can be split.
 				if (sub === "answer" && ctx.hasUI && !rest.length) {
-					const groups = groupQuestions(ledger.openQuestions());
-					if (!groups.length) return show(ctx, sub, "no open questions");
 					const done: string[] = [];
+					// many questions: a model sums them up; the recommended answers can be taken in one go
+					const all = ledger.openQuestions();
+					if (all.length >= 3) {
+						const { config } = loadConfig(findConfigPath(ctx.cwd)!);
+						const { summarizeQuestions } = await import("../jev/ask.ts");
+						const { OpenRouterClient } = await import("../models/openrouter.ts");
+						const s = await summarizeQuestions({ config, client: process.env["BR_NO_LLM"] ? undefined : new OpenRouterClient() }, all);
+						const easy = all.filter((q) => !s.lookAt.includes(q.id));
+						const ACCEPT = "accept", EACH = "each";
+						const v = await askCard(ctx, {
+							message: `${all.length} open questions${s.lookAt.length ? ` · ${s.lookAt.length} need you` : ""}\n${s.summary.join("\n")}`,
+							recommended: easy.length ? ACCEPT : EACH,
+							options: [
+								...(easy.length ? [{ value: ACCEPT, label: `Take the recommended answer for ${easy.length}`, description: s.lookAt.length ? `then go through the ${s.lookAt.length} that need you` : "nothing left to answer after that" }] : []),
+								{ value: EACH, label: "Go through them one by one" },
+							],
+						});
+						if (v === undefined) return show(ctx, sub, "nothing answered");
+						if (v === ACCEPT) {
+							for (const q of easy) {
+								const r = (JSON.parse(q.context ?? "{}") as { recommended?: string }).recommended;
+								if (r) ledger.answerQuestion(q.id, optionFor(q, r), "human (pi, accepted the summary)");
+							}
+							done.push(`${easy.length} recommended answers taken: ${s.summary.slice(0, 3).join("; ")}`);
+						}
+					}
+					const groups = groupQuestions(ledger.openQuestions());
+					if (!groups.length) return show(ctx, sub, done.length ? `answered:\n${done.join("\n")}\nno open questions left` : "no open questions");
 					const TYPE = "Type an answer…", SKIP = "Skip for now", QUIT = "Stop answering", SPLIT = "Answer these one by one";
 					const ask = async (qs: QuestionRow[], label: string): Promise<"quit" | void> => {
 						const q = qs[0]!;
