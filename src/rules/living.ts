@@ -61,7 +61,13 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 	if (!d.client) return result;
 	for (const stack of d.config.target.stacks) {
 		const open = d.ledger.db.prepare("SELECT * FROM rule_proposals WHERE stack = ? AND status IN ('pending','approved') ORDER BY id").all(stack) as unknown as RuleProposal[];
-		if (!open.length || (!opts.force && open.length < (opts.threshold ?? 5))) continue;
+		// only proposals the curator has not seen count toward the threshold: ones it left out stay open for the next
+		// curation but must not trigger a new one on every accept
+		const seenKey = `rules_seen:${stack}`;
+		const seen = Number(d.ledger.getMeta(seenKey) ?? "0");
+		const fresh = open.filter((p) => p.id > seen || p.status === "approved").length;
+		if (!fresh || (!opts.force && fresh < (opts.threshold ?? 5))) continue;
+		d.ledger.setMeta(seenKey, String(Math.max(seen, ...open.map((p) => p.id))));
 		const path = join(rulesDir(d.root, stack), "RULES.md");
 		const current = existsSync(path) ? stripLayout(readFileSync(path, "utf8")).trim() : "";
 		const role = d.config.models.escalate;

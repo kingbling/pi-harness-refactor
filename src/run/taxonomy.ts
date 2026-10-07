@@ -36,7 +36,7 @@ interface Deps {
 	client?: ModelClient;
 }
 
-type Meta = { files?: string[]; place?: { stack: string; area: string; shared: boolean; source: string }; exclude?: { question: number; why: string } };
+type Meta = { files?: string[]; place?: { stack: string; area: string; shared: boolean; source: string }; exclude?: { question: number; why: string }; taxonomyQuestion?: number; taxonomyKeep?: number };
 
 const ACT = 0.8;
 
@@ -44,15 +44,22 @@ export function areasPath(root: string): string {
 	return join(root, ".bigrefactor", "areas.json");
 }
 
-export function currentAreas(ledger: Ledger): Array<{ key: string; stack: string; area: string; shared: boolean; units: number; files: string[] }> {
-	const rows = ledger.db.prepare("SELECT meta FROM units").all() as Array<{ meta: string }>;
-	const by = new Map<string, { key: string; stack: string; area: string; shared: boolean; units: number; files: string[] }>();
+/**
+ * Areas as placed now. `fixed` = not to be re-curated: some unit already started or landed there (relabelling would
+ * split migrated code from the ledger), the owner answered keep, or an area question about it is still open.
+ */
+export function currentAreas(ledger: Ledger): Array<{ key: string; stack: string; area: string; shared: boolean; units: number; files: string[]; fixed?: string }> {
+	const rows = ledger.db.prepare("SELECT state, meta FROM units").all() as Array<{ state: string; meta: string }>;
+	const by = new Map<string, { key: string; stack: string; area: string; shared: boolean; units: number; files: string[]; fixed?: string }>();
 	for (const r of rows) {
 		const m = JSON.parse(r.meta) as Meta;
 		if (!m.place?.area || m.exclude) continue;
 		const key = `${m.place.stack}:${m.place.shared ? "shared/" : ""}${m.place.area}`;
 		const e = by.get(key) ?? by.set(key, { key, stack: m.place.stack, area: m.place.area, shared: m.place.shared, units: 0, files: [] }).get(key)!;
 		e.units++;
+		if (r.state !== "planned") e.fixed ??= "has migrated or running units";
+		else if (m.taxonomyKeep) e.fixed ??= `owner kept it (question #${m.taxonomyKeep})`;
+		else if (m.taxonomyQuestion && ledger.getQuestion(m.taxonomyQuestion)?.status === "open") e.fixed ??= `question #${m.taxonomyQuestion} open`;
 		if (e.files.length < 4) e.files.push(...(m.files ?? []).slice(0, 4 - e.files.length));
 	}
 	return [...by.values()].sort((a, b) => b.units - a.units);
@@ -67,7 +74,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 	// idempotent: when every feature area is already in the curated set (and no area question is pending), nothing to do
 	const prev = existsSync(areasPath(d.root)) ? (JSON.parse(readFileSync(areasPath(d.root), "utf8")) as { stacks?: Array<{ stack: string; areas: Array<{ name: string }> }> }) : undefined;
 	const curated = new Set((prev?.stacks ?? []).flatMap((s) => s.areas.map((a) => `${s.stack}:${kebab(a.name)}`)));
-	if (prev && areas.every((a) => a.shared || curated.has(`${a.stack}:${a.area}`))) return { ...none, areas: Object.fromEntries((prev.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])) };
+	if (prev && areas.every((a) => a.shared || a.fixed || curated.has(`${a.stack}:${a.area}`))) return { ...none, areas: Object.fromEntries((prev.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])) };
 	const brief = await repoBrief(d);
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -109,7 +116,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 - "exclude" only for things that are not application behaviour to migrate (static-analysis stubs, entry/bootstrap scripts the new framework replaces); these are confirmed by the owner.
 - Return a mapping for EVERY current area (also ones that stay as they are). confidence = how sure you are (0–1).`,
 			},
-			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nCurrent areas (key, units, sample files):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}`).join("\n")}` },
+			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nCurrent areas (key, units, sample files; FIXED areas stay as they are — map others into them where they fit):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n")}` },
 		],
 	});
 	let cost = brief.costUsd + res.usage.costUsd;
@@ -127,7 +134,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 	for (const m of mappings) {
 		const cur = areas.find((a) => a.key === m.from)!;
 		const unchanged = m.to !== "exclude" && m.stack === cur.stack && m.area === cur.area && (m.to === "shared") === cur.shared;
-		if (unchanged) continue;
+		if (unchanged || cur.fixed) continue;
 		const units = unitsOf(d.ledger, m.from);
 		// a stack change against a surface the source adapter knows is the rare exception: always asked
 		const surfaceKnown = units.some((u) => ((JSON.parse(u.meta) as Meta).files ?? []).some((f) => !!source.placeFile?.(f, d.config.source.path)?.surface));
@@ -176,7 +183,11 @@ export function syncTaxonomyAnswers(d: Pick<Deps, "ledger" | "root">): number {
 		if (!q || (q.status !== "answered" && q.status !== "auto")) continue;
 		const m = (JSON.parse(q.context ?? "{}") as { mapping?: AreaMapping }).mapping;
 		const v = answerValue(q.answer);
-		if (m && v === "apply") {
+		const started = d.ledger.getUnit(r.id)!.state !== "planned";
+		if (m && started) {
+			// the unit started while the question was open: its placement is what landed, the answer is moot for it
+			d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined } });
+		} else if (m && v === "apply") {
 			d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined, place: { stack: m.stack, area: m.area, shared: m.to === "shared", source: "taxonomy" } } });
 			for (const f of meta.files ?? []) rules.push({ prefix: f, area: m.area, stack: m.stack, ...(m.to === "shared" ? { shared: true } : {}) });
 		} else if (m && v === "exclude") {
@@ -188,7 +199,7 @@ export function syncTaxonomyAnswers(d: Pick<Deps, "ledger" | "root">): number {
 			}
 			d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined, exclude: { question: q.id, why: m.why } } });
 		}
-		else d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined } });
+		else d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined, taxonomyKeep: q.id } }); // keep is remembered: never re-asked
 		n++;
 	}
 	addPlacementRules(d.root, rules);
@@ -214,7 +225,8 @@ function unitsOf(ledger: Ledger, key: string): Array<{ id: string; meta: string 
 	const [stack, rest] = [key.slice(0, key.indexOf(":")), key.slice(key.indexOf(":") + 1)];
 	const shared = rest.startsWith("shared/");
 	const area = shared ? rest.slice(7) : rest;
-	return ledger.db.prepare("SELECT id, meta FROM units WHERE json_extract(meta,'$.place.stack') = ? AND json_extract(meta,'$.place.area') = ? AND COALESCE(json_extract(meta,'$.place.shared'), 0) = ?").all(stack, area, shared ? 1 : 0) as Array<{ id: string; meta: string }>;
+	// only units that have not started move: migrated code is never relabelled behind the ledger's back
+	return ledger.db.prepare("SELECT id, meta FROM units WHERE state = 'planned' AND json_extract(meta,'$.place.stack') = ? AND json_extract(meta,'$.place.area') = ? AND COALESCE(json_extract(meta,'$.place.shared'), 0) = ?").all(stack, area, shared ? 1 : 0) as Array<{ id: string; meta: string }>;
 }
 
 function addPlacementRules(root: string, add: Array<{ prefix: string; area: string; stack?: string; shared?: boolean }>): void {

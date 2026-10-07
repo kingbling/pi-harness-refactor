@@ -189,27 +189,11 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		await run({ units: flag(args, "--units")?.split(","), slice: flag(args, "--slice"), limit: limit ? Number(limit) : undefined, dry: args.includes("--dry"), force: args.includes("--force") });
 	},
 	requeue: async (args) => {
-		// Put quarantined units back into the queue (after a sweep/fix). Worktree and branch are dropped; truth is kept.
+		// Put quarantined or waiting units back into the queue (after a fix). Worktree and branch are dropped; truth is kept.
 		if (!args.length) throw new Error("usage: br requeue <unit-id...> | --all");
-		const { removeWorktree } = await import("./git.ts");
-		const { worktreeDir } = await import("./run/run.ts");
+		const { requeueUnits } = await import("./run/run.ts");
 		const { config, root, ledger } = open();
-		const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
-		const ids = args.includes("--all") ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : args.filter((a) => !a.startsWith("--"));
-		for (const id of ids) {
-			const u = ledger.getUnit(id);
-			if (!u) throw new Error(`unknown unit ${id}`);
-			if (!stuck(u.state)) throw new Error(`${id} is ${u.state}; only quarantined or parked (truth/implementing/gating/review) units can be requeued`);
-			for (const a of ledger.db.prepare("SELECT id FROM attempts WHERE unit_id = ? AND ended_at IS NULL").all(id) as Array<{ id: number }>) ledger.endAttempt(a.id, { outcome: "aborted:requeue" });
-			removeWorktree(config.target.path, worktreeDir(root, id));
-			try {
-				execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", `unit/${id}`], { stdio: "pipe" });
-			} catch {
-				/* no branch */
-			}
-			ledger.transitionUnit(id, "planned", `requeued by ${process.env["USER"] ?? "human"}`);
-			console.log(pc.green(`requeued ${id}`));
-		}
+		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human")) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
 	},
 	onboard: async (args) => {
 		const { onboard } = await import("./init/onboard.ts");

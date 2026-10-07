@@ -146,7 +146,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		});
 		let res;
 		try {
-			res = await tester.run(renderTaskCard(card, o.config) + (extra ? `\n\n## Re-port requested\n${extra}` : ""));
+			// the orchestrator's note (owner hint, earlier diagnosis) reaches the first tester too, not only the implementer
+			const note = o.retryNote && !extra ? `\n\n## Note from the orchestrator\n${o.retryNote}` : "";
+			res = await tester.run(renderTaskCard(card, o.config) + (extra ? `\n\n## Re-port requested\n${extra}` : "") + note);
 		} finally {
 			tester.dispose();
 		}
@@ -185,7 +187,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time. Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
 				options: [
 					{ value: "fixed", facts: "the legacy environment (dependencies, module loading, DB) is fixed now: the tester runs again" },
-					{ value: "goldens", facts: "the code cannot run here: capture golden outputs another way, then rerun" },
+					{ value: "quarantine", facts: "the code cannot run here: leave the unit for a human (type a hint instead to steer the tester)" },
 				],
 				context: { error: lastErr?.slice(-1500) },
 			});

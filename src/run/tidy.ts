@@ -58,6 +58,9 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const cards = d.ledger.db.prepare("SELECT path, name, summary FROM capabilities WHERE stack = ? AND path LIKE ?").all(o.stackId, `${areaDir}/%`) as Array<{ path: string; name: string; summary: string }>;
 	const drift = (d.ledger.getMeta(`drift:${o.stackId}`) ?? "").split("\n").filter((l) => l.startsWith(`${areaDir}/`)).slice(0, 40).join("\n");
 	const open = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "asked" || t.status === "approved");
+	const rejected = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "rejected");
+	const sig = (op: string, from: string[], to: string[]) => `${op}|${[...from].sort().join(",")}|${[...to].sort().join(",")}`;
+	const seen = new Set([...open, ...rejected].map((t) => sig(t.op, t.from, t.to)));
 
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -83,7 +86,7 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 		},
 		messages: [
 			{ role: "system", content: `You review one feature module of a codebase under migration for tidiness: a new developer must find things by name, every file has one clear job, names are professional and consistent, nothing reads like a legacy artifact. Propose only changes worth their cost (at most 6), all paths relative to the project and inside ${areaDir}/ or the shared dirs (${adapter.layout.sharedDirs.join(", ")}); never break the binding layout below. Conventions = patterns the whole stack should follow from now on.\n\nBinding layout:\n${adapter.layout.structureDoc}` },
-			{ role: "user", content: `${loadBrief(d.root) ? `Repo brief:\n${loadBrief(d.root).slice(0, 2500)}\n\n` : ""}Area "${o.area}" (${o.stackId}):\n${tree}\n\nExports:\n${exports.map((e) => `${e.path}: ${e.kind} ${e.name}`).join("\n")}\n\nWhat the code does:\n${cards.map((c) => `${c.path} ${c.name}: ${c.summary}`).join("\n") || "(no cards)"}\n${drift ? `\nCode checks flagged:\n${drift}\n` : ""}${open.length ? `\nAlready pending (do not repeat):\n${open.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}` },
+			{ role: "user", content: `${loadBrief(d.root) ? `Repo brief:\n${loadBrief(d.root).slice(0, 2500)}\n\n` : ""}Area "${o.area}" (${o.stackId}):\n${tree}\n\nExports:\n${exports.map((e) => `${e.path}: ${e.kind} ${e.name}`).join("\n")}\n\nWhat the code does:\n${cards.map((c) => `${c.path} ${c.name}: ${c.summary}`).join("\n") || "(no cards)"}\n${drift ? `\nCode checks flagged:\n${drift}\n` : ""}${open.length ? `\nAlready pending (do not repeat):\n${open.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}${rejected.length ? `\nRejected by the owner (never propose these again, nor variants of them):\n${rejected.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}` },
 		],
 	});
 	let cost = res.usage.costUsd;
@@ -97,7 +100,7 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const tasks = loadTasks(d.ledger);
 	let asked = 0;
 	for (const c of j.changes ?? []) {
-		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed)) continue;
+		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed) || seen.has(sig(c.op, c.from, c.to))) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
 			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, the next unit of this area performs it (the build gate catches broken imports); nothing waits for this answer.`,

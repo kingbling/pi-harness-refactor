@@ -299,6 +299,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]`));
 			let res: UnitRunResult | undefined;
 			let conflictNote: string | undefined;
+			let crash: string | undefined;
 			try {
 				// Playbook: run → (merge conflict → fresh worktree on current main, one more implement pass with the conflict as the gate output) ×2 → accept or quarantine.
 				for (let round = 1; round <= 3; round++) {
@@ -365,7 +366,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
 				}
 			} catch (e: any) {
-				log(pc.red(`✗ ${unitId}: ${e?.message ?? e}`));
+				// a crash is not a gate failure: end the open attempts, count it, and stop after the second one so a
+				// resubmit cannot loop; the circuit breaker sees it as an error signature like any other
+				const msg = String(e?.message ?? e);
+				log(pc.red(`✗ ${unitId}: ${msg}`));
+				for (const a of ledger.db.prepare("SELECT id FROM attempts WHERE unit_id = ? AND ended_at IS NULL").all(unitId) as Array<{ id: number }>) ledger.endAttempt(a.id, { outcome: "exception", gateReport: { error: msg.slice(0, 2000) } });
+				const crashes = ((JSON.parse(ledger.getUnit(unitId)!.meta) as { crashes?: number }).crashes ?? 0) + 1;
+				ledger.updateUnit(unitId, { meta: { crashes } });
+				const st = ledger.getUnit(unitId)!.state;
+				if (crashes >= 2 && st !== "accepted" && st !== "quarantined") ledger.transitionUnit(unitId, "quarantined", `crashed ${crashes} times: ${msg.slice(0, 300)}`);
+				crash = msg;
 			} finally {
 				const st = ledger.getUnit(unitId)!.state;
 				if (st === "accepted" || st === "quarantined") {
@@ -377,7 +387,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					}
 				}
 				ran.push({ unitId, state: st, attempts: res?.attempts ?? 0, gate: res?.gate, triage: res?.triage, costUsd: res?.costUsd ?? 0 });
-				await circuit(unitId, st, res);
+				await circuit(unitId, st, res, crash);
 			}
 		});
 		running.set(unitId, p.finally(() => running.delete(unitId)));
@@ -389,10 +399,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let circuitOpen = false;
 	const askSystemic = async (facts: string, decisionId?: number): Promise<number> =>
 		(await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "systemic_failure", facts, options: [{ value: "fixed", facts: "the shared cause is fixed: br requeue the failed units and br run again" }, { value: "investigate", facts: "keep the run stopped until someone has looked at it" }], recommended: "investigate", blocks: "none", askedBy: "orchestrator", decisionId })).id;
-	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined) => {
-		const bad = res?.gate?.steps.find((x) => !x.ok);
+	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined, crash?: string) => {
+		const bad = crash ? { name: "exception", output: crash } : res?.gate?.steps.find((x) => !x.ok);
 		const gate = bad ? `${bad.name}: ${String(bad.output ?? "").slice(0, 600)}` : undefined;
-		recent.push({ unit: unitId, ok: st === "accepted" || st === "review", cause: res?.triage?.cause, gate, sig: bad ? errorSignature(bad.name, String(bad.output ?? "")) : undefined });
+		recent.push({ unit: unitId, ok: !crash && (st === "accepted" || st === "review"), cause: crash ? "exception" : res?.triage?.cause, gate, sig: bad ? errorSignature(bad.name, String(bad.output ?? "")) : undefined });
 		if (recent.length > 6) recent.shift();
 		const failed = recent.filter((r) => !r.ok);
 		// certain case first: the same error in 3 units is one cause, whatever a model says
@@ -696,14 +706,88 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
 		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest / stack config)", "orchestrator");
 	}
-	const parked = (ledger.db.prepare("SELECT id, state FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.unit_id = units.id AND q.status = 'open')").all() as Array<{ id: string; state: string }>).filter((u) => !running.has(u.id));
-	for (const u of parked) {
-		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_remove(meta, '$.parked') WHERE id = ?").run(u.id);
-		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'resubmitted: cause resolved (question answered or environment changed)', datetime('now'))").run(u.id, u.state);
+	// waiting units whose blocking questions are all answered (non-blocking ones never hold a unit) get their answer applied
+	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.unit_id = units.id AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));
+	const parked: typeof candidates = [];
+	for (const u of candidates) {
+		const meta = JSON.parse(u.meta) as { parked?: { question?: number; diagnosis?: { summary?: string; note?: string } }; hold?: number; applied?: number };
+		const q = ledger.db.prepare("SELECT id, point, answer, options FROM questions WHERE unit_id = ? AND status IN ('answered','auto') AND id > ? ORDER BY id DESC LIMIT 1").get(u.id, meta.applied ?? 0) as { id: number; point: string; answer: string; options: string | null } | undefined;
+		if (meta.hold && (!q || q.id <= meta.hold)) continue; // the owner said wait: only a newer answer or br requeue moves it
+		const a = applyParkedAnswer(q?.answer, q?.options ? (JSON.parse(q.options) as string[]) : []);
+		if (a.action === "hold") {
+			ledger.updateUnit(u.id, { meta: { hold: q!.id, applied: q!.id } });
+			continue;
+		}
+		if (a.action === "quarantine") {
+			ledger.updateUnit(u.id, { meta: { applied: q!.id } });
+			ledger.transitionUnit(u.id, "quarantined", `owner answered "${q!.answer}" on question #${q!.id}`);
+			removeWorktree(config.target.path, worktreeDir(root, u.id));
+			log(pc.red(`■ ${u.id}: quarantined by the answer to #${q!.id}`));
+			continue;
+		}
+		// what the run learned before parking (diagnosis) and the owner's hint go to the next attempt
+		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `The owner's hint: ${a.hint}`].filter(Boolean).join(" ");
+		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
+		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, datetime('now'))").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`);
 		removeWorktree(config.target.path, worktreeDir(root, u.id));
+		parked.push(u);
 	}
 	if (parked.length) log(pc.cyan(`↻ resubmitted ${parked.length} unit(s) whose blocker is resolved: ${parked.map((u) => u.id).slice(0, 5).join(", ")}${parked.length > 5 ? ", …" : ""}`));
 	return parked.map((u) => u.id);
+}
+
+/**
+ * Put quarantined or waiting units back into the queue: open attempts end, worktree and branch go, truth stays.
+ * Crash counts and "wait" holds are cleared; an owner's requeue is a fresh start. Returns what happened per id.
+ */
+export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string): string[] {
+	const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
+	const list = ids === "all" ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : ids;
+	const out: string[] = [];
+	for (const id of list) {
+		const u = ledger.getUnit(id);
+		if (!u) {
+			out.push(`${id}: unknown unit`);
+			continue;
+		}
+		if (!stuck(u.state)) {
+			out.push(`${id}: ${u.state}; only quarantined or waiting units can be requeued`);
+			continue;
+		}
+		for (const a of ledger.db.prepare("SELECT id FROM attempts WHERE unit_id = ? AND ended_at IS NULL").all(id) as Array<{ id: number }>) ledger.endAttempt(a.id, { outcome: "aborted:requeue" });
+		removeWorktree(config.target.path, worktreeDir(root, id));
+		try {
+			execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", `unit/${id}`], { stdio: "pipe" });
+		} catch {
+			/* no branch */
+		}
+		ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.crashes', '$.hold', '$.parked') WHERE id = ?").run(id);
+		ledger.transitionUnit(id, "planned", `requeued by ${by}`);
+		out.push(`${id}: requeued`);
+	}
+	return out;
+}
+
+/** The lesson a resubmitted unit carries into its next run (diagnosis + owner hint), read once. */
+function takeRetryNote(ledger: Ledger, unitId: string): string | undefined {
+	const meta = JSON.parse(ledger.getUnit(unitId)!.meta) as { retryNote?: string };
+	if (!meta.retryNote) return undefined;
+	ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.retryNote') WHERE id = ?").run(unitId);
+	return meta.retryNote;
+}
+
+/**
+ * What an answer tells a waiting unit to do. Stop words quarantine it, "wait" holds it until a newer answer or
+ * `br requeue`; an answer that is none of the question's options is a free-text hint for the next attempt.
+ */
+export function applyParkedAnswer(answer: string | undefined, options: string[]): { action: "requeue" | "quarantine" | "hold"; hint?: string } {
+	const a = (answer ?? "").trim();
+	if (!a || /^auto:/.test(a)) return { action: "requeue" };
+	const value = a.split(/\s+[—-]\s+/)[0]!.toLowerCase();
+	if (["quarantine", "leave", "investigate"].includes(value)) return { action: "quarantine" };
+	if (value === "wait") return { action: "hold" };
+	const isOption = options.some((o) => o.toLowerCase() === a.toLowerCase() || o.toLowerCase().startsWith(`${value} `) || o.toLowerCase() === value);
+	return { action: "requeue", hint: isOption ? undefined : a };
 }
 
 export interface RunRecord {

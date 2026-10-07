@@ -45,6 +45,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	why: "why <id|path>: full history of a symbol or file",
 	unaccounted: "symbols not yet in a terminal state",
 	questions: "open questions waiting for you (list)",
+	requeue: "requeue <unit...> | --all: put quarantined or waiting units back into the queue (after a fix)",
 	answer: "answer: walk through the open questions one dialog at a time (identical ones together) · answer <id> <text>",
 	init: "init: give the old and the new folder; gathers data, asks the decisions, builds the workspace",
 	start: "start: same as init",
@@ -625,6 +626,13 @@ export default function (pi: ExtensionAPI) {
 					else {
 						ledger.answerQuestion(Number(id), answer.join(" "), "human (pi)");
 						text = `answered #${id}`;
+					}
+				} else if (sub === "requeue") {
+					if (!rest.length) text = "usage: /br requeue <unit-id...> | --all";
+					else {
+						const { requeueUnits } = await import("../run/run.ts");
+						const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
+						text = requeueUnits(ledger, config, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")), "human (pi)").join("\n");
 					}
 				} else if (sub === "unaccounted") {
 					const rows = ledger.unaccounted();

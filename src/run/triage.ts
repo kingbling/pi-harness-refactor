@@ -74,7 +74,14 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		previous_stage: previous?.failedStep ?? null,
 		diff_stats: { changed_files: gate.changedFiles.length, files: gate.changedFiles.slice(0, 20) },
 	};
-	const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
+	let dec;
+	try {
+		dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
+	} catch (e) {
+		// the decision model is unavailable: the playbook still runs, by code (retry → escalate → quarantine)
+		const action: TriageAction = attemptNo >= maxTotal ? "quarantine" : attemptNo >= maxImpl ? "escalate" : "retry";
+		return deterministic(d, unitId, "other", action, `decision model unavailable (${String((e as Error)?.message ?? e).slice(0, 120)}); playbook by attempt count`);
+	}
 	const cause = choiceOf(dec.answers["cause"]) ?? "other";
 	const retryHelps = noulOf(dec.answers["retry_likely_to_help"]);
 	const same = previous ? noulOf(dec.answers["same_as_previous"]) : 0;
@@ -110,23 +117,23 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		action = "retry";
 		reason = retryHelps >= 0.5 ? "retry with the exact gate output" : "retry (escalation needs positive evidence)";
 	}
+	// Very low confidence on anything but a cheap retry: hand over instead of guessing. Otherwise code acts and
+	// nobody is asked: the outcome of the next attempt is the label, not an owner's guess at a cause code.
+	if (b === "escalate" && action !== "retry" && action !== "quarantine") {
+		action = "ask_human";
+		reason = `${reason} (decision model unsure: ${dec.confidence.toFixed(2)})`;
+	}
 
-	// Low confidence: code still acts (retries are cheap) but asks for a label so Jev gets calibrated;
-	// nothing waits on that label. Below the check band on a non-retry action we hand over instead.
 	let questionId: number | undefined;
-	if (action === "ask_human" && !questionId) {
-		questionId = (await askViaModel(d, { unitId, point: "triage_gate", facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}: ${reason}.${cause === "other" ? "" : ` The decision model's cause: ${cause}.`}\nGate output tail:\n${state.gate_report.slice(-1500)}\nAfter a fix: br requeue ${unitId}.`, options: causeOptions(), recommended: cause === "other" ? undefined : cause, context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files }, blocks: "unit", askedBy: "orchestrator", decisionId: dec.decisionId })).id;
-	} else if (b !== "act") {
-		const blocks = b === "escalate" && action !== "retry" ? "unit" : "none";
-		if (blocks === "unit") action = "ask_human";
+	if (action === "ask_human") {
 		questionId = (await askViaModel(d, {
 			unitId,
 			point: "triage_gate",
-			facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}. The decision model says cause=${cause} with low confidence (${dec.confidence.toFixed(2)}); planned action: ${action}. The answer calibrates it.\nGate output tail:\n${state.gate_report.slice(-1200)}`,
-			options: causeOptions(),
-			recommended: cause,
-			context: { gate_tail: state.gate_report.slice(-1200), files: state.diff_stats.files },
-			blocks,
+			facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}: ${reason}.${cause === "other" ? "" : ` Likely cause: ${cause}.`} Only this unit waits; the answer is applied when it arrives. Any other text you type is handed to the next attempt as a hint.\nGate output tail:\n${state.gate_report.slice(-1500)}`,
+			options: HUMAN_ACTIONS,
+			recommended: cause === "env" || !state.tool_produced_output ? "fixed" : "retry",
+			context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files, cause },
+			blocks: "unit",
 			askedBy: "orchestrator",
 			decisionId: dec.decisionId,
 		})).id;
@@ -135,9 +142,12 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	return { action, cause, confidence: dec.confidence, band: b, decisionId: dec.decisionId, questionId, reason };
 }
 
-function causeOptions(): Array<{ value: string; facts?: string }> {
-	return Object.entries(TRIAGE_GATE["cause"]!.criteria ?? {}).map(([value, facts]) => ({ value, facts: facts ?? undefined }));
-}
+/** What an owner can tell a parked unit to do; the scheduler applies the answer (applyParkedAnswer in run.ts). */
+export const HUMAN_ACTIONS: Array<{ value: string; facts: string }> = [
+	{ value: "fixed", facts: "the environment or setup is fixed: run the unit again" },
+	{ value: "retry", facts: "run the unit again as it is (type a hint instead to steer it)" },
+	{ value: "quarantine", facts: "stop: leave the unit for a human to port" },
+];
 
 function deterministic(d: TriageDeps, unitId: string, cause: string, action: TriageAction, reason: string): Triage {
 	const id = d.ledger.recordDecision({ unitId, point: "triage_gate", model: "code", stateHash: "deterministic", answers: { cause }, confidence: 1, action });
