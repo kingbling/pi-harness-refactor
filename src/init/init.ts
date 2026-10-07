@@ -1,6 +1,7 @@
 import { runCommand } from "../proc.ts";
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { CONFIG_FILE, ConfigSchema, saveConfig, type Config } from "../config.ts";
@@ -103,13 +104,22 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 	if (!yes) {
 		if (terminal) p.intro(pc.bgCyan(pc.black(" bigrefactor init ")));
 		let problem = sourcePath && !isDir(resolve(root, sourcePath)) ? `${sourcePath} is not a directory` : undefined;
+		if (!sourcePath) {
+			// pick from folders used before and nearby folders an adapter recognises, or type one
+			const found = await sourceCandidates(root);
+			if (found.length) {
+				const pick = await ui.select("Old codebase folder (read-only, never written)", [...found, { value: TYPE_PATH, label: "type a path…" }], found[0]!.value);
+				if (pick === undefined) throw cancelled();
+				if (pick !== TYPE_PATH) sourcePath = pick;
+			}
+		}
 		while (!sourcePath || problem) {
-			sourcePath = await ui.text(problem ? `Old codebase folder (${problem})` : "Old codebase folder (read-only, never written)", sourcePath ?? "./legacy");
+			sourcePath = await ui.text(problem ? `Old codebase folder (${problem})` : "Old codebase folder (read-only, never written)", sourcePath ?? "../legacy");
 			if (sourcePath === undefined) throw cancelled();
 			problem = isDir(resolve(root, sourcePath)) ? undefined : `${sourcePath} is not a directory`;
 		}
 		surveyed = await runSurvey(sourcePath!);
-		targetPath ??= await ui.text("New codebase folder", surveyed.rec.targetPath);
+		targetPath ??= await ui.text("New codebase folder", defaultTargetPath(sourcePath!));
 		if (targetPath === undefined) throw cancelled();
 	}
 	if (!stack) {
@@ -133,7 +143,7 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 	// ---- provisional stack: survey recommendation + adapter defaults; flags count as decided
 	if (sourcePath && isDir(resolve(root, sourcePath))) {
 		surveyed ??= await runSurvey(sourcePath);
-		targetPath ??= surveyed.rec.targetPath;
+		targetPath ??= defaultTargetPath(sourcePath);
 	}
 	const flagged = { targets: !!to?.length, db: !!db };
 	to ??= surveyed?.rec.targets.length ? surveyed.rec.targets : undefined;
@@ -170,6 +180,7 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 		models: {},
 	});
 	const path = saveConfig(root, config);
+	rememberSource(absSource);
 	ui.log(`wrote ${path}${commit ? pc.dim(`  (source pinned at ${commit.slice(0, 7)})`) : pc.yellow("  (source is not a git repo: no commit pin)")}`);
 	if (!opts.embedded) ui.log(renderStackPlan(targets, choices, libraryPlan(sourceAdapter, absSource, loadDecisions(root).libraries).libraries));
 
@@ -283,4 +294,62 @@ export async function checkToolchain(config: Config, adapter: TargetAdapter): Pr
 	} finally {
 		rmSync(probePath, { force: true });
 	}
+}
+
+const TYPE_PATH = "\u0000type";
+
+/** The new code goes next to the old folder: `<old>-new`. */
+export function defaultTargetPath(sourcePath: string): string {
+	const clean = sourcePath.replace(/\/+$/, "") || ".";
+	return join(dirname(clean), `${basename(resolve(clean))}-new`);
+}
+
+/** Source folders of earlier setups on this machine (newest first), kept outside any workspace. */
+const RECENT = () => join(process.env["BR_HOME"] ?? join(homedir(), ".bigrefactor"), "recent-sources.json");
+
+export function recentSources(): string[] {
+	try {
+		return (JSON.parse(readFileSync(RECENT(), "utf8")) as string[]).filter((d) => isDir(d));
+	} catch {
+		return [];
+	}
+}
+
+function rememberSource(abs: string): void {
+	try {
+		mkdirSync(dirname(RECENT()), { recursive: true });
+		writeFileSync(RECENT(), JSON.stringify([abs, ...recentSources().filter((d) => d !== abs)].slice(0, 10), null, 1));
+	} catch {
+		/* a convenience only */
+	}
+}
+
+/**
+ * Old-folder choices: folders used before, then folders in the workspace and next to it that a source adapter
+ * recognises (best match first). A workspace sits outside both repos, so the old code is usually a sibling.
+ */
+export async function sourceCandidates(root: string): Promise<PromptOption[]> {
+	const rel = (d: string) => (relative(root, d).startsWith("..") ? relative(root, d) : `./${relative(root, d)}`);
+	const out: PromptOption[] = recentSources().filter((d) => d !== root).map((d) => ({ value: rel(d), label: rel(d), hint: "used before" }));
+	const seen = new Set(out.map((o) => resolve(root, o.value)));
+	const dirs: string[] = [];
+	for (const base of [root, dirname(root)])
+		try {
+			for (const e of readdirSync(base, { withFileTypes: true }))
+				if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules" && !e.name.endsWith("-new")) dirs.push(join(base, e.name));
+		} catch {
+			/* unreadable folder */
+		}
+	const scored: Array<{ dir: string; id: string; c: number }> = [];
+	for (const dir of dirs.slice(0, 80)) {
+		if (dir === root || seen.has(dir)) continue;
+		let best = { id: "", c: 0 };
+		for (const id of knownSources()) {
+			const c = (await getSourceAdapter(id).detect(dir).catch(() => ({ confidence: 0 }))).confidence;
+			if (c > best.c) best = { id, c };
+		}
+		if (best.c > 0) scored.push({ dir, ...best });
+	}
+	for (const s of scored.sort((a, b) => b.c - a.c).slice(0, 8)) out.push({ value: rel(s.dir), label: rel(s.dir), hint: `${s.id} (${Math.round(s.c * 100)}%)` });
+	return out;
 }

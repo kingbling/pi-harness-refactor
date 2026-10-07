@@ -46,7 +46,7 @@ describe("init survey: facts from the repo, provisional values only", () => {
 		const cfg = JSON.parse(readFileSync(join(ws, "bigrefactor.config.json"), "utf8"));
 		expect(cfg.source.stack).toBe("php");
 		expect(cfg.target.stacks).toEqual(["nestjs", "react"]);
-		expect(cfg.target.path).toBe("./legacy-next");
+		expect(cfg.target.path).toBe(join(ws, "legacy-new")); // new code goes next to the old folder
 		expect(cfg.db.from.sort()).toEqual(["arangodb", "mariadb"]);
 		expect(cfg.db.to).toBe("postgresql");
 		expect(logs.join("\n")).toMatch(/found in the legacy repo/);
