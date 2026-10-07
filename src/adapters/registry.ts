@@ -2,6 +2,7 @@ import type { SourceAdapter, TargetAdapter } from "./types.ts";
 import { phpAdapter } from "./source/php.ts";
 import { fromManifest, loadManifests } from "./target/generated.ts";
 import { withLayoutRules } from "../rules/layout-rules.ts";
+import { withCommandOverrides } from "./command-overrides.ts";
 
 const sources: Record<string, SourceAdapter> = { php: phpAdapter };
 /**
@@ -23,7 +24,7 @@ export async function getTargetAdapter(id: string): Promise<TargetAdapter> {
 	if (!targets[id] && process.env["BR_WORKSPACE"]) registerGeneratedTargets(process.env["BR_WORKSPACE"]);
 	const f = targets[id];
 	if (!f) throw new Error(`unknown target adapter "${id}" (have: ${Object.keys(targets).join(", ")})`);
-	return offerable(withLayoutRules(await f(), process.env["BR_WORKSPACE"]));
+	return offerable(withCommandOverrides(withLayoutRules(await f(), process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]));
 }
 
 /** Options setup cannot produce (`unavailable`) are never offered, recommended or resolved: a choice must be installable. */

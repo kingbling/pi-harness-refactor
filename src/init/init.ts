@@ -9,6 +9,8 @@ import { getSourceAdapter, getTargetAdapter, knownSources, TARGET_SUBDIRS, targe
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
 import { fetchDocs } from "./docs.ts";
+import { fixSetupWithModel, type SetupFixer } from "./setup-fixer.ts";
+import { withCommandOverrides } from "../adapters/command-overrides.ts";
 import { libraryPlan, parseChoiceFlag, parseReplaceFlag, renderStackPlan, resolveChoices } from "./stack.ts";
 import { loadDecisions, recordEarlyDecision } from "../inventory/decisions.ts";
 
@@ -234,7 +236,8 @@ export async function setup(config: Config, root: string): Promise<void> {
 			}
 			console.log(pc.dim(`  reused the ${id} project built by the adapter check (no second download)`));
 		}
-		await adapter.scaffoldProject(dir);
+		const fixed = (step: string, run: () => Promise<void>, ok: () => boolean) => withSetupFix({ config, root, adapter, projectDir: dir }, step, run, ok);
+		await fixed("creating the project with the stack's generator", () => adapter.scaffoldProject(dir), () => adapter.toolchain.isProjectReady(dir));
 		// the stack choices made at init (ORM, validation, router…) bring their packages; the generator alone does not know them
 		const packages = resolveChoices(adapter, config.target.choices).flatMap((c) => c.option.packages ?? []);
 		if (packages.length && adapter.toolchain.isProjectReady(dir)) {
@@ -243,16 +246,16 @@ export async function setup(config: Config, root: string): Promise<void> {
 			if (missing.length) {
 				console.log(pc.dim(`  adding chosen packages: ${missing.join(", ")}`));
 				const add = adapter.toolchain.addPackages(dir, missing);
-				await runCommand(add.cmd, add.args, { cwd: dir });
+				const have = () => new Set(adapter.toolchain.installedPackages(dir));
+				await fixed(`installing the chosen packages ${missing.join(", ")}`, () => runCommand(add.cmd, add.args, { cwd: dir }), () => missing.every((p) => have().has(p)));
 			}
 		}
 	}
 	// Guarantee, before any unit runs: the project matches every stack choice, and the gate's own build and
 	// test commands pass on a probe test written the way agents will write theirs.
-	for (const id of config.target.stacks) await checkToolchain(config, await getTargetAdapter(id));
+	for (const id of config.target.stacks) await checkToolchain(config, await getTargetAdapter(id), { root });
 	const sha = commitAll(target, `chore: bootstrap ${config.target.stacks.join(" + ")} with official generators\n\nsource: ${config.source.stack} @ ${config.source.commit ?? "unpinned"}`);
 	console.log(sha ? pc.green(`committed ${sha.slice(0, 7)} on ${config.target.git.branch}`) : pc.dim("nothing new to commit"));
-	void root;
 }
 
 /** Where a stack's project lives inside the target repo. Single stack → the target root itself. */
@@ -293,28 +296,83 @@ function str(v: unknown): string {
 	return String(v);
 }
 
-/** Setup check: choices installed, runner as chosen, gate build + test green on a probe spec. Throws with the fix. */
-export async function checkToolchain(config: Config, adapter: TargetAdapter): Promise<void> {
+/** Runs a gate command with its output captured (the setup fixer needs the error text, CLI or Pi). */
+async function runChecked(c: { cmd: string; args: string[] }, cwd: string): Promise<string | undefined> {
+	const { execFile } = await import("node:child_process");
+	return new Promise((res) => {
+		execFile(c.cmd, c.args, { cwd, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: 10 * 60_000 }, (e, stdout, stderr) => {
+			res(e ? `${String(stderr)}\n${String(stdout)}`.trim().split("\n").slice(-40).join("\n") || String(e.message) : undefined);
+		});
+	});
+}
+
+/** What is wrong with the stack's setup right now (undefined = fine): stack choices, then gate build + lint + test on a probe spec. */
+async function toolchainProblem(config: Config, adapter: TargetAdapter): Promise<string | undefined> {
 	const dir = projectDir(config, adapter.id);
-	if (!adapter.toolchain.isProjectReady(dir)) return;
 	const chosen = resolveChoices(adapter, config.target.choices).map((c) => ({ key: c.choice.key, id: c.option.id, packages: c.option.packages }));
 	const problems = adapter.verifyChoices?.(dir, chosen) ?? [];
-	if (problems.length) throw new Error(`${adapter.id}: the project does not match the stack choices:\n  ${problems.map((p) => `${p.text}${p.fix ? ` (fix: ${p.fix})` : ""}`).join("\n  ")}\nchange the choice with \`br decide\` (or install what is missing) and rerun setup`);
+	if (problems.length) return `${adapter.id}: the project does not match the stack choices:\n  ${problems.map((p) => `${p.text}${p.fix ? ` (fix: ${p.fix})` : ""}`).join("\n  ")}`;
 	const probe = adapter.probeTest?.(dir);
-	if (!probe) return;
+	if (!probe) return undefined;
 	const probePath = join(dir, probe.path);
-	writeFileSync(probePath, probe.content);
 	try {
-		for (const [step, c] of [["build", adapter.build(dir)], ["test", adapter.test(dir, [probe.path])]] as const) {
-			try {
-				await runCommand(c.cmd, c.args, { cwd: dir });
-			} catch (e: any) {
-				throw new Error(`${adapter.id}: the gate's ${step} command fails on a fresh project (${c.cmd} ${c.args.join(" ")}):\n${String(e?.message ?? e).split("\n").slice(-8).join("\n")}`);
-			}
+		writeFileSync(probePath, probe.content);
+		for (const [step, c] of [["build", adapter.build(dir)], ["lint", adapter.lint(dir, [probe.path])], ["test", adapter.test(dir, [probe.path])]] as const) {
+			const err = await runChecked(c, dir);
+			if (err !== undefined) return `${adapter.id}: the gate's ${step} command fails on a fresh project (${c.cmd} ${c.args.join(" ")}):\n${err}`;
 		}
-		console.log(pc.green(`  ${adapter.id}: toolchain verified (choices installed; gate build + test pass on a probe spec)`));
+		// a test command that cannot fail proves nothing: the same probe with a wrong expectation must fail
+		const broken = probe.content.replace("toBe(2)", "toBe(3)");
+		if (broken !== probe.content) {
+			writeFileSync(probePath, broken);
+			const c = adapter.test(dir, [probe.path]);
+			if ((await runChecked(c, dir)) === undefined) return `${adapter.id}: the gate's test command passes a failing test (${c.cmd} ${c.args.join(" ")}): it does not run the given test files`;
+		}
+		return undefined;
 	} finally {
 		rmSync(probePath, { force: true });
+	}
+}
+
+/**
+ * A setup step (generator, package install) that fails goes to the setup model, which runs it its own way
+ * (a renamed flag, a missing tool); `ok` is the code's check that it worked. Still failing → the original error.
+ */
+async function withSetupFix(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; fix?: SetupFixer }, step: string, run: () => Promise<void>, ok: () => boolean, attempts = 2): Promise<void> {
+	try {
+		await run();
+		return;
+	} catch (e: any) {
+		const fix = o.fix ?? fixSetupWithModel;
+		mkdirSync(o.projectDir, { recursive: true });
+		for (let i = 1; i <= attempts; i++) {
+			await fix({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: `${o.adapter.id}: ${step} failed in ${o.projectDir}:\n${String(e?.message ?? e).split("\n").slice(-30).join("\n")}\nDo this step yourself so the project ends up as the step intended.`, attempt: i });
+			if (ok()) return;
+		}
+		throw e;
+	}
+}
+
+/**
+ * Setup check: choices installed, gate build + test green on a probe spec (and red on a failing one). A failure goes
+ * to a model with tools that fixes it (install, config, or a workspace override of the command); code checks again.
+ * Throws with the last problem when it is still not fixed.
+ */
+export async function checkToolchain(config: Config, adapter: TargetAdapter, o: { root?: string; fix?: SetupFixer | false; attempts?: number } = {}): Promise<void> {
+	const dir = projectDir(config, adapter.id);
+	if (!adapter.toolchain.isProjectReady(dir)) return;
+	const fix = o.fix === undefined ? fixSetupWithModel : o.fix;
+	const attempts = o.attempts ?? 2;
+	for (let i = 0; ; i++) {
+		// overrides set by the fixer apply at once
+		const a = o.root ? withCommandOverrides(adapter, o.root) : adapter;
+		const problem = await toolchainProblem(config, a);
+		if (!problem) {
+			console.log(pc.green(`  ${adapter.id}: toolchain verified (choices installed; gate build, lint and test pass on a probe spec)${i ? ` — fixed by the setup model` : ""}`));
+			return;
+		}
+		if (!fix || !o.root || i >= attempts) throw new Error(`${problem}${fix && o.root ? `\nthe setup model could not fix it in ${attempts} tries (transcripts: .bigrefactor/sessions/__setup__.*)` : ""}`);
+		await fix({ config, root: o.root, adapter: a, projectDir: dir, problem, attempt: i + 1 });
 	}
 }
 

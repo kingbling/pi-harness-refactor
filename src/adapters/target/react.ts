@@ -114,5 +114,6 @@ export const reactAdapter: TargetAdapter = {
 
 	build: () => ({ cmd: "npx", args: ["tsc", "-p", "tsconfig.app.json", "--noEmit"] }),
 	lint: (_root, files) => ({ cmd: "npx", args: ["eslint", "--cache", ...files] }),
-	test: (_root, related) => ({ cmd: "npx", args: ["vitest", "run", ...(related.length ? ["--related", ...related] : [])] }),
+	// `vitest related <files>` (a command since vitest 0.x; the `--related` flag is gone in vitest 5)
+	test: (_root, related) => ({ cmd: "npx", args: related.length ? ["vitest", "related", "--run", ...related] : ["vitest", "run"] }),
 };

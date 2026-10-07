@@ -179,7 +179,7 @@ export const nestjsAdapter: TargetAdapter = {
 	lint: (root, files) => (devDeps(root).has("oxlint") ? { cmd: "npx", args: ["oxlint", "--type-aware", ...files] } : { cmd: "npx", args: ["eslint", "--cache", ...files] }),
 	test: (root, related) =>
 		devDeps(root).has("vitest")
-			? { cmd: "npx", args: ["vitest", "run", "--reporter=dot", ...(related.length ? ["--changed=false", "related", ...related] : [])] }
+			? { cmd: "npx", args: related.length ? ["vitest", "related", "--run", "--reporter=dot", ...related] : ["vitest", "run", "--reporter=dot"] }
 			: { cmd: "npx", args: ["jest", "--ci", "--silent", ...(related.length ? ["--findRelatedTests", ...related] : [])] },
 };
 
