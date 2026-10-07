@@ -18,6 +18,9 @@ describe("bash guard (roles with bash: tester, setup)", () => {
 		expect(bashTouchesReadOnly("sed -i 's/a/b/' /work/legacy/src/Config.php", src, cwd)).toMatch(/read-only/);
 		expect(bashTouchesReadOnly("php gen.php > /work/legacy/out.json", src, cwd)).toMatch(/read-only/);
 		expect(bashTouchesReadOnly("cd /work/legacy && git checkout -- .", src, cwd)).toMatch(/read-only|git/);
+		// package-manager writes come from the source language (adapter), not a core list
+		expect(bashTouchesReadOnly("cd /work/legacy && composer update", src, cwd)).toBeUndefined();
+		expect(bashTouchesReadOnly("cd /work/legacy && composer update", src, cwd, /\bcomposer\s+update\b/)).toMatch(/read-only/);
 	});
 	it("blocks git mutations anywhere (the orchestrator commits)", () => {
 		expect(bashTouchesReadOnly("git commit -am wip", src, cwd)).toMatch(/git/);

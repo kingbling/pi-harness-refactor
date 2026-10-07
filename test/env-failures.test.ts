@@ -77,18 +77,20 @@ describe("parked units resubmit themselves", () => {
 		writeFileSync(join(api, "package.json"), JSON.stringify({ devDependencies: { vitest: "^3" } }));
 		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
 		await inventory(config, ws, ledger);
+		const nest = await getTargetAdapter("nestjs");
 		const unit = ledger.listUnits()[0]!.id;
 		ledger.transitionUnit(unit, "truth", "test");
 		ledger.transitionUnit(unit, "implementing", "test");
 		const q = ledger.askQuestion({ unitId: unit, point: "triage_gate", question: "env", askedBy: "test" });
-		ledger.updateUnit(unit, { meta: { parked: { question: q, env: envFingerprint(config, api) } } });
+		ledger.updateUnit(unit, { meta: { parked: { question: q, env: envFingerprint(config, api, nest.toolchain.manifestFiles) } } });
 		const logs: string[] = [];
+		const adapters = new Map([["nestjs", nest]]);
 
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l))).toEqual([]); // nothing changed: stays parked
+		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters)).toEqual([]); // nothing changed: stays parked
 		expect(ledger.getUnit(unit)!.state).toBe("implementing");
 
 		writeFileSync(join(api, "package.json"), JSON.stringify({ dependencies: { "drizzle-orm": "^1" }, devDependencies: { vitest: "^3" } })); // e.g. `pnpm add drizzle-orm`
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l))).toEqual([unit]);
+		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters)).toEqual([unit]);
 		expect(ledger.getUnit(unit)!.state).toBe("planned");
 		expect(ledger.openQuestions().some((x) => x.id === q)).toBe(false);
 		expect(JSON.parse(ledger.getUnit(unit)!.meta).parked).toBeUndefined();

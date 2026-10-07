@@ -1,5 +1,5 @@
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -47,13 +47,12 @@ export function changedFiles(path: string, fromCommit: string, toCommit = "HEAD"
 	return r;
 }
 
-export function ensureRepo(path: string, defaultBranch = "main"): void {
+/** `ignored`: generated paths of the stacks living here (TargetToolchain.ignoredPaths), written to a new .gitignore. */
+export function ensureRepo(path: string, defaultBranch = "main", ignored: string[] = []): void {
 	// a target nested inside another checkout (a workspace under a repo) gets its own repo: commits must never land in the parent
 	if (isRepo(path) && realpathSync(git(path, ["rev-parse", "--show-toplevel"])) === realpathSync(path)) return;
 	git(path, ["init", "-b", defaultBranch]);
-	if (!existsSync(join(path, ".gitignore"))) {
-		execFileSync("sh", ["-c", `printf 'node_modules/\\ndist/\\n.env\\n' > .gitignore`], { cwd: path });
-	}
+	if (!existsSync(join(path, ".gitignore"))) writeFileSync(join(path, ".gitignore"), [...ignored.map((i) => `${i}/`), ".env"].join("\n") + "\n");
 }
 
 export function commitAll(path: string, message: string, opts: { allowEmpty?: boolean } = {}): string | undefined {

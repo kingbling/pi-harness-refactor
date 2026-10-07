@@ -49,6 +49,8 @@ export interface TaskCard {
 	moduleDir?: string;
 	/** The area's module as it is now (binding dir, contents, sibling units): units of one area extend it, never fork it. */
 	areaModule?: AreaModule;
+	/** The target stack's data-access convention (TargetLayout.dataAccessHint). */
+	dataAccessHint?: string;
 }
 
 export interface AreaModule {
@@ -148,7 +150,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -188,7 +190,7 @@ function areaModule(ledger: Ledger, config: Config, unitId: string, place: Place
 function renderAreaModule(a: AreaModule, L: string[]): void {
 	L.push("", `## Area module (binding): ${a.area} on ${a.stackId} → ${a.moduleDir}/${a.shared ? " (shared: used by several areas; add new files, never edit existing ones)" : ""}`);
 	L.push(`One legacy area = one module per stack. Everything this unit writes goes under ${a.moduleDir}/, and every unit of the area extends the same classes instead of adding parallel ones.`);
-	if (a.shared) L.push(`This unit is shared (used by several areas): its files are ${a.moduleDir}/<name> (kebab-case topic files); the feature-dir shapes below are for the code that imports it.`);
+	if (a.shared) L.push(`This unit is shared (used by several areas): its files are topic files directly in ${a.moduleDir}/, named as the layout below names files; the feature-dir shapes are for the code that imports it.`);
 	L.push("File shape inside the module:", a.structureDoc);
 	if (!a.files.length) L.push("", `### ${a.moduleDir}/ is empty: this unit creates the area's first files; later units of the area will extend them.`);
 	else {
@@ -256,7 +258,7 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		for (const r of card.routes) L.push(`- ${r.method ?? "ANY"} ${r.path} → ${r.handler}`);
 	}
 	if (card.queries.length) {
-		L.push("", "## Database access (DTOs required; keep-schema: tables stay as they are)");
+		L.push("", `## Database access${card.dataAccessHint ? ` (${card.dataAccessHint})` : ""}`);
 		for (const q of card.queries) L.push(`- ${q.symbol}: tables ${q.tables.join(", ")}${q.text ? ` — \`${q.text.slice(0, 80)}\`` : ""}`);
 	}
 	if (card.dynamicMarkers.length) L.push("", `## Dynamic constructs found (handle explicitly): ${card.dynamicMarkers.join(", ")}`);

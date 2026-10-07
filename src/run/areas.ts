@@ -23,17 +23,18 @@ export function singular(w: string): string {
 }
 
 /** Directory names that say what a file IS (layer/kind), not which feature it belongs to. */
-const LAYER_DIR = /^(src|source|lib|libs|app|apps|include|includes|inc|classes|class|controllers?|models?|views?|templates?|services?|repositories|repos?|helpers?|utils?|components?|modules?|core|common|shared|public|www|web|http|legacy|base|domain|entities|entity|handlers?|actions?)$/i;
+/** Layer words common to most stacks; a language adds its own conventions via SourceTraits.layerDirs. */
+const LAYER_DIR = /^(src|source|lib|libs|app|apps|controllers?|models?|views?|templates?|services?|repositories|repos?|helpers?|utils?|components?|modules?|core|common|shared|public|web|http|legacy|base|domain|entities|entity|handlers?|actions?)$/i;
 const KIND_SUFFIX = /(Controller|Repository|Repo|Service|Model|Facade|Handler|Helper|Manager|Factory|View|Template|Page|Action|Command)$/;
 
 /**
  * Stack-neutral fallback: the outermost directory that names a feature (`billing/…` → billing); in a
  * layer-first tree (`controllers/InvoiceController.x`) the file's own name minus its kind suffix (→ invoice).
  */
-export function genericArea(path: string): string {
+export function genericArea(path: string, layerDirs: string[] = []): string {
 	const parts = path.split("/").filter(Boolean);
 	const file = parts.pop() ?? "unit";
-	const dir = parts.find((d) => !LAYER_DIR.test(d));
+	const dir = parts.find((d) => !LAYER_DIR.test(d) && !layerDirs.includes(d.toLowerCase()));
 	if (dir) return kebab(dir) || SHARED_AREA;
 	const stem = basename(file).split(".")[0]!;
 	return kebab(stem.replace(KIND_SUFFIX, "") || stem) || SHARED_AREA;

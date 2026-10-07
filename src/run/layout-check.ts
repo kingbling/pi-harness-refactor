@@ -159,11 +159,12 @@ export function scanTree(config: Config, a: TargetAdapter): StackTree {
 
 function scanDir(dir: string, a: TargetAdapter): StackTree {
 	const l = a.layout;
+	const ig = l.ignoreDirs;
 	const moduleRoot = l.moduleDir("x").replace(/x$/, "");
 	const parts = moduleRoot.split("/").filter(Boolean);
 	const srcRoot = parts.slice(0, -1).join("/");
-	const features = listDirs(join(dir, moduleRoot)).map((area) => ({ area, files: walk(join(dir, moduleRoot, area)).length }));
-	const shared = l.sharedDirs.flatMap((s) => walk(join(dir, s)).map((f) => posix.join(s, f)));
+	const features = listDirs(join(dir, moduleRoot), ig).map((area) => ({ area, files: walk(join(dir, moduleRoot, area), ig).length }));
+	const shared = l.sharedDirs.flatMap((s) => walk(join(dir, s), ig).map((f) => posix.join(s, f)));
 	let stray: string[] = [];
 	if (srcRoot) {
 		const top = (p: string) => (p.startsWith(`${srcRoot}/`) ? p.slice(srcRoot.length + 1).split("/") : []);
@@ -173,7 +174,7 @@ function scanDir(dir: string, a: TargetAdapter): StackTree {
 			if (t.length > 1 && t[0]) allowed.add(t[0]);
 		}
 		const isSource = (f: string) => l.sourceExtensions.some((e) => f.endsWith(e));
-		stray = listDirs(join(dir, srcRoot)).filter((d) => !allowed.has(d) && walk(join(dir, srcRoot, d)).some(isSource));
+		stray = listDirs(join(dir, srcRoot), ig).filter((d) => !allowed.has(d) && walk(join(dir, srcRoot, d), ig).some(isSource));
 	}
 	return { stackId: a.id, dir, moduleRoot, features, shared, stray, srcRoot };
 }
@@ -222,10 +223,10 @@ function scaffoldDirs(dir: string, srcRoot: string): string[] {
 	}
 }
 
-function listDirs(dir: string): string[] {
+function listDirs(dir: string, ignore: string[]): string[] {
 	try {
 		return readdirSync(dir, { withFileTypes: true })
-			.filter((e) => e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules")
+			.filter((e) => e.isDirectory() && !e.name.startsWith(".") && !ignore.includes(e.name))
 			.map((e) => e.name)
 			.sort();
 	} catch {
@@ -233,8 +234,8 @@ function listDirs(dir: string): string[] {
 	}
 }
 
-/** Files under a dir, relative to it (no dot dirs, no node_modules). */
-function walk(dir: string, rel = ""): string[] {
+/** Files under a dir, relative to it (no dot dirs, none of the stack's ignored dirs). */
+function walk(dir: string, ignore: string[], rel = ""): string[] {
 	let out: string[] = [];
 	let names: string[];
 	try {
@@ -243,7 +244,7 @@ function walk(dir: string, rel = ""): string[] {
 		return out;
 	}
 	for (const n of names) {
-		if (n.startsWith(".") || n === "node_modules") continue;
+		if (n.startsWith(".") || ignore.includes(n)) continue;
 		const r = rel ? `${rel}/${n}` : n;
 		let isDir = false;
 		try {
@@ -251,7 +252,7 @@ function walk(dir: string, rel = ""): string[] {
 		} catch {
 			continue;
 		}
-		if (isDir) out = out.concat(walk(dir, r));
+		if (isDir) out = out.concat(walk(dir, ignore, r));
 		else out.push(r);
 	}
 	return out;
@@ -271,7 +272,7 @@ export async function sampleFacts(config: Config, ledger: Ledger, landed: Placem
 		drift += found.length;
 		const classes = ledger.db.prepare("SELECT path, kind, name FROM index_symbols WHERE side = 'target' AND tags LIKE '%\"class\"%' AND tags LIKE ?").all(stackTagLike(id)) as Array<{ path: string; kind: string; name: string }>;
 		for (const mod of [...new Set(landed.filter((p) => p.stackId === id).map((p) => placementDir(a.layout, p)))].sort()) {
-			const files = walk(join(dir, mod)).filter((f) => !a.layout.isTestFile(f)).sort();
+			const files = walk(join(dir, mod), a.layout.ignoreDirs).filter((f) => !a.layout.isTestFile(f)).sort();
 			const show = (f: string) => {
 				const c = classes.filter((r) => r.path === `${mod}/${f}`).map((r) => `${r.kind} ${r.name}`);
 				return c.length ? `${f} [${c.join(", ")}]` : f;

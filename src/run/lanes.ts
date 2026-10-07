@@ -25,7 +25,7 @@ export function lanes(configPath: string, set: { lanes?: number; gates?: number 
 		const gateLoad = (config.run.agentConcurrency * m.gateS) / (m.unitS * config.run.gateConcurrency);
 		const maxByGates = Math.floor((m.unitS * config.run.gateConcurrency * 0.7) / Math.max(0.1, m.gateS));
 		L.push(`measured: a unit holds a lane ~${Math.round(m.unitS)} s (tester + implementer), a gate ~${m.gateS.toFixed(1)} s · gate slots ${Math.round(gateLoad * 100)}% busy at this lane count · rate-limited calls so far: ${m.rateLimited}`);
-		L.push(`gates would saturate around ${maxByGates} lanes; past that, raise --gates (each gate is a tsc + test process: ~1 core, more memory as the project grows)`);
+		L.push(`gates would saturate around ${maxByGates} lanes; past that, raise --gates (each gate is a build + test process: ~1 core, more memory as the project grows)`);
 	}
 	L.push("change: br lanes <n> [--gates <m>]  ·  in Pi: /br lanes <n> [gates <m>]");
 	return L.join("\n");

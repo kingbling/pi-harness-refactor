@@ -28,12 +28,13 @@ export async function generateProfile(config: Config, root: string, ledger: Ledg
 	const { example, schemaDoc } = source.profileExample() as { example: { id: string }; schemaDoc: string };
 	const src = config.source.path;
 	const dirs = source.frameworkDirs?.(src) ?? [];
-	const candidates = dirs.length ? dirs : detectFrameworkDirs(src);
+	const vendor = source.traits?.vendorDirs ?? [];
+	const candidates = dirs.length ? dirs : detectFrameworkDirs(src, vendor);
 	if (!candidates.length) {
 		console.log(pc.yellow("no framework directory found (vendor-only app?) — nothing to profile"));
 		return;
 	}
-	const tree = candidates.map((d) => `${d}\n${listTree(join(src, d), 2, "  ")}`).join("\n");
+	const tree = candidates.map((d) => `${d}\n${listTree(join(src, d), 2, "  ", vendor)}`).join("\n");
 	const stats = indexStats(ledger);
 
 	mkdirSync(join(root, ".bigrefactor", "sessions"), { recursive: true });
@@ -98,10 +99,10 @@ function indexStats(ledger: Ledger): string {
 }
 
 /** Directories that look like a framework (many files, named like one, or a git submodule) when the adapter has no idea yet. */
-function detectFrameworkDirs(src: string): string[] {
+function detectFrameworkDirs(src: string, vendor: string[]): string[] {
 	const out: string[] = [];
 	for (const n of readdirSync(src)) {
-		if (["vendor", "node_modules", ".git", "app", "src", "tests", "docs"].includes(n)) continue;
+		if (n.startsWith(".") || vendor.includes(n) || ["app", "src", "tests", "docs"].includes(n)) continue;
 		const p = join(src, n);
 		try {
 			if (!statSync(p).isDirectory()) continue;
@@ -113,10 +114,10 @@ function detectFrameworkDirs(src: string): string[] {
 	return out;
 }
 
-function listTree(dir: string, depth: number, prefix: string): string {
+function listTree(dir: string, depth: number, prefix: string, vendor: string[]): string {
 	if (depth < 0 || !existsSync(dir)) return "";
 	let out = "";
-	for (const n of readdirSync(dir).filter((n) => ![".git", "node_modules"].includes(n)).sort().slice(0, 40)) {
+	for (const n of readdirSync(dir).filter((n) => n !== ".git" && !vendor.includes(n)).sort().slice(0, 40)) {
 		const p = join(dir, n);
 		let isDir = false;
 		try {
@@ -125,7 +126,7 @@ function listTree(dir: string, depth: number, prefix: string): string {
 			continue;
 		}
 		out += `${prefix}${n}${isDir ? "/" : ""}\n`;
-		if (isDir) out += listTree(p, depth - 1, prefix + "  ");
+		if (isDir) out += listTree(p, depth - 1, prefix + "  ", vendor);
 	}
 	return out;
 }

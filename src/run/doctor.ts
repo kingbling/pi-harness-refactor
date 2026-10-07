@@ -8,7 +8,7 @@ import { join } from "node:path";
 /**
  * Environment doctor: when triage says a gate failure is not the code's fault, find out why before asking a
  * human. Adapter rules first (certain: e.g. a test imports another runner's package → the tests are wrong),
- * then the escalate model reading the gate output and package.json. The orchestrator acts on the result:
+ * then the escalate model reading the gate output and the installed packages. The orchestrator acts on the result:
  *   retest / reimplement → done automatically (capped), the note goes into the next prompt
  *   fix                  → one exact command; the human is told it is easily fixable
  *   unknown              → the human gets the model's explanation
@@ -18,13 +18,7 @@ export async function diagnoseFailure(o: { config: Config; adapter: TargetAdapte
 	const rule = o.adapter.diagnose?.(o.projectDir, o.failedStep, o.output, o.adapter.layout.isTestFile, expected);
 	if (rule) return rule;
 	if (!o.client) return { action: "unknown", summary: "no rule matched and no model available", by: "rule" };
-	let deps = "";
-	try {
-		const pkg = JSON.parse(readFileSync(join(o.projectDir, "package.json"), "utf8"));
-		deps = Object.keys({ ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }).join(", ");
-	} catch {
-		/* no package.json */
-	}
+	const deps = o.adapter.toolchain.installedPackages(o.projectDir).join(", ");
 	const schema = {
 		type: "object",
 		additionalProperties: false,

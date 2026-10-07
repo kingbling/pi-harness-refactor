@@ -11,7 +11,7 @@ import type { Ledger } from "../ledger/db.ts";
 export async function indexTarget(ledger: Ledger, adapter: TargetAdapter, projectDir: string, files?: string[]): Promise<number> {
 	if (!adapter.indexFile) return 0;
 	const L = adapter.layout;
-	const rels = (files ?? listSources(projectDir, L.sourceExtensions)).filter((f) => L.sourceExtensions.some((e) => f.endsWith(e)) && !L.isTestFile(f));
+	const rels = (files ?? listSources(projectDir, L.sourceExtensions, L.ignoreDirs)).filter((f) => L.sourceExtensions.some((e) => f.endsWith(e)) && !L.isTestFile(f));
 	// several stacks share one ledger with project-relative paths: rows carry a stack tag (see stackTagLike)
 	const del = ledger.db.prepare("DELETE FROM index_symbols WHERE side = 'target' AND path = ? AND (tags IS NULL OR tags NOT LIKE '%\"stack:%' OR tags LIKE ?)");
 	const ins = ledger.db.prepare("INSERT OR REPLACE INTO index_symbols(id, side, path, kind, name, line, signature, exported, ast_hash, doc, tags) VALUES (?, 'target', ?, ?, ?, ?, ?, 1, ?, ?, ?)");
@@ -83,12 +83,12 @@ export function similarTargetSymbols(ledger: Ledger, legacyNames: string[], limi
 	return out;
 }
 
-function listSources(dir: string, exts: string[]): string[] {
+function listSources(dir: string, exts: string[], ignore: string[]): string[] {
 	const out: string[] = [];
 	const visit = (d: string) => {
 		if (!existsSync(d)) return;
 		for (const n of readdirSync(d)) {
-			if (["node_modules", "dist", "build", ".git", "vendor", "test", "tests", "__tests__"].includes(n)) continue;
+			if (n.startsWith(".") || ignore.includes(n)) continue;
 			const p = join(d, n);
 			if (statSync(p).isDirectory()) visit(p);
 			else if (exts.some((e) => n.endsWith(e))) out.push(relative(dir, p));

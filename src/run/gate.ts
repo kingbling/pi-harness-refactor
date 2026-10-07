@@ -59,7 +59,7 @@ export interface GateReport {
 
 export async function runGate(g: GateInput): Promise<GateReport> {
 	const steps: GateStep[] = [];
-	const changed = changedFiles(g.targetProjectDir);
+	const changed = changedFiles(g.targetProjectDir, g.adapter.toolchain.ignoredPaths);
 	const tracked = new Set(trackedFiles(g.targetProjectDir));
 	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
 	const timeout = g.timeoutMs ?? 240_000;
@@ -263,7 +263,8 @@ export function run(cmd: string, args: string[], cwd: string, timeoutMs: number)
 }
 
 /** Files changed in the working tree under `dir` (git status), relative to `dir`. */
-export function changedFiles(dir: string): string[] {
+/** Files changed in the project, without generated paths (`ignored`: dependencies, build output; symlinked in worktrees). */
+export function changedFiles(dir: string, ignored: string[] = []): string[] {
 	try {
 		const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8" }).trim();
 		const out = execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8" });
@@ -272,7 +273,7 @@ export function changedFiles(dir: string): string[] {
 			.filter(Boolean)
 			.map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
 			.map((p) => relative(realpathSync(dir), join(top, p))) // top is the real path (/var → /private/var on macOS)
-			.filter((p) => !p.startsWith("..") && !/^(node_modules|dist)(\/|$)/.test(p)); // worktrees symlink node_modules (a symlink is not matched by "node_modules/")
+			.filter((p) => !p.startsWith("..") && !ignored.some((i) => p === i || p.startsWith(`${i}/`))); // a symlinked dependency dir is not matched by a "dir/" ignore line
 	} catch {
 		return [];
 	}

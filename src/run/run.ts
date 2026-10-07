@@ -29,7 +29,7 @@ import { afterAccept, envFingerprint, runUnit, type UnitRunOptions, type UnitRun
  *  ready(unit)  = planned ∧ not stale ∧ not waiting on a question ∧ every dep accepted (merged)
  *  priority     = (sliceRank asc, depth desc, id)  — slices order the work, the DAG keeps it correct
  *  isolation    = one git worktree per running unit under .bigrefactor/worktrees/<unit> (outside the repo),
- *                 node_modules symlinked from the main project; accept = rebase onto the main branch, ff-merge
+ *                 dependency dirs symlinked from the main project; accept = rebase onto the main branch, ff-merge
  *  recovery     = attempts left open by a crash are closed as aborted at start; their units go back to planned
  */
 export interface SchedulerOptions {
@@ -129,16 +129,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// Parked units (state kept, attempt closed, waiting on a question) are resubmitted as soon as the cause is
 	// gone: their question was answered, or — for environment failures — the target project or the stack
 	// config changed since they parked. Checked at start and on every scheduling loop.
-	const resubmitParked = () => resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log);
+	const resubmitParked = () => resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
 
 	// Each unit lands in the stack placement picks; a worktree holds the whole target repo, so every stack's
-	// node_modules is linked into it.
+	// dependency dirs (adapter-declared) are linked into it.
 	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
 	const linkAll = (wt: string) => {
-		for (const id of config.target.stacks) linkNodeModules(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))));
+		for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks);
 	};
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
-	excludeFromGit(config.target.path, ["node_modules", "dist"]);
+	excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
 	const agents = new Semaphore(config.run.agentConcurrency);
 	const gates = new Semaphore(config.run.gateConcurrency);
 	// Lanes are live: `br lanes <n>` / `/br lanes <n>` edits run.agentConcurrency (and gateConcurrency) in the
@@ -594,7 +594,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string): string | undefined {
 	const main = config.target.git.branch;
 	const before = headOf(config.target.path);
-	gitIn(wt, ["add", "-A"]); // node_modules/dist are excluded repo-wide via info/exclude (see excludeFromGit)
+	gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
 	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8" }).trim();
 	if (staged) execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`], { stdio: "pipe" });
 	try {
@@ -620,7 +620,7 @@ export function worktreeDir(root: string, unitId: string): string {
 	return join(root, ".bigrefactor", "worktrees", unitId);
 }
 
-/** Repo-level excludes shared by all worktrees. The generators' `.gitignore` uses `node_modules/`, which does not match our symlink. */
+/** Repo-level excludes shared by all worktrees. A generator's `.gitignore` line `dir/` does not match our symlinked dir. */
 export function excludeFromGit(repo: string, patterns: string[]): void {
 	try {
 		const gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
@@ -635,10 +635,12 @@ export function excludeFromGit(repo: string, patterns: string[]): void {
 	}
 }
 
-function linkNodeModules(mainProject: string, wtProject: string): void {
-	const src = join(mainProject, "node_modules");
-	const dst = join(wtProject, "node_modules");
-	if (existsSync(src) && !existsSync(dst)) symlinkSync(src, dst, "dir");
+function linkDependencies(mainProject: string, wtProject: string, dirs: string[]): void {
+	for (const d of dirs) {
+		const src = join(mainProject, d);
+		const dst = join(wtProject, d);
+		if (existsSync(src) && !existsSync(dst)) symlinkSync(src, dst, "dir");
+	}
 }
 
 function loadOverrides(root: string): SliceOverrides {
@@ -670,14 +672,14 @@ export async function run(opts: { units?: string[]; slice?: string; limit?: numb
 export function errorSignature(step: string, output: string): string {
 	const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
 	const line = clean.split(/\r?\n/).find((l) => /error|failed|cannot|not found/i.test(l)) ?? clean.split(/\r?\n/).find((l) => l.trim()) ?? "";
-	return `${step}: ${line.replace(/\S+\.(?:[cm]?[jt]sx?|php|py|rb|go|java)(?::\d+)*/g, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
+	return `${step}: ${line.replace(/[\w./\\-]*[\w-]\.[a-z][a-z0-9]{0,5}(?::\d+)+|[\w.-]*[/\\][\w./\\-]+\.[a-z][a-z0-9]{0,5}\b/gi, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
 }
 
 /**
  * Parked units (state kept, attempt closed, waiting on a question) go back to planned as soon as the cause is
  * gone: their question was answered, or (environment failures) the target project or stack config changed.
  */
-export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void): string[] {
+export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>): string[] {
 	let cfg = config;
 	try {
 		cfg = loadConfig(join(root, "bigrefactor.config.json")).config;
@@ -685,11 +687,14 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 		/* keep the run's config */
 	}
 	// the environment of the stack the unit parked in (its placement)
-	const envNow = (meta: string) => envFingerprint(cfg, projectDir(cfg, placeUnit(cfg, meta, root).stackId));
+	const envNow = (meta: string) => {
+		const stackId = placeUnit(cfg, meta, root).stackId;
+		return envFingerprint(cfg, projectDir(cfg, stackId), manifests.get(stackId)?.toolchain.manifestFiles ?? []);
+	};
 	const parkedEnv = ledger.db.prepare("SELECT id, meta, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; meta: string; q: number | null; env: string }>;
 	for (const p of parkedEnv) {
 		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
-		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (package.json / stack config)", "orchestrator");
+		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest / stack config)", "orchestrator");
 	}
 	const parked = (ledger.db.prepare("SELECT id, state FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.unit_id = units.id AND q.status = 'open')").all() as Array<{ id: string; state: string }>).filter((u) => !running.has(u.id));
 	for (const u of parked) {

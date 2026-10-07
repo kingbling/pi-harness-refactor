@@ -100,7 +100,7 @@ export function sourceSymbolBody(d: ToolDeps): ToolDefinition {
 			const end = fn?.end_line ?? row.end_line;
 			// ledgers indexed before end lines existed: bounded slice instead of the rest of the file
 			const to = end ?? Math.min(lines.length, from + 199);
-			return text("```" + d.config.source.stack + `\n// ${row.path}:${from}-${to}\n` + lines.slice(from - 1, to).join("\n") + "\n```" + (end ? "" : `\n(end of the symbol unknown: showing at most 200 lines; re-run br inventory for exact spans)`));
+			return text(`${row.path}:${from}-${to}\n` + "```" + d.config.source.stack + "\n" + lines.slice(from - 1, to).join("\n") + "\n```" + (end ? "" : `\n(end of the symbol unknown: showing at most 200 lines; re-run br inventory for exact spans)`));
 		},
 	});
 }
@@ -157,7 +157,7 @@ export function patternExamples(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "pattern_examples",
 		label: "Pattern examples",
-		description: "The 3 most recently accepted target files of a kind (controller, service, dto, repository, module, test, page, component, hook). Copy their structure, naming and imports.",
+		description: `The 3 most recently accepted target files of a kind (${d.adapter.patternKinds.join(", ")}). Copy their structure, naming and imports.`,
 		promptSnippet: "pattern_examples: how accepted code of a kind looks in this codebase",
 		parameters: Type.Object({ kind: Type.String(), limit: Type.Optional(Type.Number()) }),
 		execute: async (_id, p) => {
@@ -166,7 +166,7 @@ export function patternExamples(d: ToolDeps): ToolDefinition {
 				const idioms = safeRead(join(rulesDir(d.root, d.adapter.id), "idioms.json"));
 				return text(`no accepted ${p.kind} yet. Follow RULES.md and the idiom table${idioms ? `:\n${idioms.slice(0, 3000)}` : ""}.`);
 			}
-			return text(rows.map((r) => `### ${r.path}\n\`\`\`ts\n${safeRead(join(d.targetProjectDir, r.path))?.slice(0, 4000) ?? "(missing)"}\n\`\`\``).join("\n\n"));
+			return text(rows.map((r) => `### ${r.path}\n\`\`\`${d.adapter.layout.lang(r.path) ?? ""}\n${safeRead(join(d.targetProjectDir, r.path))?.slice(0, 4000) ?? "(missing)"}\n\`\`\``).join("\n\n"));
 		},
 	});
 }
@@ -218,7 +218,7 @@ export function ledgerProve(d: ToolDeps): ToolDefinition {
 		name: "ledger_prove",
 		label: "Ledger prove",
 		description:
-			"Record what happened to ONE legacy symbol of this unit. Required for every symbol in the task card before you finish. op: moved (1:1 port), extracted (split into several target symbols), merged_into (deduplicated into an existing/another target symbol), inlined (body folded into its caller), split, dropped (not needed in the new system — say why). targetSymbols are target ids like `src/invoices/pricing.service.ts::PricingService.lineTotal`.",
+			"Record what happened to ONE legacy symbol of this unit. Required for every symbol in the task card before you finish. op: moved (1:1 port), extracted (split into several target symbols), merged_into (deduplicated into an existing/another target symbol), inlined (body folded into its caller), split, dropped (not needed in the new system — say why). targetSymbols are target ids `<project-relative file>::<symbol>` as target_lookup prints them.",
 		promptSnippet: "ledger_prove: account for each legacy symbol (moved/extracted/merged_into/inlined/split/dropped + why)",
 		promptGuidelines: ["Call ledger_prove once per legacy symbol in the task card; the unit cannot pass the gate with unproven symbols."],
 		parameters: Type.Object({

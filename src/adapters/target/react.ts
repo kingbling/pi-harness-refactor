@@ -2,7 +2,7 @@ import { runCommand } from "../../proc.ts";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { TargetAdapter } from "../types.ts";
-import { indexTsFile, tsLayoutBase, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
+import { indexTsFile, tsLayoutBase, nodeToolchain, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
 import { tsCheckStructure, tsCheckTree, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
 
 /** Fresh setup via the official Vite scaffolder (`create vite --template react-ts`), not model-generated. */
@@ -10,8 +10,11 @@ export const reactAdapter: TargetAdapter = {
 	id: "react",
 	role: "ui",
 	subdir: "web",
+	aliases: ["reactjs"],
+	toolchain: nodeToolchain(),
 	layout: {
 		...tsLayoutBase(),
+
 		// one legacy area = one feature module; units of the same area extend its files, never fork them
 		moduleDir: tsModuleDir,
 		astGrepLanguages: ["TypeScript", "Tsx"],

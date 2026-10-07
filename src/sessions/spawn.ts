@@ -1,3 +1,4 @@
+import { getSourceAdapter } from "../adapters/registry.ts";
 import { recordSpend } from "../spend.ts";
 import { describeArgs, progress } from "../progress.ts";
 import { mkdirSync } from "node:fs";
@@ -42,21 +43,22 @@ export interface SpawnOptions {
 	maxBlocked?: number;
 }
 
-const WRITE_VERBS = /(^|[\s;&|(])(rm|mv|cp|tee|sed\s+-i|truncate|chmod|chown|ln|mkdir|touch|git\s+(add|commit|checkout|reset|clean|push|rm|mv|stash|rebase|merge|apply)|npm\s+(i|install|uninstall|publish)|pnpm\s+(add|remove|install)|composer\s+(install|update|require))\b|>{1,2}\s*\S/;
+const WRITE_VERBS = /(^|[\s;&|(])(rm|mv|cp|tee|sed\s+-i|truncate|chmod|chown|ln|mkdir|touch|git\s+(add|commit|checkout|reset|clean|push|rm|mv|stash|rebase|merge|apply))\b|>{1,2}\s*\S/;
 
 /**
  * Bash guard for roles that may run commands (tester, setup): the legacy source repo is read-only for
  * everyone, by code. A command is blocked when it mentions the source root (or a path inside it) together
  * with a write verb or output redirection. `cd <source> && php cases.php` stays allowed.
  */
-export function bashTouchesReadOnly(command: string, sourceRoot: string, cwd: string): string | undefined {
+/** `mutating`: the source language's own commands that change a checkout (package managers; SourceTraits.mutatingCommands). */
+export function bashTouchesReadOnly(command: string, sourceRoot: string, cwd: string, mutating?: RegExp): string | undefined {
 	const src = resolve(sourceRoot);
 	const relSrc = relative(cwd, src);
 	const mentions = command.includes(src) || (relSrc && !relSrc.startsWith("..") && command.includes(relSrc)) || /\.\.\/legacy|\blegacy\//.test(command) && relSrc.includes("legacy");
 	// Redirects to /dev/null or between fds (2>/dev/null, 2>&1) write nothing; neither does a redirect whose
 	// target lies outside the source repo. Only the remaining write verbs and source-bound redirects count.
 	const harmless = command.replace(/\d*>{1,2}\s*(\/dev\/null|&\d)/g, " ").replace(/\d*>{1,2}\s*([^\s;&|]+)/g, (m, target: string) => (resolve(cwd, target).startsWith(src) ? m : " "));
-	if (mentions && WRITE_VERBS.test(harmless)) return "the legacy source repo is read-only: no writes, moves, deletes, redirects or git operations there";
+	if (mentions && (WRITE_VERBS.test(harmless) || mutating?.test(harmless))) return "the legacy source repo is read-only: no writes, moves, deletes, redirects or git operations there";
 	if (/\bgit\s+(commit|push|rebase|merge|reset|checkout|clean|stash)\b/.test(command)) return "git is driven by the orchestrator (commits per accepted unit); do not run git mutations";
 	return undefined;
 }
@@ -202,7 +204,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				reason = gate(path);
 				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""));
 			} else if (event.toolName === "bash") {
-				reason = ROLE_TOOLS[opts.role].includes("bash") ? bashTouchesReadOnly(String(input["command"] ?? ""), opts.config.source.path, opts.cwd) : "bash is not available to this role";
+				reason = ROLE_TOOLS[opts.role].includes("bash") ? bashTouchesReadOnly(String(input["command"] ?? ""), opts.config.source.path, opts.cwd, getSourceAdapter(opts.config.source.stack).traits?.mutatingCommands) : "bash is not available to this role";
 			}
 			if (progress.aborting) return { block: true, terminate: true, reason: "stopped by the user" };
 			if (reason) {

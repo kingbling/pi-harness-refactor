@@ -102,7 +102,7 @@ export function codePlace(config: Config, meta: UnitMeta, root?: string): { plac
 		if (rule?.shared) shared = true;
 		if (!p?.area && !rule?.area) why.push(`no adapter area for ${f}`);
 		const surface = p?.surface ?? labelled;
-		return { area: kebab(rule?.area ?? p?.area ?? genericArea(f)) || SHARED_AREA, stack: rule?.stack ?? (surface ? stackFor(config, surface) : undefined) };
+		return { area: kebab(rule?.area ?? p?.area ?? genericArea(f, source.traits?.layerDirs)) || SHARED_AREA, stack: rule?.stack ?? (surface ? stackFor(config, surface) : undefined) };
 	});
 	const area = majority(votes.map((v) => v.area));
 	const stacks = votes.map((v) => v.stack).filter((s): s is string => !!s);

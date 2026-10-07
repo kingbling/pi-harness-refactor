@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { getSourceAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { decide } from "../jev/decide.ts";
 import { ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
@@ -20,9 +21,8 @@ import { resolvePlacements } from "../run/placement.ts";
  * decisions table for calibration. Cheap: Jev ≈ $0.00004 per call.
  */
 const ACT = 0.75;
-/** Literal, language-agnostic text signals (code facts, certain): SQL keywords in strings, superglobals/globals. */
+/** Literal, language-agnostic text signal (code fact, certain): SQL keywords in strings. Global state is the adapter's. */
 const SQL_TEXT = /["'`]\s*(SELECT\s.+\sFROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b/i;
-const GLOBAL_TEXT = /\$_SESSION|\$_COOKIE|\$GLOBALS|^\s*global\s+\$|\bsession_(start|id|destroy)\(/m;
 const LEVELS = ["mechanical", "moderate", "hard"] as const;
 
 export async function labelUnits(config: Config, root: string, ledger: Ledger, client: ModelClient, opts: { concurrency?: number; log?: (l: string) => void; onProgress?: (detail: string) => void } = {}): Promise<{ units: number; hard: number; auth: string[]; placed: number; areas: { placed: number; asked: number }; costUsd: number }> {
@@ -42,6 +42,7 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 		}
 		return out;
 	};
+	const globalState = getSourceAdapter(config.source.stack).traits?.globalState;
 	const readSources = (files: string[]) => files.map((f) => { try { return readFileSync(join(config.source.path, f), "utf8"); } catch { return ""; } }).join("\n");
 	let hard = 0;
 	let next = 0;
@@ -69,8 +70,9 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 				const src = readSources(meta.files);
 				facts["dynamic_refs"] = (meta.dynamic_markers ?? []).length > 0 ? 1 : 0;
 				facts["raw_sql"] = meta.queries > 0 || SQL_TEXT.test(src) ? 1 : 0;
-				facts["global_state"] = GLOBAL_TEXT.test(src) ? 1 : 0;
-				for (const k of ["dynamic_refs", "raw_sql", "global_state"]) confidence[k] = 1;
+				for (const k of ["dynamic_refs", "raw_sql"]) confidence[k] = 1;
+				// only the language knows what global state looks like; a match is certain, no match leaves Jev's judgement
+				if (globalState?.test(src)) [facts["global_state"], confidence["global_state"]] = [1, 1];
 				const diff = unitDifficulty(facts, { loc: meta.loc, deps: JSON.parse(u.deps).length, cutDeps: (meta.cutDeps ?? []).length });
 				const route = { difficulty: diff.level, difficultyFactors: diff.factors, difficultyConfidence: diff.confidence, kind: kind?.choice, kindConfidence: kind?.confidence, ...facts, confidence, decision: r.decisionId };
 				if (route.difficulty === "hard" && route.difficultyConfidence >= ACT) hard++;

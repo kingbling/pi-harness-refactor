@@ -76,6 +76,41 @@ export interface CodeContainer {
 	uses?: string[];
 }
 
+export interface SourceTraits {
+	/** Source text touches process-global state (sessions, cookies, globals): a unit risk signal. */
+	globalState?: RegExp;
+	/** One-line examples of constructs that are artifacts of this language and are not carried over (quoted to agents). */
+	languageArtifacts?: string[];
+	/** Shell commands that would change the legacy checkout or its dependencies (refused in agent sessions). */
+	mutatingCommands?: RegExp;
+	/** Directory names that are technical layers of this ecosystem, never business areas (lowercase). */
+	layerDirs?: string[];
+	/** Directories holding third-party dependencies or build output (skipped by surveys and scans). */
+	vendorDirs?: string[];
+}
+
+/** How a target ecosystem manages its project and packages; the core never assumes a package manager. */
+export interface TargetToolchain {
+	/** Package ecosystem name for prompts ("npm", "maven", "pypi"). */
+	ecosystem: string;
+	/** Shape of a valid package name in this ecosystem (anchored at the start; the match is the name). */
+	packageName: RegExp;
+	/** Example package names for prompts. */
+	packageExamples: string[];
+	/** The project is scaffolded (its manifest exists). */
+	isProjectReady(dir: string): boolean;
+	/** Files whose change means dependencies changed (re-submits units parked on the environment). */
+	manifestFiles: string[];
+	/** Packages the project declares. */
+	installedPackages(dir: string): string[];
+	/** Command that adds packages to the project. */
+	addPackages(dir: string, packages: string[]): { cmd: string; args: string[] };
+	/** Dependency dirs shared from the main project into unit worktrees (symlinked, never copied). */
+	worktreeLinks: string[];
+	/** Generated paths (dependencies, build output) that are never committed or reviewed. */
+	ignoredPaths: string[];
+}
+
 export interface IndexedDep {
 	from: string; // symbol id or file path (for includes)
 	to: string; // symbol id, file path, or bare name (resolved later)
@@ -154,6 +189,11 @@ export interface SourceAdapter {
 	reading?: { indentSignificant?: boolean };
 	/** Name semantics the core needs to resolve calls: true when class/function/method names match regardless of case. */
 	names?: { caseInsensitive?: boolean };
+	/**
+	 * What only this language knows, for core heuristics and prompts. Every field is optional; absent = the core
+	 * makes no claim (a fact stays unknown for a model to judge) instead of assuming one language's conventions.
+	 */
+	traits?: SourceTraits;
 	/** Route table extraction when it is not derivable per file (framework route files, CLI dumps). */
 	indexRoutes?(root: string): Promise<IndexedRoute[]>;
 	/** Which tier a symbol belongs to, from its own shape (deps decide the rest). */
@@ -273,6 +313,12 @@ export interface TargetLayout {
 	astGrepLanguages?: string[];
 	/** One line for the tester on how to write ported tests (file naming, framework). */
 	testHint: string;
+	/** The comment that marks a kept legacy quirk in code of this stack, e.g. `// LEGACY: <why>`. */
+	legacyMarker(why: string): string;
+	/** One line on how data access is written in this stack (DTOs, repositories); quoted where a unit touches tables. */
+	dataAccessHint?: string;
+	/** Directories of the project that are never source (dependencies, build output, tests) for scans. */
+	ignoreDirs: string[];
 }
 
 /**
@@ -310,6 +356,9 @@ export interface TargetAdapter {
 	/** Sub-directory of the target repo this stack lives in when several stacks share one repo (e.g. "api", "web"). */
 	subdir: string;
 	layout: TargetLayout;
+	toolchain: TargetToolchain;
+	/** Other names users and docs use for this stack (lowercase), e.g. "nest". */
+	aliases?: string[];
 	/** Index one target file's exports for `target_lookup`/`shared_lookup`. Omit to disable target indexing. */
 	indexFile?(root: string, relPath: string): Promise<TargetSymbol[]>;
 	/**

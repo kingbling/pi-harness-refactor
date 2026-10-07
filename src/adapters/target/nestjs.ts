@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../types.ts";
-import { indexTsFile, tsLayoutBase, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
+import { indexTsFile, tsLayoutBase, nodeToolchain, tsProjectNotes, tsVerifyChoices, tsDiagnose, tsProbeTest } from "./ts-index.ts";
 import { tsCheckStructure, tsCheckTree, tsModuleDir, tsStructureDoc } from "./ts-structure.ts";
 
 /**
@@ -15,8 +15,12 @@ export const nestjsAdapter: TargetAdapter = {
 	id: "nestjs",
 	role: "server",
 	subdir: "api",
+	aliases: ["nest"],
+	toolchain: nodeToolchain(),
 	layout: {
 		...tsLayoutBase(),
+		dataAccessHint: "DTOs required; keep-schema: tables stay as they are",
+
 		// one legacy area = one feature module; units of the same area extend its files, never fork them
 		moduleDir: tsModuleDir,
 		astGrepLanguages: ["TypeScript"],

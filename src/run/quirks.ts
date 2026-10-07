@@ -98,12 +98,12 @@ export function quirkRetestNote(d: Pick<AskDeps, "ledger"> & { root: string }, u
 /** Decided quirks of a unit, for the implementer's task. */
 export function quirkSummary(d: Pick<AskDeps, "ledger">, unitId: string): string {
 	const qs = quirksOf(d, unitId).filter((q) => q.status !== "pending");
-	return qs.map((q) => `- ${q.symbol_id}: ${q.behaviour} → ${q.status === "kept" ? "keep (reproduce, `LEGACY:` comment)" : q.status === "dropped" ? "drop (do not reproduce)" : `waiting for an answer; follow "${q.applied}"`}`).join("\n");
+	return qs.map((q) => `- ${q.symbol_id}: ${q.behaviour} → ${q.status === "kept" ? "keep (reproduce, with the legacy marker comment)" : q.status === "dropped" ? "drop (do not reproduce)" : `waiting for an answer; follow "${q.applied}"`}`).join("\n");
 }
 
 export function writeQuirkFile(d: Pick<AskDeps, "ledger"> & { root: string }): void {
 	const rows = quirksOf(d);
-	const L = ["# Legacy quirks", "", "Recorded by the tester per unit. `dropped` = the new code does not reproduce it; `kept` = reproduced with a `LEGACY:` comment; `asked` = waiting for your answer (`br questions`).", ""];
+	const L = ["# Legacy quirks", "", "Recorded by the tester per unit. `dropped` = the new code does not reproduce it; `kept` = reproduced, marked with a legacy comment; `asked` = waiting for your answer (`br questions`).", ""];
 	let unit = "";
 	for (const q of rows) {
 		if (q.unit_id !== unit) L.push(`## ${(unit = q.unit_id)}`, "");

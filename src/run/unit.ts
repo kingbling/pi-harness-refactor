@@ -95,7 +95,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const { stackId, area } = place;
 	const adapter = await getTargetAdapter(stackId);
 	const targetProjectDir = o.workDir ? join(o.workDir, relative(o.config.target.path, projectDir(o.config, stackId))) : projectDir(o.config, stackId);
-	if (!existsSync(join(targetProjectDir, "package.json"))) throw new Error(`target project missing at ${targetProjectDir}; run br setup`);
+	if (!adapter.toolchain.isProjectReady(targetProjectDir)) throw new Error(`target project missing at ${targetProjectDir}; run br setup`);
 	const sourceAdapter = getSourceAdapter(o.config.source.stack);
 	// one legacy area = one feature module (or, for code ≥ 2 areas use, the shared dir + area)
 	const moduleDir = placementDir(adapter.layout, place);
@@ -184,7 +184,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				point: "truth_env",
 				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time. Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
 				options: [
-					{ value: "fixed", facts: "the legacy environment (deps, autoload, DB) is fixed now: the tester runs again" },
+					{ value: "fixed", facts: "the legacy environment (dependencies, module loading, DB) is fixed now: the tester runs again" },
 					{ value: "goldens", facts: "the code cannot run here: capture golden outputs another way, then rerun" },
 				],
 				context: { error: lastErr?.slice(-1500) },
@@ -296,7 +296,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs,
 			appendOnlyGlobs,
 			protectedGlobs: adapter.protectedGlobs,
-			systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs }),
+			systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs, source: sourceAdapter, target: adapter }),
 			customTools: implementerTools({ ...deps, attemptId: attempt }),
 			transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
 			validateWrite: async (path, content) => {
@@ -314,7 +314,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			loadIface(),
 			"",
 			`## Ported tests (read-only): ${testFiles.map((t) => t.path).join(", ") || "none"}`,
-			...testFiles.map((t) => `### ${t.path}\n\`\`\`ts\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
+			...testFiles.map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
 			lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
 			o.retryNote && attemptNo === 1 ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
 			tidyMoved.length ? `\n## Tidy moves already done by the orchestrator\n${tidyMoved.join("\n")}\nUpdate every import of the moved files; keep behaviour identical.` : "",
@@ -393,7 +393,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					});
 				}
 				// remember the environment the failure happened in: a change (package.json/config) resubmits the unit
-				o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId)), diagnosis: dx } } });
+				o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles), diagnosis: dx } } });
 				log(pc.yellow(`  waiting for human question #${qid} — other units keep running`));
 				return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
 			}
@@ -464,8 +464,8 @@ export function tidyLeftovers(dir: string, tasks: TidyTask[], moved: string[]): 
 		.flatMap((t) => t.from.filter((f) => !t.to.includes(f) && existsSync(join(dir, f))));
 }
 
-/** What a parked environment failure depends on: the target's package.json and the workspace config. */
-export function envFingerprint(config: Config, projectDir: string): string {
+/** What a parked environment failure depends on: the target's dependency manifests (adapter-declared) and the workspace config. */
+export function envFingerprint(config: Config, projectDir: string, manifestFiles: string[]): string {
 	const read = (p: string) => {
 		try {
 			return readFileSync(p, "utf8");
@@ -473,7 +473,9 @@ export function envFingerprint(config: Config, projectDir: string): string {
 			return "";
 		}
 	};
-	return createHash("sha1").update(read(join(projectDir, "package.json"))).update(JSON.stringify(config.target.choices)).update(JSON.stringify(config.target.stacks)).digest("hex").slice(0, 12);
+	const h = createHash("sha1");
+	for (const f of manifestFiles) h.update(read(join(projectDir, f)));
+	return h.update(JSON.stringify(config.target.choices)).update(JSON.stringify(config.target.stacks)).digest("hex").slice(0, 12);
 }
 
 function transcriptPath(root: string, unitId: string, role: string, attemptId: number): string {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { captures, parse, registerGrammar, type Node } from "../../inventory/treesitter.ts";
 
@@ -157,6 +157,31 @@ export function tsLayoutBase() {
 		lang: (p: string) => (/\.tsx$/.test(p) ? "tsx" : /\.[cm]?ts$/.test(p) ? "typescript" : /\.[cm]?jsx?$/.test(p) ? "javascript" : undefined),
 		skipMarker: /\.(skip|only|todo)\s*\(/,
 		interfaceHint: "TypeScript signatures; DTOs/classes where the legacy code used arrays",
+		legacyMarker: (why: string) => `// LEGACY: ${why}`,
+		ignoreDirs: ["node_modules", "dist", "build", "coverage", ".git", "test", "tests", "__tests__"],
+	};
+}
+
+/** Node project with pnpm: manifest, installed packages, how to add some, what worktrees share and git never sees. */
+export function nodeToolchain(): import("../types.ts").TargetToolchain {
+	const deps = (dir: string): string[] => {
+		try {
+			const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+			return Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
+		} catch {
+			return [];
+		}
+	};
+	return {
+		ecosystem: "npm",
+		packageName: /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*/,
+		packageExamples: ["exceljs", "@aws-sdk/client-s3"],
+		isProjectReady: (dir) => existsSync(join(dir, "package.json")),
+		manifestFiles: ["package.json", "pnpm-lock.yaml"],
+		installedPackages: deps,
+		addPackages: (_dir, packages) => ({ cmd: "pnpm", args: ["add", ...packages] }),
+		worktreeLinks: ["node_modules"],
+		ignoredPaths: ["node_modules", "dist"],
 	};
 }
 /** @deprecated use tsLayoutBase(); kept for importers outside the adapters. */

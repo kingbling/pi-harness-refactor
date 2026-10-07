@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { CONFIG_FILE, ConfigSchema, saveConfig, type Config } from "../config.ts";
-import { getSourceAdapter, getTargetAdapter, knownSources, knownTargets, TARGET_SUBDIRS } from "../adapters/registry.ts";
+import { getSourceAdapter, getTargetAdapter, knownSources, knownTargets, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
 import { fetchDocs } from "./docs.ts";
@@ -86,7 +86,10 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 		const { surveySource, recommend, renderSurvey } = await import("./survey.ts");
 		const abs = resolve(root, src);
 		const guesses = await Promise.all(knownSources().map(async (id) => ({ id, c: (await getSourceAdapter(id).detect(abs)).confidence })));
-		const adapterId = stack ?? guesses.sort((a, b) => b.c - a.c)[0]?.id ?? knownSources()[0]!;
+		const best = guesses.sort((a, b) => b.c - a.c)[0];
+		const adapterId = stack ?? (best && best.c > 0 ? best.id : undefined);
+		// no adapter recognises the repo: say so instead of reading it as the first language we happen to support
+		if (!adapterId) throw new Error(`no source adapter recognises ${src} (have: ${knownSources().join(", ")}); pass the stack explicitly or add an adapter`);
 		const survey = await surveySource(abs, getSourceAdapter(adapterId));
 		const rec = recommend(survey, src);
 		ui.log(renderSurvey(survey, rec));
@@ -192,20 +195,22 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 export async function setup(config: Config, root: string): Promise<void> {
 	const target = config.target.path;
 	mkdirSync(target, { recursive: true });
-	ensureRepo(target, config.target.git.branch);
-	for (const id of config.target.stacks) {
-		const adapter = await getTargetAdapter(id);
+	const adapters = await Promise.all(config.target.stacks.map((id) => getTargetAdapter(id)));
+	ensureRepo(target, config.target.git.branch, [...new Set(adapters.flatMap((a) => a.toolchain.ignoredPaths))]);
+	for (const adapter of adapters) {
+		const id = adapter.id;
 		const dir = projectDir(config, id);
 		console.log(pc.bold(`bootstrapping ${id} → ${dir}`));
 		await adapter.scaffoldProject(dir);
 		// the stack choices made at init (ORM, validation, router…) bring their packages; the generator alone does not know them
 		const packages = resolveChoices(adapter, config.target.choices).flatMap((c) => c.option.packages ?? []);
-		if (packages.length && existsSync(join(dir, "package.json"))) {
-			const installed = new Set(Object.keys({ ...(JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).dependencies ?? {}), ...(JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).devDependencies ?? {}) }));
+		if (packages.length && adapter.toolchain.isProjectReady(dir)) {
+			const installed = new Set(adapter.toolchain.installedPackages(dir));
 			const missing = packages.filter((p) => !installed.has(p));
 			if (missing.length) {
 				console.log(pc.dim(`  adding chosen packages: ${missing.join(", ")}`));
-				await runCommand("pnpm", ["add", ...missing], { cwd: dir });
+				const add = adapter.toolchain.addPackages(dir, missing);
+				await runCommand(add.cmd, add.args, { cwd: dir });
 			}
 		}
 	}
@@ -227,13 +232,12 @@ function subdirOf(stackId: string): string {
 	return TARGET_SUBDIRS[stackId] ?? stackId;
 }
 
-const TARGET_ALIASES: Record<string, string> = { nest: "nestjs", nestjs: "nestjs", react: "react", reactjs: "react" };
 /** "nest + react", "nestjs,react", "NestJS and React" → known target ids (deduped) plus whatever was not recognised. */
 export function parseTargets(text: string): { ids: string[]; unknown: string[] } {
 	const ids: string[] = [];
 	const unknown: string[] = [];
 	for (const raw of text.split(/[\s,+&/]+|\band\b/i).map((t) => t.trim().toLowerCase()).filter(Boolean)) {
-		const id = TARGET_ALIASES[raw] ?? (knownTargets().includes(raw) ? raw : undefined);
+		const id = targetIdFor(raw);
 		if (!id) unknown.push(raw);
 		else if (!ids.includes(id)) ids.push(id);
 	}
@@ -271,7 +275,7 @@ function str(v: unknown): string {
 /** Setup check: choices installed, runner as chosen, gate build + test green on a probe spec. Throws with the fix. */
 export async function checkToolchain(config: Config, adapter: TargetAdapter): Promise<void> {
 	const dir = projectDir(config, adapter.id);
-	if (!existsSync(join(dir, "package.json"))) return;
+	if (!adapter.toolchain.isProjectReady(dir)) return;
 	const chosen = resolveChoices(adapter, config.target.choices).map((c) => ({ key: c.choice.key, id: c.option.id, packages: c.option.packages }));
 	const problems = adapter.verifyChoices?.(dir, chosen) ?? [];
 	if (problems.length) throw new Error(`${adapter.id}: the project does not match the stack choices:\n  ${problems.map((p) => `${p.text}${p.fix ? ` (fix: ${p.fix})` : ""}`).join("\n  ")}\nchange the choice with \`br decide\` (or install what is missing) and rerun setup`);

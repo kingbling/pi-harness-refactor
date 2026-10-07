@@ -26,10 +26,13 @@ export function rulesText(root: string, stackId: string, moduleDir?: string): st
  * The migration policy (stack-neutral, decided by the owner): behaviour real callers observe is preserved;
  * artifacts of the old language are not; every quirk is recorded with an opinion and decided by the owner.
  */
-const BEHAVIOUR_POLICY = `Behaviour policy:
-- Preserve what real callers observe: outputs, side effects, errors, ordering, for the inputs the callers actually pass (who_calls shows them). Inputs outside the target's types (null where a value is required, numeric strings, wrong shapes) are not pinned — the target's types exclude them.
-- Artifacts of the old language are NOT carried over: loose truthiness/emptiness checks, implicit type coercion, string/number juggling, reference/copy semantics. Write idiomatic typed code instead.
-- Every oddity you notice (surprising output, likely bug, language artifact a caller might depend on) is recorded with record_quirk and your opinion (drop|keep + why). Language artifacts with opinion drop are dropped automatically; the rest are decided by the owner.`;
+function behaviourPolicy(source: SourceAdapter, recorder = "record_quirk"): string {
+	const artifacts = source.traits?.languageArtifacts;
+	return `Behaviour policy:
+- Preserve what real callers observe: outputs, side effects, errors, ordering, for the inputs the callers actually pass (who_calls shows them). Inputs outside the target's types (values of the wrong type or shape where the target declares one) are not pinned — the target's types exclude them.
+- Artifacts of the old language are NOT carried over${artifacts?.length ? ` (in ${source.id}: ${artifacts.join("; ")})` : ""}: constructs that only exist because of how the old language works. Write idiomatic typed code instead.
+- Every oddity you notice (surprising output, likely bug, language artifact a caller might depend on) is recorded with ${recorder} and your opinion (drop|keep + why). Language artifacts with opinion drop are dropped automatically; the rest are decided by the owner.`;
+}
 
 export interface PlacementPromptOpts {
 	area: string;
@@ -50,12 +53,12 @@ Your job for one unit:
 If something about the target conventions is missing or wrong in the rules and would matter for other units too, call propose_rule.
 Finish with one line: "TESTER DONE <n> cases".
 
-${BEHAVIOUR_POLICY}
+${behaviourPolicy(opts.source)}
 
 ${opts.rules ? `## Target rules (${opts.stackId}; the layout section is binding)\n${opts.rules}` : `## Layout of area "${opts.area}" (${opts.stackId})\n${opts.structureDoc}`}`;
 }
 
-export function implementerSystemPrompt(config: Config, opts: PlacementPromptOpts & { sharedDirs: string[]; rules: string; attempt: number; quirks?: string; writeGlobs?: string[] }): string {
+export function implementerSystemPrompt(config: Config, opts: PlacementPromptOpts & { sharedDirs: string[]; rules: string; attempt: number; quirks?: string; writeGlobs?: string[]; source: SourceAdapter; target: TargetAdapter }): string {
 	return `You are the IMPLEMENTER for a legacy migration (${config.source.stack} → ${config.target.stacks.join(" + ")}). You write the new code for ONE unit in ONE pass, then stop. You do not run builds or tests (a gate does that after you finish) and you cannot edit tests.
 
 Rules of the pass:
@@ -68,8 +71,8 @@ Rules of the pass:
 ${opts.attempt > 1 ? `- This is attempt ${opts.attempt}. The gate output is in the task; fix exactly what failed, keep what passed.` : ""}
 Finish with one line: "IMPLEMENTER DONE" plus anything the reviewer must know.
 
-${BEHAVIOUR_POLICY.replace("record_quirk", "your final message (the tester records quirks)")}
-${opts.quirks ? `\n## Quirks of this unit (decided)\n${opts.quirks}\nKept quirks get a \`// LEGACY: <why>\` comment; dropped ones are not reproduced.` : ""}
+${behaviourPolicy(opts.source, "your final message (the tester records quirks)")}
+${opts.quirks ? `\n## Quirks of this unit (decided)\n${opts.quirks}\nKept quirks get a \`${opts.target.layout.legacyMarker("<why>")}\` comment; dropped ones are not reproduced.` : ""}
 
 ${opts.rules ? `## Target rules (${opts.stackId}; the layout section is binding)\n${opts.rules}` : `## Layout of area "${opts.area}" (${opts.stackId})\n${opts.structureDoc}`}`;
 }

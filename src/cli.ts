@@ -19,7 +19,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br init | br start           give the old and the new folder; everything else runs (gather → decide → build)
   br resume                    continue onboarding where it stopped (finished steps are skipped)
        flags: [--source <old> --target <new>] [--yes: accept every recommendation] [--no-llm: offline]
-              [--to nestjs,react --db keep-schema --choose nestjs.orm=typeorm,… --replace lib=pkg|drop,…] pre-decide items
+              [--to <target ids> --db keep-schema --choose <stack>.<key>=<option>,… --replace lib=pkg|drop,…] pre-decide items
   br onboard                   same as init (kept for scripts)
   br init --config-only        only write bigrefactor.config.json (no data gathering)
   br setup                     bootstrap target with each stack's official CLI, git init + commit

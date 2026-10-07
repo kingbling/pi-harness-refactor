@@ -5,7 +5,7 @@ import { ConfigSchema, type Config } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { draftedOutside, runUnit } from "../src/run/unit.ts";
-import { getTargetAdapter, knownTargets, TARGET_ROLES } from "../src/adapters/registry.ts";
+import { getTargetAdapter, knownTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdFor } from "../src/adapters/registry.ts";
 import { applyPlacementAnswers, codePlace, placeUnit, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
@@ -184,6 +184,12 @@ describe("placement", () => {
 
 	it("the static role mirror equals every target adapter's role", async () => {
 		for (const id of knownTargets()) expect(TARGET_ROLES[id], id).toBe((await getTargetAdapter(id)).role);
+		// the registry knows role, subdir and aliases without loading an adapter; they must match the adapter's own
+		for (const id of knownTargets()) {
+			const t = await getTargetAdapter(id);
+			expect(TARGET_SUBDIRS[id], id).toBe(t.subdir);
+			for (const alias of [id, ...(t.aliases ?? [])]) expect(targetIdFor(alias), alias).toBe(id);
+		}
 	});
 
 	it("drafted interface paths must stay inside the unit's placement", () => {

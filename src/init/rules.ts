@@ -86,7 +86,7 @@ export async function generateRules(config: Config, root: string, ledger: Ledger
 		const prompt = [
 			`Repo brief (what the legacy app is):\n${brief.brief}`,
 			`\nBinding layout for ${stackId} (generated; agents see it above your rules):\n${composeRules(adapter, "").trim()}`,
-			`\nTarget project ${targetRel}/ (bootstrapped by the official generator):\n${listTree(target, 2)}`,
+			`\nTarget project ${targetRel}/ (bootstrapped by the official generator):\n${listTree(target, 2, adapter.layout.ignoreDirs)}`,
 			facts.length ? `\nProject facts (override any decision; never name a package that is not installed):\n${facts.join("\n")}` : "",
 			`\nRead the project's dependency manifest and config in ${targetRel}/ yourself before naming any package or command.`,
 			`\nStack decisions (binding):\n${stackPlan}`,
@@ -157,14 +157,14 @@ function sampleLegacyFiles(ledger: Ledger, n: number): string[] {
 	return out;
 }
 
-function listTree(dir: string, depth: number, prefix = ""): string {
+function listTree(dir: string, depth: number, ignore: string[], prefix = ""): string {
 	if (depth < 0 || !existsSync(dir)) return "";
 	let out = "";
-	for (const n of readdirSync(dir).filter((n) => !["node_modules", ".git", "dist"].includes(n)).sort()) {
+	for (const n of readdirSync(dir).filter((n) => n !== ".git" && !ignore.includes(n)).sort()) {
 		const p = join(dir, n);
 		const isDir = statSync(p).isDirectory();
 		out += `${prefix}${n}${isDir ? "/" : ""}\n`;
-		if (isDir) out += listTree(p, depth - 1, prefix + "  ");
+		if (isDir) out += listTree(p, depth - 1, ignore, prefix + "  ");
 	}
 	return out;
 }

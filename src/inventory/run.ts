@@ -1,3 +1,4 @@
+import { globToRegExp } from "../sessions/spawn.ts";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import pc from "picocolors";
@@ -54,7 +55,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	const resolveGlob = (g: string): string[] => {
 		let hit = globCache.get(g);
 		if (!hit) {
-			const re = new RegExp("^" + g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*\//g, "(?:.*/)?").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*") + "$", "i");
+			const re = new RegExp("^" + g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*\//g, "(?:.*/)?").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*") + "$", adapter.names?.caseInsensitive ? "i" : "");
 			hit = indexes.map((f) => f.path).filter((p) => re.test(p));
 			globCache.set(g, hit);
 		}
@@ -396,13 +397,15 @@ function unitIdFor(files: string[], n: number): string {
 
 function listFiles(root: string, adapter: SourceAdapter): string[] {
 	const out: string[] = [];
-	const exts = adapter.include.map((g) => g.replace(/^\*\*\/\*/, ""));
-	const excluded = adapter.exclude.map((g) => g.replace(/^\*\*\//, "").replace(/\/\*\*$/, ""));
+	// the adapter's globs, matched as globs (not just extensions); excluded dirs are pruned while walking
+	const include = adapter.include.map(globToRegExp);
+	const exclude = adapter.exclude.map(globToRegExp);
+	const excludedDir = (rel: string) => exclude.some((re) => re.test(`${rel}/x`) || re.test(rel));
 	const visit = (dir: string) => {
 		for (const name of readdirSync(dir)) {
 			const abs = join(dir, name);
 			const rel = relative(root, abs).split(sep).join("/");
-			if (excluded.some((x) => rel === x || rel.startsWith(x + "/") || name === x)) continue;
+			if (excludedDir(rel)) continue;
 			let st;
 			try {
 				st = statSync(abs); // follows symlinks; dangling ones throw and are skipped
@@ -410,7 +413,7 @@ function listFiles(root: string, adapter: SourceAdapter): string[] {
 				continue;
 			}
 			if (st.isDirectory()) visit(abs);
-			else if (exts.some((e) => name.endsWith(e))) out.push(rel);
+			else if (include.some((re) => re.test(rel)) && !exclude.some((re) => re.test(rel))) out.push(rel);
 		}
 	};
 	visit(root);

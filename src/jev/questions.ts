@@ -98,7 +98,7 @@ export const TRIAGE_TRUTH: Battery = {
 			flaky: "The failure depends on time, randomness, ordering, or external state",
 			real_bug: "The old code's behavior is clearly a defect but it is the real current behavior",
 			wrong_symbol: "The test targets the wrong function, class, or file",
-			env: "Missing dependency, autoload, database, or runtime problem",
+			env: "Missing dependency, module loading, database, or runtime problem",
 			other: "Cannot tell",
 		},
 	},
