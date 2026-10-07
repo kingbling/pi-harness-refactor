@@ -215,4 +215,29 @@ describe("placement + taxonomy", () => {
 		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
 		expect(client.calls.length).toBe(first); // nothing new to place: no curation, no Jev
 	});
+
+	it("re-placement settles stale questions: a placed unit never keeps an open placement or area question", async () => {
+		// no model: unsure units (money, fpdf, uuid) get placement questions
+		await resolvePlacements({ ledger, config, root: ws });
+		const open = () => ledger.openQuestions().filter((q) => q.point === "placement").map((q) => q.unit_id).sort();
+		expect(open()).toEqual(["fpdf", "money", "uuid"]);
+		// an area question on a code-placed unit, then a rule that now places fpdf for sure
+		const tq = ledger.askQuestion({ point: "taxonomy", unitId: "agency_cmd", question: "area?", blocks: "unit", askedBy: "taxonomy" });
+		ledger.updateUnit("agency_cmd", { meta: { taxonomyQuestion: tq } });
+		writeFileSync(join(ws, ".bigrefactor", "placement.json"), JSON.stringify({ rules: [{ prefix: "app/lib/components/fpdf.", area: "campaign" }] }));
+		await resolvePlacements({ ledger, config, root: ws, force: true });
+		expect(place("fpdf")).toMatchObject({ area: "campaign", source: "override" });
+		for (const u of ledger.listUnits()) {
+			const m = JSON.parse(u.meta);
+			if (m.place) expect(ledger.openQuestions().filter((q) => q.unit_id === u.id), u.id).toEqual([]);
+		}
+		expect(ledger.getQuestion(tq)!.status).toBe("withdrawn");
+		// still unsure units are asked again with the current candidates: one open question each, not two
+		expect(open()).toEqual(["money", "uuid"]);
+		// a later placement by another route (e.g. taxonomy writing meta.place) withdraws the open question on the next pass
+		ledger.updateUnit("uuid", { meta: { place: { stack: "nestjs", area: "ids", shared: true, source: "taxonomy" } } });
+		await resolvePlacements({ ledger, config, root: ws });
+		expect(open()).toEqual(["money"]);
+	});
 });
+

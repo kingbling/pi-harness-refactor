@@ -202,6 +202,8 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 	const log = d.log ?? (() => {});
 	applyPlacementAnswers(d.ledger, d.config, d.root);
 	syncTaxonomyAnswers({ ledger: d.ledger, root: d.root });
+	// forced: open placement/area questions are re-planned with the current candidates, not left dangling
+	if (d.force) for (const u of d.ledger.listUnits()) if (u.state === "planned") settleQuestions(d.ledger, u.id, "superseded: forced re-placement");
 	const all = d.ledger.listUnits();
 	const plan = planPlacements(d.config, all, d.root, d.force);
 	const todo = all.filter((u) => {
@@ -210,6 +212,7 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 	});
 	const res = { placed: 0, byModel: 0, asked: 0, shared: 0, costUsd: 0 };
 	const save = (id: string, p: Placement, extra: Partial<StoredPlace> = {}) => {
+		settleQuestions(d.ledger, id, `superseded: placed at ${p.moduleKey} (${p.source})`);
 		d.ledger.updateUnit(id, { meta: { place: { stack: p.stackId, area: p.area, shared: p.shared, source: p.source, ...extra } satisfies StoredPlace } });
 		res.placed++;
 		if (p.shared) res.shared++;
@@ -263,8 +266,26 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 		const t = await curateAreas({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { log });
 		res.costUsd += t.costUsd;
 	}
+	// placed by another route meanwhile (taxonomy rules, an answer to a similar file): their old questions go
+	for (const u of d.ledger.listUnits()) {
+		const m = JSON.parse(u.meta) as UnitMeta;
+		if (m.place && openQuestion(d.ledger, m.placeQuestion)) settleQuestions(d.ledger, u.id, `superseded: placed at ${m.place.stack}:${m.place.area} (${m.place.source})`, ["placeQuestion"]);
+	}
 	if (todo.length) log(`  placed ${res.placed}/${todo.length} units (${res.byModel} by Jev, ${res.shared} shared), ${res.asked} placement question(s), $${res.costUsd.toFixed(4)}`);
 	return res;
+}
+
+/** Withdraws a unit's open placement (and area) questions and forgets them; owner exclusions are never touched. */
+function settleQuestions(ledger: Ledger, unitId: string, why: string, keys: Array<"placeQuestion" | "taxonomyQuestion"> = ["placeQuestion", "taxonomyQuestion"]): void {
+	const m = JSON.parse(ledger.getUnit(unitId)!.meta) as UnitMeta & { taxonomyQuestion?: number };
+	const clear: Record<string, undefined> = {};
+	for (const k of keys) {
+		const id = m[k];
+		if (!id) continue;
+		if (openQuestion(ledger, id)) ledger.withdrawQuestion(id, why);
+		if (ledger.getQuestion(id)?.status !== "answered" || k === "taxonomyQuestion") clear[k] = undefined; // answered placement questions stay linked for applyPlacementAnswers
+	}
+	if (Object.keys(clear).length) ledger.updateUnit(unitId, { meta: clear });
 }
 
 function openQuestion(ledger: Ledger, id: number | undefined): boolean {
