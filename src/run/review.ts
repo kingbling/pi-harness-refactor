@@ -29,6 +29,8 @@ export interface ReviewInput {
 	/** The unit's legacy files (relative to the legacy repo). */
 	legacyFiles: string[];
 	changedFiles: string[];
+	/** Review an accepted unit: its commit is the diff (br recheck). */
+	commit?: string;
 	transcriptPath?: string;
 	spawn?: typeof spawnLeaf;
 }
@@ -91,8 +93,18 @@ function facts(o: ReviewInput): string {
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
 		`\nStack choices of the owner (${o.adapter.id}):\n${choices.join("\n") || "- none recorded"}`,
 		`\nAlready migrated code this unit's legacy code calls:\n${deps.join("\n") || "- none"}`,
-		`\nWhat the unit changed:\n${diff(o.targetProjectDir, o.changedFiles)}`,
+		`\nWhat the unit changed:\n${o.commit ? show(o.config.target.path, o.commit) : diff(o.targetProjectDir, o.changedFiles)}`,
 	].join("\n");
+}
+
+/** An accepted unit's commit as a diff; capped like diff(). */
+function show(repo: string, sha: string): string {
+	try {
+		const all = execFileSync("git", ["show", "--format=%s", sha], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
+		return all.length > 60_000 ? `${all.slice(0, 60_000)}\n[… cut: read the rest with your tools]` : all;
+	} catch {
+		return `(commit ${sha} not found: read the files with your tools)`;
+	}
 }
 
 /** The unit's changes: git diff for files git knows, the whole file for new ones; capped. */

@@ -41,6 +41,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
+  br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, the reviewer model); failures go back to planned, code kept
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
   br push [on|off] [remote]    push the migration branch to the target repo's remote after merges
@@ -217,6 +218,12 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { requeueUnits } = await import("./run/run.ts");
 		const { config, root, ledger } = open();
 		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human")) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
+	},
+	recheck: async (args) => {
+		const { recheckAccepted } = await import("./run/recheck.ts");
+		const { config, root, ledger } = open();
+		const limit = flag(args, "--limit");
+		await recheckAccepted({ ledger, config, root, limit: limit ? Number(limit) : undefined, again: args.includes("--again") });
 	},
 	onboard: async (args) => {
 		const { onboard } = await import("./init/onboard.ts");

@@ -354,6 +354,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]`));
 			let res: UnitRunResult | undefined;
 			let conflictNote: string | undefined;
+			// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
+			const carried = takeRetryNote(ledger, unitId);
 			let crash: string | undefined;
 			try {
 				// Playbook: run → (merge conflict → fresh worktree on current main, one more implement pass with the conflict as the gate output) ×2 → accept or quarantine.
@@ -367,7 +369,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						accept: false,
 						workDir: wt,
 						reuseTruth: round > 1,
-						retryNote: conflictNote,
+						retryNote: conflictNote ?? carried,
 						gateSlot: (fn) => gates.run(fn),
 						log: (l) => log(`  ${l}`),
 						spawn: o.spawn,

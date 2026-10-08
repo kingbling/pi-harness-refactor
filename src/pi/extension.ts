@@ -50,6 +50,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	unaccounted: "symbols not yet in a terminal state",
 	questions: "open questions waiting for you (list)",
 	requeue: "requeue <unit...> | --all: put quarantined or waiting units back into the queue (after a fix)",
+	recheck: "recheck [--limit N] [--again]: accepted units under the newer checks; failures go back to planned with their code kept (background)",
 	answer: "answer: walk through the open questions one dialog at a time (identical ones together) · answer <id> <text>",
 	init: "init: give the old and the new folder; gathers data, asks the decisions, builds the workspace",
 	start: "start: same as init",
@@ -608,6 +609,22 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "run") {
 				if (!ctx.hasUI) return warn(ctx, "use `br run` in a terminal outside the Pi TUI");
 				return startRun(pi, ctx, rest);
+			}
+			if (sub === "recheck") {
+				const i = rest.indexOf("--limit");
+				return startJob(pi, ctx, "recheck of accepted units", async () => {
+					const cp = findConfigPath(ctx.cwd);
+					if (!cp) return { error: "no bigrefactor.config.json here" };
+					const { config, root } = loadConfig(cp);
+					const { recheckAccepted } = await import("../run/recheck.ts");
+					const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+					try {
+						const r = await recheckAccepted({ ledger, config, root, limit: i >= 0 ? Number(rest[i + 1]) : undefined, again: rest.includes("--again"), log: (l) => progress.log(l) });
+						return { lines: [`${r.checked} checked · ${r.reopened.length} back to planned (code kept)${r.notJudged ? ` · ${r.notJudged} not judged` : ""}`, "continue with /br run"] };
+					} finally {
+						ledger.close();
+					}
+				});
 			}
 			if (sub === "progress") {
 				const snap = progress.snapshot();

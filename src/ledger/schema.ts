@@ -92,7 +92,7 @@ export const SYMBOL_TRANSITIONS: Record<SymbolState, readonly SymbolState[]> = {
 	mapped: ["tested", "in_progress", "quarantined"],
 	dropped: ["in_progress"], // a human can re-open
 	tested: ["accepted", "in_progress", "quarantined"],
-	accepted: [],
+	accepted: ["clustered"], // br recheck re-opens a unit whose accepted code fails the newer checks
 	quarantined: ["clustered", "dropped"],
 };
 
