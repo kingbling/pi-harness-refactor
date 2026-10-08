@@ -218,24 +218,52 @@ describe("triage without a decision model", () => {
 });
 
 describe("quirks stay few", () => {
-	it("drops of artifacts and edge cases are the tester's call; a precedent answers a matching quirk", async () => {
+	it("drops of artifacts and edge cases are the tester's call; the owner's earlier answers go to the phrasing model", async () => {
 		const { root, config, ledger, mk } = workspace();
 		mk("U1");
 		mk("U2");
+		mk("U3");
 		const sym = "src/U1.php::f";
 		expect(recordQuirk({ ledger, root }, { unitId: "U1", symbolId: sym, kind: "edge_case", behaviour: "empty list returns '0'", opinion: "drop", why: "callers cast" }).status).toBe("dropped");
 		recordQuirk({ ledger, root }, { unitId: "U1", symbolId: sym, kind: "suspected_bug", behaviour: "VAT rounds half down on totals", opinion: "drop", why: "looks like a bug" });
-		// the decision model matches the second rounding quirk to the owner's first decision
-		const client = new FakeModelClient({
-			decide: (req) => (req.questions["precedent"] ? { precedent: { type: "choice", choice: `p${(ledger.db.prepare("SELECT id FROM quirks WHERE behaviour LIKE 'VAT rounds%'").get() as { id: number }).id}`, probabilities: {}, confidence: 0.95 } } : undefined),
-		});
+		recordQuirk({ ledger, root }, { unitId: "U3", symbolId: "src/U3.php::f", kind: "intentional", behaviour: "dates print in US order", opinion: "keep", why: "reports" });
+		// no phrasing (plain text back): the questions reach the owner
+		const prompts: string[] = [];
+		const client = new FakeModelClient({ chat: (req) => (prompts.push(req.messages.map((m) => m.content).join("\n")), undefined) });
 		const d = { ledger, config, root, client };
 		expect((await askPendingQuirks(d, "U1")).asked).toBe(1);
-		const q = ledger.openQuestions()[0]!;
-		ledger.answerQuestion(q.id, "keep");
+		expect(prompts[0]).not.toContain("Owner's earlier answers");
+		expect((await askPendingQuirks(d, "U3")).asked).toBe(1);
+		const [q1, q3] = ledger.openQuestions();
+		ledger.answerQuestion(q1!.id, "keep");
+		// a bulk "accepted the summary" answer only repeats a recommendation: not shown as the owner's view
+		ledger.answerQuestion(q3!.id, "keep", "human (pi, accepted the summary)");
 		recordQuirk({ ledger, root }, { unitId: "U2", symbolId: "src/U2.php::f", kind: "suspected_bug", behaviour: "VAT on invoice lines rounds half down", opinion: "drop", why: "same rounding" });
-		expect((await askPendingQuirks(d, "U2")).asked).toBe(0);
-		expect(quirksOf({ ledger }, "U2")[0]).toMatchObject({ status: "kept", decided_by: expect.stringMatching(/^precedent #/) });
+		expect((await askPendingQuirks(d, "U2")).asked).toBe(1);
+		const last = prompts.at(-1)!;
+		expect(last).toContain("Owner's earlier answers:\n- suspected_bug in src/U1.php::f: VAT rounds half down on totals → keep");
+		expect(last).not.toContain("dates print in US order");
+		// nothing decided behind the owner's back: the new quirk waits for its own answer
+		expect(quirksOf({ ledger }, "U2")[0]).toMatchObject({ status: "asked" });
+		ledger.close();
+	});
+});
+
+describe("phrasing a question", () => {
+	it("mentions another pick only when one was passed", async () => {
+		const { config, ledger } = workspace();
+		const systems: string[] = [];
+		const client = new FakeModelClient({ chat: (req) => (systems.push(req.messages[0]!.content as string), undefined) });
+		const { askViaModel } = await import("../src/jev/ask.ts");
+		const d = { ledger, config, client };
+		await askViaModel(d, { point: "gate_env", facts: "the database is down", options: [{ value: "fixed" }, { value: "quarantine" }], askedBy: "doctor" });
+		expect(systems[0]).not.toMatch(/agent|current pick/);
+		expect(systems[0]).toContain("your own pick");
+		await askViaModel(d, { point: "gate_env", facts: "the database is down", options: [{ value: "fixed" }, { value: "quarantine" }], recommended: "fixed", askedBy: "doctor" });
+		expect(systems[1]).toContain("agree or disagree with the current pick");
+		expect(systems[1]).not.toMatch(/agent/);
+		await askViaModel(d, { point: "quirk", facts: "x", options: [{ value: "drop" }, { value: "keep" }], recommended: "drop", agentOpinion: "a bug", askedBy: "tester" });
+		expect(systems[2]).toContain("agent's opinion");
 		ledger.close();
 	});
 });

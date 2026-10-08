@@ -1,11 +1,12 @@
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { getSourceAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { decide } from "../jev/decide.ts";
-import { JEV_ACT as ACT, noulConfidence, ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
+import { JEV_ACT as ACT, ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
+import { functionsInFiles } from "../inventory/codemap.ts";
 import { authWord, planSlices, type SliceOverrides } from "../inventory/slices.ts";
 import { resolvePlacements } from "../run/placement.ts";
 
@@ -14,8 +15,10 @@ import { resolvePlacements } from "../run/placement.ts";
  *  1. every planned unit: difficulty, kind, needs_db, has_ui, dynamic_refs (ROUTE_UNIT) → `meta.route`.
  *     The scheduler starts a unit on the escalate model when Jev rates it Hard with confidence; kind
  *     replaces the adapter's path heuristic when Jev is confident.
- *  2. feature slices: which ones are authentication/session (they go first) → `slices.json → advised.auth`.
- *  3. units no entry point reaches (`dynamic` slice): which feature they belong to → `advised.units`.
+ *  2. feature slices: which one is login/authentication (it goes first) → `slices.json → advised.auth`; an unsure
+ *     answer is not stored, so it is asked again on the next `br label`.
+ *  3. units no entry point reaches (`dynamic` slice): which feature uses them (all slices offered, with how many
+ *     files of each name the unit) → `advised.units`.
  *  4. placement: every planned unit's target stack + legacy area (code, Jev where code is unsure, else a question).
  * Advice never overrides a human: explicit `overrides` in slices.json win. Every call lands in the
  * decisions table for calibration. Cheap: Jev ≈ $0.00004 per call.
@@ -23,24 +26,76 @@ import { resolvePlacements } from "../run/placement.ts";
 /** Literal, language-agnostic text signal (code fact, certain): SQL keywords in strings. Global state is the adapter's. */
 const SQL_TEXT = /["'`]\s*(SELECT\s.+\sFROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b/i;
 const LEVELS = ["mechanical", "moderate", "hard"] as const;
+/** Size of the code Jev sees per unit. */
+const EXCERPT_CHARS = 2400;
+
+/**
+ * What Jev reads about a unit: the code map first (every function's signature, grouped by class, with its
+ * purpose or first doc line), so a long file is seen whole; the room left goes to the start of the file text,
+ * which is all a file without functions (a template) has. Capped at EXCERPT_CHARS.
+ */
+export function codeMapExcerpt(ledger: Ledger, sourceRoot: string, files: string[], max = EXCERPT_CHARS): string {
+	const fns = functionsInFiles(ledger, files);
+	const map: string[] = [];
+	for (const f of files) {
+		const own = fns.filter((x) => x.path === f);
+		if (!own.length) continue;
+		map.push(`// ${f}: ${own.length} function${own.length === 1 ? "" : "s"}`);
+		let container: string | null | undefined;
+		for (const x of own) {
+			if (x.container !== container) {
+				container = x.container;
+				if (container) map.push(`${container}:`);
+			}
+			const doc = (JSON.parse(x.comments) as Array<{ kind: string; body: string }>).find((c) => c.kind === "doc");
+			const note = x.purpose ?? doc?.body.split("\n")[0]!.slice(0, 100) ?? "";
+			map.push(`${container ? "  " : ""}${(x.signature ?? `${x.name}()`).replace(/\s+/g, " ").trim()}${note ? `  // ${note}` : ""}`);
+		}
+	}
+	let out = map.length ? `${map.join("\n")}\n`.slice(0, max) : "";
+	for (const f of files) {
+		if (out.length >= max - 80) break;
+		try {
+			out += `// ${f} (start)\n${readFileSync(join(sourceRoot, f), "utf8").slice(0, max - out.length)}\n`;
+		} catch {
+			/* unreadable: path only */
+		}
+	}
+	return out;
+}
+
+/** Per feature slice, how many of its files mention one of `names` (a file name or a class name). A code fact for Jev. */
+function mentionCounts(sourceRoot: string, filesBySlice: Map<string, string[]>, names: Map<string, string[]>): Map<string, Record<string, number>> {
+	const out = new Map<string, Record<string, number>>();
+	const all = [...new Set([...names.values()].flat())].filter((n) => n.length >= 3);
+	if (!all.length) return out;
+	const re = new RegExp(`\\b(${all.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`, "g");
+	const unitsOf = new Map<string, string[]>();
+	for (const [id, ns] of names) for (const n of ns) (unitsOf.get(n) ?? unitsOf.set(n, []).get(n)!).push(id);
+	for (const [slice, files] of filesBySlice)
+		for (const f of files) {
+			let text: string;
+			try {
+				text = readFileSync(join(sourceRoot, f), "utf8");
+			} catch {
+				continue;
+			}
+			const hit = new Set<string>();
+			for (const m of text.match(re) ?? []) for (const id of unitsOf.get(m) ?? []) hit.add(id);
+			for (const id of hit) {
+				const c = out.get(id) ?? out.set(id, {}).get(id)!;
+				c[slice] = (c[slice] ?? 0) + 1;
+			}
+		}
+	return out;
+}
 
 export async function labelUnits(config: Config, root: string, ledger: Ledger, client: ModelClient, opts: { concurrency?: number; log?: (l: string) => void; onProgress?: (detail: string) => void } = {}): Promise<{ units: number; hard: number; auth: string[]; placed: number; areas: { placed: number; asked: number }; costUsd: number }> {
 	const log = opts.log ?? console.log;
 	const model = config.models.decide.id;
 	let cost = 0;
 	const units = ledger.listUnits({ state: "planned" }).filter((u) => !JSON.parse(u.meta).route);
-	const excerpt = (files: string[]) => {
-		let out = "";
-		for (const f of files) {
-			if (out.length > 2400) break;
-			try {
-				out += `// ${f}\n${readFileSync(join(config.source.path, f), "utf8").slice(0, 2400 - out.length)}\n`;
-			} catch {
-				/* unreadable: path only */
-			}
-		}
-		return out;
-	};
+	const excerpt = (files: string[]) => codeMapExcerpt(ledger, config.source.path, files);
 	const globalState = getSourceAdapter(config.source.stack).traits?.globalState;
 	const readSources = (files: string[]) => files.map((f) => { try { return readFileSync(join(config.source.path, f), "utf8"); } catch { return ""; } }).join("\n");
 	let hard = 0;
@@ -91,29 +146,37 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 	const plan = planSlices(ledger, ov);
 	const features = plan.slices.filter((s) => s.kind === "feature" || s.kind === "auth");
 	const advised = (ov.advised ??= {});
+	const key = (n: string) => n.replace(/[^A-Za-z0-9_]/g, "_");
 	let auth: string[] = advised.auth ?? [];
 	if (features.length && !advised.auth) {
-		// a name match is one fact for Jev (it also hits `authors`, `sessions` of a training app); Jev decides
-		const fact = (s: (typeof features)[number]) => { const w = authWord(s.name, s.entryPoints); return w ? ` Fact: its name or an entry point contains "${w}" (a word match only, not a verdict).` : ""; };
-		const battery: Battery = Object.fromEntries(features.map((s) => [s.name.replace(/[^A-Za-z0-9_]/g, "_"), { type: "noul", instructions: `Is the feature slice "${s.name}" (entry points: ${s.entryPoints.slice(0, 12).join(", ")}) about authentication, login, sessions or user identity, so that other features depend on it?${fact(s)}` }]));
-		const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_auth", { app: config.source.framework ?? config.source.stack }, battery, Object.keys(battery));
+		// one choice among all slices: a yes/no per slice let the least sure slice sink the whole answer.
+		// A name match is one fact for Jev (it also hits `authors`, `sessions` of a training app); Jev decides
+		const fact = (s: (typeof features)[number]) => { const w = authWord(s.name, s.entryPoints); return w ? `; its name or an entry point contains "${w}" (a word match only, not a verdict)` : ""; };
+		const criteria: Record<string, string | null> = { ...Object.fromEntries(features.map((s) => [key(s.name), `feature "${s.name}" (entry points: ${s.entryPoints.slice(0, 12).join(", ")})${fact(s)}`])), none: "no slice is about login or authentication" };
+		const battery: Battery = { auth: { type: "choice", instructions: "Which feature slice is the login / authentication / session one, that other features depend on?", criteria } };
+		const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_auth", { app: config.source.framework ?? config.source.stack }, battery, ["auth"]);
 		cost += r.costUsd;
-		auth = features.filter((s) => { const a = r.answers[s.name.replace(/[^A-Za-z0-9_]/g, "_")]; return a?.type === "noul" && a.noul >= 0.5 && noulConfidence(a.noul) >= ACT; }).map((s) => s.name);
-		advised.auth = auth;
+		const a = r.answers["auth"];
+		// only a sure answer is stored; an unsure one stays undecided (the name match stands in) and is asked again next time
+		if (a?.type === "choice" && a.confidence >= ACT) {
+			auth = a.choice === "none" ? [] : features.filter((s) => key(s.name) === a.choice).map((s) => s.name);
+			advised.auth = auth;
+		}
 	}
 	const dyn = plan.slices.find((s) => s.name === "dynamic")?.units ?? [];
 	const placedBefore = Object.keys(advised.units ?? {}).length;
 	const targets = features.map((s) => s.name);
 	let byCode = 0;
 	if (dyn.length && targets.length) {
-		const key = (n: string) => n.replace(/[^A-Za-z0-9_]/g, "_");
 		// evidence from the index: which slice the unit's folder neighbours (same dir, then parent dir) belong to
 		const sliceOf = new Map<string, string>();
 		for (const sl of plan.slices) if (sl.name !== "dynamic") for (const id of sl.units) sliceOf.set(id, sl.name);
 		const dirUnits = new Map<string, string[]>();
 		const fileOfUnit = new Map<string, string>();
+		const filesOfUnit = new Map<string, string[]>();
 		for (const u of ledger.listUnits()) {
-			const f = (JSON.parse(u.meta).files ?? [])[0] as string | undefined;
+			filesOfUnit.set(u.id, JSON.parse(u.meta).files ?? []);
+			const f = filesOfUnit.get(u.id)![0];
 			if (!f) continue;
 			fileOfUnit.set(u.id, f);
 			for (const d of [dirname(f), dirname(dirname(f))]) (dirUnits.get(d) ?? dirUnits.set(d, []).get(d)!).push(u.id);
@@ -133,6 +196,11 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 			return { dir: "", tally: [] as Array<[string, number]> };
 		};
 		const units2 = dyn.filter((id) => !(advised.units ?? {})[id] && !(ov.overrides ?? {})[id]);
+		// evidence from the code: per slice, how many of its files name this unit's file or classes (who uses it)
+		const filesBySlice = new Map(plan.slices.filter((sl) => sl.kind !== "dynamic").map((sl) => [sl.name, sl.units.flatMap((id) => filesOfUnit.get(id) ?? [])]));
+		const classes = ledger.db.prepare("SELECT DISTINCT name FROM symbols WHERE unit_id = ? AND kind IN ('class','interface','trait')");
+		const names = new Map(units2.map((id) => [id, [...(filesOfUnit.get(id) ?? []).flatMap((f) => [basename(f), `${basename(dirname(f))}/${basename(f).split(".")[0]}`]), ...(classes.all(id) as Array<{ name: string }>).map((c) => c.name)]]));
+		const usedBy = mentionCounts(config.source.path, filesBySlice, names);
 		let i = 0;
 		const work = async () => {
 			for (;;) {
@@ -149,12 +217,11 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 					byCode++;
 					continue;
 				}
-				// 2. Jev with the evidence, choosing only among plausible slices (neighbours' + foundation), else all
-				const plausible = v.tally.length ? features.filter((sl) => v.tally.some(([n]) => n === sl.name)) : features;
-				const criteria: Record<string, string | null> = { ...Object.fromEntries(plausible.map((sl) => [key(sl.name), `feature "${sl.name}" (entry points: ${sl.entryPoints.slice(0, 6).join(", ")})`])), foundation: "shared code many features use", other: null };
-				const battery: Battery = { slice: { type: "choice", instructions: "No route reaches the code in `summary`. `neighbours` lists which feature the other files in its folder belong to. Which feature slice should it be migrated with?", criteria } };
+				// 2. Jev with the evidence, choosing among every feature slice (the folder alone often misses the right one)
+				const criteria: Record<string, string | null> = { ...Object.fromEntries(features.map((sl) => [key(sl.name), `feature "${sl.name}" (entry points: ${sl.entryPoints.slice(0, 6).join(", ")})`])), foundation: "shared code several features use", other: null };
+				const battery: Battery = { slice: { type: "choice", instructions: "No route reaches the code in `summary`. `usedBy` counts, per slice, the files that name this file or its classes; `neighbours` lists which slice the other files in its folder belong to. Which feature uses this code, so it should be migrated with it? Pick foundation when several features use it.", criteria } };
 				try {
-					const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_slice", { summary: excerpt(meta.files), path: meta.files[0], neighbours: { folder: v.dir, slices: Object.fromEntries(v.tally) } }, battery, ["slice"], id);
+					const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_slice", { summary: excerpt(meta.files), path: meta.files[0], usedBy: usedBy.get(id) ?? {}, neighbours: { folder: v.dir, slices: Object.fromEntries(v.tally) } }, battery, ["slice"], id);
 					cost += r.costUsd;
 					const a = r.answers["slice"];
 					if (a?.type === "choice" && a.choice !== "other" && a.confidence >= ACT) {
@@ -170,7 +237,7 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 	}
 	writeFileSync(p, JSON.stringify(ov, null, 2) + "\n");
 	const placed = Object.keys(advised.units ?? {}).length - placedBefore;
-	if (features.length) log(`  slices: auth = ${auth.join(", ") || "none"}; ${placed}/${dyn.length} unreached units placed (${byCode} by folder neighbours, ${placed - byCode} by Jev)`);
+	if (features.length) log(`  slices: auth = ${advised.auth ? auth.join(", ") || "none" : "undecided (Jev unsure; asked again next br label)"}; ${placed}/${dyn.length} unreached units placed (${byCode} by folder neighbours, ${placed - byCode} by Jev)`);
 	// after the labels: Jev's has_ui decides the surface where the source adapter cannot tell
 	const areas = await resolvePlacements({ ledger, config, root, client, log, concurrency: opts.concurrency, curate: true });
 	cost += areas.costUsd;

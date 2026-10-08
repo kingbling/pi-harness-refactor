@@ -272,6 +272,8 @@ export interface AskRequest {
 	guess?: boolean;
 	/** An agent's opinion to carry along (e.g. the tester's on a quirk). */
 	agentOpinion?: string;
+	/** The owner's earlier answers on like questions, as context for the phrasing model (not binding). */
+	ownerAnswers?: string;
 	blocks?: QuestionBlocks;
 	askedBy: string;
 	context?: Record<string, unknown>;
@@ -393,8 +395,8 @@ async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & {
 			effort: "low",
 			schema: { type: "object", additionalProperties: false, required: PHRASE_SCHEMA.properties.questions.items.required, properties: PHRASE_SCHEMA.properties.questions.items.properties },
 			messages: [
-				{ role: "system", content: `You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion (agree or disagree with the agent's, with a reason).\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
-				{ role: "user", content: `${brief ? `Repo brief:\n${brief.slice(0, 4000)}\n\n` : ""}Point: ${q.point}${q.unitId ? ` (unit ${q.unitId})` : ""}\nFacts:\n${q.facts}\n\nOptions: ${JSON.stringify(q.options)}\n${q.recommended ? `Current pick: ${q.recommended}\n` : ""}${q.agentOpinion ? `Agent's opinion: ${q.agentOpinion}\n` : ""}\nReturn id "${q.point}".` },
+				{ role: "system", content: `You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion${q.recommended || q.agentOpinion ? ` (agree or disagree with the ${q.agentOpinion ? "agent's opinion" : "current pick"}, with a reason)` : " (your own pick and why; no other pick was made)"}.${q.ownerAnswers ? " The owner's earlier answers on like questions show what they want; follow them where the case is the same." : ""}\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
+				{ role: "user", content: `${brief ? `Repo brief:\n${brief.slice(0, 4000)}\n\n` : ""}Point: ${q.point}${q.unitId ? ` (unit ${q.unitId})` : ""}\nFacts:\n${q.facts}\n\nOptions: ${JSON.stringify(q.options)}\n${q.recommended ? `Current pick: ${q.recommended}\n` : ""}${q.agentOpinion ? `Agent's opinion: ${q.agentOpinion}\n` : ""}${q.ownerAnswers ? `Owner's earlier answers:\n${q.ownerAnswers}\n` : ""}\nReturn id "${q.point}".` },
 			],
 		});
 		const j = (res.json ?? {}) as { question?: string; options?: Array<{ value: string; label: string; hint: string }>; recommended?: string; opinion?: string };
