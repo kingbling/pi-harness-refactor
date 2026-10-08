@@ -507,7 +507,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			// Whole-target decisions refuse; every other open decision only blocks the units it affects and is
 			// asked on the side (dialogs) while the run goes on. Answers release their units at the next loop.
 			const { decisionGate, renderGate, liveBlocks } = await import("../run/decisions-gate.ts");
-			const { applyDecision } = await import("../inventory/decisions.ts");
+			const { applyDecision, decisionPrompt } = await import("../inventory/decisions.ts");
 			const source = getSourceAdapter(config.source.stack);
 			const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
 			const g = decisionGate(ledger, config, source, targets, root);
@@ -524,7 +524,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 					if (!next || progress.stopping) return;
 					asked.add(next.id);
 					const ui = piPrompter(ctx, []);
-					const v = await ui.select(`decision while the run continues — ${next.question}\n${next.evidence}${next.reason ? `\nwhy ${next.recommended}: ${next.reason}` : ""}`, next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), next.recommended);
+					const v = await ui.select(`decision while the run continues — ${decisionPrompt(next)}`, next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), next.recommended);
 					if (v === undefined) {
 						progress.log(`decision ${next.id} skipped: its units stay blocked (/br decide later)`);
 						continue;
@@ -790,7 +790,7 @@ export default function (pi: ExtensionAPI) {
 							applySlicePlan(ledger, plan);
 							lines.push(renderSlicePlan(plan));
 						} else {
-							const { openDecisions, applyDecision, renderDecisions } = await import("../inventory/decisions.ts");
+							const { openDecisions, applyDecision, renderDecisions, decisionPrompt } = await import("../inventory/decisions.ts");
 							for (const a of rest) {
 								const eq = a.indexOf("=");
 								if (eq > 0) lines.push(`decided ${a.slice(0, eq)} = ${a.slice(eq + 1)}  ${applyDecision(ledger, config, root, a.slice(0, eq), a.slice(eq + 1), "human (pi)")}`);
@@ -799,7 +799,7 @@ export default function (pi: ExtensionAPI) {
 							if (ctx.hasUI) {
 								const ui = piPrompter(ctx, lines);
 								for (const d of ds) {
-									const v = await ui.select(`${d.question}\n${d.evidence}`, d.options.map((o) => ({ value: o.value, label: o.label, hint: o.hint })), d.recommended);
+									const v = await ui.select(decisionPrompt(d), d.options.map((o) => ({ value: o.value, label: o.label, hint: o.hint })), d.recommended);
 									if (v === undefined) break;
 									lines.push(`decided ${d.id} = ${v}  ${applyDecision(ledger, config, root, d.id, v, "human (pi)")}`);
 								}

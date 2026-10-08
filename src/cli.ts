@@ -267,7 +267,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 			const { inventory } = await import("./inventory/run.ts");
 			await inventory(config, root, ledger); // the kept files become units again
 		}
-		console.log(`${r.asked} dropped files judged, ${r.alive.length} kept as entry points${r.alive.length ? `: ${r.alive.slice(0, 8).join(", ")}${r.alive.length > 8 ? ", …" : ""}` : ""}, $${r.costUsd.toFixed(4)}`);
+		console.log(`${r.asked} dropped files checked, ${r.questions} folder question(s) asked, ${r.alive.length} kept as entry points${r.alive.length ? `: ${r.alive.slice(0, 8).join(", ")}${r.alive.length > 8 ? ", …" : ""}` : ""}, $${r.costUsd.toFixed(4)}`);
 	},
 	label: async () => {
 		const { labelUnits } = await import("./init/label.ts");
@@ -316,7 +316,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		console.log(await ownerRule({ root, stack: t.id, adapter: t, words, ui: terminalPrompter, client: makeClient(), model: config.models.escalate.id, projectDir: projectDir(config, t.id), ledger }));
 	},
 	decide: async (args) => {
-		const { openDecisions, applyDecision, renderDecisions } = await import("./inventory/decisions.ts");
+		const { openDecisions, applyDecision, renderDecisions, decisionPrompt } = await import("./inventory/decisions.ts");
 		const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
 		const { config, ledger, root } = open();
 		const source = getSourceAdapter(config.source.stack);
@@ -342,7 +342,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!answers.length && !args.includes("--list") && ds.length && process.stdout.isTTY) {
 			const { terminalPrompter } = await import("./init/init.ts");
 			for (const d of ds) {
-				const v = await terminalPrompter.select(`${d.question}\n   ${pc.dim(d.evidence)}`, d.options.map((o) => ({ value: o.value, label: o.label, hint: o.hint })), d.recommended);
+				const v = await terminalPrompter.select(decisionPrompt(d), d.options.map((o) => ({ value: o.value, label: o.label, hint: o.hint })), d.recommended);
 				if (v === undefined) break;
 				console.log(pc.dim(applyDecision(ledger, cfg2, root, d.id, v, process.env["USER"] ?? "human")));
 			}

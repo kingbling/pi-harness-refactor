@@ -211,14 +211,14 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		});
 
 		await step("decide", () => undefined, async () => {
-			const { openDecisions, applyDecision, renderDecisions } = await import("../inventory/decisions.ts");
+			const { openDecisions, applyDecision, renderDecisions, decisionPrompt } = await import("../inventory/decisions.ts");
 			const l = ledger();
 			try {
 				const { knownTargets } = await import("../adapters/registry.ts");
 				// one dialog per decision; besides the options: type another answer, or leave it open for later
 				const OTHER = "\0other", LATER = "\0later";
 				const askOne = async (d: (typeof ds)[number], count?: string): Promise<string | undefined> => {
-					const v = await ui.select(`${count ? `(${count}) ` : ""}${d.question}\n   ${d.evidence}${d.reason ? `\n   why ${d.recommended}: ${d.reason}` : ""}`, [...d.options.map((o) => ({ value: o.value, label: o.value === d.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), { value: OTHER, label: "something else (type it)" }, { value: LATER, label: "decide later", hint: "stays open; br decide asks again" }], d.recommended);
+					const v = await ui.select(`${count ? `(${count}) ` : ""}${decisionPrompt(d)}`, [...d.options.map((o) => ({ value: o.value, label: o.value === d.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), { value: OTHER, label: "something else (type it)" }, { value: LATER, label: "decide later", hint: "stays open; br decide asks again" }], d.recommended);
 					if (v === undefined) throw new Error("onboarding cancelled");
 					if (v === LATER) return undefined;
 					if (v !== OTHER) return v;
@@ -304,9 +304,11 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				if (yes) {
 					for (const d of ds) if (d.recommended) applyDecision(l, config, root, d.id, d.recommended, "onboard --yes");
 				} else {
-					// one question first: accept every recommendation? (a typical run is a single answer)
-					const withRec = ds.filter((d) => d.recommended);
-					const accept = await ui.select(`${ds.length} open decisions. Accept the ${withRec.length} recommended answers and only review the rest?`, [{ value: "accept", label: "accept recommendations", hint: withRec.map((d) => `${d.id}=${d.recommended}`).slice(0, 8).join(", ") + (withRec.length > 8 ? ", …" : "") }, { value: "each", label: "ask me each one" }], "accept");
+					// one question first: accept every recommendation? (a typical run is a single answer). Where the two
+					// models disagree there is no single recommendation: those are asked one by one, with both views
+					const withRec = ds.filter((d) => d.recommended && !d.disagree);
+					const split = ds.length - withRec.length;
+					const accept = await ui.select(`${ds.length} open decisions. Accept the ${withRec.length} recommended answers and only review the rest${split ? ` (${split} where the models disagree)` : ""}?`, [{ value: "accept", label: "accept recommendations", hint: withRec.map((d) => `${d.id}=${d.recommended}`).slice(0, 8).join(", ") + (withRec.length > 8 ? ", …" : "") }, { value: "each", label: "ask me each one" }], "accept");
 					if (accept === undefined) throw new Error("onboarding cancelled");
 					if (accept === "accept") for (const d of withRec) applyDecision(l, config, root, d.id, d.recommended!, "human (accepted recommendations)");
 					reload();
@@ -380,7 +382,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			return `${entries.length} docs`;
 		});
 
-		// files the reachability walk dropped: Jev judges whether they still run (cron, CLI, dynamic dispatch);
+		// files the reachability walk dropped: a model with tools checks whether they still run (cron, CLI, dynamic dispatch);
 		// the inventory below keeps the ones it says may run
 		await step("dead code", () => (noLlm ? "skipped (--no-llm): unreached files stay dropped" : undefined), async () => {
 			const { confirmDeadCode } = await import("./dead.ts");
@@ -388,7 +390,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			const l = ledger();
 			try {
 				const r = await confirmDeadCode(config, root, l, new OpenRouterClient(), { log: (x) => log(pc.dim(x)) });
-				return r.asked ? `${r.asked} dropped files judged, ${r.alive.length} kept as entry points, $${r.costUsd.toFixed(4)}` : "no new dropped files";
+				return r.asked ? `${r.asked} dropped files checked, ${r.alive.length} kept as entry points, ${r.questions} folder(s) to drop asked (/br answer), $${r.costUsd.toFixed(4)}` : "no new dropped files";
 			} finally {
 				l.close();
 			}

@@ -2,6 +2,7 @@ import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { Config } from "../config.ts";
 import { effectivePlatform } from "../init/stack.ts";
+import { legacyLibraries } from "./not-app.ts";
 
 /**
  * `br frameworks`: what the legacy framework(s) and libraries do for the app, how much the app leans on
@@ -92,7 +93,7 @@ export function planFrameworks(ledger: Ledger, source: SourceAdapter, targets: T
 	}
 	const out: ConcernRow[] = [...rows.values()].map((r) => ({ concern: r.concern, legacy: r.legacy, verdict: r.verdict, platform: r.platform, classes: r.classes, loc: r.loc, appRefs: r.appRefs, appFiles: r._files.size, extendedBy: r.extendedBy, top: [...r._top.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, k]) => `${n}(${k})`) })).sort((a, b) => b.appRefs - a.appRefs);
 	unmapped.sort((a, b) => b.appRefs - a.appRefs);
-	const libraries = (source.externalDeps?.(sourceRoot) ?? []).map((l) => { const d = decisions?.libraries?.[l.name]; return d ? { ...l, verdict: d.verdict, successor: d.successor ?? l.successor, note: `${l.note ? l.note + "; " : ""}decided` } : l; });
+	const libraries = legacyLibraries(source, sourceRoot).map((l) => { const d = decisions?.libraries?.[l.name]; return d ? { ...l, verdict: d.verdict, successor: d.successor ?? l.successor, note: `${l.note ? l.note + "; " : ""}decided` } : l; });
 	// decided framework classes leave the unmapped list
 	const decidedClasses = decisions?.frameworkClasses ?? {};
 	for (let i = unmapped.length - 1; i >= 0; i--) if (decidedClasses[unmapped[i]!.name]) unmapped.splice(i, 1);

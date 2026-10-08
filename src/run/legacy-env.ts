@@ -29,6 +29,8 @@ export interface LegacyEnv {
 	 * Unset = not probed yet. Delete legacy-env.json to probe again.
 	 */
 	mode?: TruthMode;
+	/** The owner question asked once after a red probe (blocks nothing): "retry" makes the next run probe again. */
+	probeQuestion?: number;
 }
 
 /** run = expected values recorded by running the old code; read = written from reading it (not run). */
@@ -133,32 +135,55 @@ export function loadReadTruth(truthDirAbs: string): { ok: boolean; cases: TruthC
 	}
 }
 
+/** Asks the owner one question (blocks nothing); returns its id. */
+export type ProbeAsker = (q: { facts: string; options: Array<{ value: string; facts: string }>; recommended: string }) => Promise<number | undefined>;
+/** The owner's answer to the probe question: "retry" = probe again at the next run. */
+export type ProbeAnswer = (questionId: number) => string | undefined;
+
 /**
- * Once per workspace, before any unit: can the old code run here? The setup model tries (copy, install the
- * dependencies, a database from the schema files) and writes a probe script; code runs the probe. Green → "run",
- * anything else → "read" (units then get read-not-run truth). Already decided → nothing happens.
+ * Once per workspace, before any unit: can single units of the old code be loaded and called here, with whatever
+ * this machine has? (The whole app does not need to boot.) The setup model tries and writes a probe script; code
+ * runs the probe. Green → "run", anything else → "read" (units then try a small script each, else read-not-run
+ * truth), and the owner is asked once — blocking nothing — whether to probe again after setting something up.
  */
-export async function probeLegacyEnv(o: { config: Config; root: string; source: SourceAdapter; fixer?: LegacyFixer; log?: (l: string) => void }): Promise<TruthMode> {
+export async function probeLegacyEnv(o: { config: Config; root: string; source: SourceAdapter; fixer?: LegacyFixer; log?: (l: string) => void; ask?: ProbeAsker; answer?: ProbeAnswer }): Promise<TruthMode> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const cur = loadLegacyEnv(o.root, o.config);
-	if (cur.mode) return cur.mode;
+	// read mode: probe again only when the owner said so (after installing something); otherwise decided
+	const retry = cur.mode === "read" && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
+	if (cur.mode && !retry) return cur.mode;
 	const dir = join(o.root, ".bigrefactor", "legacy-env", "probe");
 	mkdirSync(dir, { recursive: true });
 	const script = join(dir, o.source.truth.scriptName);
-	const db = o.config.db.schemaFiles?.length ? ` It uses ${o.config.db.from.join(" + ") || "a database"}; the schema is in ${o.config.db.schemaFiles.join(", ")}: when the code needs it, start a local database from it (docker is fine) and point the old code's config at it in the copy.` : "";
+	const db = o.config.db.schemaFiles?.length ? ` The old code uses ${o.config.db.from.join(" + ") || "a database"} (schema in ${o.config.db.schemaFiles.join(", ")}); a unit that needs no database is the better probe. Start a database only if one is needed and this machine can run it.` : "";
 	const said = await (o.fixer ?? fixLegacyEnvWithModel)({
 		config: o.config,
 		root: o.root,
 		source: o.source,
 		script,
 		probe: true,
-		problem: `Nothing has run on the old code yet. Make its backend runnable here (dependencies installed in a copy, its bootstrap/autoloader working).${db} Then write the probe ${script}: it loads the app's bootstrap, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} Use the symbol id "probe". If the old code cannot run on this machine, say why and stop.`,
+		problem: `Nothing has run on the old code yet. Find out whether single units of the old code can be loaded and called with what this machine has (any installed runtime or tool; check which ones and their versions). The whole app does not need to boot: loading one real file of the old code (and what it needs) and calling one of its functions is enough. Install dependencies in a copy only if that unit needs them.${db} Then write the probe ${script}: it loads that file, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} Use the symbol id "probe". Try more than one way before giving up; if nothing works, say exactly what is missing.`,
 	}).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	const ok = verifyTruthOnOld(dir, o.config, o.source, o.root).ok;
 	const mode: TruthMode = ok ? "run" : "read";
-	saveLegacyEnv(o.root, o.config, { mode }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
+	saveLegacyEnv(o.root, o.config, { mode, probeQuestion: undefined }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
 	appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} probe → ${mode}: ${String(said || "").replace(/\s+/g, " ")}\n`);
-	log(ok ? pc.green(`truth: the old code runs here — expected values come from running it`) : pc.yellow(`truth: the old code does not run here (${said || "probe red"}) — units get read-not-run truth, marked in the ledger. Delete .bigrefactor/legacy-env.json to try again.`));
+	if (ok) {
+		log(pc.green(`truth: the old code runs here — expected values come from running it`));
+		return mode;
+	}
+	log(pc.yellow(`truth: the old code could not be run here (${said || "probe red"}) — each unit still tries a small script; where that fails its truth is read from the code, marked in the ledger.`));
+	const qid = await o
+		.ask?.({
+			facts: `Before the first unit, a setup model tried to load and call one unit of the old code on this machine and could not. What it said: ${said || "nothing"}. Units now try a small script each; where that fails, expected values are written from reading the code (marked "read, not run").`,
+			options: [
+				{ value: "retry", facts: "I installed or set up what is missing: try again at the next run" },
+				{ value: "read", facts: "keep going like this" },
+			],
+			recommended: "read",
+		})
+		.catch(() => undefined);
+	if (qid !== undefined) saveLegacyEnv(o.root, o.config, { probeQuestion: qid }, "");
 	return mode;
 }
 
@@ -226,7 +251,7 @@ export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
 	});
 	try {
 		const now = truthCommand(env, o.source, o.script);
-		const r = await session.run(o.probe ? `${o.problem}\nRun it the way the tool will: cd ${now.cwd} && ${[now.cmd, ...now.args].join(" ")} (after set_legacy_run, with the command set).${truth ? `\nThe owner said at setup how the old app runs: ${JSON.stringify(truth)} (paths relative to the legacy repo).` : ""}` : `A characterization script fails on the old code:\n${o.problem.slice(-3000)}\n\nThe script: ${o.script}\nIt runs now as: cd ${now.cwd} && ${[now.cmd, ...now.args].join(" ")}${truth ? `\nThe owner said at setup how the old app runs: ${JSON.stringify(truth)} (paths relative to the legacy repo). Use it if this machine has what it needs; otherwise find another way.` : ""}\nMake the environment such that this script runs green, then run it the way the tool will (with the command set) to confirm.`);
+		const r = await session.run(o.probe ? `${o.problem}\nRun it the way the tool will: cd ${now.cwd} && ${[now.cmd, ...now.args].join(" ")} (after set_legacy_run, with the command set).${truth ? ownerPreference(truth) : ""}` : `A characterization script fails on the old code:\n${o.problem.slice(-3000)}\n\nThe script: ${o.script}\nIt runs now as: cd ${now.cwd} && ${[now.cmd, ...now.args].join(" ")}${truth ? ownerPreference(truth) : ""}\nMake the environment such that this script runs green, then run it the way the tool will (with the command set) to confirm.`);
 		const said = r.text.trim().split("\n").at(-1) ?? "";
 		console.log(pc.dim(`  legacy setup model: ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${said}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
 		return said;
@@ -234,6 +259,9 @@ export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
 		session.dispose();
 	}
 };
+
+/** The owner's setup answer is a preference, never a reason to give up: what this machine lacks is worked around. */
+const ownerPreference = (truth: Record<string, string>) => `\nThe owner's preference for how the old app runs (from setup): ${JSON.stringify(truth)} (paths relative to the legacy repo). It is a preference, not a requirement: if this machine lacks what it needs (e.g. a tool that is not installed), use what the machine has instead.`;
 
 let fixing: Promise<string | undefined> | undefined;
 const tries = new Map<string, number>();

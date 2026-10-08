@@ -78,4 +78,27 @@ describe("the old code's environment", () => {
 		expect(await probeLegacyEnv({ ...other, fixer: async () => "no php on this machine", log: () => {} })).toBe("read");
 		expect(loadLegacyEnv(other.root, other.config).mode).toBe("read");
 	});
+
+	it("the probe asks for single units with whatever this machine has; red asks the owner once, and retry probes again", async () => {
+		const { root, config, source } = workspace();
+		const problems: string[] = [];
+		const asked: Array<{ facts: string; recommended: string }> = [];
+		const answers = new Map<number, string>();
+		const red: LegacyFixer = async (o) => (problems.push(o.problem), "docker is not installed");
+		const opts = { config, root, source, log: () => {}, ask: async (q: { facts: string; recommended: string }) => (asked.push(q), 41), answer: (id: number) => answers.get(id) };
+		expect(await probeLegacyEnv({ ...opts, fixer: red })).toBe("read");
+		expect(problems[0]).toMatch(/single units of the old code can be loaded and called with what this machine has/);
+		expect(problems[0]).not.toMatch(/cannot run on this machine, say why and stop/);
+		expect(asked).toHaveLength(1);
+		expect(asked[0]!.facts).toMatch(/docker is not installed/);
+		// unanswered (or "read"): decided, nobody probes or asks again
+		expect(await probeLegacyEnv({ ...opts, fixer: red })).toBe("read");
+		expect(problems).toHaveLength(1);
+		expect(asked).toHaveLength(1);
+		// the owner installed something: the next run probes again
+		answers.set(41, "retry");
+		const green: LegacyFixer = async (o) => (writeFileSync(o.script, "echo '[{\"symbol\":\"probe\",\"inputs\":null,\"expected\":\"ok\"}]'\n"), "plain php loads the class");
+		expect(await probeLegacyEnv({ ...opts, fixer: green })).toBe("run");
+		expect(loadLegacyEnv(root, config).probeQuestion).toBeUndefined();
+	});
 });

@@ -9,6 +9,8 @@ import type { Ledger } from "../ledger/db.ts";
 import { buildGraph, condense, cutLargeCycles, tarjanScc } from "./scc.ts";
 import { headOf, isRepo } from "../git.ts";
 import { loadDecisions } from "./decisions.ts";
+import { answerValue } from "../jev/ask.ts";
+import { loadNotApp, notAppOf } from "./not-app.ts";
 import { isDbUnitKind, wireDbDeps } from "./db.ts";
 import { resolveCodeMap, writeCodeMap } from "./codemap.ts";
 
@@ -31,7 +33,13 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	const previousHashes = new Map((ledger.db.prepare("SELECT path, hash FROM files").all() as Array<{ path: string; hash: string }>).map((r) => [r.path, r.hash]));
 	const drift = { changed: [] as string[], added: [] as string[], removed: [] as string[], staleUnits: [] as string[] };
 
-	const files = listFiles(srcRoot, adapter);
+	// folders the profile model found are not the app (tooling, stubs, vendored libraries, docs, one-off scripts,
+	// tests) are left out on top of the adapter's minimal defaults; a file the adapter calls an entry point stays
+	const notApp = loadNotApp(_root);
+	const files = listFiles(srcRoot, adapter).filter((f) => {
+		const n = notAppOf(f, notApp);
+		return !n || (n.kind !== "vendored" && !!adapter.isEntryPoint?.(f));
+	});
 	const indexes: FileIndex[] = [];
 	for (const rel of files) {
 		const source = readFileSync(join(srcRoot, rel), "utf8");
@@ -158,8 +166,10 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// owner-confirmed exclusions (area questions → decisions.json `excluded`): same disposition, kept across re-inventories
 	const decided = loadDecisions(_root) as ReturnType<typeof loadDecisions> & { excluded?: Record<string, string> };
 	const excluded = decided.excluded ?? {};
-	// files Jev judged reachable although nothing refers to them (cron, CLI, dynamic dispatch): entry points
-	const judgedAlive = new Set(Object.entries(decided.liveness ?? {}).filter(([, v]) => v.alive).map(([p]) => p));
+	// files judged reachable although nothing refers to them (cron, CLI, dynamic dispatch), and dead-looking ones
+	// the owner chose to keep (src/init/dead.ts asks per folder): entry points
+	const keptByOwner = (q?: number) => q !== undefined && answerValue(ledger.getQuestion(q)?.answer) === "keep";
+	const judgedAlive = new Set(Object.entries(decided.liveness ?? {}).filter(([, v]) => v.alive || keptByOwner(v.question)).map(([p]) => p));
 	for (const f of indexes) if (excluded[f.path] && !regenerated.includes(f.path)) regenerated.push(f.path);
 	// ---- framework files: indexed so names resolve, mapped per concern (br frameworks), never units
 	const framework = indexes.filter((f) => isFramework(f.path)).map((f) => f.path);

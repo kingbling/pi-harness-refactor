@@ -167,7 +167,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			config: o.config,
 			writeGlobs: [`${truthDirRel}/**`, ...adapter.layout.testFileGlobs(moduleDir).map((g) => `${targetRel}/${g}`)],
 			protectedGlobs: [],
-			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirRel, targetProjectDir: targetRel, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
+			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirRel, targetProjectDir: targetRel, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
 			customTools: testerTools({ ...deps, attemptId: attempt }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && log(pc.dim(`  tester blocked: ${e.blocked}`)),
@@ -193,14 +193,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
-		// type the results in) and load the cases; read-not-run cases are only checked for shape.
-		const verified = truthMode === "run" ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : loadReadTruth(truthDirAbs);
-		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: truthMode, cases: verified.cases.length, error: verified.error } });
+		// type the results in) and load the cases; read-not-run cases are only checked for shape. In read mode a
+		// small per-unit script the tester got running still counts as run when it is green on the old code.
+		const ranAnyway = truthMode === "read" && existsSync(join(truthDirAbs, sourceAdapter.truth.scriptName)) ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
+		const madeBy: TruthMode = truthMode === "run" || ranAnyway?.ok ? "run" : "read";
+		const verified = truthMode === "run" ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : ranAnyway?.ok ? ranAnyway : loadReadTruth(truthDirAbs);
+		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: madeBy, cases: verified.cases.length, error: verified.error } });
 		if (!verified.ok) {
 			log(pc.red(`  truth (${truthMode}) failed: ${verified.error}`));
 			return false;
 		}
-		recordTruth(verified.cases, truthMode);
+		recordTruth(verified.cases, madeBy);
 		return true;
 	};
 	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks)

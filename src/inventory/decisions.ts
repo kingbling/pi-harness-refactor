@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { effectivePlatform } from "../init/stack.ts";
@@ -5,6 +6,7 @@ import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { planFrameworks } from "./frameworks.ts";
+import { applySlicePlan, planSlices } from "./slices.ts";
 import { TARGET_ROLES } from "../adapters/registry.ts";
 import { pointHash, type DecisionPoint, type PhrasedQuestion } from "../jev/ask.ts";
 import { JEV_ACT } from "../jev/questions.ts";
@@ -34,10 +36,12 @@ export interface Decision {
 	evidence: string;
 	/** The recommendation is a model's judgment of the repo (not the code's offline fallback). */
 	advised?: boolean;
+	/** The analysis and the phrasing model recommend different options: never accepted in bulk, asked on its own with both views. */
+	disagree?: { advised: { value: string; why?: string }; phrased: { value: string; why: string } };
 }
 
 export interface DecisionAnswer { answer: string; by: string; at: string }
-export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; dimensions?: import("../init/survey.ts").Dimension[]; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string>; /** Jev on files the reachability walk dropped (src/init/dead.ts): alive ones are entry points. */ liveness?: Record<string, { alive: boolean; why: string }> };
+export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; dimensions?: import("../init/survey.ts").Dimension[]; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string>; /** Jev on files the reachability walk dropped (src/init/dead.ts): alive ones are entry points. */ liveness?: Record<string, { alive: boolean; why: string; /** owner question about the file's folder (dead ones): answer keep → alive */ question?: number }> };
 
 export function decisionsPath(root: string): string {
 	return join(root, ".bigrefactor", "decisions.json");
@@ -133,7 +137,8 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 
 	// --- truth environment
 	const compose = findCompose(config.source.path);
-	out.push({ id: "truth-env", topic: "truth", question: "Truth needs the legacy app runnable. What exists?", evidence: compose ? `docker compose found: ${compose}` : "no docker compose found", recommended: compose ? "docker-dump" : "none", options: [{ value: "docker-dump", label: "docker compose + a DB dump I can provide", hint: "recorded HTTP responses + the legacy test suite on the old code" }, { value: "docker-only", label: "docker compose, schema only (no data dump yet)", hint: "unit truth now, goldens later" }, { value: "none", label: "nothing runnable locally", hint: "tester-written characterization tests on pure code only" }] });
+	const runtime = runtimeHere(source.truth.run(config.source.path, "x").cmd);
+	out.push({ id: "truth-env", topic: "truth", question: "Truth needs the old code runnable. How does it run?", evidence: `${compose ? `docker compose found: ${compose}` : "no docker compose found"}; ${runtime}. This is a preference: before the first unit a model checks what really runs on this machine (single units are enough, the whole app need not boot)`, recommended: compose ? "docker-dump" : "local", options: [{ value: "local", label: "with the tools installed on this machine", hint: "single units loaded and called directly; no containers" }, { value: "docker-dump", label: "docker compose + a DB dump I can provide", hint: "recorded HTTP responses + the legacy test suite on the old code" }, { value: "docker-only", label: "docker compose, schema only (no data dump yet)", hint: "unit truth now, goldens later" }, { value: "none", label: "nothing runnable locally", hint: "tester-written characterization tests on pure code only" }] });
 
 	// --- target location
 	if (/\/\.sim\//.test(config.target.path)) out.push({ id: "target-location", topic: "target", question: `Target is ${relative(root, config.target.path) || config.target.path} (simulation dir). Fine for L3 sampling?`, evidence: "L3 never merges into a real repo", recommended: "sim-ok", options: [{ value: "sim-ok", label: "yes, decide the real location after L3" }, { value: "set-now", label: "set the real path now (answer `set:<absolute path>`)" }] });
@@ -185,6 +190,9 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 		if (!d.advised && ph.recommended && d.options.some((o) => o.value === ph.recommended)) {
 			d.recommended = ph.recommended;
 			d.advised = true;
+		} else if (d.advised && d.recommended && ph.recommended && ph.recommended !== d.recommended && d.options.some((o) => o.value === ph.recommended)) {
+			// two models read the repo and disagree: the owner sees both views and decides this one alone
+			d.disagree = { advised: { value: d.recommended, why: d.reason }, phrased: { value: ph.recommended, why: ph.opinion } };
 		}
 		d.reason = d.reason && advice[d.id] ? `${d.reason.replace(/\.\s*$/, "")}. ${ph.opinion}` : ph.opinion;
 	}
@@ -269,6 +277,9 @@ export function applyDecision(ledger: Ledger, config: Config, root: string, id: 
 		d.strategy ??= {};
 		d.strategy["dynamic"] = answer;
 		if (answer !== "last") note = writeDynamicOverrides(ledger, root, answer);
+		// the slices follow the answer right away (a run only plans when no plan exists)
+		const sp = join(root, ".bigrefactor", "slices.json");
+		applySlicePlan(ledger, planSlices(ledger, existsSync(sp) ? JSON.parse(readFileSync(sp, "utf8")) : {}));
 	} else if (id === "truth-env") {
 		d.truth = { env: answer, compose: findCompose(config.source.path) ?? "" };
 		note = `truth.env = ${answer}`;
@@ -295,7 +306,8 @@ export function renderDecisions(ds: Decision[]): string {
 	const L = [`${ds.length} open decision${ds.length === 1 ? "" : "s"} (br run / simulate --level 3 wait for them):`];
 	for (const d of ds) {
 		L.push("", `[${d.id}] ${d.question}`, `   evidence: ${d.evidence}`);
-		if (d.reason) L.push(`   advice: ${d.recommended} — ${d.reason}`);
+		if (d.disagree) L.push(`   two views: ${d.disagree.advised.value} — ${d.disagree.advised.why ?? "analysis"} | ${d.disagree.phrased.value} — ${d.disagree.phrased.why}`);
+		else if (d.reason) L.push(`   advice: ${d.recommended} — ${d.reason}`);
 		for (const o of d.options) L.push(`   ${o.value === d.recommended ? "*" : " "} ${o.value.padEnd(22)} ${o.label}${o.hint ? `  (${o.hint})` : ""}`);
 	}
 	L.push("", "answer: br decide --answer <id>=<value> [...]   interactive: br decide");
@@ -303,6 +315,30 @@ export function renderDecisions(ds: Decision[]): string {
 }
 
 // ---- helpers
+
+/** The prompt line for one decision: question, evidence, and the recommendation's why (or both views when the models disagree). */
+export function decisionPrompt(d: Decision): string {
+	const why = d.disagree
+		? `\n   the models disagree, so you decide this one:\n   · ${d.disagree.advised.value}: ${d.disagree.advised.why ?? "the analysis picked it"}\n   · ${d.disagree.phrased.value}: ${d.disagree.phrased.why}`
+		: d.reason ? `\n   why ${d.recommended}: ${d.reason}` : "";
+	return `${d.question}\n   ${d.evidence}${why}`;
+}
+
+const runtimes = new Map<string, string>();
+/** Whether the source adapter's runtime is installed here (a fact for the truth question), cached per process. */
+function runtimeHere(cmd: string): string {
+	if (!runtimes.has(cmd)) {
+		let v = `${cmd} not found on this machine`;
+		try {
+			const out = execFileSync(cmd, ["--version"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"] });
+			v = `${cmd} on this machine: ${out.split("\n")[0]!.trim().slice(0, 80)}`;
+		} catch {
+			/* not installed */
+		}
+		runtimes.set(cmd, v);
+	}
+	return runtimes.get(cmd)!;
+}
 
 function findCompose(root: string): string | undefined {
 	for (const c of ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml", "docker/docker-compose.yml", "docker/docker-compose.yaml"]) if (existsSync(join(root, c))) return c;
@@ -346,5 +382,5 @@ function writeDynamicOverrides(ledger: Ledger, root: string, mode: string): stri
 		n++;
 	}
 	writeFileSync(p, JSON.stringify(overrides, null, 2) + "\n");
-	return `${n} dynamic units assigned in .bigrefactor/slices.json (re-run br order)`;
+	return `${n} dynamic units assigned in .bigrefactor/slices.json; slices planned again`;
 }
