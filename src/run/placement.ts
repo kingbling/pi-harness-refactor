@@ -1,8 +1,9 @@
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { getSourceAdapter, TARGET_ROLES } from "../adapters/registry.ts";
 import type { TargetLayout } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
+import { renameDir, trackedChildDirs } from "../git.ts";
 import { answerValue, askViaModel, type AskOption } from "../jev/ask.ts";
 import { decide } from "../jev/decide.ts";
 import { JEV_ACT as ACT, noulConfidence, type Battery } from "../jev/questions.ts";
@@ -68,6 +69,41 @@ export function placementDir(layout: TargetLayout, p: Placement): string {
 	if (!p.shared) return layout.moduleDir(p.area);
 	if (!layout.sharedDirs[0]) throw new Error(`shared unit in area ${p.area}, but the target layout has no shared dir`);
 	return `${layout.sharedDirs[0].replace(/\/?$/, "/")}${layout.moduleDir(p.area).split("/").pop()}`;
+}
+
+/**
+ * Area folders already in git under another spelling than the plugin uses now (src/Shared/persistence where it
+ * now places src/Shared/Persistence, file-storage for FileStorage): renamed in git and committed, so new units
+ * land next to the old code instead of in a second folder. Only spelling (case, "-", "_"); returns what moved.
+ */
+export function renameMisspelledAreaDirs(config: Config, ledger: Ledger, layouts: Map<string, TargetLayout>, projectDirOf: (stackId: string) => string): string[] {
+	const same = (a: string) => a.toLowerCase().replace(/[-_]/g, "");
+	const repo = config.target.path;
+	const dirs = new Map<string, Set<string>>();
+	for (const u of ledger.db.prepare("SELECT meta FROM units WHERE json_extract(meta, '$.place.area') IS NOT NULL").all() as Array<{ meta: string }>) {
+		const p = placeUnit(config, u.meta);
+		const layout = layouts.get(p.stackId);
+		if (!layout || (p.shared && !layout.sharedDirs[0])) continue;
+		const set = dirs.get(p.stackId) ?? new Set<string>();
+		set.add(placementDir(layout, p));
+		dirs.set(p.stackId, set);
+	}
+	const moved: string[] = [];
+	for (const [stackId, set] of dirs) {
+		const prefix = relative(repo, projectDirOf(stackId));
+		for (const dir of set) {
+			const parent = join(prefix, dirname(dir));
+			const want = basename(dir);
+			const tracked = trackedChildDirs(repo, parent);
+			if (tracked.includes(want)) continue; // both spellings exist (a disk that tells case apart): a move would nest them
+			for (const have of tracked.filter((h) => same(h) === same(want))) {
+				const from = join(parent, have);
+				const to = join(parent, want);
+				if (renameDir(repo, from, to, `bigrefactor: rename ${from} to ${to} (the area's folder as the stack spells it)`)) moved.push(`${from} → ${to}`);
+			}
+		}
+	}
+	return moved;
 }
 
 /** Why a unit may not run yet: no persisted placement and code is unsure (the model/question step has not placed it). */

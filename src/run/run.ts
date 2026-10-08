@@ -12,7 +12,7 @@ import pc from "picocolors";
 import { progress } from "../progress.ts";
 import { paidSince } from "../spend.ts";
 import { loadConfig, type Config } from "../config.ts";
-import { addWorktree, emptyWorktreeTrash, headOf, mainBranch, removeWorktree } from "../git.ts";
+import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import { probeLegacyEnv } from "./legacy-env.ts";
@@ -24,7 +24,7 @@ import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
 import { SYSTEMIC_FAILURE, JEV_ACT } from "../jev/questions.ts";
-import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } from "./placement.ts";
+import { applyPlacementAnswers, placeUnit, renameMisspelledAreaDirs, resolvePlacements, unplacedReason } from "./placement.ts";
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals } from "../jev/ask.ts";
@@ -172,6 +172,14 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// Each unit lands in the stack placement picks; a worktree holds the whole target repo, so every stack's
 	// dependency dirs (adapter-declared) are linked into it.
 	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
+	// area folders the plugin now spells differently move in git first, so new units land next to the old code
+	if (!o.dry && isRepo(config.target.path)) {
+		try {
+			for (const m of renameMisspelledAreaDirs(config, ledger, new Map([...adapters].map(([id, a]) => [id, a.layout])), (id) => projectDir(config, id))) log(pc.cyan(`↻ renamed ${m}`));
+		} catch (e) {
+			log(pc.yellow(`renaming area folders failed: ${String((e as Error)?.message ?? e).split("\n")[0]}`));
+		}
+	}
 	const linkAll = (wt: string) => {
 		for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(o.root, id).worktreeCopy ?? []);
 	};
