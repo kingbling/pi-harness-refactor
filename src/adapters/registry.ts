@@ -1,6 +1,6 @@
 import type { SourceAdapter, TargetAdapter } from "./types.ts";
 import { phpAdapter } from "./source/php.ts";
-import { fromManifest, loadManifests } from "./target/generated.ts";
+import { fromManifest, loadManifests, restoreManifest } from "./target/generated.ts";
 import { withLayoutRules } from "../rules/layout-rules.ts";
 import { withCommandOverrides } from "./command-overrides.ts";
 
@@ -21,7 +21,10 @@ export function getSourceAdapter(id: string): SourceAdapter {
 	return a;
 }
 export async function getTargetAdapter(id: string): Promise<TargetAdapter> {
-	if (!targets[id] && process.env["BR_WORKSPACE"]) registerGeneratedTargets(process.env["BR_WORKSPACE"]);
+	const root = process.env["BR_WORKSPACE"];
+	if (!targets[id] && root) registerGeneratedTargets(root);
+	// a fresh start used to leave generated adapters behind in .bigrefactor.old-<time>: bring the stack's back
+	if (!targets[id] && root && restoreManifest(root, id)) registerGeneratedTargets(root);
 	const f = targets[id];
 	if (!f) throw new Error(`unknown target adapter "${id}" (have: ${Object.keys(targets).join(", ")})`);
 	return offerable(withCommandOverrides(withLayoutRules(await f(), process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]));

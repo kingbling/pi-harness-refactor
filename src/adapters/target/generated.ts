@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { runCommand } from "../../proc.ts";
@@ -215,6 +215,22 @@ export function validateManifest(m: AdapterManifest): string[] {
 export function generatedDir(root: string): string {
 	return join(root, ".bigrefactor", "adapters");
 }
+/**
+ * A stack's generated adapter that a fresh start left behind in .bigrefactor.old-<time>/adapters (before fresh
+ * starts kept them): copied back, newest first. Returns whether one was found.
+ */
+export function restoreManifest(root: string, id: string): boolean {
+	const olds = existsSync(root) ? readdirSync(root).filter((n) => n.startsWith(".bigrefactor.old-")).sort().reverse() : [];
+	for (const old of olds) {
+		const from = join(root, old, "adapters");
+		if (!existsSync(join(from, `${id}.json`))) continue;
+		mkdirSync(generatedDir(root), { recursive: true });
+		for (const n of [`${id}.json`, `${id}.seed`]) if (existsSync(join(from, n))) cpSync(join(from, n), join(generatedDir(root), n), { recursive: true });
+		return true;
+	}
+	return false;
+}
+
 /** Verified manifests of this workspace (an invalid one, e.g. edited by hand, is skipped, never run). */
 export function loadManifests(root: string): AdapterManifest[] {
 	const dir = generatedDir(root);
