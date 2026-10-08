@@ -5,7 +5,7 @@ import { runCommand } from "../../proc.ts";
 import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
 import type { StackChoice, TargetAdapter } from "../types.ts";
-import { DEFAULT_FORBID_DIRS, normalize, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
+import { DEFAULT_FORBID_DIRS, normalize, slashed, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
 
 /**
  * A target adapter for a stack bigrefactor has no hand-written adapter for, written as DATA by a model that
@@ -131,7 +131,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 		layout: {
 			moduleDir,
 			structureDoc: m.layout.structureDoc,
-			sharedDirs: m.layout.sharedDirs,
+			sharedDirs: (m.layout.sharedDirs ?? []).map(slashed),
 			testFileGlobs: testGlobs,
 			isTestFile: (p) => testRe.test(p),
 			sourceExtensions: m.layout.sourceExtensions,
@@ -270,8 +270,9 @@ const SYSTEM = [
 	"- EVERY command is ONE executable with plain arguments, run without a shell: no sh/bash/cmd -c, no pipes, &&, ;, $, redirects, loops or globs. When the stack has no single build command, use its main static checker as build (e.g. PHP: vendor/bin/phpstan analyse src; Python: mypy or python -m compileall; Ruby: bundle exec rubocop), its linter/formatter check as lint, and its test runner as test with {files} appended (e.g. vendor/bin/phpunit {files}). Tools installed into the project are called by their project-relative path (vendor/bin/…, node_modules/.bin/…, bin/console) and added in postScaffold.",
 	"- toolchain.installed: a JSON manifest file in the project and the object keys whose keys are package names. toolchain.packageName: a regex (anchored with ^) matching a package name.",
 	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer.",
-	"- layout.testFileGlobs: where the stack's official convention keeps an area's tests ({moduleDir}, {area}, {Area}, {area_snake} expand). Next to the code ({moduleDir}/…) only where the framework expects that; where the app loads everything under its source dir as app code (service containers, autoloaded apps), tests go in the official tests dir mirrored per area (e.g. tests/{Area}/…), or the app will not start.",
-	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does; (a|b) either word), each with a short doc. require: files every feature folder has (its entry point, e.g. the controller). place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
+	"- layout.sharedDirs: usually ONE folder for app code that several feature areas use (e.g. src/Shared/ next to the feature folders), spelled like the feature folders. Never the framework's own folders such as config, templates or tests: those are not shared app code.",
+	"- layout.testFileGlobs: where the stack's official convention keeps an area's tests ({moduleDir}, {area}, {Area}, {area_snake} expand). Next to the code ({moduleDir}/…) only where the framework expects that; where the app loads everything under its source dir as app code (service containers, autoloaded apps), tests go in the official tests dir mirrored per area (e.g. tests/{Area}/…), or the app will not start. The FIRST glob must be a place the test command without {files} runs (the tool checks this with the probe test).",
+	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does, spelled like the feature folders; (a|b) either word), each with a short doc. require: only files the framework itself needs to load a feature folder (none when the framework finds the code on its own, e.g. autoloading or service discovery); never an empty class just to have one. place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up.",
@@ -442,12 +443,43 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 				return `${step} failed on the fresh project (${c.cmd} ${c.args.join(" ")}):\n${String(e?.message ?? e)}`;
 			}
 		}
+		// the whole-project test run (no files) must find tests where the layout puts them: a broken copy of the
+		// probe at the first test glob has to make it fail
+		const at = firstGlobFile(a, probe.path);
+		if (!at) return `layout.testFileGlobs gives no place for a test file (first glob: ${m.layout.testFileGlobs[0] ?? "none"})`;
+		if (!a.layout.isTestFile(at)) return `${at} (the first layout.testFileGlobs place) does not match layout.testFileRegex ${m.layout.testFileRegex}`;
+		mkdirSync(dirname(join(dir, at)), { recursive: true });
+		writeFileSync(join(dir, at), `${probe.content}\n)))}}}]]] this line breaks the file on purpose\n`);
+		const all = a.test(dir, []);
+		const missed = await runCommand(all.cmd, all.args, { cwd: dir }).then(
+			() => true,
+			() => false,
+		);
+		rmSync(join(dir, at), { force: true });
+		if (missed) return `the test command without files (${all.cmd} ${all.args.join(" ")}) does not run tests at ${at}, the first layout.testFileGlobs place (a broken test file there did not make it fail). Fix layout.testFileGlobs or the test command so the whole-project test run includes the tests where the layout puts them.`;
 		rmSync(join(dir, probe.path), { force: true });
 		ok = true;
 		return undefined;
 	} finally {
 		if (!ok || !opts.keepAt) rmSync(scratch, { recursive: true, force: true });
 	}
+}
+
+/**
+ * A test file in the FIRST test glob of an example area (tests/{Area}/**\/*Test.php → tests/Probe/ProbeTest.php):
+ * the probe's own file name when the glob allows it, else the glob's name with "Probe" for the wildcard.
+ */
+export function firstGlobFile(a: TargetAdapter, probePath: string): string | undefined {
+	const glob = a.layout.testFileGlobs(a.layout.moduleDir("probe"))[0];
+	if (!glob) return undefined;
+	const parts = glob.split("/");
+	const last = parts.pop()!;
+	const wild = parts.findIndex((p) => /[*?[{]/.test(p));
+	const dir = (wild < 0 ? parts : parts.slice(0, wild)).join("/");
+	const re = new RegExp(`^${last.replace(/[.+^$()|\\]/g, "\\$&").replace(/\{([^}]*)\}/g, (_, x: string) => `(${x.split(",").join("|")})`).replace(/\*+/g, ".*").replace(/\?/g, ".")}$`);
+	const own = basename(probePath);
+	const name = re.test(own) ? own : last.replace(/\{([^},]*)[^}]*\}/g, "$1").replace(/\*+/g, "Probe").replace(/\?/g, "x");
+	return dir ? `${dir}/${name}` : name;
 }
 
 /** Where a workspace keeps the project an adapter's verification built. */

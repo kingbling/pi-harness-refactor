@@ -296,7 +296,7 @@ const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
 	tidy: (v) => v === "apply" || v === "skip",
 	area_taxonomy: (v) => v === "apply" || v === "keep",
 	triage_gate: (v) => v === "retry",
-	// the first units' tree: code found no layout problems and the model agrees → the run goes on
+	// the first units' tree: the model read it with the code's findings and calls it right → the run goes on
 	layout_sample: (v) => v === "approve",
 };
 

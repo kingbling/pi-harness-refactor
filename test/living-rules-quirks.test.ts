@@ -225,6 +225,20 @@ describe("tidy review", () => {
 		expect(completeTidyTasks(ledger, proj, "nestjs", "flights")).toHaveLength(1);
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
 	});
+
+	it("a shared topic is reviewed in the shared dir, not in a feature folder of the same name", async () => {
+		const { root, config, ledger } = setup();
+		const { maybeTidyReview } = await import("../src/run/tidy.ts");
+		const { projectDir } = await import("../src/init/init.ts");
+		const proj = projectDir(config, "nestjs");
+		mkdirSync(join(proj, "src/shared/money"), { recursive: true });
+		writeFileSync(join(proj, "src/shared/money/amount.ts"), "export const amount = 1;\n");
+		let seen = "";
+		const client = new FakeModelClient({ chat: (req) => ((seen = req.messages.map((m) => m.content).join("\n")), { json: { changes: [], conventions: [] } }) });
+		const r = await maybeTidyReview({ ledger, config, root, client }, { stackId: "nestjs", area: "money", shared: true, force: true });
+		expect(r.reviewed).toBe(true);
+		expect(seen).toContain("src/shared/money/amount.ts");
+	});
 });
 
 describe("the run decides routine questions itself", () => {

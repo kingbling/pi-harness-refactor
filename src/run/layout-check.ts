@@ -7,7 +7,7 @@ import { projectDir } from "../init/init.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { stackTagLike } from "../inventory/target.ts";
 import { activeRuleFiles, rulesDir, validateRulesLayout } from "../rules/layout.ts";
-import { layoutRulesProblem, scaffoldDirs } from "../rules/layout-rules.ts";
+import { layoutRulesProblem, scaffoldDirs, scaffoldFiles } from "../rules/layout-rules.ts";
 import { kebab } from "./areas.ts";
 import { placementDir, planPlacements, type Placement } from "./placement.ts";
 
@@ -216,7 +216,9 @@ const STRAY = "outside the feature root, the shared dirs and the scaffold";
  * shared dirs and the scaffold. `only` limits the adapter's findings to those files (the gate) and skips the folders.
  */
 export function checkTree(dir: string, a: TargetAdapter, only?: string[]): string[] {
-	const lines = a.layout.checkTree?.(dir, only) ?? [];
+	// files that came with the generated project (its first commit) are the framework's, never drift
+	const scaffold = new Set(scaffoldFiles(dir));
+	const lines = (a.layout.checkTree?.(dir, only) ?? []).filter((l) => !scaffold.has(l.slice(0, l.indexOf(": "))));
 	if (only) return lines;
 	const t = scanDir(dir, a);
 	return [...lines, ...t.stray.map((d) => `${t.srcRoot}/${d}/: ${STRAY}`)];

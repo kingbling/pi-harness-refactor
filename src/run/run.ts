@@ -429,8 +429,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 								for (const x of r.refused) log(pc.yellow(`  rules ${x.stack}: proposal ${x.id} ("${x.text.slice(0, 80)}") stays out although the owner said apply — curator: ${x.reason}`));
 							}, (e) => log(pc.yellow(`  rules curation failed: ${e?.message ?? e}`)));
 						// tidy review: every N accepts of an area a model reads its module; approved changes become tidy tasks
-						const { stackId: tStack, area: tArea } = placementOf(ledger.getUnit(unitId)!.meta);
-						await curate.run(() => maybeTidyReview({ ledger, config, root: o.root, client: o.client }, { stackId: tStack, area: tArea })).then((r) => r.reviewed && log(pc.cyan(`  tidy review ${tStack}:${tArea}: ${r.asked} change(s) asked, ${r.proposals} convention(s) proposed`)), (e) => log(pc.yellow(`  tidy review failed: ${e?.message ?? e}`)));
+						const { stackId: tStack, area: tArea, shared: tShared } = placementOf(ledger.getUnit(unitId)!.meta);
+						await curate.run(() => maybeTidyReview({ ledger, config, root: o.root, client: o.client }, { stackId: tStack, area: tArea, shared: tShared })).then((r) => r.reviewed && log(pc.cyan(`  tidy review ${tStack}:${tArea}: ${r.asked} change(s) asked, ${r.proposals} convention(s) proposed`)), (e) => log(pc.yellow(`  tidy review failed: ${e?.message ?? e}`)));
 						break;
 					} catch (e: any) {
 						if (!/merge conflict/.test(String(e?.message)) || round === 3) {
@@ -586,8 +586,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				"Landed area modules (files [exported classes]):",
 				...sf.lines,
 				...(lr?.problems.length ? [`Layout check problems: ${lr.problems.join(" | ")}`] : ["Layout check: no problems found by code."]),
+				// the code makes no pick: a drift line can be a real misplacement or something harmless; the model weighs them
+				"The code makes no recommendation: judge from the tree, the drift lines and the problems above whether the structure is right (files that came with the generated project are never counted as drift).",
 			].join("\n");
-			const q = await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "layout_sample", facts, options: [{ value: "approve", facts: "the structure is right: continue the run" }, { value: "stop", facts: "the structure is wrong: keep the run stopped, fix placement/rules, reset the sample" }], recommended: lr?.problems.length || sf.drift ? "stop" : "approve", blocks: "none", askedBy: "orchestrator", context: { sample: acc } });
+			const q = await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "layout_sample", facts, options: [{ value: "approve", facts: "the structure is right: continue the run" }, { value: "stop", facts: "the structure is wrong: keep the run stopped, fix placement/rules, reset the sample" }], blocks: "none", askedBy: "orchestrator", context: { sample: acc } });
 			ledger.setMeta("layout_sample", JSON.stringify({ question: q.id }));
 			log(pc.yellow(`layout sample: ${acc} units landed — review the target tree (question #${q.id}, br questions); the run goes on, an answer "stop" stops it`));
 			for (const l of renderTrees(trees, 15)) log(pc.dim(`  ${l}`));

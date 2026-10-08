@@ -13,8 +13,9 @@ import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
  * Path patterns (relative to the feature folder):
  *   {area} {Area} {area_snake}  the unit's area (kebab, Pascal, snake case)
  *   {name} {Name}               any kebab-case / PascalCase name
- *   {sub}                       one kebab-case folder named after what the code does; the same value where it repeats;
- *                               never a banned name or a folder another pattern names literally (dto, entities …)
+ *   {sub}                       one folder named after what the code does, spelled like the area folders ({area} → kebab,
+ *                               {Area} → Pascal, {area_snake} → snake); the same value where it repeats; never a banned
+ *                               name or a folder another pattern names literally (dto, entities …)
  *   (a|b)                       either word
  */
 export interface LayoutRules {
@@ -40,6 +41,19 @@ export const DEFAULT_FORBID_DIRS = ["extended", "misc", "common", "helpers", "ut
 
 const KEBAB = "[a-z0-9]+(?:-[a-z0-9]+)*";
 const PASCAL = "[A-Z][A-Za-z0-9]*";
+const SNAKE = "[a-z0-9]+(?:_[a-z0-9]+)*";
+
+/** How a {sub} folder is spelled: like the layout's own area folders (src/{Area} → Pascal sub-folders). */
+export interface SubStyle { re: string; sample: string; word: string }
+const SUB_STYLES: Record<string, SubStyle> = {
+	area: { re: KEBAB, sample: "billing", word: "kebab-case" },
+	Area: { re: PASCAL, sample: "Billing", word: "PascalCase" },
+	area_snake: { re: SNAKE, sample: "billing", word: "snake_case" },
+};
+export function subStyle(moduleDir: string): SubStyle {
+	const last = /\{(area|Area|area_snake)\}\/?$/.exec(moduleDir)?.[1] ?? "area";
+	return SUB_STYLES[last]!;
+}
 const GROUP: Record<string, string> = { name: "n", Name: "N", sub: "sub" };
 const PLACEHOLDERS = new Set(["area", "Area", "area_snake", "name", "Name", "sub"]);
 const pascal = (s: string) => s.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("");
@@ -54,7 +68,7 @@ export function layoutRulesPath(root: string, stackId: string): string {
 type Matcher = { test(rel: string): boolean; pattern: string };
 
 /** A path pattern for one area → matcher. Throws on an unknown placeholder or a malformed group. */
-export function compilePattern(pattern: string, area: string, reserved: Set<string> = new Set()): Matcher {
+export function compilePattern(pattern: string, area: string, reserved: Set<string> = new Set(), sub: SubStyle = SUB_STYLES["area"]!): Matcher {
 	let src = "";
 	const seen = new Set<string>(); // {name} {Name} {sub} repeated in one path = the same value
 	for (const m of pattern.matchAll(/\{([^}]*)\}|\(([^)]*)\)|([^{(]+)|(.)/g)) {
@@ -63,7 +77,7 @@ export function compilePattern(pattern: string, area: string, reserved: Set<stri
 			if (m[1] === "area") src += esc(area);
 			else if (m[1] === "Area") src += esc(pascal(area));
 			else if (m[1] === "area_snake") src += esc(area.replace(/-/g, "_"));
-			else src += seen.has(m[1]) ? `\\k<${GROUP[m[1]]}>` : (seen.add(m[1]), `(?<${GROUP[m[1]]}>${m[1] === "Name" ? PASCAL : KEBAB})`);
+			else src += seen.has(m[1]) ? `\\k<${GROUP[m[1]]}>` : (seen.add(m[1]), `(?<${GROUP[m[1]]}>${m[1] === "Name" ? PASCAL : m[1] === "sub" ? sub.re : KEBAB})`);
 		} else if (m[2] !== undefined) {
 			const words = m[2].split("|");
 			if (words.some((w) => !/^[A-Za-z0-9_.-]+$/.test(w))) throw new Error(`"(${m[2]})" in "${pattern}": only plain words separated by |`);
@@ -76,20 +90,20 @@ export function compilePattern(pattern: string, area: string, reserved: Set<stri
 		pattern,
 		test: (rel) => {
 			const x = re.exec(rel);
-			return !!x && !(x.groups?.["sub"] && reserved.has(x.groups["sub"]));
+			return !!x && !(x.groups?.["sub"] && reserved.has(x.groups["sub"].toLowerCase()));
 		},
 	};
 }
 
-/** A concrete example path for a pattern (area invoice, name sample, sub billing). */
-export function samplePath(pattern: string, area = "invoice"): string {
+/** A concrete example path for a pattern (area invoice, name sample, sub billing in the layout's spelling). */
+export function samplePath(pattern: string, area = "invoice", sub = "billing"): string {
 	return pattern
 		.replace(/\{area\}/g, area)
 		.replace(/\{Area\}/g, pascal(area))
 		.replace(/\{area_snake\}/g, area.replace(/-/g, "_"))
 		.replace(/\{name\}/g, "sample")
 		.replace(/\{Name\}/g, "Sample")
-		.replace(/\{sub\}/g, "billing")
+		.replace(/\{sub\}/g, sub)
 		.replace(/\(([^)|]*)(\|[^)]*)?\)/g, "$1");
 }
 
@@ -102,15 +116,19 @@ export function expandModuleDir(r: LayoutRules, area: string): string {
 const banned = (r: LayoutRules, d: string) => r.forbidDirs.some((b) => b.toLowerCase() === d.toLowerCase());
 const KEBAB_RE = new RegExp(`^${KEBAB}$`);
 
-/** First folders other patterns name literally (dto, entities …) plus the banned names: never a {sub}. */
+/** First folders other patterns name literally (dto, entities …) plus the banned names: never a {sub} (lower case). */
 function reservedSubs(r: LayoutRules): Set<string> {
-	const out = new Set(r.forbidDirs);
+	const out = new Set(r.forbidDirs.map((d) => d.toLowerCase()));
 	for (const f of r.files) {
 		const first = f.path.split("/")[0]!;
-		if (f.path.includes("/") && /^[A-Za-z0-9_.-]+$/.test(first)) out.add(first);
+		if (f.path.includes("/") && /^[A-Za-z0-9_.-]+$/.test(first)) out.add(first.toLowerCase());
 	}
 	return out;
 }
+
+/** A pattern of these rules for one area ({sub} spelled like the rules' area folders). */
+const compileFor = (r: LayoutRules, pattern: string, area: string) => compilePattern(pattern, area, reservedSubs(r), subStyle(r.moduleDir));
+const sampleFor = (r: LayoutRules, pattern: string, area?: string) => samplePath(pattern, area, subStyle(r.moduleDir).sample);
 
 /** Problems that make the rules unusable; empty = sound. Checked by code before a layout.json is written. */
 export function validateLayoutRules(r: LayoutRules): string[] {
@@ -123,27 +141,26 @@ export function validateLayoutRules(r: LayoutRules): string[] {
 	if (parents.some((d) => /[{(]/.test(d))) out.push(`moduleDir "${r.moduleDir}": only the last folder may be a placeholder`);
 	if (r.moduleDir.startsWith("/") || r.moduleDir.includes("..")) out.push(`moduleDir "${r.moduleDir}" must be a relative path inside the project`);
 	if (!r.files.length) out.push("files: list the files a feature folder may hold");
-	const reserved = reservedSubs(r);
 	const ok: Matcher[] = [];
 	for (const f of r.files) {
 		if (f.path.startsWith("/") || f.path.includes("..")) out.push(`files: "${f.path}" must stay inside the feature folder`);
 		try {
-			const m = compilePattern(f.path, "invoice", reserved);
-			if (!m.test(samplePath(f.path))) out.push(`files: the example ${samplePath(f.path)} does not match its own pattern "${f.path}"`);
+			const m = compileFor(r, f.path, "invoice");
+			if (!m.test(sampleFor(r, f.path))) out.push(`files: the example ${sampleFor(r, f.path)} does not match its own pattern "${f.path}"`);
 			ok.push(m);
 		} catch (e: any) {
 			out.push(`files: ${e.message}`);
 		}
 	}
 	const allowed = (p: string) => ok.some((m) => m.test(p));
-	for (const q of r.require ?? []) if (!allowed(samplePath(q))) out.push(`require: "${q}" is not an allowed file (add it to files)`);
+	for (const q of r.require ?? []) if (!allowed(sampleFor(r, q))) out.push(`require: "${q}" is not an allowed file (add it to files)`);
 	for (const p of r.place ?? []) {
 		try {
 			new RegExp(p.text);
 		} catch {
 			out.push(`place: "${p.text}" is not a valid regex`);
 		}
-		for (const i of p.in) if (!allowed(samplePath(i))) out.push(`place: "${i}" is not an allowed file (add it to files)`);
+		for (const i of p.in) if (!allowed(sampleFor(r, i))) out.push(`place: "${i}" is not an allowed file (add it to files)`);
 	}
 	// a literal folder that is also banned would reject its own allowed files
 	for (const x of [...r.files.map((f) => f.path), ...(r.require ?? []), ...(r.place ?? []).flatMap((p) => p.in)]) {
@@ -159,8 +176,7 @@ export function validateLayoutRules(r: LayoutRules): string[] {
 
 /** Problems of files relative to one feature folder (no I/O). */
 function checkFiles(rels: string[], area: string, r: LayoutRules): string[] {
-	const reserved = reservedSubs(r);
-	const allowed = r.files.map((f) => compilePattern(f.path, area, reserved));
+	const allowed = r.files.map((f) => compileFor(r, f.path, area));
 	const out: string[] = [];
 	for (const rel of rels) {
 		const dirs = rel.split("/").slice(0, -1);
@@ -195,7 +211,7 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 			out.push(`${f}: "${legacy}" is a legacy file kind; name files and classes after what they do, never after the legacy file`);
 			continue;
 		}
-		const shared = o.sharedDirs.find((d) => f.startsWith(d));
+		const shared = o.sharedDirs.map(slashed).find((d) => f.startsWith(d));
 		if (shared) {
 			const parts = f.slice(shared.length).split("/");
 			// a banned topic only for new files: shared code that is already there keeps working
@@ -204,6 +220,8 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 			else if (bad) out.push(`${f}: shared topic "${bad}" is not allowed (banned names: ${r.forbidDirs.join(", ")}); name the topic after what the code does`);
 			continue;
 		}
+		// tests go where the stack's test runner finds them (the adapter's test globs), inside the feature folder or not
+		if (!f.startsWith(mod) && o.isTestFile(f)) continue;
 		if (!f.startsWith(mod)) {
 			out.push(`${f}: outside this unit's feature folder ${mod} and the shared dirs (${o.sharedDirs.join(", ")})`);
 			continue;
@@ -211,7 +229,7 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 		touched = true;
 		if (o.isTestFile(f) && !/\.d\.ts$/.test(f)) {
 			const bad = f.slice(mod.length).split("/").slice(0, -1).find((d) => banned(r, d));
-			if (bad) out.push(`${f}: folder "${bad}" is not allowed; tests live beside the code they test`);
+			if (bad) out.push(`${f}: folder "${bad}" is not allowed (banned names: ${r.forbidDirs.join(", ")}); name the folder after what the code does`);
 			continue;
 		}
 		const shape = checkFiles([f.slice(mod.length)], area, r);
@@ -250,12 +268,11 @@ function placeProblems(projectDir: string, f: string, mod: string, area: string,
 	if (!r.place?.length) return [];
 	const text = read(projectDir, f);
 	if (!text) return [];
-	const reserved = reservedSubs(r);
 	const rel = f.slice(mod.length);
 	const out: string[] = [];
 	for (const p of r.place) {
 		const m = new RegExp(p.text, "m").exec(text);
-		if (!m || p.in.some((i) => compilePattern(i, area, reserved).test(rel))) continue;
+		if (!m || p.in.some((i) => compileFor(r, i, area).test(rel))) continue;
 		out.push(`${f}: "${m[0].trim()}" belongs in ${p.in.map((i) => show(i, area)).join(" or ")} (${p.doc}); move it there`);
 	}
 	return out;
@@ -264,9 +281,8 @@ function placeProblems(projectDir: string, f: string, mod: string, area: string,
 /** Every feature folder has the required files (on disk or written by this unit). */
 function missingRequired(projectDir: string, mod: string, area: string, r: LayoutRules, written: string[]): string[] {
 	if (!r.require?.length) return [];
-	const reserved = reservedSubs(r);
 	const have = new Set([...listFiles(join(projectDir, mod)), ...written.filter((f) => f.startsWith(mod)).map((f) => f.slice(mod.length))]);
-	return r.require.filter((q) => ![...have].some((h) => compilePattern(q, area, reserved).test(h))).map((q) => `${mod}: missing ${show(q, area)} (every feature folder has ${r.require.map((x) => show(x, area)).join(", ")}); create it`);
+	return r.require.filter((q) => ![...have].some((h) => compileFor(r, q, area).test(h))).map((q) => `${mod}: missing ${show(q, area)} (every feature folder has ${r.require.map((x) => show(x, area)).join(", ")}); create it`);
 }
 
 /**
@@ -274,6 +290,8 @@ function missingRequired(projectDir: string, mod: string, area: string, r: Layou
  * stack's per-file findings. `only` limits the findings to those files (the gate). Lines `<path>: <finding>`.
  */
 export function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutCheckOptions, only?: string[], notAreas: string[] = []): string[] {
+	// files that came with the generated project (its first commit) are the framework's, never drift
+	const scaffold = new Set(scaffoldFiles(projectDir));
 	const want = only && new Set(only);
 	const root = r.moduleDir.replace(/\/$/, "").split("/").slice(0, -1).join("/");
 	const placeholder = r.moduleDir.replace(/\/$/, "").split("/").at(-1)!;
@@ -287,13 +305,13 @@ export function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutChe
 			if (!want || [...want].some((f) => f.startsWith(`${root}/${d}/`))) out.push(`${root}/${d}/: folder "${d}" does not follow ${r.moduleDir}`);
 			continue;
 		}
-		const files = listFiles(join(projectDir, mod)).map((f) => `${mod}/${f}`);
+		const files = listFiles(join(projectDir, mod)).map((f) => `${mod}/${f}`).filter((f) => !scaffold.has(f));
 		const checked = want ? files.filter((f) => want.has(f)) : files;
 		if (!checked.length) continue;
 		out.push(...checkLayoutRules(checked, mod, area, projectDir, r, o, {}, !want));
 		for (const f of checked.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, mod, area, r, o));
 	}
-	const shared = o.sharedDirs.flatMap((s) => listFiles(join(projectDir, s)).map((f) => s + f)).filter((f) => !want || want.has(f));
+	const shared = o.sharedDirs.map(slashed).flatMap((s) => listFiles(join(projectDir, s)).map((f) => s + f)).filter((f) => !scaffold.has(f) && (!want || want.has(f)));
 	out.push(...checkLayoutRules(shared, "\0none", "", projectDir, r, o));
 	for (const f of shared.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, undefined, undefined, r, o));
 	return [...new Set(out)];
@@ -315,16 +333,20 @@ function topUnder(dir: string, root: string): string | undefined {
 	return dir.slice(prefix.length).split("/")[0] || undefined;
 }
 
-/** The binding layout text agents and RULES.md read, rendered from the same rules the checker uses. */
-export function renderLayoutDoc(r: LayoutRules, sharedDirs: string[]): string {
+/**
+ * The binding layout text agents and RULES.md read, rendered from the same rules the checker uses. `testGlobs`: where
+ * the stack's test runner finds an area's tests (the adapter's test globs, for the example area invoice).
+ */
+export function renderLayoutDoc(r: LayoutRules, sharedDirs: string[], testGlobs: string[] = []): string {
 	const d = (p: string) => p.replace(/\{(\w+)\}/g, "<$1>");
 	const lines = [`One feature folder per legacy area: ${d(r.moduleDir)}/${r.source ? ` (from ${r.source})` : ""}. Inside it only:`];
 	for (const f of r.files) lines.push(`- ${d(f.path)} — ${f.doc}`);
 	if (r.require.length) lines.push(`Every feature folder has: ${r.require.map(d).join(", ")}.`);
 	for (const p of r.place ?? []) lines.push(`Placement: ${p.doc} (only in ${p.in.map(d).join(" or ")}).`);
-	lines.push(`<sub> is one kebab-case folder named after what the code does (creation/, tracking/). Never a folder named ${r.forbidDirs.join(", ")}.`);
-	lines.push("Tests live beside the code they test.");
-	if (sharedDirs.length) lines.push(`Code used by several areas: ${sharedDirs.map((x) => `${x}<topic>/<name>`).join(" or ")} (topic named after what it does).`);
+	const sub = subStyle(r.moduleDir);
+	lines.push(`<sub> is one ${sub.word} folder named after what the code does (e.g. ${sub.sample}/). Never a folder named ${r.forbidDirs.join(", ")}.`);
+	if (testGlobs.length) lines.push(`Tests of an area go where the test runner finds them: ${testGlobs.join(" or ")} (for the area invoice).`);
+	if (sharedDirs.length) lines.push(`Code used by several areas: ${sharedDirs.map((x) => `${slashed(x)}<topic>/<name>`).join(" or ")} (topic named after what it does).`);
 	if (r.maxLines) lines.push(`A file stays under ${r.maxLines} lines.`);
 	return lines.join("\n");
 }
@@ -381,7 +403,7 @@ export function normalize(r: Partial<LayoutRules>): LayoutRules {
  * it (read at call time); without one the adapter's own checks stay and the banned folder names are added.
  */
 export function withLayoutRules(adapter: TargetAdapter, root: string | undefined): TargetAdapter {
-	const base = adapter.layout;
+	const base = { ...adapter.layout, sharedDirs: adapter.layout.sharedDirs.map(slashed) };
 	const rules = () => (root ? loadLayoutRules(root, adapter.id) : undefined);
 	const opts: LayoutCheckOptions = { sharedDirs: base.sharedDirs, dataDirs: base.dataDirs, isTestFile: (f) => base.isTestFile(f), sourceExtensions: base.sourceExtensions, fileFindings: base.fileFindings };
 	const layout = {
@@ -401,11 +423,31 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 			return r ? checkLayoutTree(projectDir, r, opts, only, scaffoldDirs(projectDir, r.moduleDir.split("/").slice(0, -1).join("/"))) : (base.checkTree?.(projectDir, only) ?? []);
 		},
 	};
-	Object.defineProperty(layout, "structureDoc", { enumerable: true, get: () => (rules() ? renderLayoutDoc(rules()!, base.sharedDirs) : base.structureDoc) });
+	// the adapter's own notes stay next to the layout written from layout.json
+	const doc = (r: LayoutRules) => [renderLayoutDoc(r, base.sharedDirs, base.testFileGlobs(expandModuleDir(r, "invoice"))), base.structureDoc.trim() && `Notes for this stack:\n${base.structureDoc.trim()}`].filter(Boolean).join("\n\n");
+	Object.defineProperty(layout, "structureDoc", { enumerable: true, get: () => (rules() ? doc(rules()!) : base.structureDoc) });
 	return { ...adapter, layout };
 }
 
 // ---- helpers ------------------------------------------------------------------------------------------------
+
+/** A folder path with exactly one trailing slash (`src/Shared` → `src/Shared/`), so folder + file never run together. */
+export const slashed = (d: string) => d.replace(/\/*$/, "/");
+
+/**
+ * Files of the project's first commit (what the official generator made) still as generated, relative to `dir`:
+ * never drift. A scaffold file a unit changed is checked like any other.
+ */
+export function scaffoldFiles(dir: string): string[] {
+	try {
+		const git = (args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+		const first = git(["rev-list", "--max-parents=0", "HEAD"]).trim().split("\n").at(-1)!;
+		const changed = new Set(git(["diff", "--name-only", "--relative", first]).split("\n").filter(Boolean));
+		return git(["ls-tree", "-r", "--name-only", first]).split("\n").filter((f) => f && !changed.has(f));
+	} catch {
+		return [];
+	}
+}
 
 /** Dirs under `srcRoot` in the project's first commit (what the official generator made): never feature folders. */
 export function scaffoldDirs(dir: string, srcRoot: string): string[] {
@@ -420,11 +462,14 @@ export function scaffoldDirs(dir: string, srcRoot: string): string[] {
 	}
 }
 
+/**
+ * A legacy file kind in the file name's dotted parts (Create.cmd.php → cmd). Folders and words inside a name
+ * (translations/, AccessTokenHandler) are never judged, nor the file's own extension (the target language).
+ */
 function legacyWord(f: string, words?: string[]): string | undefined {
 	if (!words?.length) return undefined;
-	// the file's own extension is the target language (a PHP → Symfony migration writes .php files), never a legacy kind
-	const parts = f.replace(/\.[A-Za-z0-9]+$/, "").split(/[^A-Za-z0-9]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])/)).map((p) => p.toLowerCase());
-	return words.find((w) => parts.includes(w));
+	const parts = f.split("/").at(-1)!.split(".").slice(1, -1).map((p) => p.toLowerCase());
+	return words.find((w) => parts.includes(w.toLowerCase()));
 }
 
 function read(projectDir: string, f: string): string {

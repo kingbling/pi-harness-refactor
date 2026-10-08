@@ -6,7 +6,7 @@ import type { InitPrompter } from "../init/init.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
-import { checkLayoutRules, checkLayoutTree, loadLayoutRules, normalize, samplePath, saveLayoutRules, validateLayoutRules, type LayoutRules } from "./layout-rules.ts";
+import { checkLayoutRules, checkLayoutTree, loadLayoutRules, normalize, samplePath, saveLayoutRules, subStyle, validateLayoutRules, type LayoutRules } from "./layout-rules.ts";
 import { rulesDir, stripLayout } from "./layout.ts";
 
 /**
@@ -19,12 +19,13 @@ import { rulesDir, stripLayout } from "./layout.ts";
 /** One example feature folder, the way the owner reads a layout: paths for area "campaign" with what goes there. */
 export function layoutPreview(r: LayoutRules, area = "campaign"): string {
 	const mod = r.moduleDir.replace(/\{area\}/g, area).replace(/\{Area\}/g, area[0]!.toUpperCase() + area.slice(1)).replace(/\{area_snake\}/g, area);
-	const required = new Set(r.require.map((q) => samplePath(q, area)));
+	const sub = subStyle(r.moduleDir).sample;
+	const required = new Set(r.require.map((q) => samplePath(q, area, sub)));
 	return [
 		`${mod}/`,
 		...r.files.map((f) => {
-			const p = samplePath(f.path, area).replace(/\bsample\b/g, "<name>").replace(/\bSample\b/g, "<Name>").replace(/\bbilling\b/g, "<sub>");
-			return `  ${p}${required.has(samplePath(f.path, area)) ? " (always)" : ""} — ${f.doc}`;
+			const p = samplePath(f.path, area, sub).replace(/\bsample\b/g, "<name>").replace(/\bSample\b/g, "<Name>").replace(new RegExp(`\\b${sub}\\b`, "g"), "<sub>");
+			return `  ${p}${required.has(samplePath(f.path, area, sub)) ? " (always)" : ""} — ${f.doc}`;
 		}),
 		`  never: ${r.forbidDirs.map((d) => `${d}/`).join(", ")}`,
 		...(r.place ?? []).map((p) => `  ${p.doc}`),
@@ -51,7 +52,7 @@ export async function draftLayout(o: { client: ModelClient; model: string; stack
 	const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
 		{
 			role: "system",
-			content: `You maintain the feature-folder layout of the ${o.stack} project in an automated migration. The layout is data a checker enforces (layout.json). Patterns are relative to the feature folder: {area} {Area} {area_snake} the feature, {name}/{Name} any kebab/Pascal name, {sub} a sub-feature folder named after what it does (same value where it repeats), (a|b) either word. files = the only files allowed; require = files every feature folder has; place = code (regex on the text) that may only live in some files; forbidDirs = banned folder names. Change only what the owner asks; keep everything else exactly. If the request is the framework's own convention, use the official docs' layout. If the request is not about where files and folders go (naming inside code, style), set checkable=false.\n\n${PLAIN_LANGUAGE}`,
+			content: `You maintain the feature-folder layout of the ${o.stack} project in an automated migration. The layout is data a checker enforces (layout.json). Patterns are relative to the feature folder: {area} {Area} {area_snake} the feature, {name}/{Name} any kebab/Pascal name, {sub} a sub-feature folder named after what it does, spelled like the feature folders ({Area} → PascalCase, {area} → kebab-case; same value where it repeats), (a|b) either word. files = the only files allowed; require = files the framework itself needs in every feature folder to load it (none when it finds the code on its own); place = code (regex on the text) that may only live in some files; forbidDirs = banned folder names. Change only what the owner asks; keep everything else exactly. If the request is the framework's own convention, use the official docs' layout. If the request is not about where files and folders go (naming inside code, style), set checkable=false.\n\n${PLAIN_LANGUAGE}`,
 		},
 		{ role: "user", content: `Current layout.json:\n${JSON.stringify(o.current ?? { moduleDir: "src/{area}", files: [], require: [], forbidDirs: [], place: [] }, null, 1)}\n\nThe owner says: ${o.words}` },
 	];
@@ -118,7 +119,7 @@ export async function askLayout(o: { root: string; stack: string; adapter: Targe
 	let summary = rules?.source ? `the framework's own convention (${rules.source})` : "";
 	if (!rules && o.client && !o.yes) {
 		o.log?.(`${o.stack}: asking a model for the framework's official folder layout…`);
-		const d = await draftLayout({ client: o.client, model: o.model, stack: o.stack, current: undefined, words: `Write the official feature-folder convention of ${o.stack}: one folder per feature, its entry point always present, request/response classes in their own folder, sub-features in folders named after what they do.` });
+		const d = await draftLayout({ client: o.client, model: o.model, stack: o.stack, current: undefined, words: `Write the official feature-folder convention of ${o.stack}: one folder per feature, request/response classes in their own folder, sub-features in folders named after what they do (spelled like the feature folders). require only a file the framework itself needs to load a feature folder; none when the framework finds the code on its own.` });
 		if (d.ok) ({ rules, summary } = { rules: d.rules, summary: d.summary });
 	}
 	if (!rules) return "no layout proposal: the built-in checks apply (/br rule sets one later)";

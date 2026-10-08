@@ -13,6 +13,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import { QUIRK_KINDS, recordQuirk, type QuirkKind } from "../run/quirks.ts";
 import { proposeRule } from "../rules/living.ts";
 import { rulesDir } from "../rules/layout.ts";
+import { slashed } from "../rules/layout-rules.ts";
 import { findCapabilities, renderCapability } from "../inventory/capabilities.ts";
 
 /**
@@ -184,7 +185,7 @@ export function sharedLookup(d: ToolDeps): ToolDefinition {
 		parameters: Type.Object({ query: Type.Optional(Type.String()) }),
 		execute: async (_id, p) => {
 			const rows = sharedSymbols(d.ledger, d.adapter.layout.sharedDirs, p.query, 40, d.adapter.id);
-			return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}]${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`).join("\n") : `no shared helpers${p.query ? ` match "${p.query}"` : " yet"} — if you need a cross-cutting helper, create it under ${d.adapter.layout.sharedDirs[0] ?? "the shared dir"}<area>/ with a doc comment so others find it`);
+			return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}]${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`).join("\n") : `no shared helpers${p.query ? ` match "${p.query}"` : " yet"} — cross-cutting helpers live in topic folders named after what they do (${d.adapter.layout.sharedDirs[0] ? slashed(d.adapter.layout.sharedDirs[0]) : "the shared dir/"}<topic>/), never named after an area; add a file with a doc comment to an existing topic, or keep the code in your module`);
 		},
 	});
 }

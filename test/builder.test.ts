@@ -28,7 +28,7 @@ function setup() {
 	const adapter = {
 		id: "fake",
 		protectedGlobs: [],
-		layout: { isTestFile: (p: string) => p.includes(".test.") },
+		layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"] },
 		// the "type check" of everything: it cannot take files
 		build: () => ({ cmd: "grep", args: ["-q", "ok", "src/a.txt"] }),
 		lint: (_r: string, files: string[]) => ({ cmd: "true", args: files }),
