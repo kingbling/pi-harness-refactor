@@ -28,6 +28,7 @@ import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } f
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals } from "../jev/ask.ts";
+import { resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
@@ -80,6 +81,8 @@ export interface SchedulerOptions {
 	setupFixer?: SetupFixer | false;
 	/** Fixes whole-project check failures after merges; default: the big model (none when `spawn` is faked). */
 	builderRepair?: Repairer | false;
+	/** Tries open questions before the owner sees them (default: a model with read tools; off with a test spawn). */
+	resolver?: Resolver | false;
 }
 
 export interface SchedulerResult {
@@ -150,6 +153,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// Quarantined units heal too: something changed since (a setup fix, the old code's environment, the plugin)
 	// → back into the queue, every hour or sooner, up to run.maxAutoHeals times; then the owner is asked.
 	let askingStuck: Promise<unknown> | undefined;
+	let resolving: Promise<unknown> | undefined;
 	const resubmitParked = () => {
 		resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
 		if (o.dry) return;
@@ -157,6 +161,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		askingStuck ??= askStuckUnits({ ledger, config, root: o.root, client: o.client })
 			.then((n) => n && log(pc.yellow(`${n} question(s): units still failing after ${config.run.maxAutoHeals} automatic tries`)), (e) => log(pc.yellow(`asking about stuck units failed: ${e?.message ?? e}`)))
 			.finally(() => (askingStuck = undefined));
+		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
+		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
+		if (resolver)
+			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, log: (l) => log(pc.cyan(l)) })
+				.then((r) => r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`)), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
+				.finally(() => (resolving = undefined));
 	};
 
 	// Each unit lands in the stack placement picks; a worktree holds the whole target repo, so every stack's

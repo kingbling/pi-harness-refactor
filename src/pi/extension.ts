@@ -78,6 +78,44 @@ interface BrEntry {
  * result is persisted with the session.
  */
 /** A question card (options with descriptions, recommendation preselected, or a prefilled text field); undefined = cancelled. */
+const TYPE = "Type an answer…", SKIP = "Skip for now", QUIT = "Stop answering", SPLIT = "Answer these one by one";
+/**
+ * One question card for a group of open questions that ask the same thing (groupQuestions): its options, a typed
+ * answer, skip or stop. Used by /br answer and, during a run, for questions no model could answer.
+ */
+export async function answerGroup(ctx: ExtensionContext, ledger: Ledger, qs: QuestionRow[], label: string, by: string, done: string[]): Promise<"quit" | "skipped" | "answered"> {
+	const q = qs[0]!;
+	const differ = qs.some((x) => x.question !== q.question);
+	// the group's members: one line each, cut at the screen edge (the card scrolls when they do not fit)
+	const members = differ ? [`${qs.length} questions, one answer for all:`, ...qs.map((x) => `· ${x.unit_id ?? x.point}: ${x.question.split("\n")[0]!}`)] : undefined;
+	const head = `${label}${qs.length > 1 && !differ ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}`;
+	const options = q.options ? (JSON.parse(q.options) as string[]) : [];
+	const recommended = q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined;
+	const pick = await askCard(ctx, {
+		message: head,
+		...(members ? { details: members } : {}),
+		recommended,
+		options: [
+			...options.map((o) => ({ value: o, label: o })),
+			...(differ ? [{ value: SPLIT, label: SPLIT, description: "the texts differ: decide each one on its own" }] : []),
+			{ value: TYPE, label: "Type an answer", description: "your own answer, in your words" },
+			{ value: SKIP, label: SKIP, description: "stays open; only the code waiting on it waits" },
+			{ value: QUIT, label: QUIT },
+		],
+	});
+	if (pick === undefined || pick === QUIT) return "quit";
+	if (pick === SKIP) return "skipped";
+	if (pick === SPLIT) {
+		for (const [j, x] of qs.entries()) if ((await answerGroup(ctx, ledger, [x], `${label}.${j + 1}`, by, done)) === "quit") return "quit";
+		return "answered";
+	}
+	const answer = pick === TYPE ? (await askCard(ctx, { message: q.question, text: { initial: "" } }))?.trim() : pick;
+	if (!answer) return "skipped";
+	for (const x of qs) ledger.answerQuestion(x.id, pick === TYPE ? answer : optionFor(x, answer), by);
+	done.push(`#${qs.map((x) => x.id).join(", #")} = ${answer}`);
+	return "answered";
+}
+
 function askCard(ctx: ExtensionContext, q: CardQuestion & { multi?: undefined }): Promise<string | undefined>;
 function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<CardAnswer | undefined>;
 function askCard(ctx: ExtensionContext, q: CardQuestion): Promise<CardAnswer | undefined> {
@@ -464,6 +502,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 		const { runScheduler } = await import("../run/run.ts");
 		const { OpenRouterClient } = await import("../models/openrouter.ts");
 		const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+		let runDone = false;
 		try {
 			// Whole-target decisions refuse; every other open decision only blocks the units it affects and is
 			// asked on the side (dialogs) while the run goes on. Answers release their units at the next loop.
@@ -493,7 +532,39 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 					progress.log(`decided ${next.id} = ${v}  ${applyDecision(ledger, loadConfig(cp).config, root, next.id, v, "human (pi, during run)")}`);
 				}
 			};
-			if (!flags.includes("--dry")) void askOnTheSide().catch((e) => progress.log(`decision dialog failed: ${e?.message ?? e}`));
+			// Questions the resolver model could not settle (context.forOwner) come up as cards while the run goes on;
+			// "Stop answering" ends the cards for this run (/br answer still works).
+			const answerOnTheSide = async () => {
+				if (!ctx.hasUI) return;
+				const shown = new Set<number>();
+				const done: string[] = [];
+				// its own handle: a card still open when the run ends must still be able to save its answer
+				const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+				try {
+					while (!runDone && !progress.stopping) {
+						const mine = ledger.openQuestions().filter((q) => !shown.has(q.id) && q.context && JSON.parse(q.context).forOwner !== undefined);
+						const qs = groupQuestions(mine)[0];
+						if (!qs) {
+							await new Promise((r) => setTimeout(r, 5000));
+							continue;
+						}
+						for (const q of qs) shown.add(q.id);
+						const why = JSON.parse(qs[0]!.context!).forOwner as string;
+						if ((await answerGroup(ctx, ledger, qs, `question while the run continues (${why})`, "human (pi, during run)", done)) === "quit") {
+							progress.log("question cards off for this run: /br answer answers the rest");
+							return;
+						}
+						for (const d of done.splice(0)) progress.log(`answered ${d}`);
+					}
+				} finally {
+					ledger.close();
+				}
+			};
+			if (!flags.includes("--dry"))
+				void (async () => {
+					await askOnTheSide().catch((e) => progress.log(`decision dialog failed: ${e?.message ?? e}`));
+					await answerOnTheSide().catch((e) => progress.log(`question dialog failed: ${e?.message ?? e}`));
+				})();
 			// Scheduler lines → panel steps: "▶ <unit>" starts one, "✓ <unit> accepted" / "■ <unit>: …" / "✗ <unit>: …" end it.
 			const log = (l: string) => {
 				progress.log(l);
@@ -510,6 +581,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			const own = ledger.ownDecisions(since).length;
 			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(own ? [`${own} routine question(s) decided from your goals (br questions lists them; /br answer <id> <text> changes one)`] : []), ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };
 		} finally {
+			runDone = true;
 			ledger.close();
 		}
 	});
@@ -779,39 +851,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					const groups = groupQuestions(ledger.openQuestions());
 					if (!groups.length) return show(ctx, sub, done.length ? `answered:\n${done.join("\n")}\nno open questions left` : "no open questions");
-					const TYPE = "Type an answer…", SKIP = "Skip for now", QUIT = "Stop answering", SPLIT = "Answer these one by one";
-					const ask = async (qs: QuestionRow[], label: string): Promise<"quit" | void> => {
-						const q = qs[0]!;
-						const differ = qs.some((x) => x.question !== q.question);
-						// the group's members: one line each, cut at the screen edge (the card scrolls when they do not fit)
-						const members = differ ? [`${qs.length} questions, one answer for all:`, ...qs.map((x) => `· ${x.unit_id ?? x.point}: ${x.question.split("\n")[0]!}`)] : undefined;
-						const head = `${label}${qs.length > 1 && !differ ? ` (same question for ${qs.length} units)` : ""} · ${q.unit_id ?? q.point}\n${q.question}`;
-						const options = q.options ? (JSON.parse(q.options) as string[]) : [];
-						const recommended = q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined;
-						const pick = await askCard(ctx, {
-							message: head,
-							...(members ? { details: members } : {}),
-							recommended,
-							options: [
-								...options.map((o) => ({ value: o, label: o })),
-								...(differ ? [{ value: SPLIT, label: SPLIT, description: "the texts differ: decide each one on its own" }] : []),
-								{ value: TYPE, label: "Type an answer", description: "your own answer, in your words" },
-								{ value: SKIP, label: SKIP, description: "stays open; only the code waiting on it waits" },
-								{ value: QUIT, label: QUIT },
-							],
-						});
-						if (pick === undefined || pick === QUIT) return "quit";
-						if (pick === SKIP) return;
-						if (pick === SPLIT) {
-							for (const [j, x] of qs.entries()) if ((await ask([x], `${label}.${j + 1}`)) === "quit") return "quit";
-							return;
-						}
-						const answer = pick === TYPE ? (await askCard(ctx, { message: q.question, text: { initial: "" } }))?.trim() : pick;
-						if (!answer) return;
-						for (const x of qs) ledger.answerQuestion(x.id, pick === TYPE ? answer : optionFor(x, answer), "human (pi)");
-						done.push(`#${qs.map((x) => x.id).join(", #")} = ${answer}`);
-					};
-					for (const [i, qs] of groups.entries()) if ((await ask(qs, `question ${i + 1}/${groups.length}`)) === "quit") break;
+					for (const [i, qs] of groups.entries()) if ((await answerGroup(ctx, ledger, qs, `question ${i + 1}/${groups.length}`, "human (pi)", done)) === "quit") break;
 					const left = ledger.openQuestions().length;
 					show(ctx, sub, [done.length ? `answered:\n${done.join("\n")}` : "nothing answered", left ? `${left} still open: /br answer again` : "no open questions left", "a running migration picks the answers up at its next loop"].join("\n"));
 					return;

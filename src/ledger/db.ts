@@ -310,6 +310,10 @@ export class Ledger {
 		// A human answer to a question that mirrors a Jev decision is a calibration label for that decision.
 		if (q.decision_id !== null && status === "answered") this.db.prepare("UPDATE decisions SET label = ? WHERE id = ?").run(answer, q.decision_id);
 	}
+	/** The resolver model tried an open question and could not settle it: it waits for the owner, with the model's reason. */
+	markForOwner(id: number, why: string): void {
+		this.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.forOwner', ?) WHERE id = ? AND status = 'open'").run(why, id);
+	}
 	withdrawQuestion(id: number, reason: string): void {
 		this.db.prepare("UPDATE questions SET status = 'withdrawn', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'").run(`withdrawn: ${reason}`, now(), id);
 	}
