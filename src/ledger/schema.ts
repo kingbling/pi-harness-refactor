@@ -264,12 +264,11 @@ CREATE TABLE IF NOT EXISTS index_queries (
   id INTEGER PRIMARY KEY AUTOINCREMENT, symbol_id TEXT NOT NULL, kind TEXT NOT NULL, tables TEXT NOT NULL DEFAULT '[]', text TEXT
 );
 -- Code map (legacy side): every function/method with comments lifted out, and its call sites resolved by the core.
--- purpose/effects are written later by a cheap model, keyed to body_hash (normalized AST) so they survive re-inventory.
+-- Readers take a function's meaning from its doc comment and code; no model writes a summary here.
 CREATE TABLE IF NOT EXISTS code_functions (
   id TEXT PRIMARY KEY, path TEXT NOT NULL, container TEXT, name TEXT NOT NULL,
   line INTEGER NOT NULL, end_line INTEGER NOT NULL, signature TEXT, returns TEXT,
-  comments TEXT NOT NULL DEFAULT '[]', body_hash TEXT,
-  purpose TEXT, effects TEXT, purpose_model TEXT, purpose_hash TEXT
+  comments TEXT NOT NULL DEFAULT '[]', body_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS code_functions_path ON code_functions(path);
 -- resolution: code (to_id = function or class in the app), framework (to_id in a framework dir), ambiguous

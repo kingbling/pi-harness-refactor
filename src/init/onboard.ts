@@ -56,7 +56,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		setup: "bootstrap the new codebase with the official generators + chosen packages",
 		docs: "fetch the official docs of every chosen technology for the agents",
 		"inventory (after decisions)": "re-index with the decisions applied",
-		label: "Jev rates every unit (difficulty → model, kind, needs_db, has_ui), places unreached code, gives every unit its stack + area",
+		label: "Jev rates every unit (difficulty → model, needs_db, has_ui), places unreached code, gives every unit its stack + area",
 		rules: "a model writes RULES.md, AGENTS.md, idioms and lint rules from the framework mapping",
 		order: "order units into slices: foundation → data (DB lane) → auth → features",
 		layout: "preflight: placement dry run, rules vs. adapter layout, the target tree as it is (br run refuses on problems)",

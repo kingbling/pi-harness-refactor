@@ -148,19 +148,17 @@ export function resolveCodeMap(indexes: FileIndex[], isFramework: (path: string)
 	return { functions, calls };
 }
 
-/** Writes the code map inside the caller's transaction. Purposes survive when the body did not change. */
+/** Writes the code map inside the caller's transaction. */
 export function writeCodeMap(ledger: Ledger, rows: CodeMapRows): void {
 	const db = ledger.db;
 	const old = new Map((db.prepare("SELECT id, body_hash FROM code_functions").all() as Array<{ id: string; body_hash: string | null }>).map((r) => [r.id, r.body_hash]));
 	const upsert = db.prepare(`INSERT INTO code_functions(id, path, container, name, line, end_line, signature, returns, comments, body_hash) VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET path=excluded.path, container=excluded.container, name=excluded.name, line=excluded.line, end_line=excluded.end_line,
 		signature=excluded.signature, returns=excluded.returns, comments=excluded.comments, body_hash=excluded.body_hash`);
-	const clearPurpose = db.prepare("UPDATE code_functions SET purpose = NULL, effects = NULL, purpose_model = NULL, purpose_hash = NULL WHERE id = ?");
 	const seen = new Set<string>();
 	for (const f of rows.functions) {
 		seen.add(f.id);
 		upsert.run(f.id, f.path, f.container ?? null, f.name, f.line, f.endLine, f.signature, f.returns ?? null, JSON.stringify(f.comments), f.bodyHash ?? null);
-		if (old.has(f.id) && old.get(f.id) !== (f.bodyHash ?? null)) clearPurpose.run(f.id);
 	}
 	const del = db.prepare("DELETE FROM code_functions WHERE id = ?");
 	for (const id of old.keys()) if (!seen.has(id)) del.run(id);
@@ -179,8 +177,6 @@ export interface FunctionRow {
 	signature: string | null;
 	returns: string | null;
 	comments: string;
-	purpose: string | null;
-	effects: string | null;
 }
 
 /** A function by id, or by `Class::name` / bare name when unique. */
@@ -291,7 +287,6 @@ export function readFunction(ledger: Ledger, sourceRoot: string, ref: string, op
 	const dropped = comments.length - kept.length;
 	const tidy = (c: CodeComment) => (c.body ?? c.text).split("\n").map((l) => l.trim()).filter(Boolean).join(" ");
 	const out = [`${f.id}  (${f.path} L${f.line}-${f.end_line}${start < f.line ? `, doc from L${start}` : ""})`];
-	if (f.purpose) out.push(`purpose: ${f.purpose}${f.effects ? ` | effects: ${(JSON.parse(f.effects) as string[]).join("; ")}` : ""}`);
 	if (kept.length) out.push("comments:", ...kept.map((c) => `  L${c.line} ${c.kind === "doc" ? "[doc] " : ""}${tidy(c)}`));
 	if (dropped) out.push(`(${dropped} commented-out code / banner comment${dropped > 1 ? "s" : ""} removed)`);
 	out.push(`code (starts at L${start}, line positions kept):`, body.trim() ? body : "(empty)");
