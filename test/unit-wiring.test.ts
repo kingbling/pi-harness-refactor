@@ -52,6 +52,24 @@ describe("runUnit wiring", () => {
 		expect(seen[0]!.legacyWords).toContain("tpl");
 	});
 
+	it("a generated stack without generated wiring: the files its manifest names for registration are in the implementer's scope", async () => {
+		const cmd = { cmd: "true", args: [] };
+		const m = {
+			id: "go-wire", role: "server", subdir: "api", aliases: [], docs: [], scaffold: { ...cmd, readyFile: "package.json" }, postScaffold: [], build: cmd, lint: cmd, test: cmd,
+			toolchain: { ecosystem: "go", packageName: "^[\\w./-]+", packageExamples: [], manifestFiles: ["go.mod"], installed: { file: "", keys: [] }, add: cmd, worktreeLinks: [], ignoredPaths: [] },
+			layout: { moduleDir: "internal/{area}", structureDoc: "-", sharedDirs: ["internal/shared/"], testFileGlobs: ["{moduleDir}/*_test.go"], testFileRegex: "_test\\.go$", sourceExtensions: [".go"], langByExtension: {}, skipMarker: "t\\.Skip", interfaceHint: "-", testHint: "-", legacyMarker: "// LEGACY: {why}", dataAccessHint: "", ignoreDirs: [], wiringFiles: ["cmd/server/routes.go"] },
+			platform: {}, stackChoices: [], protectedGlobs: [], patternKinds: ["handler"], probeTest: { path: "x_test.go", content: "" }, detect: { file: "go.mod", contains: "module" },
+		};
+		write(join(ws, ".bigrefactor", "adapters", "go-wire.json"), JSON.stringify(m));
+		const goConfig = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["go-wire"] }, models: {} });
+		ledger.db.prepare("UPDATE units SET meta = ? WHERE id = 'u1'").run(JSON.stringify({ files: ["app/behaviour/commands/agency/create.cmd.php"], place: { stack: "go-wire", area: "agency", shared: false, source: "code" } }));
+		const seen: GateInput[] = [];
+		const gate = async (g: GateInput): Promise<GateReport> => (seen.push(g), { ok: true, steps: [], changedFiles: [], testFiles: [] });
+		write(join(ws, ".bigrefactor", "truth", "u1", "interface.md"), "internal/agency/agency.go exports Service\n");
+		await runUnit({ ledger, config: goConfig, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, log: () => {} });
+		expect(seen[0]!.writeGlobs).toEqual(["internal/agency/**", "cmd/server/routes.go"]);
+	});
+
 	it("after the doctor, the triage question is withdrawn and asked again with the diagnosis, phrased by the model", async () => {
 		const client = new FakeModelClient({ chat: () => ({ json: { action: "unknown", summary: "the protected globs block the module dir", question: "The gate keeps refusing agency writes: fix the protected globs?", options: [], recommended: "retry", opinion: "Looks like config." } }) });
 		const gate = async (): Promise<GateReport> => failing("write outside unit scope: src/features/agency/agency.service.ts");

@@ -91,3 +91,59 @@ describe("generated target adapters", () => {
 		expect(JSON.parse(readFileSync(join(ws, ".bigrefactor", "adapters", "vuex-test.json"), "utf8")).role).toBe("ui");
 	});
 });
+
+describe("generated target adapters on non-TypeScript stacks", () => {
+	const go = (over: Partial<AdapterManifest["layout"]> = {}) => {
+		const base = manifest();
+		return manifest({
+			id: "go-test",
+			toolchain: { ...base.toolchain, packageName: "^[\\w./-]+", installed: { file: "", keys: [], list: { cmd: process.execPath, args: ["-e", "console.log('example.com/app'); console.log('github.com/go-chi/chi/v5 v5.0.12')"] }, listPattern: "^(\\S+) v\\d" } },
+			layout: { ...base.layout, moduleDir: "internal/{area}", sharedDirs: ["internal/shared/"], dataDirs: ["db/migrations", "internal/store/"], wiringFiles: ["cmd/server/routes.go"], ...over },
+		});
+	};
+
+	it("installed packages come from the stack's list command when it has no JSON manifest", () => {
+		expect(fromManifest(go()).toolchain.installedPackages(here)).toEqual(["github.com/go-chi/chi/v5"]);
+		// the JSON manifest still works where it applies
+		expect(fromManifest(manifest()).toolchain.installedPackages(here)).toContain("vitest");
+		const ok = go();
+		ok.toolchain.installed.list = { cmd: "go", args: ["list", "-m", "all"] };
+		expect(validateManifest(ok)).toEqual([]);
+		const bad = go();
+		bad.toolchain.installed.list = { cmd: "sh", args: ["-c", "pip list"] };
+		expect(validateManifest(bad).join("\n")).toMatch(/installed\.list.*shell/);
+	});
+
+	it("the manifest names the data folders and the wiring files; the adapter passes them on", () => {
+		const a = fromManifest(go());
+		expect(a.layout.dataDirs).toEqual(["db/migrations/", "internal/store/"]);
+		expect(a.layout.wiringFiles).toEqual(["cmd/server/routes.go"]);
+		expect(fromManifest(manifest()).layout.dataDirs).toBeUndefined(); // older manifests: the DB lane's defaults
+		expect(validateManifest(go({ dataDirs: ["../db/"] })).join("\n")).toMatch(/dataDirs.*project-relative/);
+	});
+
+	it("the implementer is told where to register its unit, not that wiring is generated", async () => {
+		const { implementerSystemPrompt } = await import("../src/run/prompts.ts");
+		const { ConfigSchema } = await import("../src/config.ts");
+		const config = ConfigSchema.parse({ source: { path: "/x", stack: "php" }, target: { path: "/y", stacks: ["go-test"] }, models: {} });
+		const opts = { area: "billing", stackId: "go-test", moduleDir: "internal/billing", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, source: { id: "php" } as never };
+		const p = implementerSystemPrompt(config, { ...opts, target: fromManifest(go()) });
+		expect(p).toContain("in cmd/server/routes.go");
+		expect(p).not.toMatch(/wiring files are generated/);
+		expect(implementerSystemPrompt(config, { ...opts, target: { ...fromManifest(go()), generateRegistration: async () => [] } })).toMatch(/wiring files are generated/);
+	});
+
+	it("without a symbol index the lookups say so and send the model to grep/ls instead of claiming nothing exists", async () => {
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { ConfigSchema } = await import("../src/config.ts");
+		const { patternExamples, sharedLookup, targetLookup } = await import("../src/sessions/tools.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/x", stack: "php" }, target: { path: "/y", stacks: ["go-test"] }, models: {} });
+		const d = { ledger, config, unitId: "u1", root: "/nowhere", targetProjectDir: "/y", adapter: fromManifest(go()), moduleDir: "internal/billing" };
+		const run = async (t: ReturnType<typeof targetLookup>, p: object) => JSON.stringify(await (t as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", p));
+		for (const out of [await run(targetLookup(d), { query: "Invoice" }), await run(targetLookup(d), { query: "*" }), await run(sharedLookup(d), {}), await run(patternExamples(d), { kind: "component" })]) {
+			expect(out).toMatch(/no symbol index/);
+			expect(out).not.toMatch(/you are creating it|is empty/);
+		}
+	});
+});

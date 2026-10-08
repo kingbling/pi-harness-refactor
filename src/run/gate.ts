@@ -208,7 +208,9 @@ export function classKey(name: string): string {
  * the reviewer model as `near`, which judges whether it is the same record.
  */
 async function reuseProblems(g: GateInput, prodFiles: string[], allChanged: string[]): Promise<{ problems: string[]; near: string[] }> {
-	if (!g.adapter.indexFile) return { problems: [], near: [] };
+	// no symbol index for this stack (generated adapters): code cannot compare, so the reviewer searches instead
+	if (!g.adapter.indexFile)
+		return { problems: [], near: prodFiles.length ? [`the ${g.adapter.id} stack has no symbol index, so the duplicate check did not run on ${prodFiles.join(", ")}: search the project (grep) for the classes and functions these files declare; a copy of a class, record or helper that already exists elsewhere is a finding (reuse the existing one)`] : [] };
 	// every changed path, deleted ones too: a tidy move's old path is still indexed but no original any more
 	const changed = new Set(allChanged);
 	const fresh: TargetSymbol[] = [];

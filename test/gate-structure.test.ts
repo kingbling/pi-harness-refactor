@@ -130,6 +130,16 @@ describe("gate structure_ok", () => {
 		expect(s.ok).toBe(false);
 		expect(s.output).toMatch(/reuse src\/features\/agency\/agency\.service\.ts::AgencyService\.total — .*CampaignService\.sum has the same body/);
 	});
+
+	it("a stack without a symbol index says the duplicate check did not run, and the reviewer is told to search", async () => {
+		write("src/features/campaign/campaign.service.ts", COPIED);
+		const near: string[][] = [];
+		const review = async (_f: string[], n?: string[]) => (near.push(n ?? []), { ok: true, output: "ok", judged: true });
+		const s = step(await gate("campaign", { adapter: { ...adapter, indexFile: undefined }, review }), "structure_ok")!;
+		expect(s.ok).toBe(true);
+		expect(s.output).toMatch(/no symbol index, so the duplicate check did not run/);
+		expect(near[0]!.join("\n")).toMatch(/search the project \(grep\)/);
+	});
 });
 
 describe("gate structure_ok: one area extends one class per kind (the incident)", () => {

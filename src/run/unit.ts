@@ -129,7 +129,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const tidyMoved = tidyMoves(targetProjectDir, tidy, (l) => log(pc.dim(`  tidy: ${l}`)));
 	if (tidyMoved.length) log(pc.dim(`  tidy: moved ${tidyMoved.join(", ")} (imports are the implementer's job)`));
 	const tidyPaths = [...new Set(tidy.flatMap((t) => [...t.from, ...t.to]))];
-	const writeGlobs = [`${moduleDir}/**`, ...tidyPaths];
+	// wiring files the stack names (route table, main module) when no code regenerates them: the unit registers itself
+	const wiring = adapter.generateRegistration ? [] : (adapter.layout.wiringFiles ?? []);
+	const writeGlobs = [...new Set([`${moduleDir}/**`, ...tidyPaths, ...wiring])];
 	const appendOnlyGlobs = adapter.layout.sharedDirs.map((d) => `${d.replace(/\/$/, "")}/**`); // cross-cutting helpers: add new files, never edit
 	const truthDirAbs = join(o.root, ".bigrefactor", "truth", o.unitId);
 	mkdirSync(truthDirAbs, { recursive: true });
