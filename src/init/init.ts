@@ -303,7 +303,7 @@ function subdirOf(stackId: string): string {
  */
 export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: boolean; fresh: boolean }): Promise<boolean> {
 	const dir = join(root, ".bigrefactor");
-	if (!existsSync(dir) || !readdirSync(dir).length) return false;
+	if (!existsSync(dir) || !readdirSync(dir).filter((n) => n !== "adapters").length) return false; // kept adapters are no earlier work
 	let answers = 0;
 	try {
 		answers = Object.keys((JSON.parse(readFileSync(join(dir, "decisions.json"), "utf8")) as { answers?: object }).answers ?? {}).length;
@@ -324,7 +324,10 @@ export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: 
 	if (!fresh) return false;
 	const to = join(root, `.bigrefactor.old-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`);
 	renameSync(dir, to);
-	ui.log(`earlier work moved to ${basename(to)}; starting fresh`);
+	// generated stack adapters are verified setup, not answers: a running session keeps them in memory, so without
+	// a copy here the next start no longer knows the stack ("unknown target adapter")
+	if (existsSync(join(to, "adapters"))) cpSync(join(to, "adapters"), join(dir, "adapters"), { recursive: true });
+	ui.log(`earlier work moved to ${basename(to)}; starting fresh${existsSync(join(dir, "adapters")) ? " (generated stack adapters kept)" : ""}`);
 	return true;
 }
 
