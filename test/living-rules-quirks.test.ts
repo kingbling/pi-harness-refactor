@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
-import { answerValue, askViaModel, discoverDecisions, phraseDecisions, pointHash } from "../src/jev/ask.ts";
+import { answerValue, askViaModel, decideOpenFromGoals, discoverDecisions, phraseDecisions, pointHash } from "../src/jev/ask.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { askPendingQuirks, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
@@ -104,7 +104,7 @@ describe("living rules", () => {
 		expect(rulesText(root, "nestjs")).toMatch(/throw HttpException/);
 		expect(rulesText(root, "react")).not.toMatch(/HttpException/);
 	});
-	it("proposals are curated into a new version; breaking ones become questions and merge only after apply", async () => {
+	it("proposals are curated into a new version; breaking ones are decided by the run, and merge after the owner says apply", async () => {
 		const { root, config, ledger } = setup();
 		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
 		const p1 = proposeRule({ ledger }, { stack: "nestjs", unitId: "U1", kind: "add", text: "Dates are ISO strings in DTOs", why: "legacy sends Y-m-d" });
@@ -129,7 +129,8 @@ describe("living rules", () => {
 		expect(st(p1)).toBe("merged");
 		expect(st(p2)).toBe("asked");
 		const qid = (ledger.db.prepare("SELECT question_id FROM rule_proposals WHERE id = ?").get(p2) as { question_id: number }).question_id;
-		ledger.answerQuestion(qid, "apply — Yes");
+		expect(ledger.getQuestion(qid)!.status).toBe("auto"); // the run decided "reject" from the goals, nobody waited
+		ledger.answerQuestion(qid, "apply — Yes"); // the owner changes it later
 		const r2 = await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 });
 		expect(r2.versions).toEqual({ nestjs: 3 });
 		expect(st(p2)).toBe("merged");
@@ -207,6 +208,35 @@ describe("the run decides routine questions itself", () => {
 		expect(quirkRetestNote({ ledger, root }, "U1")).toBeUndefined(); // the tests already follow the decision
 		expect(quirksOf({ ledger }, "U1")[0]!.status).toBe("kept");
 		expect(ledger.ownDecisions()).toHaveLength(1);
+	});
+
+	it("a quirk the tester would keep but the goals-aware model drops is decided drop; the owner can still change it", async () => {
+		const { root, config, ledger } = setup();
+		const d = { ledger, config, root, client: phrase("drop") };
+		recordQuirk({ ...d }, { unitId: "U1", symbolId: "total", kind: "intentional", behaviour: "mails contain unescaped HTML", opinion: "keep", why: "same output" });
+		await askPendingQuirks(d, "U1");
+		const q = ledger.db.prepare("SELECT * FROM questions WHERE point = 'quirk'").get() as { id: number; status: string };
+		expect(q.status).toBe("auto");
+		expect(quirkRetestNote({ ledger, root }, "U1")).toMatch(/DROP it/); // the tests pinned the quirk: the tester rewrites them
+		expect(quirksOf({ ledger }, "U1")[0]!.status).toBe("dropped");
+		ledger.answerQuestion(q.id, "keep", "human (pi)"); // the owner overrides the run
+		expect(quirksOf({ ledger }, "U1")[0]!.status).toBe("dropped"); // synced on the next read
+		expect(quirkRetestNote({ ledger, root }, "U1")).toMatch(/KEEP it/);
+		expect(quirksOf({ ledger }, "U1")[0]!).toMatchObject({ status: "kept", decided_by: "human (pi)" });
+		expect(() => ledger.answerQuestion(q.id, "drop", "human")).toThrow(/already answered/); // only the run's own answers stay open
+	});
+
+	it("questions left open under older rules are decided at run start from the picks stored with them", async () => {
+		const { config, ledger } = setup();
+		const old = (point: string, askedBy: string, context: object) => ledger.askQuestion({ unitId: "U1", point, question: "q", options: ["drop — Drop it", "keep — Keep it (recommended)"], context, askedBy });
+		const quirk = old("quirk", "tester", { codePick: "keep", modelPick: "drop", phrasedBy: "some-model" });
+		const rule = old("rule_change", "curator", { modelPick: "keep", phrasedBy: "some-model" });
+		const unphrased = old("quirk", "tester", { codePick: "keep", phrasedBy: "code" });
+		const human = old("systemic_failure", "orchestrator", { codePick: "keep", modelPick: "keep", phrasedBy: "some-model" });
+		expect(decideOpenFromGoals(ledger, config)).toBe(2);
+		expect(ledger.getQuestion(quirk)).toMatchObject({ status: "auto", answer: "drop — Drop it" });
+		expect(ledger.getQuestion(rule)!.status).toBe("auto");
+		expect(ledger.openQuestions().map((q) => q.id)).toEqual([unphrased, human]);
 	});
 
 	it("asks when the model disagrees, when there is no model, for points that need a human, and with run.ask all", async () => {

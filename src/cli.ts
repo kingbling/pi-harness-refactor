@@ -105,7 +105,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const qs = ledger.openQuestions();
 		const own = ledger.ownDecisions();
 		if (own.length) {
-			console.log(pc.dim(`decided by the run from your goals (${own.length}; set run.ask to "all" to be asked instead):`));
+			console.log(pc.dim(`decided by the run from your goals (${own.length}; change one with br answer <id> <text>, or set run.ask to "all" to be asked instead):`));
 			for (const q of own.slice(0, 10)) console.log(pc.dim(`  #${q.id} [${q.point}]${q.unit_id ? ` ${q.unit_id}` : ""} → ${q.answer}`));
 			console.log("");
 		}

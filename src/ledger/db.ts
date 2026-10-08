@@ -303,7 +303,8 @@ export class Ledger {
 	answerQuestion(id: number, answer: string, answeredBy = "human", status: "answered" | "auto" = "answered"): void {
 		const q = this.getQuestion(id);
 		if (!q) throw new LedgerError(`question ${id} not found`);
-		if (q.status !== "open") throw new LedgerError(`question ${id} is already ${q.status}`);
+		// a question the run decided itself (status auto) stays open to the owner: their answer replaces the run's
+		if (q.status !== "open" && !(q.status === "auto" && status === "answered")) throw new LedgerError(`question ${id} is already ${q.status}`);
 		this.db.prepare("UPDATE questions SET status = ?, answer = ?, answered_by = ?, answered_at = ? WHERE id = ?").run(status, answer, answeredBy, now(), id);
 		// A human answer to a question that mirrors a Jev decision is a calibration label for that decision.
 		if (q.decision_id !== null && status === "answered") this.db.prepare("UPDATE decisions SET label = ? WHERE id = ?").run(answer, q.decision_id);

@@ -70,6 +70,8 @@ export async function askPendingQuirks(d: AskDeps & { root: string }, unitId?: s
 				{ value: "keep", facts: "keep the quirk 1:1 (callers may depend on it)" },
 			],
 			recommended: q.opinion,
+			// the tester only sees the code; the phrasing model also knows the owner's goals, so its pick wins
+			guess: true,
 			agentOpinion: q.why,
 			blocks: "unit",
 			askedBy: "tester",
@@ -105,7 +107,7 @@ async function precedentFor(d: AskDeps, q: QuirkRow): Promise<{ id?: number; dec
 
 /** Copy answered quirk questions into the quirk table. Returns units whose tests follow a different decision. */
 export function syncQuirkAnswers(d: Pick<AskDeps, "ledger"> & { root: string }): string[] {
-	const asked = d.ledger.db.prepare("SELECT q.id, q.unit_id, q.applied, x.answer, x.answered_by FROM quirks q JOIN questions x ON x.id = q.question_id WHERE q.status = 'asked' AND x.status IN ('answered','auto')").all() as Array<{ id: number; unit_id: string; applied: string | null; answer: string; answered_by: string }>;
+	const asked = d.ledger.db.prepare("SELECT q.id, q.unit_id, q.applied, x.answer, x.answered_by FROM quirks q JOIN questions x ON x.id = q.question_id WHERE (q.status = 'asked' AND x.status IN ('answered','auto')) OR (q.decided_by LIKE 'auto%' AND x.status = 'answered')").all() as Array<{ id: number; unit_id: string; applied: string | null; answer: string; answered_by: string }>;
 	const rework = new Set<string>();
 	for (const a of asked) {
 		const v = answerValue(a.answer) === "keep" ? "keep" : "drop";

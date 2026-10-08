@@ -286,6 +286,8 @@ export interface AskRequest {
 const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
 	placement: () => true,
 	quirk: () => true,
+	// a rule the curator calls breaking: the model weighs it against the goals; the owner can still change it later
+	rule_change: () => true,
 	tidy: (v) => v === "apply" || v === "skip",
 	area_taxonomy: (v) => v === "apply" || v === "keep",
 	triage_gate: (v) => v === "retry",
@@ -315,7 +317,7 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 		point: q.point,
 		question: phrased.question + (phrased.opinion ? `\nOpinion: ${phrased.opinion}` : ""),
 		options: phrased.options.map((o) => `${o.value} — ${o.label}${o.value === phrased.recommended ? " (recommended)" : ""}`),
-		context: { ...q.context, facts: q.facts, recommended: phrased.recommended, codePick: q.recommended, modelPick: phrased.modelPick, opinion: phrased.opinion, phrasedBy: phrased.by },
+		context: { ...q.context, facts: q.facts, recommended: phrased.recommended, codePick: q.recommended, guess: q.guess, modelPick: phrased.modelPick, opinion: phrased.opinion, phrasedBy: phrased.by },
 		blocks: q.blocks ?? "unit",
 		askedBy: q.askedBy,
 		decisionId: q.decisionId,
@@ -326,6 +328,23 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 	const label = phrased.options.find((o) => o.value === own)?.label ?? own;
 	d.ledger.answerQuestion(id, `${own} — ${label} (recommended)`, OWN_ANSWER, "auto");
 	return { id, phrased, costUsd, decided: own };
+}
+
+/**
+ * Open questions the run may now decide itself (its rules changed since they were asked, e.g. after an update):
+ * decided from the picks stored with them, no model call. A tester's pick counts as a guess, as it does today.
+ */
+export function decideOpenFromGoals(ledger: Ledger, config: Config): number {
+	let n = 0;
+	for (const row of ledger.openQuestions()) {
+		if (!DECIDES_ITSELF[row.point] || !row.context) continue;
+		const c = JSON.parse(row.context) as { codePick?: string; guess?: boolean; modelPick?: string; phrasedBy?: string };
+		const own = ownPick(config, { point: row.point, recommended: c.codePick, guess: c.guess ?? row.asked_by === "tester" } as AskRequest, { modelPick: c.modelPick, by: c.phrasedBy ?? "code" } as PhrasedQuestion);
+		if (!own) continue;
+		ledger.answerQuestion(row.id, optionFor(row, own), OWN_ANSWER, "auto");
+		n++;
+	}
+	return n;
 }
 
 /** The machine value of an answer given to an askViaModel question ("drop — remove it" → "drop"). */

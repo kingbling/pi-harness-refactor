@@ -121,8 +121,8 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 	return result;
 }
 
-/** Answered rule-change questions: apply → approved (merged on the next curation), reject → rejected. */
+/** Answered rule-change questions: apply → approved (merged on the next curation), reject → rejected. The owner's later answer to a run-decided one changes it until it is merged. */
 export function syncRuleAnswers(d: Pick<AskDeps, "ledger">): void {
-	const rows = d.ledger.db.prepare("SELECT p.id, x.answer FROM rule_proposals p JOIN questions x ON x.id = p.question_id WHERE p.status = 'asked' AND x.status IN ('answered','auto')").all() as Array<{ id: number; answer: string }>;
+	const rows = d.ledger.db.prepare("SELECT p.id, x.answer FROM rule_proposals p JOIN questions x ON x.id = p.question_id WHERE (p.status = 'asked' AND x.status IN ('answered','auto')) OR (p.status IN ('approved','rejected') AND x.status = 'answered')").all() as Array<{ id: number; answer: string }>;
 	for (const r of rows) d.ledger.db.prepare("UPDATE rule_proposals SET status = ? WHERE id = ?").run(answerValue(r.answer) === "apply" ? "approved" : "rejected", r.id);
 }

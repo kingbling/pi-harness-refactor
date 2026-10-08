@@ -21,7 +21,7 @@ import { SYSTEMIC_FAILURE, JEV_ACT } from "../jev/questions.ts";
 import { applyPlacementAnswers, placeUnit, resolvePlacements, unplacedReason } from "./placement.ts";
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
-import { answerValue, askViaModel } from "../jev/ask.ts";
+import { answerValue, askViaModel, decideOpenFromGoals } from "../jev/ask.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
@@ -179,6 +179,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let cost = 0;
 	let stop = false;
 	const startedAt = new Date().toISOString();
+	if (!o.dry) {
+		const caught = decideOpenFromGoals(ledger, config);
+		if (caught) log(pc.cyan(`decided ${caught} open routine question(s) from your goals (br questions lists them; br answer <id> changes one)`));
+	}
 	// A stop drains: running lanes finish their unit, nothing new starts. It is written down (run log + ledger)
 	// so the next run and `br status` can say what happened.
 	let stopRecord: { at: string; reason: string; finishing: string[] } | undefined;

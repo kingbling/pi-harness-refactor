@@ -506,7 +506,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), limit, slice: flag("--slice"), units: flag("--units")?.split(","), dry: flags.includes("--dry"), force: flags.includes("--force"), log, onLanes: (l) => progress.setLanes(l), shouldStop: () => progress.stopping, handleSigint: false, blocked, waitForDecisions: ctx.hasUI });
 			const questions = ledger.openQuestions().length;
 			const own = ledger.ownDecisions(since).length;
-			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(own ? [`${own} routine question(s) decided from your goals (br questions lists them)`] : []), ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };
+			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(own ? [`${own} routine question(s) decided from your goals (br questions lists them; /br answer <id> <text> changes one)`] : []), ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };
 		} finally {
 			ledger.close();
 		}
