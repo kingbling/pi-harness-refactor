@@ -9,6 +9,7 @@ import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
+import { placeUnit } from "../src/run/placement.ts";
 import { runUnit } from "../src/run/unit.ts";
 import type { LeafSession } from "../src/sessions/spawn.ts";
 
@@ -163,6 +164,9 @@ describe("DB lane", () => {
 		const r = await planDbLane(ledger, config, { client, root: ws });
 		expect(r.units).toEqual(["DB_schema_agencies", "DB_schema_campaigns", "DB_data"]);
 		expect(JSON.parse(ledger.getUnit("DB_schema_agencies")!.meta)).toMatchObject({ tables: ["agency", "agencyextras"], businessArea: "agencies" });
+		// the DB unit sits in its business area, but DB units still run one at a time (they share the data dir)
+		expect(placeUnit(config, ledger.getUnit("DB_schema_agencies")!.meta)).toMatchObject({ area: "agencies", moduleKey: "nestjs:db" });
+		expect(placeUnit(config, ledger.getUnit("DB_data")!.meta)).toMatchObject({ area: "db", moduleKey: "nestjs:db" });
 		expect(JSON.parse(ledger.getUnit("DB_data")!.meta).tables).toEqual(["agency", "agencyextras", "campaign"]);
 		// facts by code in the one model call: databases, code references, columns, foreign keys, the areas
 		expect(prompts).toHaveLength(1);
