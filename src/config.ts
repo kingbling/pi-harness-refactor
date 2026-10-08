@@ -39,6 +39,10 @@ export const ConfigSchema = z.object({
 				branch: z.string().default("migration/main"),
 				/** When to commit: every accepted unit, or when a whole module (all units of a dir) is accepted. */
 				commitOn: z.enum(["unit", "module"]).default("unit"),
+				/** "on": after merges the branch is pushed to the target repo's remote, when it has one (on the side, at most once a minute, and at the end of a run). */
+				push: z.enum(["off", "on"]).default("off"),
+				/** Which remote to push to; default: origin, else the repo's only remote. */
+				remote: z.string().optional(),
 			})
 			.prefault({}),
 	}),

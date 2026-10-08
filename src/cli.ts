@@ -43,6 +43,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
+  br push [on|off] [remote]    push the migration branch to the target repo's remote after merges
   br forecast                  how far the migration is: done, open, spend and time left (with range)
   br questions | answer <id> <text>   open human questions (nothing unrelated waits on them)
   br why <symbol|path>         full history of one symbol or file
@@ -60,6 +61,13 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const p = findConfigPath();
 		if (!p) throw new Error("no bigrefactor.config.json here");
 		console.log(lanes(p, parseLanesArgs(args)));
+	},
+	push: async (args) => {
+		const { pushSetting } = await import("./run/push.ts");
+		const { findConfigPath } = await import("./config.ts");
+		const p = findConfigPath();
+		if (!p) throw new Error("no bigrefactor.config.json here");
+		console.log(pushSetting(p, args));
 	},
 	forecast: async () => {
 		const { forecast, renderForecast } = await import("./run/forecast.ts");

@@ -45,6 +45,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	check: "what bigrefactor needs here (Pi packages, logins, the stacks' tools) and what is missing",
 	forecast: "how far the migration is: done, open, spend and time left",
 	lanes: "lanes [n] [gates m]: show/change parallel units live (running units finish)",
+	push: "push [on|off] [remote]: push the migration branch to the target repo's remote after merges",
 	why: "why <id|path>: full history of a symbol or file",
 	unaccounted: "symbols not yet in a terminal state",
 	questions: "open questions waiting for you (list)",
@@ -562,7 +563,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("br", {
-		description: "bigrefactor: init | status | forecast | lanes | why <id|path> | unaccounted | questions | answer [<id> <text>]",
+		description: "bigrefactor: init | status | forecast | lanes | push | why <id|path> | unaccounted | questions | answer [<id> <text>]",
 		getArgumentCompletions: (prefix) => {
 			if (/\s/.test(prefix)) return null;
 			const items = Object.entries(SUBCOMMANDS)
@@ -584,6 +585,17 @@ export default function (pi: ExtensionAPI) {
 					show(ctx, "lanes", lanes(p, parseLanesArgs(rest)));
 				} catch (e: any) {
 					warn(ctx, `lanes: ${e?.message ?? e}`);
+				}
+				return;
+			}
+			if (sub === "push") {
+				const p = findConfigPath(ctx.cwd);
+				if (!p) return warn(ctx, "no bigrefactor.config.json here");
+				try {
+					const { pushSetting } = await import("../run/push.ts");
+					show(ctx, "push", pushSetting(p, rest));
+				} catch (e: any) {
+					warn(ctx, `push: ${e?.message ?? e}`);
 				}
 				return;
 			}

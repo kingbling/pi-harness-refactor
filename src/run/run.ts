@@ -5,6 +5,7 @@ import { dirname, join, relative } from "node:path";
 import { loadCommandOverrides } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { createBuilder, type Repairer } from "./builder.ts";
+import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
 import { loadConfig, type Config } from "../config.ts";
@@ -175,6 +176,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 	reloadLanes();
 	const merge = new Semaphore(1);
+	// target.git.push "on": main goes to the target repo's remote after merges, on the side
+	const pusher = createPusher({ config, root: o.root, log });
 	// whole-project checks run on the side, now and then after merges (never in every unit's gate)
 	const builder = createBuilder({
 		config,
@@ -185,7 +188,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		log,
 		linkAll,
 		repair: o.builderRepair ?? (o.spawn ? false : undefined),
-		mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)),
+		mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)),
 	});
 	const curate = new Semaphore(1);
 	const ran: UnitRunResult[] = [];
@@ -372,7 +375,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						});
 						acceptedNow++;
 						log(pc.green(`✓ ${unitId} accepted ($${res.costUsd.toFixed(4)})`));
-						if (!o.dry) builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
+						if (!o.dry) {
+							builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
+							pusher.afterMerge();
+						}
 						// living rules: proposals from units are curated into a new rules version once enough piled up
 						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => Object.entries(r.versions).forEach(([s, v]) => log(pc.cyan(`  rules ${s} → v${v}`))), (e) => log(pc.yellow(`  rules curation failed: ${e?.message ?? e}`)));
 						// tidy review: every N accepts of an area a model reads its module; approved changes become tidy tasks
@@ -644,6 +650,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	process.off("SIGINT", onSigint);
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
 	if (!o.dry && !stopRecord) await builder.finish().catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
+	if (!o.dry) await pusher.finish();
 
 	const quarantined = ran.filter((r) => r.state === "quarantined").length;
 	const waiting = ledger.listUnits({ state: "planned" }).length;
