@@ -62,6 +62,10 @@ export const EVIDENCE_TYPES = [
 	"truth_ahead",
 	// written files match the stack layout (area module, no per-legacy-file folders, no duplicate classes)
 	"structure_ok",
+	// another model said the tests are wrong (implementer dispute, reviewer: weak tests): the tester re-checked them
+	"test_disputed",
+	// a later unit found a bug in this unit's accepted code: it was re-opened with the report
+	"bug_reported",
 	// the new code is real and connected: no stubs, entry point for HTTP units, uses its migrated deps, chosen stack used
 	"wired_ok",
 ] as const;

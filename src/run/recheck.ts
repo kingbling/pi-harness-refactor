@@ -69,7 +69,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 				}
 				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString() } });
 				if (!findings.length) return;
-				reopen(o.ledger, u.id, findings.join("\n"), badTruth);
+				reopenUnit(o.ledger, u.id, `This unit was accepted before, and its code stays on the branch. A later check found problems; start from the existing code and fix them:\n${findings.join("\n")}`, `recheck: ${findings.join(" ").slice(0, 200)}`, badTruth);
 				reopened.push(u.id);
 				log(pc.yellow(`↺ ${u.id}: back to planned (code kept) — ${findings.join(" ").split("\n")[0]!.slice(0, 160)}`));
 			}),
@@ -79,16 +79,15 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 	return { checked: units.length, reopened, notJudged };
 }
 
-/** Back to planned with the code kept: symbols re-open, findings become the next run's note; bad truth is redone. */
-function reopen(ledger: Ledger, unitId: string, findings: string, badTruth: boolean): void {
-	for (const s of ledger.symbolsOfUnit(unitId)) if (s.state === "accepted") ledger.transitionSymbol(s.id, "clustered", "recheck: the accepted code fails a newer check");
+/** An accepted unit back to planned with its code kept: symbols re-open, `note` is its next run's note; bad truth is redone. */
+export function reopenUnit(ledger: Ledger, unitId: string, note: string, reason: string, badTruth = false): void {
+	for (const s of ledger.symbolsOfUnit(unitId)) if (s.state === "accepted") ledger.transitionSymbol(s.id, "clustered", reason.slice(0, 200));
 	if (badTruth) {
 		ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(unitId);
 		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_ahead')").run(unitId);
 	}
-	const note = `This unit was accepted before, and its code stays on the branch. A later check found problems; start from the existing code and fix them:\n${findings}`;
-	ledger.updateUnit(unitId, { meta: { ...JSON.parse(ledger.getUnit(unitId)!.meta), retryNote: note } });
-	ledger.transitionUnit(unitId, "planned", `recheck: ${findings.split("\n")[0]!.slice(0, 200)}`);
+	ledger.updateUnit(unitId, { meta: { retryNote: note } });
+	ledger.transitionUnit(unitId, "planned", reason.split("\n")[0]!.slice(0, 200));
 }
 
 function committedFiles(repo: string, sha: string): string[] {

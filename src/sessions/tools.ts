@@ -30,6 +30,10 @@ export interface ToolDeps {
 	adapter: TargetAdapter;
 	/** The unit's area module (from placement), relative to the target project; lookups rank it first. */
 	moduleDir?: string;
+	/** Implementer: a test it believes is wrong goes to the tester before the next attempt (see dispute_test). */
+	onDispute?: (d: { test: string; why: string; evidence: string }) => void;
+	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
+	onReport?: (r: { owner: string; target: string; problem: string; evidence: string }) => void;
 }
 
 const text = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details });
@@ -299,8 +303,52 @@ export function proposeRuleTool(d: ToolDeps): ToolDefinition {
 	});
 }
 
+export function disputeTestTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "dispute_test",
+		label: "Dispute a test",
+		description: "A ported test (or its truth case) is wrong: it expects something the legacy code does not do, or it imports a name the interface cannot have. You cannot edit tests; the tester re-checks this one against the legacy code before your next attempt and fixes it or tells you why it is right. Give evidence from the legacy code, not a guess.",
+		promptSnippet: "dispute_test: a test you believe is wrong goes back to the tester (with evidence)",
+		parameters: Type.Object({ test: Type.String({ description: "test file and test name (or truth case id)" }), why: Type.String(), evidence: Type.String({ description: "what the legacy code really does (symbol, line, value)" }) }),
+		execute: async (_id, p) => {
+			d.onDispute?.(p);
+			return text("recorded: the tester re-checks it if this attempt fails the tests. Implement the behaviour of the legacy code, not the disputed expectation.");
+		},
+	});
+}
+
+/** The accepted unit whose ported code is `target` (`path::Name`, or a file path), via the ledger's moves. */
+export function ownerOf(ledger: Ledger, target: string, except: string): string[] {
+	const file = target.split("::")[0]!;
+	const q = (like: string) => (ledger.db.prepare("SELECT DISTINCT m.unit_id id FROM moves m JOIN units u ON u.id = m.unit_id WHERE u.state = 'accepted' AND m.unit_id != ? AND m.target_symbols LIKE ?").all(except, like) as Array<{ id: string }>).map((r) => r.id);
+	const exact = target.includes("::") ? q(`%"${target}%`) : [];
+	return exact.length ? exact : q(`%"${file}::%`);
+}
+
+export const MAX_REPORT_REOPENS = 2;
+
+export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "report_migrated_bug",
+		label: "Report a bug in migrated code",
+		description: `Code another unit already migrated (outside your write scope) is wrong or misses something this unit needs from it. Do not copy it or work around it: report it. That unit is re-opened with your report and fixed first; this unit waits and continues after it. Give the target symbol (\`<file>::<Name>\` as target_lookup prints it), the problem and evidence from the legacy code. Each unit is re-opened by reports at most ${MAX_REPORT_REOPENS} times.`,
+		promptSnippet: "report_migrated_bug: a bug in another unit's accepted code re-opens that unit; this one waits for the fix",
+		parameters: Type.Object({ target: Type.String(), problem: Type.String(), evidence: Type.String() }),
+		execute: async (_id, p) => {
+			const owners = ownerOf(d.ledger, p.target, d.unitId);
+			if (!owners.length) return text(`no accepted unit owns ${p.target}: check the name with target_lookup (shared helpers you may extend are not reported)`, { error: true });
+			if (owners.length > 1) return text(`several units wrote ${p.target.split("::")[0]}: ${owners.join(", ")}. Name the symbol (<file>::<Name>).`, { error: true });
+			const owner = owners[0]!;
+			const reopens = (JSON.parse(d.ledger.getUnit(owner)!.meta) as { reportReopens?: number }).reportReopens ?? 0;
+			if (reopens >= MAX_REPORT_REOPENS) return text(`${owner} was already re-opened ${reopens} times by reports: not again. Finish this unit with what exists and describe the gap in your final message.`, { error: true });
+			d.onReport?.({ owner, ...p });
+			return text(`reported to ${owner}: it is re-opened with your report once this session ends, and this unit waits until it is accepted again. Finish what does not depend on it, then stop.`);
+		},
+	});
+}
+
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), reportMigratedBugTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
 	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d)];

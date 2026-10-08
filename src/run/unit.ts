@@ -26,6 +26,7 @@ import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
+import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
@@ -151,6 +152,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// ---- truth ----------------------------------------------------------------------------------
 	// run: expected values come from running the old code; read: it cannot run here (decided once per workspace,
 	// or for this unit after running failed), so the tester writes them from reading it — marked in the ledger
+	let lastTesterText = "";
 	const envMode: TruthMode = loadLegacyEnv(o.root, o.config).mode ?? "run";
 	let truthMode: TruthMode = envMode;
 	const runTruth = async (extra?: string): Promise<boolean> => {
@@ -177,6 +179,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			tester.dispose();
 		}
 		cost += res.usage.cost;
+		lastTesterText = res.text;
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
@@ -374,6 +377,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let forceEscalate = route?.difficulty === "hard" && (route.difficultyConfidence ?? 0) >= 0.75;
 	if (forceEscalate) log(pc.dim(`  routed to ${o.config.models.escalate.id}: Jev rates this unit hard (${Math.round((route!.difficultyConfidence ?? 0) * 100)}%)`));
 	let lastGateText = "";
+	// what other models said about the TESTS during an attempt: the implementer disputes one, the reviewer finds some weak
+	let disputes: Array<{ test: string; why: string; evidence: string }> = [];
+	let reviewWeak: string | undefined;
+	let testRounds = 0;
+	const reports: Array<{ owner: string; target: string; problem: string; evidence: string }> = [];
 	while (attemptNo < maxTotal) {
 		attemptNo++;
 		// the tests as they are on disk now: the tester (it has a shell) may have renamed or removed one since they
@@ -391,7 +399,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			appendOnlyGlobs,
 			protectedGlobs: adapter.protectedGlobs,
 			systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs, source: sourceAdapter, target: adapter }),
-			customTools: implementerTools({ ...deps, attemptId: attempt }),
+			customTools: implementerTools({ ...deps, attemptId: attempt, onDispute: (d) => disputes.push(d), onReport: (r) => reports.push(r) }),
 			transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
 			validateWrite: async (path, content) => {
 				const lang = adapter.layout.lang(path);
@@ -421,6 +429,26 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		cost += res.usage.cost;
 		log(pc.dim(`  ${role} #${attemptNo}: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
+		// the implementer found a bug in another unit's accepted code: that unit is re-opened with the report, this one
+		// waits for it (the owner becomes a dependency) and continues from its worktree's tests afterwards
+		if (reports.length) {
+			const owners = [...new Set(reports.map((r) => r.owner))];
+			for (const owner of owners) {
+				const mine = reports.filter((r) => r.owner === owner);
+				reopenUnit(o.ledger, owner, `Unit ${o.unitId} uses your accepted code and found a problem in it. Your code stays on the branch; fix this in it, keep what works:\n${mine.map((r) => `- ${r.target}: ${r.problem}\n  evidence: ${r.evidence}`).join("\n")}`, `bug reported by ${o.unitId}: ${mine[0]!.problem}`);
+				const meta = JSON.parse(o.ledger.getUnit(owner)!.meta) as { reportReopens?: number };
+				o.ledger.updateUnit(owner, { meta: { reportReopens: (meta.reportReopens ?? 0) + 1 } });
+				o.ledger.addEvidence(owner, "bug_reported", { by: o.unitId, reports: mine });
+			}
+			const unitDeps = JSON.parse(o.ledger.getUnit(o.unitId)!.deps) as string[];
+			o.ledger.db.prepare("UPDATE units SET deps = ? WHERE id = ?").run(JSON.stringify([...new Set([...unitDeps, ...owners])]), o.unitId);
+			o.ledger.endAttempt(attempt, { outcome: "waits_on_fix", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { reports } });
+			savePorted();
+			o.ledger.updateUnit(o.unitId, { meta: { retryNote: `This unit waited for ${owners.join(", ")} to fix what it reported (${reports.map((r) => r.target).join(", ")}). That code is fixed now: use it.` } });
+			o.ledger.transitionUnit(o.unitId, "planned", `waits for ${owners.join(", ")} to fix a reported bug`);
+			log(pc.yellow(`  reported a bug in ${owners.join(", ")}: re-opened; this unit waits for the fix`));
+			return { unitId: o.unitId, state: "planned", attempts: attemptNo, costUsd: cost };
+		}
 		if (res.error && res.toolCalls === 0) {
 			// The session never ran (provider error even after tier fallback). Not the code's fault: no attempt burned.
 			o.ledger.endAttempt(attempt, { outcome: "session_error", costUsd: res.usage.cost, gateReport: { error: res.error } });
@@ -447,8 +475,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const review = reviewer
 			? async (changedFiles: string[], nearDuplicates?: string[]) => {
 					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
 					cost += r.costUsd ?? 0;
+					reviewWeak = r.weakTests;
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					return r;
 				}
@@ -461,6 +490,24 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		lastGateText = `failed step: ${gate.failedStep}\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
+
+		// another model says the TESTS are wrong: the tester re-checks them against the legacy code first, and its
+		// answer goes into the implementer's next prompt (twice per unit; then triage decides as usual)
+		const testsNote = [
+			disputes.length && gate.failedStep === "ported_tests_green" ? `The implementer disputes these tests:\n${disputes.map((d) => `- ${d.test}: ${d.why}\n  evidence: ${d.evidence}`).join("\n")}` : "",
+			reviewWeak ? `The reviewer finds these tests too weak (they do not really check the legacy behaviour):\n${reviewWeak}` : "",
+		].filter(Boolean).join("\n\n");
+		disputes = [];
+		reviewWeak = undefined;
+		if (testsNote && testRounds < 2) {
+			testRounds++;
+			o.ledger.addEvidence(o.unitId, "test_disputed", { note: testsNote.slice(0, 2000) });
+			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
+			if (await runTruth(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`)) testFiles = loadTests();
+			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
+			previousGate = gate;
+			continue;
+		}
 
 		// the same error is already asked about for another unit: wait on that question (no triage, no doctor, no new question)
 		const signature = errorSignature(gate.failedStep ?? "", gate.steps.find((s) => !s.ok)?.output ?? "");

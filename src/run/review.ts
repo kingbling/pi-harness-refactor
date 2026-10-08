@@ -33,21 +33,23 @@ export interface ReviewInput {
 	nearDuplicates?: string[];
 	/** Review an accepted unit: its commit is the diff (br recheck). */
 	commit?: string;
+	/** The ported tests (the tester's): weak ones go back to the tester, not the implementer. */
+	testFiles?: string[];
 	transcriptPath?: string;
 	spawn?: typeof spawnLeaf;
 }
 export type Finding = { file: string; line?: number; problem: string; fix: string };
-export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number }>;
+export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number; weakTests?: string }>;
 
 export const reviewWithModel: Reviewer = async (o) => {
-	let verdict: { ok: boolean; findings: Finding[] } | undefined;
+	let verdict: { ok: boolean; findings: Finding[]; weakTests?: Array<{ file: string; problem: string }> } | undefined;
 	const verdictTool = {
 		name: "review_verdict",
 		label: "Review verdict",
-		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking.",
-		promptSnippet: "review_verdict: your verdict (ok + findings)",
-		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })) }),
-		execute: async (_id: string, p: { ok: boolean; findings: Finding[] }) => {
+		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester.",
+		promptSnippet: "review_verdict: your verdict (ok + findings for the code, weakTests for the tester)",
+		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))) }),
+		execute: async (_id: string, p: { ok: boolean; findings: Finding[]; weakTests?: Array<{ file: string; problem: string }> }) => {
 			verdict = p;
 			return { content: [{ type: "text" as const, text: "verdict recorded; stop here" }], details: {} };
 		},
@@ -64,14 +66,17 @@ export const reviewWithModel: Reviewer = async (o) => {
 1. Real: the unit's legacy behaviour is really ported. No stubs or placeholders (TODO, "not implemented", a fixed empty result where the legacy code computes something, an interface or port nothing implements, an endpoint that only answers "not implemented"). Compare with the legacy code (source_symbol_body, read_function).
 2. Connected: the framework reaches the new code (an HTTP handler has its route/page/command registered the way this stack does it), and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet.
 3. On the chosen stack: the owner's stack choices below are used where they apply (data access, rendering, data fetching, routing, forms, styling …), not gone around.
+4. The tests: the ported tests (listed below) really check the legacy behaviour — they assert the expected values, not only that something renders or exists. Weak tests go in weakTests (the tester rewrites them), never in findings.
 Judge only what this unit added or changed. Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and few: only what must change for the unit to be acceptable.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
 	});
 	try {
 		const r = await session.run(facts(o));
 		if (!verdict) return { ok: true, judged: false, costUsd: r.usage.cost, output: `not judged: the reviewer ended without a verdict${r.error ? ` (${r.error})` : ""}` };
-		const v = verdict as { ok: boolean; findings: Finding[] };
-		const ok = v.ok && !v.findings.length;
-		return { ok, judged: true, costUsd: r.usage.cost, output: ok ? "reviewer: real, connected, on the chosen stack" : `reviewer findings:\n${v.findings.map((f) => `- ${f.file}${f.line ? `:${f.line}` : ""}: ${f.problem} → ${f.fix}`).join("\n")}` };
+		const v = verdict as { ok: boolean; findings: Finding[]; weakTests?: Array<{ file: string; problem: string }> };
+		const weakTests = v.weakTests?.length ? v.weakTests.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
+		const ok = v.ok && !v.findings.length && !weakTests;
+		const out = [v.findings.length ? `reviewer findings:\n${v.findings.map((f) => `- ${f.file}${f.line ? `:${f.line}` : ""}: ${f.problem} → ${f.fix}`).join("\n")}` : "", weakTests ? `weak tests (the tester rewrites them):\n${weakTests}` : ""].filter(Boolean).join("\n");
+		return { ok, judged: true, costUsd: r.usage.cost, weakTests, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
 	} catch (e: any) {
 		return { ok: true, judged: false, output: `not judged: ${e?.message ?? e}` };
 	} finally {
@@ -93,6 +98,7 @@ function facts(o: ReviewInput): string {
 	return [
 		`Unit ${o.unitId} (${unit?.kind ?? "?"}), area module ${o.moduleDir}/ in ${o.adapter.id}.`,
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
+		`Ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
 		`\nStack choices of the owner (${o.adapter.id}):\n${choices.join("\n") || "- none recorded"}`,
 		`\nAlready migrated code this unit's legacy code calls:\n${deps.join("\n") || "- none"}`,
 		...(o.nearDuplicates?.length ? [`\nLook-alike class names the reuse check found (a guess from the names, not proof). For each, read both classes: when they are the same record or class, it is a finding (reuse the existing one); when they hold different things, it is fine:\n${o.nearDuplicates.map((n) => `- ${n}`).join("\n")}`] : []),
