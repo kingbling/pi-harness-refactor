@@ -1,8 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { getSourceAdapter, knownSources, registerGeneratedSources } from "../src/adapters/registry.ts";
-import { draftPath, exampleSourceManifest, generateSourceAdapter, type ManifestWriter, type SourceManifest } from "../src/adapters/source/generated.ts";
+import { getSourceAdapter, getTargetAdapter, knownSources, registerGeneratedSources } from "../src/adapters/registry.ts";
+import { draftPath, exampleSourceManifest, fromSourceManifest, generateSourceAdapter, resolveImport, type ManifestWriter, type SourceManifest } from "../src/adapters/source/generated.ts";
+import { planFrameworks } from "../src/inventory/frameworks.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { Ledger } from "../src/ledger/db.ts";
@@ -134,6 +135,55 @@ describe("generated source adapters", () => {
 		await init(args, { root: ws, prompter: ui, sourceWriter: writer });
 		expect(writer.prompts).toHaveLength(1);
 		expect(JSON.parse(readFileSync(join(ws, "bigrefactor.config.json"), "utf8")).source.stack).toBe("javascript");
+	});
+
+	it("imports resolve by name parts in any language: relative dots, source roots, module prefixes; never a guess", () => {
+		const root = join(here, ".sim", "gen-source-imports");
+		rmSync(root, { recursive: true, force: true });
+		const files = ["billing/__init__.py", "billing/models.py", "billing/views.py", "shop/models.py", "utils.py", "src/main/java/com/acme/billing/Invoice.java", "internal/tax/tax.go"];
+		for (const f of files) {
+			mkdirSync(dirname(join(root, f)), { recursive: true });
+			writeFileSync(join(root, f), "");
+		}
+		const py = (spec: string) => resolveImport(root, "billing/views.py", spec, [".py"], files);
+		expect(py(".models")).toBe("billing/models.py");
+		expect(py("..utils")).toBe("utils.py");
+		expect(py(".")).toBe("billing/__init__.py");
+		expect(py("billing.models")).toBe("billing/models.py");
+		expect(py("django.db.models")).toBe("django.db.models"); // installed package: kept as written
+		expect(resolveImport(root, "x.py", "app.models", [".py"], files)).toBe("app.models"); // two files end in models: no edge
+		expect(resolveImport(root, "src/main/java/com/acme/App.java", "com.acme.billing.Invoice", [".java"], files)).toBe("src/main/java/com/acme/billing/Invoice.java");
+		expect(resolveImport(root, "cmd/main.go", "example.com/shop/internal/tax", [".go"], files)).toBe("internal/tax/tax.go");
+	});
+
+	it("routes come from the manifest's routes query; installed framework names count for the profile's concerns", async () => {
+		const ws = join(here, ".sim", "gen-source-routes");
+		const legacy = join(ws, "legacy");
+		rmSync(ws, { recursive: true, force: true });
+		legacyRepo(legacy);
+		writeFileSync(join(legacy, "lib/handlers.js"), `function listInvoices(req, res) {\n  res.send("ok");\n}\nmodule.exports = { listInvoices };\n`);
+		writeFileSync(join(legacy, "lib/thing.js"), `const { Model } = require("sequelize");\nclass Thing extends Model {}\nmodule.exports = { Thing };\n`);
+		writeFileSync(join(legacy, "index.js"), `const express = require("express");\nconst { listInvoices } = require("./lib/handlers");\nconst { Thing } = require("./lib/thing");\nconst app = express();\napp.get("/invoices", listInvoices);\nconsole.log(new Thing());\n`);
+		const m = exampleSourceManifest();
+		mkdirSync(join(ws, ".bigrefactor", "adapters", "source"), { recursive: true });
+		writeFileSync(join(ws, ".bigrefactor", "adapters", "source", "javascript.json"), JSON.stringify(m));
+		writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify({ id: "express", frameworkDirs: [], loaders: [], entryPoint: "^index\\.js$", concerns: [{ match: "^(Model|sequelize)$", concern: "orm", legacy: "Sequelize models", verdict: "platform" }] }));
+		process.env["BR_WORKSPACE"] = ws;
+		registerGeneratedSources(ws);
+		const a = fromSourceManifest(m, ws);
+		a.reloadProfile?.();
+		const idx = await a.indexFile(legacy, "index.js", readFileSync(join(legacy, "index.js"), "utf8"));
+		expect(idx.routes).toEqual([{ id: "index.js#1", method: "GET", path: "/invoices", handlerSymbol: "listInvoices" }]);
+
+		const config = ConfigSchema.parse({ source: { path: legacy, stack: "javascript" }, target: { path: join(ws, "new"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		await inventory(config, ws, ledger);
+		expect(ledger.db.prepare("SELECT method, path, handler_symbol h FROM index_routes").all()).toEqual([{ method: "GET", path: "/invoices", h: "lib/handlers.js::listInvoices" }]);
+		const plan = planFrameworks(ledger, getSourceAdapter("javascript"), [await getTargetAdapter("nestjs")], legacy);
+		const orm = plan.concerns.find((c) => c.concern === "orm")!;
+		expect(orm.appRefs).toBe(2); // the require and the base class, though sequelize is not in the repo
+		expect(orm.extendedBy).toBe(1);
+		ledger.close();
 	});
 
 	it("a manifest that never verifies fails with the last error, and a hand-broken one is never loaded", async () => {

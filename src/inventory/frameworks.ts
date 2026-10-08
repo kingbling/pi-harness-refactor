@@ -91,7 +91,21 @@ export function planFrameworks(ledger: Ledger, source: SourceAdapter, targets: T
 			row._top.set(s.name, r.refs);
 		}
 	}
-	const out: ConcernRow[] = [...rows.values()].map((r) => ({ concern: r.concern, legacy: r.legacy, verdict: r.verdict, platform: r.platform, classes: r.classes, loc: r.loc, appRefs: r.appRefs, appFiles: r._files.size, extendedBy: r.extendedBy, top: [...r._top.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, k]) => `${n}(${k})`) })).sort((a, b) => b.appRefs - a.appRefs);
+	// a framework installed by the package manager is not in the repo: the app's imports, base classes and
+	// constructions that resolve to nothing here count for the concern whose names they match
+	const external = JSON.parse(ledger.getMeta("external_refs") ?? "{}") as Record<string, Array<[string, number, number]>>;
+	for (const [name, uses] of Object.entries(external)) {
+		const c = concerns.find((k) => k.match.test(name));
+		const live = uses.filter(([f]) => !fwSet.has(f) && !deadSet.has(f));
+		if (!c || !live.length) continue;
+		const row = rows.get(c.concern)!;
+		const n = live.reduce((a, u) => a + u[1], 0);
+		row.appRefs += n;
+		row.extendedBy += live.reduce((a, u) => a + u[2], 0);
+		for (const [f] of live) row._files.add(f);
+		row._top.set(name, (row._top.get(name) ?? 0) + n);
+	}
+	const out: ConcernRow[] =[...rows.values()].map((r) => ({ concern: r.concern, legacy: r.legacy, verdict: r.verdict, platform: r.platform, classes: r.classes, loc: r.loc, appRefs: r.appRefs, appFiles: r._files.size, extendedBy: r.extendedBy, top: [...r._top.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, k]) => `${n}(${k})`) })).sort((a, b) => b.appRefs - a.appRefs);
 	unmapped.sort((a, b) => b.appRefs - a.appRefs);
 	const libraries = legacyLibraries(source, sourceRoot).map((l) => { const d = decisions?.libraries?.[l.name]; return d ? { ...l, verdict: d.verdict, successor: d.successor ?? l.successor, note: `${l.note ? l.note + "; " : ""}decided` } : l; });
 	// decided framework classes leave the unmapped list
