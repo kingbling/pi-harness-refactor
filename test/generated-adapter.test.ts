@@ -30,6 +30,12 @@ const manifest = (over: Partial<AdapterManifest> = {}): AdapterManifest => ({
 });
 
 describe("generated target adapters", () => {
+	it("tests may live outside the area module (tests/{Area}/…), so the app does not load them as its own code", () => {
+		const base = manifest();
+		const a = fromManifest(manifest({ layout: { ...base.layout, moduleDir: "src/{Area}", testFileGlobs: ["tests/{Area}/**/*Test.php", "tests/{area_snake}/*.php"] } }));
+		expect(a.layout.testFileGlobs(a.layout.moduleDir("ad-serving"))).toEqual(["tests/AdServing/**/*Test.php", "tests/ad_serving/*.php"]);
+	});
+
 	it("a manifest becomes a full adapter: placeholders expand, regexes compile, nothing runs through a shell", () => {
 		const a = fromManifest(manifest());
 		expect(a.layout.moduleDir("user-admin")).toBe("src/features/user-admin");

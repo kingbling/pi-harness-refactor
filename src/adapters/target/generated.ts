@@ -90,6 +90,16 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 	const layoutRules = m.layout.rules ? normalize(m.layout.rules) : undefined;
 	const testRe = new RegExp(m.layout.testFileRegex);
 	const moduleDir = (area: string) => m.layout.moduleDir.replace(/\{area\}/g, area).replace(/\{Area\}/g, pascal(area)).replace(/\{area_snake\}/g, area.replace(/-/g, "_"));
+	// test globs may name the area outside the module (tests/{Area}/…): read the area back from the module dir
+	const moduleRe = new RegExp(`^${m.layout.moduleDir.replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\?\{(area|Area|area_snake)\\?\}/g, "([^/]+)")}$`);
+	const testGlobs = (dir: string) => {
+		const seg = moduleRe.exec(dir)?.[1];
+		const kebab = seg?.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/_/g, "-").toLowerCase();
+		return m.layout.testFileGlobs.map((g) => {
+			const out = g.replace(/\{moduleDir\}/g, dir);
+			return kebab ? out.replace(/\{area\}/g, kebab).replace(/\{Area\}/g, pascal(kebab)).replace(/\{area_snake\}/g, kebab.replace(/-/g, "_")) : out;
+		});
+	};
 	return {
 		id: m.id,
 		role: m.role,
@@ -121,7 +131,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 			moduleDir,
 			structureDoc: m.layout.structureDoc,
 			sharedDirs: m.layout.sharedDirs,
-			testFileGlobs: (dir) => m.layout.testFileGlobs.map((g) => g.replace(/\{moduleDir\}/g, dir)),
+			testFileGlobs: testGlobs,
 			isTestFile: (p) => testRe.test(p),
 			sourceExtensions: m.layout.sourceExtensions,
 			lang: (p) => Object.entries(m.layout.langByExtension).find(([ext]) => p.endsWith(ext))?.[1],
@@ -258,7 +268,8 @@ const SYSTEM = [
 	"- build/lint/test: commands run in the project dir. A {files} argument expands to file paths (may be empty). Build must fail on type/compile errors; test must run only the given files when there are some.",
 	"- EVERY command is ONE executable with plain arguments, run without a shell: no sh/bash/cmd -c, no pipes, &&, ;, $, redirects, loops or globs. When the stack has no single build command, use its main static checker as build (e.g. PHP: vendor/bin/phpstan analyse src; Python: mypy or python -m compileall; Ruby: bundle exec rubocop), its linter/formatter check as lint, and its test runner as test with {files} appended (e.g. vendor/bin/phpunit {files}). Tools installed into the project are called by their project-relative path (vendor/bin/…, node_modules/.bin/…, bin/console) and added in postScaffold.",
 	"- toolchain.installed: a JSON manifest file in the project and the object keys whose keys are package names. toolchain.packageName: a regex (anchored with ^) matching a package name.",
-	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer. testFileGlobs use {moduleDir}.",
+	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer.",
+	"- layout.testFileGlobs: where the stack's official convention keeps an area's tests ({moduleDir}, {area}, {Area}, {area_snake} expand). Next to the code ({moduleDir}/…) only where the framework expects that; where the app loads everything under its source dir as app code (service containers, autoloaded apps), tests go in the official tests dir mirrored per area (e.g. tests/{Area}/…), or the app will not start.",
 	"- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does; (a|b) either word), each with a short doc. require: files every feature folder has (its entry point, e.g. the controller). place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: []. maxLines: 400. source: where the convention comes from (the docs page or generator).",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",

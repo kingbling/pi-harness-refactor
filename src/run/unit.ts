@@ -16,7 +16,7 @@ import { indexTarget } from "../inventory/target.ts";
 import { askViaModel } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { spawnLeaf } from "../sessions/spawn.ts";
+import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, testerTools } from "../sessions/tools.ts";
 import { errorSignature, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
@@ -655,19 +655,25 @@ export function mentionsCase(text: string, id: string): boolean {
 	return new RegExp(`${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\d)`).test(text);
 }
 
+/** The unit's test files: wherever the stack keeps an area's tests (its testFileGlobs), not only inside the module. */
 function findTests(targetProjectDir: string, rel: string, layout: TargetAdapter["layout"]): string[] {
-	const dir = join(targetProjectDir, rel);
-	if (!existsSync(dir)) return [];
-	const out: string[] = [];
+	const globs = layout.testFileGlobs(rel);
+	const res = globs.map(globToRegExp);
+	const out = new Set<string>();
 	const visit = (d: string) => {
 		for (const n of readdirSync(d)) {
 			const p = join(d, n);
+			const r = relative(targetProjectDir, p);
 			if (statSync(p).isDirectory()) visit(p);
-			else if (layout.isTestFile(n)) out.push(relative(targetProjectDir, p));
+			else if (layout.isTestFile(n) && res.some((re) => re.test(r))) out.add(r);
 		}
 	};
-	visit(dir);
-	return out.sort();
+	// walk only the fixed part of each glob (src/Billing/tests/**/*Test.php → src/Billing/tests)
+	for (const g of globs) {
+		const base = g.split("/").filter((_, i, a) => !a.slice(0, i + 1).some((s) => /[*?{[]/.test(s))).join("/");
+		if (existsSync(join(targetProjectDir, base))) visit(join(targetProjectDir, base));
+	}
+	return [...out].sort();
 }
 
 /** The old code's file kinds a new name must not carry, minus the new stack's own file types (php in a PHP → Symfony migration). */
