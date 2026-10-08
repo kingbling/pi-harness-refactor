@@ -1,17 +1,17 @@
-import { appendFileSync, cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
-import { applyTableJudgement, askDbInputs, dbDetected, findDbFiles, groupTables, planDbLane, readSchema, TABLE_PLAN_KEY, type TableJudgement } from "../src/inventory/db.ts";
+import { applyTableJudgement, askDbInputs, dbDetected, findDbFiles, foundTablesPath, groupTables, planDbLane, readSchema, TABLE_PLAN_KEY, type TableJudgement } from "../src/inventory/db.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { placeUnit } from "../src/run/placement.ts";
 import { runUnit } from "../src/run/unit.ts";
-import type { LeafSession } from "../src/sessions/spawn.ts";
+import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
 
 /**
  * The DB lane: only with a detected data store; schema inputs → tables → DB units in their own slice right
@@ -252,5 +252,51 @@ describe("DB lane", () => {
 		expect(prompts[0]).toContain("CREATE TABLE invoices");
 		expect(prompts[0]).not.toContain("audit_log");
 		expect(prompts[0]).toContain("Migration lane (keep-schema)");
+	});
+});
+
+describe("DB lane: tables no parser reads are found by a model with tools", () => {
+	it("Rails schema.rb: a read-only session records tables with file + line; code checks the files, stores them, reads the definitions", async () => {
+		write(join(ws, "legacy", "db", "schema.rb"), 'ActiveRecord::Schema.define do\n  create_table "invoices", force: :cascade do |t|\n    t.string "customer"\n  end\n\n  create_table "customers" do |t|\n    t.string "name"\n  end\nend\n');
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const config = cfg({ from: ["postgresql"], schemaFiles: ["db/schema.rb"] });
+		// the certain parsers find nothing in Ruby code
+		expect(await readSchema(config, () => {}, undefined)).toEqual([]);
+		const seen: { opts?: SpawnOptions; task?: string; runs: number } = { runs: 0 };
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => {
+			seen.opts = opts;
+			return {
+				run: async (task: string) => {
+					seen.task = task;
+					seen.runs++;
+					const rec = opts.customTools!.find((t) => t.name === "record_tables") as unknown as { execute: (i: string, p: object) => Promise<unknown> };
+					await rec.execute("x", { tables: [{ name: "invoices", file: "db/schema.rb", line: 2 }, { name: "customers", file: "./db/schema.rb", line: 6 }, { name: "ghost", file: "db/nope.rb", line: 1 }, { name: "escape", file: "../etc/passwd", line: 1 }] });
+					return { text: "done", toolCalls: 2, blocked: 0, usage: { input: 0, output: 0, cost: 0.01 } };
+				},
+				dispose() {},
+			} as unknown as LeafSession;
+		}) as never;
+		const ledger = new Ledger(":memory:");
+		const r = await planDbLane(ledger, config, { root: ws, spawn });
+		expect(seen.opts).toMatchObject({ role: "review", cwd: config.source.path, writeGlobs: [] });
+		expect(seen.task).toContain("db/schema.rb");
+		expect(r.tables).toBe(2); // ghost (no such file) and escape (outside the repo) are not recorded
+		const stored = JSON.parse(readFileSync(foundTablesPath(ws), "utf8"));
+		expect(stored.tables.map((t: { name: string }) => t.name)).toEqual(["customers", "invoices"]);
+		// the definition comes from the file itself, so the unit's task card shows real source
+		const t = await readSchema(config, () => {}, ws);
+		expect(t.find((x) => x.name === "invoices")).toMatchObject({ from: "db/schema.rb:2" });
+		expect(t.find((x) => x.name === "invoices")!.ddl).toMatch(/^ {2}create_table "invoices"/);
+		// asked once per set of schema inputs
+		await planDbLane(ledger, config, { root: ws, spawn });
+		expect(seen.runs).toBe(1);
+	});
+
+	it("without models (no client, no session) nothing is asked: the raw schema text stays the fallback", async () => {
+		write(join(ws, "legacy", "db", "schema.rb"), 'create_table "invoices" do |t|\nend\n');
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const r = await planDbLane(new Ledger(":memory:"), cfg({ from: ["postgresql"], schemaFiles: ["db/schema.rb"] }), { root: ws });
+		expect(r.units).toEqual(["DB_schema_all"]);
+		expect(existsSync(foundTablesPath(ws))).toBe(false);
 	});
 });

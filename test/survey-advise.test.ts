@@ -5,7 +5,7 @@ import { getSourceAdapter, getTargetAdapter } from "../src/adapters/registry.ts"
 import { ConfigSchema } from "../src/config.ts";
 import { advise } from "../src/init/advise.ts";
 import { init } from "../src/init/init.ts";
-import { recommend, surveySource } from "../src/init/survey.ts";
+import { recommend, renderSurvey, surveySource, testsFact } from "../src/init/survey.ts";
 import { openDecisions } from "../src/inventory/decisions.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { Ledger } from "../src/ledger/db.ts";
@@ -37,6 +37,25 @@ describe("init survey: facts from the repo, provisional values only", () => {
 		expect(r.dbFrom.sort()).toEqual(["arangodb", "mariadb"]); // redis is infrastructure, not data to migrate
 		expect(r.dbStrategy).toBe("keep-schema");
 		expect(r.targetPath).toBe("../legacy-new"); // beside the source, same as init
+	});
+
+	it("the source adapter's store kind decides what holds data (no closed word list); the fixed lists only without a kind", async () => {
+		const ws = legacyWithData("survey-kinds");
+		const php = getSourceAdapter("php");
+		const adapter = { ...php, dbSignals: () => [{ engine: "cockroachdb", kind: "relational" as const, evidence: "go.mod: pgx" }, { engine: "mssql", kind: "relational" as const, evidence: "a DSN" }, { engine: "cassandra", kind: "document" as const, evidence: "gocql" }, { engine: "nats", kind: "queue" as const, evidence: "nats.go" }, { engine: "redis", kind: "cache" as const, evidence: "go-redis" }] };
+		const s = await surveySource(join(ws, "legacy"), adapter);
+		expect(s.engines.find((e) => e.engine === "redis")).toMatchObject({ kind: "cache" }); // the compose image gets the adapter's kind
+		expect(recommend(s, "../legacy").dbFrom.sort()).toEqual(["arangodb", "cassandra", "cockroachdb", "mariadb", "mssql"]);
+	});
+
+	it("tests: never 'none found' from a folder-name list; a repo without a top-level test folder is 'not checked'", async () => {
+		const ws = legacyWithData("survey-tests");
+		const s = await surveySource(join(ws, "legacy"), getSourceAdapter("php"));
+		expect(s.tests).toBeUndefined();
+		expect(testsFact(s)).toMatch(/^not checked/);
+		mkdirSync(join(ws, "legacy", "tests"), { recursive: true });
+		expect(testsFact(await surveySource(join(ws, "legacy"), getSourceAdapter("php")))).toBe("tests");
+		expect(renderSurvey(s, recommend(s, "../legacy"))).not.toMatch(/none found/);
 	});
 
 	it("br init --yes with only --source writes a config derived from the survey", async () => {

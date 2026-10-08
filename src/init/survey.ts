@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { SourceAdapter } from "../adapters/types.ts";
+import type { SourceAdapter, StoreKind } from "../adapters/types.ts";
 import { knownTargets, TARGET_SUBDIRS } from "../adapters/registry.ts";
 import { defaultTargetPath } from "./init.ts";
 
@@ -13,12 +13,16 @@ import { defaultTargetPath } from "./init.ts";
 export interface Survey {
 	framework?: string;
 	version?: string;
-	engines: Array<{ engine: string; evidence: string }>;
+	engines: Array<{ engine: string; evidence: string; kind?: StoreKind }>;
 	/** File counts by extension (top ones): the model reads what they mean (templates, UI components, …); code does not. */
 	files: Record<string, number>;
 	compose?: string;
+	/** A top-level test folder, when there is one. Absent means code did not find one, NOT that the repo has no tests. */
 	tests?: string;
 }
+
+/** The survey's tests fact for a prompt: code only looks for a top-level test folder, so absent is "not checked". */
+export const testsFact = (s: Survey) => s.tests ?? "not checked by code (tests may sit next to the code; the repo brief says what exists)";
 
 export interface Recommendation {
 	targets: string[];
@@ -29,12 +33,14 @@ export interface Recommendation {
 }
 
 const IMAGE_ENGINES: Array<[RegExp, string]> = [[/mariadb/i, "mariadb"], [/mysql/i, "mysql"], [/postgres|postgis/i, "postgresql"], [/mongo/i, "mongodb"], [/arangodb/i, "arangodb"], [/redis|valkey/i, "redis"], [/elasticsearch|opensearch/i, "elasticsearch"], [/mssql|sqlserver/i, "sqlserver"], [/oracle/i, "oracle"]];
-/** Stores that hold data to migrate (caches/search indexes are infrastructure, kept as they are). */
+/** Stores that hold data to migrate (caches/search indexes are infrastructure, kept as they are). Fallback only: used when no kind is known (compose images, hand-written adapters). */
 export const DATA_STORES = new Set(["mariadb", "mysql", "postgresql", "mongodb", "arangodb", "sqlserver", "oracle", "sqlite"]);
+/** A store holds data to migrate: the kind the source adapter gave decides; without one, the fallback list. */
+export const holdsData = (e: { engine: string; kind?: StoreKind }) => (e.kind ? e.kind === "relational" || e.kind === "document" : DATA_STORES.has(e.engine));
 
 export async function surveySource(root: string, adapter: SourceAdapter): Promise<Survey> {
 	const det = await adapter.detect(root).catch(() => ({ confidence: 0 }) as { confidence: number; framework?: string; version?: string });
-	const engines = new Map<string, string>();
+	const engines = new Map<string, { evidence: string; kind?: StoreKind }>();
 	const files: Record<string, number> = {};
 	let compose: string | undefined;
 	// dependency dirs are the source adapter's knowledge; dot-dirs (vcs, editors) are never the app
@@ -64,7 +70,7 @@ export async function surveySource(root: string, adapter: SourceAdapter): Promis
 			if (/^(docker-)?compose(\.[\w-]+)?\.ya?ml$/.test(n) && depth <= 2) {
 				compose ??= r;
 				const text = readFileSync(p, "utf8");
-				for (const m of text.matchAll(/^\s*image:\s*["']?([^\s"']+)/gm)) for (const [re, e] of IMAGE_ENGINES) if (re.test(m[1]!)) engines.set(e, `${r}: image ${m[1]}`);
+				for (const m of text.matchAll(/^\s*image:\s*["']?([^\s"']+)/gm)) for (const [re, e] of IMAGE_ENGINES) if (re.test(m[1]!)) engines.set(e, { evidence: `${r}: image ${m[1]}` });
 			}
 			// compound extensions count as their own kind (x.tpl.y is not x.y)
 			const ext = /(\.[a-z0-9]+){1,2}$/i.exec(n)?.[0].toLowerCase();
@@ -72,12 +78,19 @@ export async function surveySource(root: string, adapter: SourceAdapter): Promis
 		}
 	};
 	visit(root, "", 0);
-	for (const s of adapter.dbSignals?.(root) ?? []) if (!engines.has(s.engine)) engines.set(s.engine, s.evidence);
+	for (const s of adapter.dbSignals?.(root) ?? []) {
+		const prev = engines.get(s.engine);
+		if (!prev) engines.set(s.engine, { evidence: s.evidence, kind: s.kind });
+		else if (s.kind) prev.kind ??= s.kind; // the adapter knows what the store is; the compose image only that it runs
+	}
 	// mariadb and mysql are one family: keep the more specific one
-	if (engines.has("mariadb")) engines.delete("mysql");
+	if (engines.has("mariadb")) {
+		engines.get("mariadb")!.kind ??= engines.get("mysql")?.kind;
+		engines.delete("mysql");
+	}
 	const tests = ["tests", "test", "spec"].find((t) => existsSync(join(root, t)));
 	const top = Object.fromEntries(Object.entries(files).sort((a, b) => b[1] - a[1]).slice(0, 25));
-	return { framework: det.framework, version: det.version, engines: [...engines].map(([engine, evidence]) => ({ engine, evidence })), files: top, compose, tests };
+	return { framework: det.framework, version: det.version, engines: [...engines].map(([engine, e]) => ({ engine, evidence: e.evidence, ...(e.kind ? { kind: e.kind } : {}) })), files: top, compose, tests };
 }
 
 /**
@@ -93,9 +106,9 @@ export function recommend(s: Survey, sourcePath: string): Recommendation {
 	// code cannot tell UI files from others without stack knowledge: provisionally every role, judged later
 	if (webs.length) targets.push(webs[0]!);
 	why.push(`files: ${Object.entries(s.files).slice(0, 10).map(([k, v]) => `${v} ${k}`).join(", ")}`);
-	const dbFrom = s.engines.map((e) => e.engine).filter((e) => DATA_STORES.has(e));
+	const dbFrom = s.engines.filter(holdsData).map((e) => e.engine);
 	const dbStrategy = dbFrom.length ? "keep-schema" : "none";
-	why.push(dbFrom.length ? `data stores found: ${s.engines.filter((e) => DATA_STORES.has(e.engine)).map((e) => `${e.engine} (${e.evidence})`).join("; ")} → keep-schema` : "no data store found → db strategy none");
+	why.push(dbFrom.length ? `data stores found: ${s.engines.filter(holdsData).map((e) => `${e.engine} (${e.evidence})`).join("; ")} → keep-schema` : "no data store found → db strategy none");
 	const targetPath = defaultTargetPath(sourcePath);
 	return { targets, dbStrategy, dbFrom, targetPath, why };
 }
@@ -106,7 +119,7 @@ export function renderSurvey(s: Survey, r: Recommendation): string {
 	L.push(`  data        ${s.engines.length ? s.engines.map((e) => e.engine).join(", ") : "none detected"}`);
 	L.push(`  files       ${Object.entries(s.files).slice(0, 10).map(([k, v]) => `${v} ${k}`).join(", ")}`);
 	if (s.compose) L.push(`  compose     ${s.compose}`);
-	if (s.tests) L.push(`  tests       ${s.tests}`);
+	L.push(`  tests       ${s.tests ?? "no top-level test folder (not searched further)"}`);
 	L.push(`provisional (decided after the repo is analyzed): targets ${r.targets.join(" + ")}, db ${r.dbStrategy}${r.dbFrom.length ? ` from ${r.dbFrom.join(" + ")}` : ""}, new code in ${r.targetPath}`);
 	for (const w of r.why) L.push(`  · ${w}`);
 	return L.join("\n");
@@ -135,7 +148,7 @@ export async function adviseStack(
 	};
 	const prompt = [
 		extra.brief ? `Repo brief:\n${extra.brief.slice(0, 4000)}\n` : "",
-		`Legacy repo survey: framework ${s.framework ?? "unknown"}${s.version ? ` ${s.version}` : ""}; data stores ${s.engines.map((e) => `${e.engine} (${e.evidence})`).join("; ") || "none"}; files by extension ${Object.entries(s.files).map(([k, v]) => `${k}=${v}`).join(", ")}; tests ${s.tests ?? "none found"}.`,
+		`Legacy repo survey: framework ${s.framework ?? "unknown"}${s.version ? ` ${s.version}` : ""}; data stores ${s.engines.map((e) => `${e.engine} (${e.evidence})`).join("; ") || "none"}; files by extension ${Object.entries(s.files).map(([k, v]) => `${k}=${v}`).join(", ")}; tests ${testsFact(s)}.`,
 		extra.dbTo ? `The data will move to ${extra.dbTo}.` : "",
 		extra.decided?.length ? `Owner decisions (binding): ${extra.decided.join("; ")}.` : "",
 		extra.legacyLibraries?.length ? `Legacy libraries: ${extra.legacyLibraries.join(", ")}.` : "",
@@ -179,7 +192,7 @@ export async function adviseDimensions(
 	const schema = { type: "object", additionalProperties: false, required: ["dimensions"], properties: { dimensions: { type: "array", items: dim } } };
 	const prompt = [
 		`Repo brief:\n${brief.slice(0, 6000)}`,
-		`\nSurvey: framework ${s.framework ?? "unknown"}${s.version ? ` ${s.version}` : ""}; data stores ${s.engines.map((e) => `${e.engine} (${e.evidence})`).join("; ") || "none"}; files by extension ${Object.entries(s.files).map(([k, v]) => `${k}=${v}`).join(", ")}; tests ${s.tests ?? "none found"}.`,
+		`\nSurvey: framework ${s.framework ?? "unknown"}${s.version ? ` ${s.version}` : ""}; data stores ${s.engines.map((e) => `${e.engine} (${e.evidence})`).join("; ") || "none"}; files by extension ${Object.entries(s.files).map(([k, v]) => `${k}=${v}`).join(", ")}; tests ${testsFact(s)}.`,
 		extra.legacyLibraries?.length ? `Legacy libraries: ${extra.legacyLibraries.join(", ")}.` : "",
 		"\nThis legacy app is rewritten into a new codebase. For each part of it, rate where it should go: 2–4 candidates, each scored 0–100 for fit with THIS repo (how its UI is built, how much client code exists and in what, data access, size, team code, odd patterns), not for fashion. Include keeping the legacy technology as a candidate where that is a serious option.",
 		"Dimensions (keys exactly):",

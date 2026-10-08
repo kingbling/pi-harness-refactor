@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getSourceAdapter, knownSources, registerGeneratedSources } from "../src/adapters/registry.ts";
-import { draftPath, exampleSourceManifest, generateSourceAdapter, type ManifestWriter, type SourceManifest } from "../src/adapters/source/generated.ts";
+import { draftPath, exampleSourceManifest, generateSourceAdapter, validateSourceManifest, type ManifestWriter, type SourceManifest } from "../src/adapters/source/generated.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { Ledger } from "../src/ledger/db.ts";
@@ -80,7 +80,7 @@ describe("generated source adapters", () => {
 		expect(a.truth.run(legacy, "/x/cases.cjs")).toEqual({ cmd: "node", args: ["/x/cases.cjs"] });
 		// packages and data stores the model read from the repo feed the library questions and the survey
 		expect(a.externalDeps?.(legacy)).toEqual([{ name: "pg", version: "^8.11.0", dev: false, verdict: "review" }, { name: "jest", version: "^29.0.0", dev: true, verdict: "review" }]);
-		expect(a.dbSignals?.(legacy)).toEqual([{ engine: "postgresql", evidence: "package.json depends on pg" }]);
+		expect(a.dbSignals?.(legacy)).toEqual([{ engine: "postgresql", kind: "relational", evidence: "package.json depends on pg" }]);
 
 		// symbols, deps, functions with comments and calls, containers with their parent class
 		const read = (p: string) => readFileSync(join(legacy, p), "utf8");
@@ -156,5 +156,12 @@ describe("generated source adapters", () => {
 		mkdirSync(join(ws, ".bigrefactor", "adapters", "source"), { recursive: true });
 		writeFileSync(join(ws, ".bigrefactor", "adapters", "source", "evil.json"), JSON.stringify({ ...m, id: "evil", truth: { ...m.truth, run: { cmd: "sh", args: ["-c", "{script}"] } } }));
 		expect(registerGeneratedSources(ws)).not.toContain("evil");
+	});
+
+	it("dataStores carry a kind from a fixed set; a manifest written before kinds existed stays valid", () => {
+		const m = exampleSourceManifest();
+		expect(validateSourceManifest({ ...m, dataStores: [{ engine: "db2", kind: "relational", evidence: "jdbc url" }] })).toEqual([]);
+		expect(validateSourceManifest({ ...m, dataStores: [{ engine: "db2", evidence: "jdbc url" }] })).toEqual([]);
+		expect(validateSourceManifest({ ...m, dataStores: [{ engine: "db2", kind: "sql" as never, evidence: "jdbc url" }] }).join()).toMatch(/kind \(relational \| document/);
 	});
 });
