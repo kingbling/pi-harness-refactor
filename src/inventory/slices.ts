@@ -10,7 +10,8 @@ import type { Ledger } from "../ledger/db.ts";
  *    file are merged into one feature; `.bigrefactor/slices.json` overrides win.
  *  - closure(feature) = units reachable from its handler units over unit deps.
  *  - foundation = units reached by ≥ max(2, ceil(0.3·features)) features, or T0 units with ≥2 dependents.
- *  - auth = features matching /login|logout|auth|session|csrf|guard/ → rank 1.
+ *  - auth = the features Jev named (`advised.auth`, br label) → rank 1. Without that advice (no model ran) a
+ *    name match (login, auth, session …) stands in; with it, the match is only one fact in Jev's input.
  *  - remaining features: topological order of the slice graph, tie-break by new LOC ascending.
  *  - units reachable from no entry point → slice `dynamic` (last, human review).
  */
@@ -42,6 +43,15 @@ export interface SlicePlan {
 }
 
 const AUTH_RE = /login|logout|auth|session|csrf|guard|password/i;
+
+/** The auth word a feature's name or entry points contain (a fact for Jev, not a verdict: `authors` matches too). */
+export function authWord(name: string, entryPoints: Iterable<string>): string | undefined {
+	for (const s of [name, ...entryPoints]) {
+		const m = AUTH_RE.exec(s);
+		if (m) return m[0].toLowerCase();
+	}
+	return undefined;
+}
 
 export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): SlicePlan {
 	const units = ledger.listUnits().map((u) => {
@@ -130,7 +140,7 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	// rank features: auth first, then topological order of the slice graph, tie-break new LOC asc
 	const locOf = (id: string) => byId.get(id)?.meta.loc ?? 0;
 	const featureNames = [...featureOf.keys()];
-	const isAuth = (n: string) => (overrides.advised?.auth ? overrides.advised.auth.includes(n) : false) || AUTH_RE.test(n) || [...(featureOf.get(n)?.entryPoints ?? [])].some((e) => AUTH_RE.test(e));
+	const isAuth = (n: string) => (overrides.advised?.auth ? overrides.advised.auth.includes(n) : !!authWord(n, featureOf.get(n)?.entryPoints ?? []));
 	const sliceEdges = new Map<string, Set<string>>(featureNames.map((n) => [n, new Set()]));
 	for (const a of featureNames) for (const u of closure.get(a)!) {
 		const owner = unitSlice.get(u);
