@@ -53,7 +53,9 @@ export function ensureRepo(path: string, defaultBranch = "main", ignored: string
 	// a target nested inside another checkout (a workspace under a repo) gets its own repo: commits must never land in the parent
 	if (isRepo(path) && realpathSync(git(path, ["rev-parse", "--show-toplevel"])) === realpathSync(path)) return;
 	git(path, ["init", "-b", defaultBranch]);
-	if (!existsSync(join(path, ".gitignore"))) writeFileSync(join(path, ".gitignore"), [...ignored.map((i) => `${i}/`), ".env"].join("\n") + "\n");
+	// only a .env at the repo root is kept out: a stack's own .env (Symfony commits its defaults there) is the stack's
+	// business, and its own .gitignore says what stays local
+	if (!existsSync(join(path, ".gitignore"))) writeFileSync(join(path, ".gitignore"), [...ignored.map((i) => `${i}/`), "/.env"].join("\n") + "\n");
 }
 
 /** True when `path` is the top of its own git repo (not a folder inside some other repo, where git would act on the parent). */
