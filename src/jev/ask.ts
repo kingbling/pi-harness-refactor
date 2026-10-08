@@ -6,6 +6,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { QuestionBlocks, QuestionRow } from "../ledger/schema.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE, goalsText } from "../policy.ts";
+import { sameQuestion } from "./same.ts";
 
 /**
  * Every question a human sees is phrased by a model that has read the source repo. Code only says WHAT is
@@ -313,10 +314,11 @@ export const OWN_ANSWER = "auto (your goals)";
  * first. When the run can decide it itself (ownPick), the question is stored already answered and nobody waits.
  */
 export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: number; phrased: PhrasedQuestion; costUsd: number; decided?: string; shared?: boolean }> {
-	const same = q.sameAs ? d.ledger.openQuestionFor(q.point, q.sameAs) : undefined;
-	if (same !== undefined) {
-		if (q.unitId) d.ledger.addWaiter(same, q.unitId);
-		return { id: same, phrased: unphrased(q), costUsd: 0, shared: true };
+	// the same problem is asked about already (same key, or the decision model says same cause): wait on that one
+	const same = q.sameAs ? await sameQuestion(d, [q.point], q.sameAs, q.facts, q.unitId) : { costUsd: 0 };
+	if (same.id !== undefined) {
+		if (q.unitId) d.ledger.addWaiter(same.id, q.unitId);
+		return { id: same.id, phrased: unphrased(q), costUsd: same.costUsd, shared: true };
 	}
 	const phrased = d.client ? await phraseOne(d, q) : unphrased(q);
 	const id = d.ledger.askQuestion({
@@ -329,7 +331,7 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 		askedBy: q.askedBy,
 		decisionId: q.decisionId,
 	});
-	const costUsd = (phrased as { costUsd?: number }).costUsd ?? 0;
+	const costUsd = ((phrased as { costUsd?: number }).costUsd ?? 0) + same.costUsd;
 	const own = ownPick(d.config, q, phrased);
 	if (!own) return { id, phrased, costUsd };
 	const label = phrased.options.find((o) => o.value === own)?.label ?? own;

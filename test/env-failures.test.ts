@@ -55,6 +55,31 @@ describe("environment failures (the @jest/globals incident)", () => {
 		expect(a).toBe(b);
 		expect(a).toMatch(/@jest\/globals/);
 	});
+
+	it("the key never carries the unit (worktree paths with '+', file names) but keeps the cause", () => {
+		const wt = (u: string) => `/w/.bigrefactor/worktrees/${u}/symfony`;
+		const oom = (u: string) => `$ vendor/bin/phpstan analyse src\nPHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes) in phar://${wt(u)}/vendor/phpstan/phpstan/phpstan.phar/src/X.php on line 98\n#13 phar://${wt(u)}/vendor/bin/phpstan(116): run()`;
+		expect(errorSignature("build_ok", oom("U2515_classes_a_facade+1"))).toBe(errorSignature("build_ok", oom("U0007_b_cls")));
+		expect(errorSignature("build_ok", oom("U2515_classes_a_facade+1"))).not.toMatch(/U2515|facade/);
+		// stdout and stderr say the same thing with and without "PHP "
+		expect(errorSignature("truth", `Fatal error: Uncaught Error: Class "Load" not found in /l/a.php:3`)).toBe(errorSignature("truth", `PHP Fatal error:  Uncaught Error: Class "Load" not found in /l/b/c.php:9`));
+		expect(errorSignature("truth", `Fatal error: Uncaught Error: Class "Load" not found in /l/a.php:3`)).not.toBe(errorSignature("truth", `Fatal error: Uncaught Error: Class "Other" not found in /l/a.php:3`));
+		// an area's bundle name is a file name, not the cause
+		const layout = (area: string) => `src/${area}/Repository/XRepositoryInterface.php: not an allowed file in the feature folder; allowed: ${area}Bundle.php | Controller/<Name>Controller.php`;
+		expect(errorSignature("structure_ok", layout("Customers"))).toBe(errorSignature("structure_ok", layout("Media")));
+	});
+
+	it("a line that names no cause is not a shared key: summaries are skipped, assertions keep their test file", () => {
+		const phpunit = (u: string, cls: string) => `$ vendor/bin/phpunit src/R/tests/${cls}Test.php\nThere were 2 errors:\n\n1) App\\R\\Tests\\${cls}Test::testA\nError: Class "App\\R\\${cls}" not found\n\n/w/worktrees/${u}/symfony/src/R/tests/${cls}Test.php:14\nERRORS!\nTests: 2, Assertions: 0, Errors: 2.`;
+		expect(errorSignature("ported_tests_green", phpunit("U1", "Radio"))).toMatch(/Class "App\\R\\Radio" not found/);
+		expect(errorSignature("ported_tests_green", phpunit("U1", "Radio"))).not.toBe(errorSignature("ported_tests_green", phpunit("U2", "Agency")));
+		const failed = (u: string, test: string) => `$ vendor/bin/phpunit src/C/tests/${test}.php\nThere was 1 failure:\n\n1) App\\C\\${test}::testX\nFailed asserting that false is true.\n\n/w/worktrees/${u}/symfony/src/C/tests/${test}.php:13\nFAILURES!`;
+		expect(errorSignature("ported_tests_green", failed("U1", "PdfDocumentTest"))).not.toBe(errorSignature("ported_tests_green", failed("U2", "ClientUpdateTest")));
+		// PHPStan: the real messages carry no error word; the footer after its summary is never the key
+		const stan = (f: string) => `$ vendor/bin/phpstan analyse src\n ------ ---\n  Line   ${f}\n ------ ---\n  15     Call to function method_exists() will always evaluate to true.\n\n [ERROR] Found 1 error\n\nInstructions for interpreting errors\nEach error has an associated identifier, like \`argument.type\``;
+		expect(errorSignature("build_ok", stan("A/One.php"))).not.toBe(errorSignature("build_ok", stan("B/Two.php")));
+		expect(errorSignature("build_ok", stan("A/One.php"))).not.toMatch(/identifier/);
+	});
 });
 
 describe("parked units resubmit themselves", () => {
