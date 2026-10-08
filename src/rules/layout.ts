@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { getTargetAdapter } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
+import { slashed } from "./layout-rules.ts";
 
 /**
  * Where a stack's rules live and the one part of them that is NOT model-written: the module layout. It comes
@@ -29,7 +30,7 @@ export function renderLayoutSection(adapter: TargetAdapter): string {
 		LAYOUT_BEGIN,
 		`## Module layout (${adapter.id}, project dir \`${adapter.subdir}/\`)`,
 		`- One legacy area → one feature module per stack: \`${l.moduleDir("<area>")}/\`. Every unit of the area extends the area's existing files and classes; never a parallel class or folder per legacy file.`,
-		`- Cross-cutting helpers (used by ≥2 areas) live in ${l.sharedDirs.map((d) => `\`${d}<topic>/\``).join(" or ")}: reuse via shared_lookup, add new files, never edit existing ones from a feature unit.`,
+		`- Cross-cutting helpers (used by ≥2 areas) live in ${l.sharedDirs.map((d) => `\`${slashed(d)}<topic>/\``).join(" or ")}: reuse via shared_lookup, add new files, never edit existing ones from a feature unit.`,
 		`- No module root other than \`${l.moduleDir("<area>").replace(/<area>$/, "")}\` and the shared dirs; no folder or file named after a legacy file name or legacy extension.`,
 		"",
 		l.structureDoc,

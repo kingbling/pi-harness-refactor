@@ -108,8 +108,10 @@ export function createBuilder(o: {
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, stackId)));
 			// every accepted unit's tests too: later units, tidy and repairs change accepted code, and a unit's gate
 			// only runs the tests of its own area
-			const hasTests = trackedFiles(dir).some((f) => adapter.layout.isTestFile(f));
-			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(hasTests ? [{ step: "test", ...adapter.test(dir, []) }] : [])];
+			// the test files found are named to the runner: a run without files may skip folders its config does not
+			// list, and "no tests ran" would pass
+			const tests = trackedFiles(dir).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
+			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
 			if (!steps.length) return;
 			const check = async () => {
 				const out: string[] = [];

@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { NEST_LAYOUT } from "../src/adapters/target/ts-structure.ts";
 import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
-import { checkLayoutRules, checkLayoutTree, layoutRulesPath, layoutRulesProblem, loadLayoutRules, normalize, saveLayoutRules, validateLayoutRules, withLayoutRules, type LayoutRules } from "../src/rules/layout-rules.ts";
+import { checkLayoutRules, checkLayoutTree, layoutRulesPath, layoutRulesProblem, loadLayoutRules, normalize, renderLayoutDoc, saveLayoutRules, validateLayoutRules, withLayoutRules, type LayoutRules } from "../src/rules/layout-rules.ts";
+import { execFileSync } from "node:child_process";
 import { examplesProblems } from "../src/rules/owner-layout.ts";
 
 /**
@@ -160,7 +161,55 @@ describe("PHP → PHP (Symfony): the new stack's own file type is no legacy file
 		const run = (f: string, w: string[]) => checkLayoutRules([f], "src/Sim", "sim", "/nonexistent", sym, { sharedDirs: [], isTestFile: () => false }, { legacyWords: w });
 		expect(run("src/Sim/CsvExport.php", words)).toEqual([]);
 		expect(run("src/Sim/CsvExport.php", ["php"])).toEqual([]); // even with php in the list: the extension itself is never judged
-		expect(run("src/Sim/AgencyFacade.php", words)).toEqual([expect.stringMatching(/"facade" is a legacy file kind/)]);
+		expect(run("src/Sim/Agency.facade.php", words)).toEqual([expect.stringMatching(/"facade" is a legacy file kind/)]);
+		// only the file name's dotted parts: words inside a name or a folder are normal names
+		expect(run("src/Sim/AgencyFacade.php", words)).toEqual([]);
+		expect(run("src/Sim/CmdRunner.php", words)).toEqual([]);
 		expect(run("src/Sim/Create.cmd.php", words)).toEqual([expect.stringMatching(/"cmd" is a legacy file kind/)]);
+	});
+});
+
+describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffold files", () => {
+	const sym = normalize({ moduleDir: "src/{Area}", files: [{ path: "{Name}.php", doc: "a class" }, { path: "{sub}/{Name}.php", doc: "a sub-feature class" }], require: [], forbidDirs: ["Utils"] });
+	const symOpts = { sharedDirs: ["src/Shared"], isTestFile: (f: string) => /Test\.php$/.test(f), sourceExtensions: [".php"] };
+
+	it("a shared dir without a trailing slash still joins with one slash (no src/Shared<topic>, no configbundles.php)", () => {
+		const dir = project({ "src/Shared/Money/Amount.php": "<?php\n", "src/Shared/Loose.php": "<?php\n" });
+		const out = checkLayoutTree(dir, sym, symOpts);
+		expect(out).toContainEqual(expect.stringMatching(/^src\/Shared\/Loose\.php: shared files go in src\/Shared\/<topic>\/<name>/));
+		expect(out.join("\n")).not.toMatch(/src\/Shared[A-Z<]/);
+		expect(renderLayoutDoc(sym, ["src/Shared"])).toContain("src/Shared/<topic>/<name>");
+	});
+
+	it("{sub} folders are spelled like the area folders: src/{Area} → src/Plans/Exception/ passes, src/Plans/exception/ fails", () => {
+		const run = (f: string) => checkLayoutRules([f], "src/Plans", "plans", "/nonexistent", sym, symOpts, NEW);
+		expect(validateLayoutRules(sym)).toEqual([]);
+		expect(run("src/Plans/Exception/PlanNotFound.php")).toEqual([]);
+		expect(run("src/Plans/exception/PlanNotFound.php")).toContainEqual(expect.stringMatching(/not an allowed file/));
+		expect(run("src/Plans/Utils/Helper.php")).toContainEqual(expect.stringMatching(/folder "Utils" is not allowed/));
+		expect(renderLayoutDoc(sym, [])).toMatch(/<sub> is one PascalCase folder/);
+		// kebab areas keep kebab sub-folders
+		expect(renderLayoutDoc(rules, [])).toMatch(/<sub> is one kebab-case folder/);
+	});
+
+	it("where tests go comes from the adapter's test globs, and its own notes stay next to the layout", () => {
+		const root = mkdtempSync(join(tmpdir(), "br-lw-"));
+		saveLayoutRules(root, "nestjs", rules);
+		const a = withLayoutRules(nestjsAdapter, root);
+		expect(a.layout.structureDoc).toContain(`Tests of an area go where the test runner finds them: ${nestjsAdapter.layout.testFileGlobs("src/invoice").join(" or ")}`);
+		expect(a.layout.structureDoc).not.toMatch(/Tests live beside the code/);
+		expect(a.layout.structureDoc).toContain(`Notes for this stack:\n${nestjsAdapter.layout.structureDoc.trim()}`);
+		// a test outside the feature folder (tests/{Area}/) is where the runner finds it, not a layout problem
+		expect(checkLayoutRules(["tests/Plans/PlanTest.php"], "src/Plans", "plans", "/nonexistent", sym, symOpts, NEW)).toEqual([]);
+	});
+
+	it("files that came with the generated project are never drift; one a unit changed is checked again", () => {
+		const dir = project({ "src/Shared/Kernel.php": "<?php\n" });
+		execFileSync("git", ["init", "-q"], { cwd: dir });
+		execFileSync("git", ["add", "-A"], { cwd: dir });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "scaffold"], { cwd: dir });
+		expect(checkLayoutTree(dir, sym, symOpts)).toEqual([]);
+		writeFileSync(join(dir, "src/Shared/Kernel.php"), "<?php // changed\n");
+		expect(checkLayoutTree(dir, sym, symOpts)).toContainEqual(expect.stringMatching(/^src\/Shared\/Kernel\.php: shared files go in/));
 	});
 });

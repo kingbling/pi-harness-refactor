@@ -8,6 +8,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { proposeRule } from "../rules/living.ts";
 import { stackTagLike } from "../inventory/target.ts";
+import { placementDir } from "./placement.ts";
 
 /**
  * Tidy review: keeps each area module professional and easy to find as it grows. Code checks (structure_ok,
@@ -39,7 +40,7 @@ interface Deps {
 	client?: ModelClient;
 }
 
-export async function maybeTidyReview(d: Deps, o: { stackId: string; area: string; every?: number; force?: boolean }): Promise<{ reviewed: boolean; asked: number; proposals: number; costUsd: number }> {
+export async function maybeTidyReview(d: Deps, o: { stackId: string; area: string; shared?: boolean; every?: number; force?: boolean }): Promise<{ reviewed: boolean; asked: number; proposals: number; costUsd: number }> {
 	syncTidyAnswers(d.ledger);
 	const key = `tidy_count:${o.stackId}:${o.area}`;
 	const n = Number(d.ledger.getMeta(key) ?? "0") + 1;
@@ -50,7 +51,8 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 
 	const adapter = await getTargetAdapter(o.stackId);
 	const proj = projectDir(d.config, o.stackId);
-	const areaDir = adapter.layout.moduleDir(o.area);
+	// a shared topic lives in the shared dir, not in a feature folder
+	const areaDir = placementDir(adapter.layout, { stackId: o.stackId, area: o.area, shared: !!o.shared, moduleKey: `${o.stackId}:${o.area}`, source: "code" });
 	const files = listFiles(join(proj, areaDir)).map((f) => relative(proj, f));
 	if (!files.length) return none;
 	const tree = files.map((f) => `${f} (${lineCount(join(proj, f))} lines)`).join("\n");

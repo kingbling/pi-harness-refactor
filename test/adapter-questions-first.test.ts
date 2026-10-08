@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { getTargetAdapter, registerGeneratedTargets } from "../src/adapters/registry.ts";
-import { generateAdapter, loadManifests, seedDir, verifyPendingAdapters, type AdapterManifest } from "../src/adapters/target/generated.ts";
+import { firstGlobFile, fromManifest, generateAdapter, loadManifests, seedDir, verifyManifest, verifyPendingAdapters, type AdapterManifest } from "../src/adapters/target/generated.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { setup } from "../src/init/init.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
@@ -23,14 +23,15 @@ const manifest = (id: string, over: Partial<AdapterManifest> = {}): AdapterManif
 	postScaffold: [{ cmd: "touch", args: ["ready.txt"] }],
 	build: { cmd: "true", args: [] },
 	lint: { cmd: "true", args: ["{files}"] },
-	test: { cmd: "test", args: ["-f", "{files}"] },
+	// node's own test runner: without files it runs every *.test.mjs it finds
+	test: { cmd: "node", args: ["--test", "{files}"] },
 	toolchain: { ecosystem: "x", packageName: "^[a-z]+", packageExamples: [], manifestFiles: ["ready.txt"], installed: { file: "none.json", keys: [] }, add: { cmd: "true", args: ["{packages}"] }, worktreeLinks: [], ignoredPaths: [] },
-	layout: { moduleDir: "src/{area}", structureDoc: "one folder per area", sharedDirs: ["src/shared/"], testFileGlobs: ["{moduleDir}/**/*.test.txt"], testFileRegex: "\\.test\\.txt$", sourceExtensions: [".txt"], langByExtension: {}, skipMarker: "skip\\(", interfaceHint: "-", testHint: "-", legacyMarker: "# LEGACY: {why}", dataAccessHint: "", ignoreDirs: [] },
+	layout: { moduleDir: "src/{area}", structureDoc: "one folder per area", sharedDirs: ["src/shared/"], testFileGlobs: ["{moduleDir}/**/*.test.mjs"], testFileRegex: "\\.(test|spec)\\.mjs$", sourceExtensions: [".mjs"], langByExtension: {}, skipMarker: "skip\\(", interfaceHint: "-", testHint: "-", legacyMarker: "# LEGACY: {why}", dataAccessHint: "", ignoreDirs: [] },
 	platform: {},
 	stackChoices: [{ key: "orm", question: "ORM?", default: "a", options: [{ id: "a", label: "A", packages: [] }, { id: "b", label: "B", packages: [] }] }] as never,
 	protectedGlobs: [],
 	patternKinds: ["service"],
-	probeTest: { path: "probe.test.txt", content: "ok\n" },
+	probeTest: { path: "probe.test.mjs", content: 'import test from "node:test"\ntest("probe", () => {})\n' },
 	detect: { file: "ready.txt", contains: "" },
 	...over,
 });
@@ -52,7 +53,7 @@ describe("adapter generation: questions first, build once", () => {
 		expect(saved.verified).toBeUndefined();
 		expect(saved.seedProject).toBe(join(seedDir(root, id), "api"));
 		expect(existsSync(join(saved.seedProject!, "ready.txt"))).toBe(true);
-		expect(existsSync(join(saved.seedProject!, "probe.test.txt"))).toBe(false); // the probe test is not part of the new project
+		expect(existsSync(join(saved.seedProject!, "probe.test.mjs"))).toBe(false); // the probe test is not part of the new project
 		expect(logs.join("\n")).toMatch(/building and testing a fresh qfirst-a project .* it becomes your new project/);
 
 		registerGeneratedTargets(root);
@@ -99,5 +100,13 @@ describe("adapter generation: questions first, build once", () => {
 		delete process.env["BR_WORKSPACE"];
 		loadConfig(join(root, "bigrefactor.config.json"));
 		expect((await getTargetAdapter(id)).id).toBe(id);
+	});
+
+	it("the whole-project test run must find tests where the layout puts them (the live run: tests in src/<Area>/tests/, the runner only ran tests/)", async () => {
+		// node --test without files never runs *.spec.mjs: a layout that puts tests there is refused
+		const bad = manifest("qfirst-d", { layout: { ...manifest("x").layout, testFileGlobs: ["{moduleDir}/tests/*.spec.mjs"] } });
+		expect(firstGlobFile(fromManifest(bad), bad.probeTest.path)).toBe("src/probe/tests/Probe.spec.mjs");
+		expect(await verifyManifest(bad)).toMatch(/the test command without files \(node --test\) does not run tests at src\/probe\/tests\/Probe\.spec\.mjs.*Fix layout\.testFileGlobs or the test command/);
+		expect(await verifyManifest(manifest("qfirst-e"))).toBeUndefined();
 	});
 });

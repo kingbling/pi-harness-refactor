@@ -7,6 +7,7 @@ import { sharedSymbols, similarTargetSymbols, stackTagLike } from "../inventory/
 import type { TargetAdapter } from "../adapters/types.ts";
 import { placeUnit, type Placement } from "../run/placement.ts";
 import { tidyTaskCard } from "../run/tidy.ts";
+import { slashed } from "../rules/layout-rules.ts";
 import { callTree } from "../inventory/codemap.ts";
 
 /**
@@ -268,7 +269,7 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	if (card.sharedHelpers.length) {
 		L.push("", `## Shared helpers that already exist (reuse; new files only inside these existing topics of ${card.sharedDirs[0] ?? "the shared dir"}, never edit existing ones, never start a topic)`);
 		for (const h of card.sharedHelpers) L.push(`- ${h.id} [${h.kind}]${h.signature ? ` ${h.signature}` : ""}${h.doc ? ` — ${h.doc}` : ""}`);
-	} else L.push("", `## Shared helpers: none yet. Code of this unit goes in its module; shared topics (${card.sharedDirs[0] ?? "the shared dir"}<topic>/) are started by shared units and tidy tasks, never named after an area.`);
+	} else L.push("", `## Shared helpers: none yet. Code of this unit goes in its module; shared topics (${card.sharedDirs[0] ? slashed(card.sharedDirs[0]) : "the shared dir/"}<topic>/) are started by shared units and tidy tasks, never named after an area.`);
 	if (card.reuseCandidates.length) {
 		L.push("", "## Reuse candidates — this logic may already exist (found by meaning): import/inject it instead of rewriting; find_capability for more");
 		for (const c of card.reuseCandidates) L.push(`- for ${c.legacy}: ${renderCapability(c.capability)}`);

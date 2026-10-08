@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { rulesDir } from "../rules/layout.ts";
+import { slashed } from "../rules/layout-rules.ts";
 import type { Config } from "../config.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import { CODE_QUALITY, goalsText } from "../policy.ts";
@@ -74,7 +75,7 @@ Rules of the pass:
 - Satisfy the drafted interface in the task card (file paths, exported names, signatures) so the ported tests can import it. If it or a test is wrong (it expects what the legacy code does not do), implement what the legacy code does and call dispute_test with the evidence: the tester re-checks it before your next attempt.
 - If code another unit already migrated is wrong or misses what this unit needs, call report_migrated_bug (never copy it or work around it): that unit is fixed first and this one continues after it.
 - This unit belongs to area "${opts.area}" on ${opts.stackId}. ${opts.moduleDir}/ is the area's module, shared with every other unit of the area: extend the existing classes/files listed in the task card first (target_lookup), never add a parallel class or a folder per legacy file.
-- You may write: ${(opts.writeGlobs ?? [`${opts.moduleDir}/**`]).join(", ")}, plus new files in an EXISTING shared topic (${opts.sharedDirs[0] ?? "the shared dir"}<topic>/). Cross-cutting code (errors, logging, formatting, dates, validation, pagination) is reused via shared_lookup and find_capability first; you may ADD a file with a doc comment to an existing topic, never edit an existing shared file and never open a new topic (the gate fails it). Registration/wiring files are generated — never edit them.
+- You may write: ${(opts.writeGlobs ?? [`${opts.moduleDir}/**`]).join(", ")}, plus new files in an EXISTING shared topic (${opts.sharedDirs[0] ? slashed(opts.sharedDirs[0]) : "the shared dir/"}<topic>/). Cross-cutting code (errors, logging, formatting, dates, validation, pagination) is reused via shared_lookup and find_capability first; you may ADD a file with a doc comment to an existing topic, never edit an existing shared file and never open a new topic (the gate fails it). Registration/wiring files are generated — never edit them.
 - Call ledger_prove for EVERY legacy symbol in the card (moved / extracted / merged_into / inlined / split / dropped + why). The unit fails the gate otherwise.
 - Pull context with tools (read_function for callees on the card, symbol_lookup, who_calls, source_symbol_body, target_lookup, pattern_examples, docs_lookup); do not ask questions. If a convention is missing from the rules and other units will need it, call propose_rule.
 ${opts.attempt > 1 ? `- This is attempt ${opts.attempt}. The gate output is in the task; fix exactly what failed, keep what passed.` : ""}
