@@ -136,7 +136,41 @@ describe("living rules", () => {
 		expect(st(p2)).toBe("merged");
 		expect(rulesText(root, "nestjs")).toMatch(/Errors return 200/);
 	});
+	it("same text = no new version; a proposal the curator refuses after the owner's apply is final, recorded once, never curated again", async () => {
+		const { root, config, ledger } = setup();
+		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
+		expect(await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException")).toBe(1);
+		expect(existsSync(join(rulesDir(root, "nestjs"), "history", "RULES.v2.md"))).toBe(false);
+		const p = proposeRule({ ledger }, { stack: "nestjs", unitId: "U1", kind: "change", text: "Tests live next to the service", why: "easier to find" });
+		let curations = 0;
+		const client = new FakeModelClient({
+			chat: (req) => {
+				const sys = req.messages[0]!.content;
+				if (sys.includes("curate")) {
+					curations++;
+					// the body never changes; first breaking, then (after the owner's apply) rejected
+					return { json: { body: "## Errors\n- throw HttpException", merged: [], rejected: curations > 1 ? [{ id: p, reason: "Placement belongs to the generated layout" }] : [], breaking: curations > 1 ? [] : [{ id: p, impact: "tests elsewhere" }] } };
+				}
+				return { json: { id: "rule_change", question: "Move tests?", options: [{ value: "apply", label: "Yes", hint: "" }, { value: "reject", label: "No", hint: "" }], recommended: "reject", opinion: "-" } };
+			},
+		});
+		const r1 = await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 });
+		expect(r1.versions).toEqual({});
+		const qid = (ledger.db.prepare("SELECT question_id FROM rule_proposals WHERE id = ?").get(p) as { question_id: number }).question_id;
+		ledger.answerQuestion(qid, "apply — Yes");
+		const r2 = await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 });
+		expect(r2.refused).toEqual([{ stack: "nestjs", id: p, text: "Tests live next to the service", reason: "Placement belongs to the generated layout" }]);
+		expect((ledger.db.prepare("SELECT status FROM rule_proposals WHERE id = ?").get(p) as { status: string }).status).toBe("refused");
+		expect(JSON.parse(ledger.getQuestion(qid)!.context!).curatorRefused).toBe("Placement belongs to the generated layout");
+		// the owner's apply no longer brings it back: no more curations, no new versions, the same text is not proposed again
+		const r3 = await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 });
+		expect(curations).toBe(2);
+		expect(r3.refused).toEqual([]);
+		expect(rulesVersionOf(ledger)).toBe("1");
+		expect(proposeRule({ ledger }, { stack: "nestjs", kind: "change", text: "Tests live next to the service", why: "again" })).toBe(p);
+	});
 });
+const rulesVersionOf = (ledger: Ledger) => ledger.getMeta("rules_version:nestjs");
 
 describe("capability cards", () => {
 	it("a model describes accepted business logic; find_capability and reuse candidates find it by meaning", async () => {

@@ -65,6 +65,8 @@ export interface UnitRunOptions {
 	retry?: boolean;
 	/** Gate pool slot: wraps the CPU-bound gate so at most K run at once. */
 	gateSlot?: <T>(fn: () => Promise<T>) => Promise<T>;
+	/** The run's merge lock: a setup fix commits to main under it. */
+	mergeLock?: <T>(fn: () => Promise<T>) => Promise<T>;
 	log?: (line: string) => void;
 	/** Git worktree of the target repo to work in (scheduler); default = the target repo itself. */
 	workDir?: string;
@@ -561,7 +563,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				let setupTried = "";
 				const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
-					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
 						// the fix serves every unit that waits on this problem
 						if (qid) o.ledger.answerQuestion(qid, `auto: the setup model fixed it (${fixed})`, "setup model");

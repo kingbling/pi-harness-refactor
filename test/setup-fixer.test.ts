@@ -22,6 +22,7 @@ function stack(over: Partial<TargetAdapter> = {}) {
 		lint: () => ({ cmd: "true", args: [] }),
 		// the "old flag": always fails, like vitest 5 on --related
 		test: () => ({ cmd: "sh", args: ["-c", "echo 'Unknown option --related' >&2; exit 1"] }),
+		layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], isTestFile: (p: string) => /\.spec\./.test(p) },
 		...over,
 	} as unknown as TargetAdapter;
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fixme"] }, models: {} });
@@ -83,6 +84,48 @@ describe("setup fixes during the run", () => {
 		expect(execFileSync("git", ["-C", target, "log", "-1", "--format=%s"], { encoding: "utf8" })).toMatch(/setup fixed during the run/);
 		// a session that changes nothing is no fix: the unit asks the owner
 		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "x", fixer: async () => "looked around" })).toBeUndefined();
+	});
+});
+
+describe("setup fixes during the run: tests and migrated code stay as they are", () => {
+	it("puts back test files and module/shared code the fixer touched, commits the rest under the lock, and leaves a ledger row", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { execFileSync } = await import("node:child_process");
+		const { existsSync, readFileSync } = await import("node:fs");
+		const { root, target, adapter, config } = stack({ id: "keepcode" } as never);
+		mkdirSync(join(target, "src", "features", "orders"), { recursive: true });
+		mkdirSync(join(target, "src", "shared"), { recursive: true });
+		writeFileSync(join(target, "src", "features", "orders", "orders.ts"), "export const a = 1;\n");
+		writeFileSync(join(target, "src", "features", "orders", "orders.spec.ts"), "expect(a).toBe(1)\n");
+		writeFileSync(join(target, "src", "shared", "money.ts"), "export const m = 1;\n");
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		const ledger = new Ledger(":memory:");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n"); // setup: kept
+			writeFileSync(join(o.projectDir, "src", "features", "orders", "orders.ts"), "export const a = 2;\n"); // accepted code
+			writeFileSync(join(o.projectDir, "src", "features", "orders", "orders.spec.ts"), "expect(a).toBe(2)\n"); // a test
+			writeFileSync(join(o.projectDir, "src", "features", "orders", "extra.spec.ts"), "new test\n"); // a new test
+			writeFileSync(join(o.projectDir, "src", "shared", "helper.ts"), "export {};\n"); // new shared code
+			return "added the vitest config";
+		};
+		let locked = 0;
+		const lock = async <T>(fn: () => Promise<T>) => (locked++, fn());
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "vitest: no config", fixer, ledger, lock })).toBe("added the vitest config");
+		expect(locked).toBe(1);
+		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim()).toBe("vitest.config.ts");
+		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+		expect(readFileSync(join(target, "src", "features", "orders", "orders.ts"), "utf8")).toBe("export const a = 1;\n");
+		expect(existsSync(join(target, "src", "features", "orders", "extra.spec.ts"))).toBe(false);
+		const row = ledger.db.prepare("SELECT role, outcome, gate_report FROM attempts").get() as { role: string; outcome: string; gate_report: string };
+		expect(row.role).toBe("__setup__:fix:keepcode");
+		expect(row.outcome).toBe("fixed");
+		const report = JSON.parse(row.gate_report) as { changedFiles: string[]; undone: string[]; said: string };
+		expect(report.changedFiles).toEqual(["vitest.config.ts"]);
+		expect(report.undone.sort()).toEqual(["src/features/orders/extra.spec.ts", "src/features/orders/orders.spec.ts", "src/features/orders/orders.ts", "src/shared/helper.ts"]);
+		expect(report.said).toBe("added the vitest config");
 	});
 });
 

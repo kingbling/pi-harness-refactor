@@ -21,14 +21,14 @@ export interface RuleProposal {
 	text: string;
 	why: string;
 	evidence: string | null;
-	status: "pending" | "approved" | "merged" | "rejected" | "asked";
+	status: "pending" | "approved" | "merged" | "rejected" | "asked" | "refused";
 	version: number | null;
 	question_id: number | null;
 	created_at: string;
 }
 
 export function proposeRule(d: Pick<AskDeps, "ledger">, p: { stack: string; unitId?: string; kind: "add" | "change"; text: string; why: string; evidence?: string }): number {
-	const dup = d.ledger.db.prepare("SELECT id FROM rule_proposals WHERE stack = ? AND text = ? AND status IN ('pending','approved','asked')").get(p.stack, p.text) as { id: number } | undefined;
+	const dup = d.ledger.db.prepare("SELECT id FROM rule_proposals WHERE stack = ? AND text = ? AND status IN ('pending','approved','asked','refused')").get(p.stack, p.text) as { id: number } | undefined;
 	if (dup) return dup.id;
 	const r = d.ledger.db.prepare("INSERT INTO rule_proposals(stack, unit_id, kind, text, why, evidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(p.stack, p.unitId ?? null, p.kind, p.text, p.why, p.evidence ?? null, new Date().toISOString());
 	return Number(r.lastInsertRowid);
@@ -38,14 +38,16 @@ export function rulesVersion(d: Pick<AskDeps, "ledger">, stack: string): number 
 	return Number(d.ledger.getMeta(`rules_version:${stack}`) ?? "1");
 }
 
-/** Save a stack's rules as a new version (layout re-rendered from the adapter). */
+/** Save a stack's rules as a new version (layout re-rendered from the adapter). Same text as now = no new version: the current one is returned. */
 export async function saveRulesVersion(d: Pick<AskDeps, "ledger"> & { root: string }, stack: string, body: string, opts: { version?: number } = {}): Promise<number> {
 	const adapter = await getTargetAdapter(stack);
 	const dir = rulesDir(d.root, stack);
 	mkdirSync(join(dir, "history"), { recursive: true });
-	const version = opts.version ?? rulesVersion(d, stack) + 1;
 	const md = composeRules(adapter, body);
-	writeFileSync(join(dir, "RULES.md"), md);
+	const path = join(dir, "RULES.md");
+	if (opts.version === undefined && existsSync(path) && readFileSync(path, "utf8") === md) return rulesVersion(d, stack);
+	const version = opts.version ?? rulesVersion(d, stack) + 1;
+	writeFileSync(path, md);
 	writeFileSync(join(dir, "history", `RULES.v${version}.md`), md);
 	d.ledger.setMeta(`rules_version:${stack}`, String(version));
 	return version;
@@ -55,9 +57,9 @@ export async function saveRulesVersion(d: Pick<AskDeps, "ledger"> & { root: stri
  * Called by the scheduler after each accepted unit. Cheap no-op unless a stack has ≥ threshold proposals
  * (pending + approved). Without a client nothing is curated (proposals wait).
  */
-export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { threshold?: number; force?: boolean } = {}): Promise<{ versions: Record<string, number>; asked: number; costUsd: number }> {
+export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { threshold?: number; force?: boolean } = {}): Promise<{ versions: Record<string, number>; asked: number; costUsd: number; refused: Array<{ stack: string; id: number; text: string; reason: string }> }> {
 	syncRuleAnswers(d);
-	const result = { versions: {} as Record<string, number>, asked: 0, costUsd: 0 };
+	const result = { versions: {} as Record<string, number>, asked: 0, costUsd: 0, refused: [] as Array<{ stack: string; id: number; text: string; reason: string }> };
 	if (!d.client) return result;
 	for (const stack of d.config.target.stacks) {
 		const open = d.ledger.db.prepare("SELECT * FROM rule_proposals WHERE stack = ? AND status IN ('pending','approved') ORDER BY id").all(stack) as unknown as RuleProposal[];
@@ -94,10 +96,21 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 		result.costUsd += res.usage.costUsd;
 		const j = (res.json ?? {}) as { body?: string; merged?: number[]; rejected?: Array<{ id: number; reason: string }>; breaking?: Array<{ id: number; impact: string }> };
 		if (!j.body?.trim()) continue;
+		const before = rulesVersion(d, stack);
 		const version = await saveRulesVersion(d, stack, j.body);
-		result.versions[stack] = version;
+		if (version !== before) result.versions[stack] = version;
 		for (const id of j.merged ?? []) d.ledger.db.prepare("UPDATE rule_proposals SET status = 'merged', version = ? WHERE id = ? AND stack = ?").run(version, id, stack);
-		for (const r of j.rejected ?? []) d.ledger.db.prepare("UPDATE rule_proposals SET status = 'rejected', why = why || ' | rejected: ' || ? WHERE id = ? AND stack = ?").run(r.reason, r.id, stack);
+		for (const r of j.rejected ?? []) {
+			const p = open.find((x) => x.id === r.id);
+			if (!p) continue;
+			// the owner said apply and the curator still says no: final ("refused"), kept on the question with the
+			// reason, never curated again; otherwise the owner's answer would put it back and the curator reject it forever
+			const final = p.status === "approved";
+			d.ledger.db.prepare("UPDATE rule_proposals SET status = ?, why = why || ' | rejected: ' || ? WHERE id = ?").run(final ? "refused" : "rejected", r.reason, p.id);
+			if (!final) continue;
+			if (p.question_id !== null) d.ledger.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.curatorRefused', ?) WHERE id = ?").run(r.reason, p.question_id);
+			result.refused.push({ stack, id: p.id, text: p.text, reason: r.reason });
+		}
 		for (const b of j.breaking ?? []) {
 			const p = open.find((x) => x.id === b.id);
 			if (!p || p.status === "approved") continue;
@@ -121,7 +134,7 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 	return result;
 }
 
-/** Answered rule-change questions: apply → approved (merged on the next curation), reject → rejected. The owner's later answer to a run-decided one changes it until it is merged. */
+/** Answered rule-change questions: apply → approved (merged on the next curation), reject → rejected. The owner's later answer to a run-decided one changes it until it is merged, or until the curator refuses it after an apply (final). */
 export function syncRuleAnswers(d: Pick<AskDeps, "ledger">): void {
 	const rows = d.ledger.db.prepare("SELECT p.id, x.answer FROM rule_proposals p JOIN questions x ON x.id = p.question_id WHERE (p.status = 'asked' AND x.status IN ('answered','auto')) OR (p.status IN ('approved','rejected') AND x.status = 'answered')").all() as Array<{ id: number; answer: string }>;
 	for (const r of rows) d.ledger.db.prepare("UPDATE rule_proposals SET status = ? WHERE id = ?").run(answerValue(r.answer) === "apply" ? "approved" : "rejected", r.id);
