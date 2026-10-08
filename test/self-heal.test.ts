@@ -62,7 +62,7 @@ describe("answers are applied per option", () => {
 		expect(applyParkedAnswer("the DB runs on port 5433 now", opts)).toEqual({ action: "requeue", hint: "the DB runs on port 5433 now" });
 	});
 
-	it("quarantined units go back every hour or after a fix, 5 times; then one question per kind of failure, and the answer is applied", async () => {
+	it("quarantined units go back after a fix or, an hour later, with a new failure, 5 times; then one question per kind of failure, and the answer is applied", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		for (const id of ["U1", "U2"]) {
@@ -76,7 +76,7 @@ describe("answers are applied per option", () => {
 		for (let i = 2; i <= config.run.maxAutoHeals + 1; i++) {
 			for (const id of ["U1", "U2"]) {
 				ledger.transitionUnit(id, "truth", "t");
-				ledger.transitionUnit(id, "quarantined", "gate still red after 5 attempts (lint_ok)");
+				ledger.transitionUnit(id, "quarantined", `gate still red after 5 attempts (${["lint_ok", "build_ok", "test_ok"][i % 3]})`); // a new failure each time
 			}
 			expect(heal({ now: Date.now() + hour + 1000 }).length).toBe(i <= config.run.maxAutoHeals ? 2 : 0); // an hour later
 		}
@@ -91,6 +91,25 @@ describe("answers are applied per option", () => {
 		ledger.answerQuestion(q[0]!.id, "the lint config was wrong, I fixed it");
 		expect(heal({}).sort()).toEqual(["U1", "U2"]);
 		expect(JSON.parse(ledger.getUnit("U2")!.meta)).toMatchObject({ autoHeals: 0, retryNote: expect.stringMatching(/hint: the lint config was wrong/) });
+	});
+
+	it("the same failure again with nothing changed is not retried: the unit is asked about, and a later fix still brings it back", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "truth cases without a ported test after 2 retests: U1#1");
+		const hour = 60 * 60_000;
+		const heal = (o: { since?: number; now?: number }) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, ...o });
+		expect(heal({ now: Date.now() + hour + 1000 })).toEqual(["U1"]); // first failure: one try an hour later
+		ledger.transitionUnit("U1", "truth", "t");
+		ledger.transitionUnit("U1", "quarantined", "truth cases without a ported test after 2 retests: U1#1");
+		expect(heal({ now: Date.now() + 9 * hour })).toEqual([]); // the same failure, nothing changed: no more tries
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 1, stuck: true });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		expect(ledger.openQuestions()[0]!.question).toMatch(/failed the same way as before and nothing changed/);
+		expect(heal({ since: Date.now() + 1000 })).toEqual(["U1"]); // the plugin or setup changed since: worth a try, question open or not
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 2 });
+		expect(JSON.parse(ledger.getUnit("U1")!.meta).stuck).toBeUndefined();
 	});
 
 	it("units hitting the same problem share one question: no new question, all wait, one answer releases them all", async () => {
@@ -182,9 +201,12 @@ describe("triage", () => {
 		expect(Object.keys(req.questions).sort()).toEqual(["cause", "same_as_previous"]);
 		expect(req.state.failing_tests).toContain("test/a.spec.ts");
 		expect(t1.action).toBe("retry");
-		// the same failure class twice → a stronger model
-		const t2 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/a.spec.ts\nexpected 2, got 4"), gate("FAIL test/a.spec.ts\nexpected 2, got 3"), 2);
+		// the same failure class twice (Jev says so), not the same finding → a stronger model
+		const t2 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/b.spec.ts\nTypeError: name of undefined"), gate("FAIL test/a.spec.ts\nexpected 2, got 3"), 2);
 		expect(t2.action).toBe("escalate");
+		// the very same finding again → nobody retries blindly: ask (the doctor looks first)
+		const t3 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/a.spec.ts\nexpected 2, got 4"), gate("FAIL test/a.spec.ts\nexpected 2, got 3"), 2);
+		expect(t3.action).toBe("ask_human");
 		ledger.close();
 	});
 

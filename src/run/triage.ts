@@ -3,7 +3,7 @@ import { decide, setDecisionAction } from "../jev/decide.ts";
 import { choiceOf, JEV_ACT, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { DecisionAnswer, ModelClient } from "../models/types.ts";
-import type { GateReport } from "./gate.ts";
+import { errorSignature, findingKey, type GateReport } from "./gate.ts";
 import { askViaModel } from "../jev/ask.ts";
 
 /**
@@ -77,6 +77,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		gate_report: out.slice(-3000),
 		previous_report: previous?.steps.find((s) => !s.ok)?.output.slice(-1500) ?? "",
 		previous_stage: previous?.failedStep ?? null,
+		same_finding_as_previous: !!failed && !!previous && previous.failedStep === failed.name && findingKey(failed.name, previous.steps.find((s) => !s.ok)?.output ?? "") === findingKey(failed.name, out),
 		diff_stats: { changed_files: gate.changedFiles.length, files: gate.changedFiles.slice(0, 20) },
 	};
 	// what code does with Jev's answers (how sure it is comes after)
@@ -88,8 +89,9 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		if (cause === "env") return { action: "ask_human", reason: "environment problem, not code" };
 		// A tool that printed nothing is an environment problem, whatever the model thinks.
 		if (!state.tool_produced_output && state.exit_code !== null) return { action: "ask_human", reason: `gate tool exited ${state.exit_code} without output` };
-		// Byte-identical failure twice: a stronger model is not the answer, a human is (only this unit waits).
-		if (state.previous_report && state.previous_report === out.slice(-1500)) return { action: "ask_human", reason: "identical failure on consecutive attempts" };
+		// The same finding twice (same step, same places, maybe new words): another attempt or a stronger model will
+		// not get further; it may lie outside what the implementer can change (plugin, setup). A model decides, else the owner (only this unit waits).
+		if (state.same_finding_as_previous) return { action: "ask_human", reason: "the same finding on consecutive attempts: the implementer may not be able to fix it (outside its files, a plugin or setup problem)" };
 		if (same > JEV_ACT && attemptNo >= 2) return { action: "escalate", reason: "same failure class twice → stronger model" };
 		if (attemptNo >= maxImpl) return { action: "escalate", reason: "implement attempts exhausted" };
 		return { action: "retry", reason: "retry with the exact gate output" };

@@ -366,6 +366,16 @@ export function errorSignature(step: string, output: string): string {
 	return `${step}: ${key}`.slice(0, 200);
 }
 
+/**
+ * What one failed gate step found, for comparing two attempts of the same unit: a reviewer says the same thing in
+ * new words each time, so its findings count by the places they point at (file:line); other output by its
+ * errorSignature. The same key twice in a row means another attempt is unlikely to get further.
+ */
+export function findingKey(step: string, output: string): string {
+	const places = [...output.matchAll(/^- (\S+?):(?:\d+:)? /gm)].map((m) => m[0].slice(2, -1).replace(/:$/, ""));
+	return places.length ? `${step}: ${[...new Set(places)].sort().join(" ")}` : errorSignature(step, output);
+}
+
 /** One error line without what differs per unit: paths (outside quotes any with a slash, inside only absolute ones), file names, commit ids, numbers. */
 function normalizeErrorLine(line: string): string {
 	return line

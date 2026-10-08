@@ -63,6 +63,27 @@ export function commitAll(path: string, message: string, opts: { allowEmpty?: bo
 	return headOf(path);
 }
 
+/** Folders git tracks directly under `parent` (relative to the repo). */
+export function trackedChildDirs(repo: string, parent: string): string[] {
+	const pre = parent.replace(/\/?$/, "/");
+	const files = git(repo, ["ls-files", "--", pre]).split("\n").filter(Boolean);
+	return [...new Set(files.map((f) => f.slice(pre.length)).filter((f) => f.includes("/")).map((f) => f.split("/")[0]!))];
+}
+
+/**
+ * Rename a tracked folder and commit just that. Two steps through a temporary name, so a rename that only changes
+ * upper/lower case also lands where the disk and git ignore case (macOS). Nothing happens while changes are staged.
+ */
+export function renameDir(repo: string, from: string, to: string, message: string): string | undefined {
+	if (git(repo, ["diff", "--cached", "--name-only"]).length) return undefined;
+	const tmp = `${from}.rename-${Date.now()}`;
+	git(repo, ["mv", from, tmp]);
+	mkdirSync(dirname(join(repo, to)), { recursive: true });
+	git(repo, ["mv", tmp, to]);
+	git(repo, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message]);
+	return headOf(repo);
+}
+
 /** Worktree per unit so parallel implementers never share a working copy. */
 export function addWorktree(repo: string, worktreePath: string, branch: string): void {
 	if (existsSync(worktreePath)) return; // same unit resuming in place: keep its work
