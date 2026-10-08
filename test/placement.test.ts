@@ -195,6 +195,45 @@ describe("placement", () => {
 		await expect(runUnit({ ledger, config, root: ws, unitId: "uuid", log: () => {} })).rejects.toThrow(/no placement yet \(code unsure/);
 	});
 
+	it("Jev chooses from the curated areas and topics, most relevant first; the stronger model's pick is what the question recommends", async () => {
+		// curated: two features + many small ones, topics with a purpose; a topic in use named after a legacy file is not curated
+		const filler = Array.from({ length: 25 }, (_, i) => ({ name: `area-${i}`, purpose: "" }));
+		writeFileSync(join(ws, ".bigrefactor", "areas.json"), JSON.stringify({
+			stacks: [{ stack: "nestjs", areas: [{ name: "agency", purpose: "agency accounts" }, { name: "campaign", purpose: "ad campaigns" }, { name: "shared", purpose: "" }, ...filler], topics: [{ name: "dates", purpose: "clocks and date helpers" }] }],
+			rules: [{ prefix: "app/view/templates/default/vue/", to: "shared", stack: "react", area: "widgets", confidence: 0.9, why: "reusable widgets" }],
+		}));
+		ledger.updateUnit("agency_tool", { meta: { place: { stack: "nestjs", area: "cpaa", shared: true, source: "code" } } });
+		const client = new FakeModelClient({
+			decide: (req) => {
+				const s = req.state as { path?: string };
+				if (s.path?.includes("money")) return { area: { type: "choice", choice: "agency", probabilities: { agency: 0.4 }, confidence: 0.4 } };
+				return { area: "other" };
+			},
+			chat: (req) => {
+				if (req.messages[0]!.content.startsWith("Answer each question")) return { json: { area: "shared__dates" } }; // the second opinion
+				return { json: { id: "placement", question: "Where does money go?", options: [], recommended: "nestjs:agency", opinion: "" } };
+			},
+		});
+		await resolvePlacements({ ledger, config, root: ws, client });
+		const call = client.calls.find((c) => c.kind === "decide" && JSON.stringify(c.req).includes("money.controller"))!;
+		const criteria = (call.req as unknown as { questions: { area: { criteria: Record<string, string | null> } } }).questions.area.criteria;
+		expect(criteria["shared__dates"]).toBe('shared topic "dates" (cross-cutting code): clocks and date helpers'); // not cut by the many small areas
+		expect(criteria["agency"]).toMatch(/agency accounts/);
+		const order = Object.keys(criteria);
+		expect(order.slice(0, 2).sort()).toEqual(["agency", "campaign"]); // what uses it first, then the topics, then the rest
+		expect(order[2]).toBe("shared__dates");
+		expect(criteria["shared__cpaa"]).toBeUndefined();
+		expect(criteria["shared"]).toBeUndefined();
+		expect(criteria["other"]).toMatch(/new feature area or shared topic/);
+		// Jev unsure, the stronger model disagrees: its pick is the recommendation, and the phrasing model cannot overrule it
+		const q = ledger.openQuestions().find((x) => x.unit_id === "money")!;
+		const ctx = JSON.parse(q.context!);
+		expect(ctx.codePick).toBe("nestjs:shared/dates");
+		expect(ctx.guess).toBe(false);
+		expect(ctx.facts).toMatch(/second opinion \(openai\/gpt-6\.1-sol, read the same code\): shared__dates/);
+		expect(q.status).toBe("open");
+	});
+
 	it("the static role mirror equals every target adapter's role", async () => {
 		for (const id of knownTargets()) expect(TARGET_ROLES[id], id).toBe((await getTargetAdapter(id)).role);
 		// the registry knows role, subdir and aliases without loading an adapter; they must match the adapter's own

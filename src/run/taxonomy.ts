@@ -96,7 +96,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 			additionalProperties: false,
 			required: ["stacks", "rules"],
 			properties: {
-				stacks: { type: "array", items: { type: "object", additionalProperties: false, required: ["stack", "areas"], properties: { stack: { type: "string" }, areas: { type: "array", items: { type: "object", additionalProperties: false, required: ["name", "purpose"], properties: { name: { type: "string" }, purpose: { type: "string" } } } } } } },
+				stacks: { type: "array", items: { type: "object", additionalProperties: false, required: ["stack", "areas", "topics"], properties: { stack: { type: "string" }, areas: { type: "array", items: { type: "object", additionalProperties: false, required: ["name", "purpose"], properties: { name: { type: "string" }, purpose: { type: "string" } } } }, topics: { type: "array", description: "the shared topics of this stack", items: { type: "object", additionalProperties: false, required: ["name", "purpose"], properties: { name: { type: "string" }, purpose: { type: "string", description: "one line: what code goes there" } } } } } } },
 				rules: {
 					type: "array",
 					items: {
@@ -121,7 +121,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 				content: `You design the feature-module structure of the NEW codebase (${d.config.target.stacks.join(" + ")}) a legacy app is migrated into, and say which legacy files go into which area. A new developer must find code by business concept. Rules:
 - Areas are business domains of THIS app (campaigns, flights, players, billing …), kebab-case, plural nouns where natural, consistent naming. Never a legacy file name, class name, technical layer or tool name.
 - Per stack, aim for roughly 12–40 areas; an area with fewer than 3 units must be a genuinely separate domain, otherwise merge it.
-- Utilities, base classes, formatting, pagination, clocks, HTTP helpers → "shared" with a topic (dates, http, formatting, pagination, errors …).
+- Utilities, base classes, formatting, pagination, clocks, HTTP helpers → "shared" with a topic (dates, http, formatting, pagination, errors …). List each stack's shared topics with a one-line purpose; like areas, a topic is a concept, never a legacy file name.
 - Server logic (models, data access, commands, jobs, mail rendering) belongs on the server stack; pages, templates, widgets and client scripts on the UI stack. Where the tree shows a ui/server fact for a folder, that fact decides the stack; your stack is used only where it shows none.
 - Answer with prefix rules. A prefix ending in "/" covers the whole folder; any other prefix covers the files whose name starts with it up to a "." (\`app/model/classes/campaign\` covers campaign.model.php and campaign.facade.php, not campaigns.model.php). The longest matching prefix wins: a folder rule plus file rules for the exceptions is enough.
 - Folders that hold one kind of file for all features (models, components, helpers, controllers) need file rules: use the names and the "used from" counts (which folders' code uses the file, ×n) to put each file with the feature that uses it; used by many features → shared.
@@ -133,7 +133,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		],
 	});
 	let cost = brief.costUsd + res.usage.costUsd;
-	const j = (res.json ?? {}) as { stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose: string }> }>; rules?: AreaRule[] };
+	const j = (res.json ?? {}) as { stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose: string }>; topics?: Array<{ name: string; purpose: string }> }>; rules?: AreaRule[] };
 	const files = units.flatMap((u) => u.m.files!);
 	// guards: a rule must cover a real file of the inventory and name a target stack
 	const rules = (j.rules ?? []).map((r) => ({ ...r, prefix: r.prefix.replace(/^\.\//, ""), area: kebab(r.area) })).filter((r) => r.prefix && (r.area || r.to === "exclude") && d.config.target.stacks.includes(r.stack) && files.some((f) => covers(r.prefix, f)));

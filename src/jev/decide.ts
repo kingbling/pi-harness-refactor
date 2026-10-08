@@ -11,6 +11,8 @@ export interface Decision {
 	decisionId: number;
 	/** Below JEV_ACT a stronger model was asked on the same evidence: agreed = the answer stands at JEV_ACT. */
 	secondOpinion?: "agreed" | "disagreed" | "unavailable";
+	/** The stronger model's own answers (question → choice key or probability of yes), when it was asked and answered. */
+	second?: { model: string; answers: Record<string, unknown> };
 }
 
 /**
@@ -67,7 +69,7 @@ export async function decide(
 		latencyMs: Date.now() - t0,
 		state: stateJson,
 	});
-	return { answers, confidence, costUsd: cost, decisionId, secondOpinion };
+	return { answers, confidence, costUsd: cost, decisionId, secondOpinion, ...(second?.answers ? { second: { model: second.model, answers: second.answers as Record<string, unknown> } } : {}) };
 }
 
 /**
