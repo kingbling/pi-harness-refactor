@@ -52,7 +52,7 @@ export async function draftLayout(o: { client: ModelClient; model: string; stack
 	const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
 		{
 			role: "system",
-			content: `You maintain the feature-folder layout of the ${o.stack} project in an automated migration. The layout is data a checker enforces (layout.json). Patterns are relative to the feature folder: {area} {Area} {area_snake} the feature, {name}/{Name} any kebab/Pascal name, {sub} a sub-feature folder named after what it does, spelled like the feature folders ({Area} → PascalCase, {area} → kebab-case; same value where it repeats), (a|b) either word. files = the only files allowed; require = files the framework itself needs in every feature folder to load it (none when it finds the code on its own); place = code (regex on the text) that may only live in some files; forbidDirs = banned folder names. Change only what the owner asks; keep everything else exactly. If the request is the framework's own convention, use the official docs' layout. If the request is not about where files and folders go (naming inside code, style), set checkable=false.\n\n${PLAIN_LANGUAGE}`,
+			content: `You maintain the feature-folder layout of the ${o.stack} project in an automated migration. The layout is data a checker enforces (layout.json). Patterns are relative to the feature folder: {area} {Area} {area_snake} the feature, {name}/{Name}/{name_snake} any kebab-case/PascalCase/snake_case name (use the one this stack names its files with, e.g. snake_case for Python, Go, Ruby, Rust), {sub} a sub-feature folder named after what it does, spelled like the feature folders ({Area} → PascalCase, {area} → kebab-case; same value where it repeats), (a|b) either word. files = the only files allowed; require = files the framework itself needs in every feature folder to load it (none when it finds the code on its own); place = code (regex on the text) that may only live in some files; forbidDirs = banned folder names. Change only what the owner asks; keep everything else exactly. If the request is the framework's own convention, use the official docs' layout. If the request is not about where files and folders go (naming inside code, style), set checkable=false.\n\n${PLAIN_LANGUAGE}`,
 		},
 		{ role: "user", content: `Current layout.json:\n${JSON.stringify(o.current ?? { moduleDir: "src/{area}", files: [], require: [], forbidDirs: [], place: [] }, null, 1)}\n\nThe owner says: ${o.words}` },
 	];
@@ -85,7 +85,7 @@ export function examplesProblems(r: LayoutRules, mustPass: string[], mustFail: s
 export function layoutImpact(projectDir: string, adapter: TargetAdapter, r: LayoutRules): { findings: string[]; areas: number } {
 	if (!existsSync(projectDir)) return { findings: [], areas: 0 };
 	const l = adapter.layout;
-	const findings = checkLayoutTree(projectDir, r, { sharedDirs: l.sharedDirs, dataDirs: l.dataDirs, isTestFile: (f) => l.isTestFile(f), sourceExtensions: l.sourceExtensions, fileFindings: l.fileFindings });
+	const findings = checkLayoutTree(projectDir, r, { sharedDirs: l.sharedDirs, dataDirs: l.dataDirs, isTestFile: (f) => l.isTestFile(f), sourceExtensions: l.sourceExtensions, ignoreDirs: l.ignoreDirs, fileFindings: l.fileFindings });
 	const root = r.moduleDir.split("/").slice(0, -1).join("/");
 	const areas = new Set(findings.map((f) => f.startsWith(`${root}/`) ? f.slice(root.length + 1).split("/")[0] : "").filter(Boolean));
 	return { findings, areas: areas.size };

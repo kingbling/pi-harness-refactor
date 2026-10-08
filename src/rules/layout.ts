@@ -64,10 +64,13 @@ export async function validateRulesLayout(root: string, config: Config): Promise
 		const moduleRoot = adapter.layout.moduleDir("<area>").replace(/<area>$/, "");
 		const allowed = [moduleRoot, ...adapter.layout.sharedDirs];
 		const body = stripLayout(md);
-		// any other src/<x>/ path the body names (with or without the project subdir, in or out of backticks) is a competing layout
-		for (const m of body.matchAll(/(?:^|[\s`("'./])((?:[\w-]+\/)?src\/[\w.<>-]+\/)/gm)) {
+		// the top folders the adapter keeps code in (src/ for NestJS, internal/ for Go, app/ …): any other <top>/<x>/ path
+		// the body names (with or without the project subdir, in or out of backticks) is a competing layout
+		const tops = [...new Set(allowed.map((d) => d.split("/")[0]!).filter(Boolean))];
+		const topRe = new RegExp(`(?:^|[\\s\`("'./])((?:[\\w-]+\\/)?(?:${tops.map(escape).join("|")})\\/[\\w.<>-]+\\/)`, "gm");
+		for (const m of tops.length ? body.matchAll(topRe) : []) {
 			const dir = m[1]!.replace(new RegExp(`^${adapter.subdir}/`), "");
-			if (!dir.startsWith("src/")) continue;
+			if (!tops.some((t) => dir.startsWith(`${t}/`))) continue;
 			// a path of the OLD codebase (a legacy file the rules quote as evidence) is no module root of the new one
 			const full = m[1]! + (/^[^\s`'"),;]*/.exec(body.slice(m.index! + m[0].length))?.[0] ?? "");
 			const ext = /\.[A-Za-z0-9]+$/.exec(full)?.[0];
