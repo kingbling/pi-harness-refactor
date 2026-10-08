@@ -258,8 +258,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				sameAs: errorSignature("truth", truthError(runErr ?? lastErr ?? "")),
 				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time.${runErr && runErr !== lastErr ? ` Running it failed with:\n${truthError(runErr).slice(-1000)}\nWriting the cases from reading the code failed too.` : ""} Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
 				options: [
-					{ value: "fixed", facts: "the legacy environment (dependencies, module loading, DB) is fixed now: the tester runs again" },
-					{ value: "quarantine", facts: "the code cannot run here: leave the unit for a human (type a hint instead to steer the tester)" },
+					{ value: "retry", facts: "run it again: the legacy environment (dependencies, module loading, DB) is fixed now (type a hint instead to steer the tester)" },
+					{ value: "leave", facts: "the code cannot run here: leave the unit parked for a human" },
 				],
 				context: { error: lastErr?.slice(-1500) },
 			});
@@ -532,7 +532,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// Jev picks the next step; code enforces caps and acts.
 		if (o.client) {
 			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo);
-			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)} ${triage.band})`));
+			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)}${triage.sure ? "" : ", unsure"})`));
 			if (triage.action === "quarantine") break;
 			// the same step failed again: another blind attempt rarely helps — find out why first (once per step)
 			const stuck = triage.action !== "ask_human" && previousGate?.failedStep === gate.failedStep && !diagnosed.has(gate.failedStep ?? "");
@@ -543,6 +543,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				const failedOut = gate.steps.find((x) => !x.ok)?.output ?? "";
 				const dx = await diagnoseFailure({ config: o.config, adapter, projectDir: targetProjectDir, failedStep: gate.failedStep ?? "", output: failedOut, client: o.client });
 				log(pc.dim(`  doctor (${dx.by}): ${dx.action} — ${dx.summary}`));
+				// triage's own question (the anti-gaming case); a plain ask_human asks nobody until doctor and setup model tried
 				let qid = triage.questionId;
 				// a question shared with other units is theirs too: only the unit's own question is answered or withdrawn here
 				const ownQ = (id: number | undefined) => id !== undefined && o.ledger.getQuestion(id)?.unit_id === o.unitId;
@@ -571,27 +572,26 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					}
 					setupTried = " The setup model tried and could not fix it.";
 				}
-				if (!qid && triage.action !== "ask_human") {
+				if (triage.action !== "ask_human") {
 					// stuck, but nothing to heal here and nobody to ask: go on as triage said (the attempt cap still holds)
 					lastGateText += `\n\nDiagnosis: ${dx.summary}. ${dx.note ?? ""}`;
 					if (triage.action === "escalate") forceEscalate = true;
 					previousGate = gate;
 					continue;
 				}
-				if (qid) {
-					// the doctor knows more than triage did: the question is asked again with the diagnosis (phrased by a model)
-					if (ownQ(qid)) o.ledger.withdrawQuestion(qid, `diagnosed: ${dx.summary}`);
-					qid = await ask({
-						point: "gate_env",
-						sameAs: signature,
-						facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${setupTried}${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
-						options: [
-							{ value: "fixed", facts: dx.command ? `ran ${dx.command}; the unit runs again` : "the environment is fixed; the unit runs again" },
-							{ value: "quarantine", facts: "leave the unit quarantined for a human" },
-						],
-						context: { diagnosis: dx, failedStep: gate.failedStep },
-					});
-				}
+				// doctor and setup model could not help: now a person is asked, with the diagnosis (phrased by a model);
+				// triage's earlier question, if any, is replaced by this one
+				if (ownQ(qid)) o.ledger.withdrawQuestion(qid!, `diagnosed: ${dx.summary}`);
+				qid = await ask({
+					point: "gate_env",
+					sameAs: signature,
+					facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${setupTried}${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
+					options: [
+						{ value: "retry", facts: dx.command ? `run it again (after you ran ${dx.command})` : "run it again (after you fixed the environment)" },
+						{ value: "leave", facts: "leave the unit parked for a human" },
+					],
+					context: { diagnosis: dx, failedStep: gate.failedStep },
+				});
 				// remember the environment the failure happened in: a change (package.json/config) resubmits the unit
 				o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles, setupFiles(o.root, stackId)), diagnosis: dx } } });
 				log(pc.yellow(`  waiting for human question #${qid} — other units keep running`));

@@ -132,7 +132,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const [id, ...text] = args;
 		if (!id || !text.length) throw new Error("usage: br answer <id> <text>");
 		const { ledger } = open();
-		ledger.answerQuestion(Number(id), text.join(" "), process.env["USER"] ?? "human");
+		ledger.answerQuestion(Number(id), text.join(" "), `human (${process.env["USER"] ?? "cli"})`);
 		console.log(pc.green(`answered #${id}`));
 	},
 	setup: async () => {

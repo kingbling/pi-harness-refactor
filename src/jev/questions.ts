@@ -78,15 +78,13 @@ export const TRIAGE_GATE: Battery = {
 			impl_bug: "The generated code is wrong: type errors, wrong logic, failing assertions on behavior the tests pin",
 			missing_pattern: "The code does not follow a required convention or misses an import/registration the project uses",
 			interface_mismatch: "The code and the ported tests disagree on names, signatures, or module layout",
-			test_bug: "The ported test itself is wrong or asserts something the old code never did",
+			test_bug: "The failing assertion is in a ported test (`failing_tests`) and the test itself looks wrong: it asserts something odd or sets things up wrongly",
 			env: "Tooling or environment problem: missing dependency, timeout, container, network, flaky infra",
 			scope: "The change touched files or paths outside the unit, or weakened tests",
 			other: "Cannot tell from the report",
 		},
 	},
-	retry_likely_to_help: { type: "noul", instructions: "Would giving the same model the exact `gate_report` and asking it to fix the code likely make the gate pass on the next attempt?" },
 	same_as_previous: { type: "noul", instructions: "Is the failure in `gate_report` the same failure as in `previous_report`?" },
-	escalate: { type: "noul", instructions: "Does fixing `gate_report` require understanding beyond the unit, such as cross-module design or unclear legacy semantics?" },
 };
 
 export const SYSTEMIC_FAILURE: Battery = {
@@ -104,27 +102,12 @@ export const SYSTEMIC_FAILURE: Battery = {
 	},
 };
 
-/** Confidence bands → action; tuned per decision point on labeled outcomes. */
-export interface Thresholds {
-	act: number; // >= act → act automatically
-	check: number; // >= check → act but flag; below → escalate
-}
 /**
  * One line for every Jev call: at or above it Jev's answer is acted on; below it a stronger model gives a second
  * opinion on the same evidence (decide `second`), and only an agreeing one lets the answer stand. Otherwise the
  * caller falls back to the code's default or asks the owner.
  */
 export const JEV_ACT = 0.7;
-export const DEFAULT_THRESHOLDS: Record<string, Thresholds> = {
-	triage_gate: { act: JEV_ACT, check: JEV_ACT },
-};
-
-export function band(confidence: number, t: Thresholds): "act" | "check" | "escalate" {
-	if (confidence >= t.act) return "act";
-	if (confidence >= t.check) return "check";
-	return "escalate";
-}
-
 /** Noul → confidence on the same 0..1 scale as Choice (distance from 0.5). */
 export function noulConfidence(p: number): number {
 	return Math.abs(2 * p - 1);

@@ -52,7 +52,7 @@ describe("runUnit wiring", () => {
 	});
 
 	it("after the doctor, the triage question is withdrawn and asked again with the diagnosis, phrased by the model", async () => {
-		const client = new FakeModelClient({ chat: () => ({ json: { action: "unknown", summary: "the protected globs block the module dir", question: "The gate keeps refusing agency writes: fix the protected globs?", options: [], recommended: "fixed", opinion: "Looks like config." } }) });
+		const client = new FakeModelClient({ chat: () => ({ json: { action: "unknown", summary: "the protected globs block the module dir", question: "The gate keeps refusing agency writes: fix the protected globs?", options: [], recommended: "retry", opinion: "Looks like config." } }) });
 		const gate = async (): Promise<GateReport> => failing("write outside unit scope: src/features/agency/agency.service.ts");
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, client, log: () => {} });
 		const qs = ledger.db.prepare("SELECT point, question, status, context FROM questions WHERE unit_id = 'u1' ORDER BY id").all() as Array<{ point: string; question: string; status: string; context: string }>;
@@ -61,6 +61,19 @@ describe("runUnit wiring", () => {
 		expect(JSON.parse(qs[1]!.context).diagnosis.summary).toBe("the protected globs block the module dir");
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
 		expect(r.attempts).toBe(2);
+	});
+
+	it("triage's ask_human asks nobody first: the doctor looks, and only when it cannot help one retry/leave question is asked", async () => {
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "env" } : undefined), chat: () => ({ json: { action: "unknown", summary: "the DB container is down", question: "The tests cannot reach the DB: start it?", options: [], recommended: "retry", opinion: "Infra." } }) });
+		const gate = async (): Promise<GateReport> => ({ ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: "FAIL src/features/agency/agency.service.spec.ts\nconnect ECONNREFUSED 127.0.0.1:5432" }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "ported_tests_green", testFiles: ["src/features/agency/agency.service.spec.ts"] });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, client, log: () => {} });
+		const qs = ledger.db.prepare("SELECT point, status, options, context FROM questions WHERE unit_id = 'u1' ORDER BY id").all() as Array<{ point: string; status: string; options: string; context: string }>;
+		expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "open"]]);
+		expect((JSON.parse(qs[0]!.options) as string[]).map((o) => o.split(" ")[0])).toEqual(["retry", "leave"]);
+		expect(JSON.parse(qs[0]!.context).diagnosis.summary).toBe("the DB container is down");
+		// the failing ported test is in what Jev saw
+		const state = (client.calls.find((c) => c.kind === "decide")!.req as { state: { failing_tests: string[] } }).state;
+		expect(state.failing_tests).toContain("src/features/agency/agency.service.spec.ts");
 	});
 
 	it("a test file the tester removed after the list was made does not crash the next attempt", async () => {

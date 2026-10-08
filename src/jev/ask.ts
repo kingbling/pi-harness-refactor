@@ -284,7 +284,7 @@ export interface AskRequest {
 /**
  * Points the run decides on its own (run.ask "unsure", the default): the model that read the repo and the owner's
  * goals picks the same option as the code or agent that raised the question. Only options that keep work going;
- * "fixed" (a human did something), "quarantine", "exclude", "stop" and the like are always asked.
+ * "leave", "exclude", "stop" and the like, and every environment question (gate_env, truth_env: a human did something), are always asked.
  */
 const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
 	placement: () => true,

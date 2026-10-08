@@ -69,7 +69,7 @@ export async function simulateL1(): Promise<void> {
 		decide: (req) => {
 			const state = req.state as { stage: string; attempt: number };
 			const cause = state.stage === "build_ok" ? "impl_bug" : state.stage === "ported_tests_green" ? (state.attempt >= 2 ? "interface_mismatch" : "impl_bug") : "other";
-			return { cause, retry_likely_to_help: state.attempt < 2 ? 0.9 : 0.3, same_as_previous: state.attempt >= 2 ? 0.9 : 0.1, escalate: state.attempt >= 2 ? 0.8 : 0.1 };
+			return { cause, same_as_previous: state.attempt >= 2 ? 0.9 : 0.1 };
 		},
 	});
 
