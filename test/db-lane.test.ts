@@ -11,6 +11,7 @@ import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { placeUnit } from "../src/run/placement.ts";
 import { runUnit } from "../src/run/unit.ts";
+import { commitAll, ensureRepo } from "../src/git.ts";
 import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
 
 /**
@@ -255,6 +256,38 @@ describe("DB lane", () => {
 		// no ORM assumed: the schema is written the way this stack accesses data
 		expect(prompts[0]).not.toContain("ORM schema/entities");
 		expect(prompts[0]).toContain("this stack's data-access approach");
+	});
+});
+
+describe("DB lane: a failed gate is read by the triage model", () => {
+	it("a setup failure goes to the setup model, not another schema attempt; the unit waits for a fresh worktree", async () => {
+		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
+		write(join(ws, "migrated", "package.json"), "{}");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await planDbLane(ledger, config);
+		let sessions = 0;
+		const spawn = async (): Promise<LeafSession> =>
+			({
+				run: async () => {
+					sessions++;
+					write(join(ws, "migrated", "src", "db", "invoice.entity.spec.ts"), "it('x', () => {});\n");
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: false, failedStep: "ported_tests_green", steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: 'Error in bootstrap script: Unable to read the ".env" environment file.' }], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "env" } : undefined) });
+		// the setup model commits its fix to the target repo: the target must be its own repo
+		ensureRepo(join(ws, "migrated"), "main", []);
+		commitAll(join(ws, "migrated"), "init");
+		const problems: string[] = [];
+		const setupFixer = async (f: { problem: string }) => (problems.push(f.problem), write(join(ws, "migrated", ".gitignore"), "vendor/\n"), "the .env file is now tracked");
+		const r = await runUnit({ ledger, config, root: ws, unitId: "DB_schema_invoice", spawn, gate, client, setupFixer: setupFixer as never, log: () => {} });
+		expect(sessions).toBe(1); // no blind second attempt at the schema
+		expect(problems[0]).toContain("Unable to read the \".env\" environment file");
+		expect(r.state).not.toBe("quarantined");
+		expect(JSON.parse(ledger.getUnit("DB_schema_invoice")!.meta).parked.diagnosis.summary).toContain("the .env file is now tracked");
 	});
 });
 

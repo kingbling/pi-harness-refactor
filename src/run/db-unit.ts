@@ -5,7 +5,9 @@ import { getTargetAdapter } from "../adapters/registry.ts";
 import { projectDir } from "../init/init.ts";
 import { schemaTextFor, type DbUnitMeta } from "../inventory/db.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { runGate, renderGate, sha1, type GateReport } from "./gate.ts";
+import { fixRunSetup, fixSetupWithModel } from "../init/setup-fixer.ts";
+import { errorSignature, runGate, renderGate, sha1, type GateReport } from "./gate.ts";
+import { triageGate } from "./triage.ts";
 import { rulesText } from "./prompts.ts";
 import type { UnitRunOptions, UnitRunResult } from "./unit.ts";
 import { CODE_QUALITY, goalsText } from "../policy.ts";
@@ -69,9 +71,11 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	let gate: GateReport | undefined;
 	let last = "";
 	let n = 0;
+	let previous: GateReport | undefined;
+	let escalate = false;
 	while (n < maxTotal) {
 		n++;
-		const role = n > maxImpl ? "escalate" : "implement";
+		const role = escalate || n > maxImpl ? "escalate" : "implement";
 		const attempt = o.ledger.startAttempt(o.unitId, role, o.config.models[role].id);
 		const s = await spawn({ role, cwd: targetProjectDir, config: o.config, writeGlobs, protectedGlobs: adapter.protectedGlobs, systemPrompt: system, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `${role}-${attempt}.jsonl`) });
 		let res;
@@ -89,6 +93,27 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
 		if (gate.ok) break;
+		// the triage model reads the failure: a setup problem (missing env file, broken test bootstrap) is the setup
+		// model's job, not another attempt at the schema; its retry/escalate/quarantine is followed like any unit's
+		if (o.client) {
+			const failedOut = gate.steps.find((x) => !x.ok)?.output ?? "";
+			const t = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previous, n).catch(() => undefined);
+			if (t) log(pc.dim(`  triage: ${t.cause} → ${t.action} (${t.reason})`));
+			const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
+			if (t?.cause === "env" && setupFixer) {
+				const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, place.stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for database unit ${o.unitId} (files in ${dataDirs.join(", ")}). Triage: ${t.reason}. Fix the project setup, not the unit's files.\nThe unit works in its own git worktree (${targetProjectDir}); only files tracked in git (and the dependency dirs linked or copied into it: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}) are there.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+				if (fixed) {
+					// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
+					o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: t.reason } } } });
+					o.ledger.transitionUnit(o.unitId, "implementing", "setup fixed; waits for a fresh worktree");
+					log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
+					return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: n, gate, costUsd: cost };
+				}
+			}
+			if (t?.action === "quarantine") break;
+			if (t?.action === "escalate") escalate = true;
+		}
+		previous = gate;
 		if (!testFiles.length) last = "no test files: write at least one test next to your schema files.\n";
 		last += `failed step: ${gate.failedStep}\n${gate.steps.find((x) => !x.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
