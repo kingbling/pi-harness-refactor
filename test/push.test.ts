@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -47,6 +47,21 @@ describe("pushing to the target's remote", () => {
 		await p.finish(); // the end of the run pushes what is left
 		expect(git(bare, ["rev-parse", "migration/main"])).toBe(git(target, ["rev-parse", "HEAD"]));
 		expect(logs.filter((l) => /fail/.test(l))).toEqual([]);
+	});
+
+	it("a merge that lands while a push runs goes out on its own, not with some later merge; br push is remembered as decided", async () => {
+		const { root, target, bare, config, cfgPath } = setup(true);
+		pushSetting(cfgPath, ["on"]);
+		expect(JSON.parse(readFileSync(cfgPath, "utf8")).target.git.pushAskedAt).toBeTruthy();
+		const p = createPusher({ config, root, log: () => {}, everyMs: 0 });
+		p.afterMerge(); // push 1 starts
+		writeFileSync(join(target, "a.txt"), "3\n");
+		commitAll(target, "unit while pushing");
+		p.afterMerge(); // push 1 still running
+		const head = git(target, ["rev-parse", "HEAD"]);
+		for (let i = 0; i < 100 && git(bare, ["rev-parse", "migration/main"]) !== head; i++) await new Promise((r) => setTimeout(r, 50));
+		expect(git(bare, ["rev-parse", "migration/main"])).toBe(head);
+		await p.finish();
 	});
 
 	it("without a remote it says so once and does nothing", async () => {

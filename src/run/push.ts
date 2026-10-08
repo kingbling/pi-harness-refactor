@@ -42,6 +42,7 @@ export function createPusher(o: { config: Config; root: string; log: (l: string)
 	let running: Promise<void> | undefined;
 	let timer: NodeJS.Timeout | undefined;
 	let lastError = "";
+	let finished = false;
 	// the setting is read at push time: `br push on` applies to a running run
 	const settings = () => {
 		try {
@@ -74,16 +75,24 @@ export function createPusher(o: { config: Config; root: string; log: (l: string)
 				if (err !== lastError) o.log(pc.yellow(`push to ${remote} failed: ${err}`));
 				lastError = err;
 			})
-			.finally(() => (running = undefined));
+			.finally(() => {
+				running = undefined;
+				// merges that landed while this push ran (or a failed push) go out with the next one, not with some later merge
+				if (dirty && !finished) schedule();
+			});
+	};
+	const schedule = () => {
+		const wait = last + every - Date.now();
+		if (wait <= 0) return push();
+		timer ??= setTimeout(() => ((timer = undefined), push()), wait);
 	};
 	return {
 		afterMerge() {
 			dirty = true;
-			const wait = last + every - Date.now();
-			if (wait <= 0) return push();
-			timer ??= setTimeout(() => ((timer = undefined), push()), wait);
+			schedule();
 		},
 		async finish() {
+			finished = true;
 			if (timer) clearTimeout(timer);
 			timer = undefined;
 			await running;
@@ -100,6 +109,7 @@ export function pushSetting(configPath: string, args: string[]): string {
 	if (mode === "on" || mode === "off") {
 		config.target.git.push = mode;
 		if (remote) config.target.git.remote = remote;
+		config.target.git.pushAskedAt = new Date().toISOString(); // the owner decided: onboarding never asks (or overwrites) again
 		saveConfig(root, config);
 	} else if (mode) throw new Error("usage: br push [on|off] [remote]");
 	const g = config.target.git;

@@ -361,10 +361,12 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		// where the new code goes: the target repo's remote, and whether the run pushes there (asked once)
 		await step("remote", () => (config.target.git.pushAskedAt ? `push ${config.target.git.push}${config.target.git.remote ? ` (${config.target.git.remote})` : ""}` : undefined), async () => {
 			const { askPush } = await import("../run/push.ts");
+			// without anyone to ask, keep what the file says (br push may have changed it since this config was loaded)
+			if (yes) return `push ${loadConfig(configPath).config.target.git.push}`;
 			const got = await askPush(config, ui, yes);
 			const { saveConfig } = await import("../config.ts");
 			const raw = loadConfig(configPath).config;
-			raw.target.git = { ...raw.target.git, ...got, pushAskedAt: yes ? raw.target.git.pushAskedAt : new Date().toISOString() };
+			raw.target.git = { ...raw.target.git, ...got, pushAskedAt: new Date().toISOString() };
 			saveConfig(root, raw);
 			reload();
 			return `push ${got.push}${got.remote ? ` → ${got.remote}` : ""}`;
