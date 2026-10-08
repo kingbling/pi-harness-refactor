@@ -1,6 +1,7 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { loadCommandOverrides } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
@@ -139,7 +140,17 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// Parked units (state kept, attempt closed, waiting on a question) are resubmitted as soon as the cause is
 	// gone: their question was answered, or — for environment failures — the target project or the stack
 	// config changed since they parked. Checked at start and on every scheduling loop.
-	const resubmitParked = () => resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
+	// Quarantined units heal too: something changed since (a setup fix, the old code's environment, the plugin)
+	// → back into the queue, every hour or sooner, up to run.maxAutoHeals times; then the owner is asked.
+	let askingStuck: Promise<unknown> | undefined;
+	const resubmitParked = () => {
+		resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
+		if (o.dry) return;
+		healQuarantined(ledger, config, o.root, new Set(running.keys()), log, adapters);
+		askingStuck ??= askStuckUnits({ ledger, config, root: o.root, client: o.client })
+			.then((n) => n && log(pc.yellow(`${n} question(s): units still failing after ${config.run.maxAutoHeals} automatic tries`)), (e) => log(pc.yellow(`asking about stuck units failed: ${e?.message ?? e}`)))
+			.finally(() => (askingStuck = undefined));
+	};
 
 	// Each unit lands in the stack placement picks; a worktree holds the whole target repo, so every stack's
 	// dependency dirs (adapter-declared) are linked into it.
@@ -811,6 +822,113 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 	}
 	if (parked.length) log(pc.cyan(`↻ resubmitted ${parked.length} unit(s) whose blocker is resolved: ${parked.map((u) => u.id).slice(0, 5).join(", ")}${parked.length > 5 ? ", …" : ""}`));
 	return parked.map((u) => u.id);
+}
+
+/** When the plugin's own code last changed (an update may fix what quarantined a unit); read once per process. */
+const PLUGIN_TIME = (() => {
+	let t = 0;
+	const walk = (d: string) => {
+		for (const n of readdirSync(d, { withFileTypes: true })) {
+			if (n.isDirectory()) walk(join(d, n.name));
+			else t = Math.max(t, statSync(join(d, n.name)).mtimeMs);
+		}
+	};
+	try {
+		walk(dirname(dirname(fileURLToPath(import.meta.url))));
+	} catch {
+		/* not readable: only the workspace counts */
+	}
+	return t;
+})();
+
+/** The newest change that may fix a quarantined unit: setup fixes, gate commands, the old code's environment, dependency manifests, the plugin. */
+export function lastFixAt(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>): number {
+	const files = [join(root, ".bigrefactor", "legacy-env.json"), join(root, ".bigrefactor", "legacy-env.log")];
+	for (const id of config.target.stacks) {
+		files.push(...setupFiles(root, id));
+		for (const m of manifests.get(id)?.toolchain.manifestFiles ?? []) files.push(join(projectDir(config, id), m));
+	}
+	let t = PLUGIN_TIME;
+	for (const f of files) {
+		try {
+			t = Math.max(t, statSync(f).mtimeMs);
+		} catch {
+			/* not there */
+		}
+	}
+	return t;
+}
+
+const ledgerTime = (s: string) => Date.parse(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
+
+type Quarantined = { id: string; meta: string; at: string; reason: string | null };
+const quarantinedUnits = (ledger: Ledger) =>
+	ledger.db.prepare("SELECT u.id, u.meta, t.created_at at, t.reason FROM units u JOIN transitions t ON t.id = (SELECT MAX(id) FROM transitions WHERE entity = 'unit' AND entity_id = u.id AND to_state = 'quarantined') WHERE u.state = 'quarantined'").all() as Quarantined[];
+
+function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string): void {
+	requeueUnits(ledger, config, root, [id], "self-heal");
+	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion'), '$.autoHeals', ?, '$.retryNote', ?) WHERE id = ?").run(heals, note, id);
+}
+
+/**
+ * Quarantined units heal by themselves: back into the queue every run.healEveryMinutes, or sooner when something
+ * changed after they failed (see lastFixAt), up to run.maxAutoHeals times. After that the owner is asked
+ * (askStuckUnits; one question per kind of failure), and the answer is applied here.
+ */
+export function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number } = {}): string[] {
+	const since = o.since ?? lastFixAt(config, root, manifests);
+	const now = o.now ?? Date.now();
+	const back: string[] = [];
+	for (const r of quarantinedUnits(ledger)) {
+		if (running.has(r.id)) continue;
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number };
+		const heals = meta.autoHeals ?? 0;
+		const why = (r.reason ?? "").slice(0, 300);
+		if (meta.healQuestion) {
+			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it
+			const q = ledger.getQuestion(meta.healQuestion);
+			if (!q || (q.status !== "answered" && q.status !== "auto")) continue;
+			const a = applyParkedAnswer(q.answer ?? "", q.options ? (JSON.parse(q.options) as string[]) : []);
+			if (a.action !== "requeue") {
+				ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
+				continue;
+			}
+			backInQueue(ledger, config, root, r.id, 0, `This unit was quarantined (${why}); the owner said to try again.${a.hint ? ` The owner's hint: ${a.hint}` : ""}`);
+			back.push(r.id);
+			continue;
+		}
+		if (meta.healQuestion === 0 || heals >= config.run.maxAutoHeals) continue;
+		const at = ledgerTime(r.at);
+		if (at >= since && now - at < config.run.healEveryMinutes * 60_000) continue;
+		backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.`);
+		back.push(r.id);
+	}
+	if (back.length) log(pc.cyan(`⚕ ${back.length} quarantined unit(s) back in the queue: ${back.slice(0, 5).join(", ")}${back.length > 5 ? ", …" : ""}`));
+	return back;
+}
+
+/** Units that used up their automatic tries: the owner is asked, one question per kind of failure (it blocks only those units). */
+export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: string; client?: ModelClient }): Promise<number> {
+	let asked = 0;
+	for (const r of quarantinedUnits(d.ledger)) {
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number };
+		if (meta.healQuestion !== undefined || (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals) continue;
+		const q = await askViaModel(d, {
+			point: "quarantine",
+			unitId: r.id,
+			facts: `${r.id} was quarantined and tried again automatically ${meta.autoHeals} times; it still fails: ${(r.reason ?? "").slice(0, 600)}. Other units with the same failure wait on this answer too.`,
+			options: [
+				{ value: "retry", facts: "try again (after you fixed something; type a hint instead to steer the next attempt)" },
+				{ value: "leave", facts: "leave it quarantined for a human" },
+			],
+			blocks: "unit",
+			askedBy: "orchestrator",
+			sameAs: errorSignature("quarantine", r.reason ?? ""),
+		});
+		d.ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', ?) WHERE id = ?").run(q.id, r.id);
+		if (!q.shared) asked++;
+	}
+	return asked;
 }
 
 /**

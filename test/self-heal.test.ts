@@ -52,6 +52,37 @@ describe("answers are applied per option", () => {
 		expect(applyParkedAnswer("auto: the environment changed", opts)).toEqual({ action: "requeue" });
 	});
 
+	it("quarantined units go back every hour or after a fix, 5 times; then one question per kind of failure, and the answer is applied", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
+		for (const id of ["U1", "U2"]) {
+			mk(id, "billing", "implementing");
+			ledger.transitionUnit(id, "quarantined", "gate still red after 5 attempts (lint_ok)");
+		}
+		const hour = 60 * 60_000;
+		const heal = (o: { since?: number; now?: number }) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, ...o });
+		expect(heal({})).toEqual([]); // just failed, nothing changed
+		expect(heal({ since: Date.now() + 1000 }).sort()).toEqual(["U1", "U2"]); // a fix landed since
+		for (let i = 2; i <= config.run.maxAutoHeals + 1; i++) {
+			for (const id of ["U1", "U2"]) {
+				ledger.transitionUnit(id, "truth", "t");
+				ledger.transitionUnit(id, "quarantined", "gate still red after 5 attempts (lint_ok)");
+			}
+			expect(heal({ now: Date.now() + hour + 1000 }).length).toBe(i <= config.run.maxAutoHeals ? 2 : 0); // an hour later
+		}
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 5, retryNote: expect.stringMatching(/try 5 of 5/) });
+		// out of tries: the owner is asked once for both (same failure)
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		expect(await askStuckUnits({ ledger, config, root })).toBe(0);
+		const q = ledger.openQuestions();
+		expect(q).toHaveLength(1);
+		expect(q[0]!.point).toBe("quarantine");
+		expect(heal({ now: Date.now() + 9 * hour })).toEqual([]); // waits for the answer now
+		ledger.answerQuestion(q[0]!.id, "the lint config was wrong, I fixed it");
+		expect(heal({}).sort()).toEqual(["U1", "U2"]);
+		expect(JSON.parse(ledger.getUnit("U2")!.meta)).toMatchObject({ autoHeals: 0, retryNote: expect.stringMatching(/hint: the lint config was wrong/) });
+	});
+
 	it("units hitting the same problem share one question: no new question, all wait, one answer releases them all", async () => {
 		const { root, config, ledger, mk } = workspace();
 		for (const id of ["U1", "U2", "U3"]) mk(id, "billing", "implementing");

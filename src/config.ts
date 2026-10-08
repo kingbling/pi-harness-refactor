@@ -107,6 +107,9 @@ export const ConfigSchema = z.object({
 			/** The builder runs the whole-project checks after this many merges, or after this many minutes with merges, whichever comes first. */
 			buildEveryUnits: z.number().int().min(1).default(20),
 			buildEveryMinutes: z.number().min(1).default(30),
+			/** Quarantined units go back into the queue every this many minutes (sooner when a fix landed), up to maxAutoHeals times; then the owner is asked. */
+			healEveryMinutes: z.number().min(1).default(60),
+			maxAutoHeals: z.number().int().min(0).default(5),
 			/** Packed task-card context above this triggers a pre-split; a session exceeding it in total usage is aborted. */
 			maxUnitTokens: z.number().int().default(250_000),
 			/** A leaf session with no model/tool activity for this long is aborted (outcome idle_timeout). */
