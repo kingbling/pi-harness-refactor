@@ -468,23 +468,26 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// instead of stopping: new units wait, the shared cause is diagnosed, the setup model fixes the project (what it
 	// learns — a command, a worktree copy — is kept for every later unit), the failed units go back into the queue
 	// and the run goes on. Cannot be healed → those units stay quarantined, the run still goes on.
-	const recent: Array<{ unit: string; ok: boolean; cause?: string; gate?: string; sig?: string; step?: string; output?: string }> = [];
+	const recent: BreakerEntry[] = [];
 	const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
+	// what was already healed (or tried): one key per error, one per set of errors the model judged; a later storm
+	// with another error is still checked
 	const tried = new Set<string>();
 	let healing: Promise<void> | undefined;
-	const heal = async (what: string, failed: typeof recent) => {
+	const heal = async (what: string, failed: BreakerEntry[]) => {
 		const units = failed.map((f) => f.unit);
 		log(pc.cyan(`⚕ ${what} (${units.join(", ")}): fixing the shared cause; new units wait, running ones go on`));
 		const first = failed.find((f) => f.output) ?? failed[0]!;
 		const stackId = placeUnit(config, ledger.getUnit(first.unit)?.meta ?? "{}", o.root).stackId;
 		const adapter = adapters.get(stackId);
+		const output = first.output ?? first.text ?? "";
 		let fixed: string | undefined;
 		if (adapter && setupFixer) {
 			const dir = projectDir(config, stackId);
-			const dx = await diagnoseFailure({ config, adapter, projectDir: dir, failedStep: first.step ?? "", output: first.output ?? "", client: o.client }).catch(() => undefined);
+			const dx = await diagnoseFailure({ config, adapter, projectDir: dir, failedStep: first.step ?? "", output, client: o.client }).catch(() => undefined);
 			if (dx) log(pc.dim(`  diagnosis (${dx.by}): ${dx.action} — ${dx.summary}`));
 			if (!dx || dx.action === "fix" || dx.action === "unknown")
-				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output of ${first.unit}:\n${(first.output ?? first.gate ?? "").slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nFailure output of ${first.unit} (${first.step}):\n${output.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 		}
 		recent.length = 0;
 		if (fixed) {
@@ -493,29 +496,25 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		} else log(pc.yellow(`⚕ could not heal it here; those units stay quarantined (br requeue after a fix), the run goes on`));
 	};
 	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined, crash?: string) => {
-		const bad = crash ? { name: "exception", output: crash } : res?.gate?.steps.find((x) => !x.ok);
-		const gate = bad ? `${bad.name}: ${String(bad.output ?? "").slice(0, 600)}` : undefined;
-		recent.push({ unit: unitId, ok: !crash && (st === "accepted" || st === "review"), cause: crash ? "exception" : res?.triage?.cause, gate, sig: bad ? errorSignature(bad.name, String(bad.output ?? "")) : undefined, step: bad?.name, output: bad ? String(bad.output ?? "") : undefined });
+		recent.push(breakerEntry(ledger, unitId, st, res, crash));
 		if (recent.length > 6) recent.shift();
 		if (healing) return;
-		const failed = recent.filter((r) => !r.ok);
-		// certain case first: the same error in 3 units is one cause, whatever a model says
-		const bySig = new Map<string, typeof recent>();
-		for (const f of failed) if (f.sig) bySig.set(f.sig, [...(bySig.get(f.sig) ?? []), f]);
-		const same = [...bySig.entries()].find(([sig, fs]) => fs.length >= 3 && !tried.has(sig));
-		if (same) {
-			tried.add(same[0]);
-			healing = heal(`${same[1].length} units failed with the same error`, same[1]).finally(() => (healing = undefined));
+		const pick = breakerPick(recent, tried);
+		if (!pick) return;
+		if (pick.same) {
+			// certain case: the same error in 3 units is one cause, whatever a model says
+			tried.add(pick.key);
+			healing = heal(`${pick.failed.length} units failed with the same error`, pick.failed).finally(() => (healing = undefined));
 			return;
 		}
-		if (!o.client || tried.has("systemic") || failed.length < 3 || failed.length < recent.length / 2) return;
+		if (!o.client) return;
 		try {
-			const r = await decide({ client: o.client, ledger, model: config.models.decide.id, second: config.models.escalate.id, secondWhen: (a) => a["systemic"]?.type === "noul" && a["systemic"].noul >= 0.5 }, "systemic_failure", { recent_failures: failed.map((f) => ({ unit: f.unit, cause: f.cause, gate: f.gate })) }, SYSTEMIC_FAILURE, ["systemic"]);
+			const r = await decide({ client: o.client, ledger, model: config.models.decide.id, second: config.models.escalate.id, secondWhen: (a) => a["systemic"]?.type === "noul" && a["systemic"].noul >= 0.5 }, "systemic_failure", { recent_failures: pick.failed.map((f) => ({ unit: f.unit, triage: f.triage, key: f.sig, cause: capText(f.text ?? "", 800) })) }, SYSTEMIC_FAILURE, ["systemic"]);
 			const sys = r.answers["systemic"];
 			const kind = r.answers["kind"]?.type === "choice" ? (r.answers["kind"] as { choice: string }).choice : "other";
 			if (sys?.type === "noul" && sys.noul >= 0.5 && r.confidence >= JEV_ACT && kind !== "hard_batch") {
-				tried.add("systemic");
-				healing = heal(`failures look systemic (${kind}, ${Math.round(sys.noul * 100)}%)`, failed).finally(() => (healing = undefined));
+				tried.add(pick.key);
+				healing = heal(`failures look systemic (${kind}, ${Math.round(sys.noul * 100)}%)`, pick.failed).finally(() => (healing = undefined));
 			}
 		} catch {
 			/* Jev unavailable: keep running */
@@ -889,6 +888,56 @@ export function lastFixAt(config: Config, root: string, manifests: Map<string, {
 		}
 	}
 	return t;
+}
+
+/** One finished unit as the circuit breaker sees it: the failure text and its key, whatever kind of failure it was. */
+export interface BreakerEntry {
+	unit: string;
+	ok: boolean;
+	/** triage's label for a gate failure ("env", "code", ...) or "exception" for a crash */
+	triage?: string;
+	/** what went wrong: the crash, the failed gate step's output, or why the unit stopped (a merge error, a quarantine) */
+	text?: string;
+	sig?: string;
+	step?: string;
+	/** the failed gate step's (or crash's) full output, for the diagnosis */
+	output?: string;
+}
+
+export function breakerEntry(ledger: Ledger, unitId: string, st: string, res: UnitRunResult | undefined, crash?: string): BreakerEntry {
+	const ok = !crash && (st === "accepted" || st === "review");
+	if (ok) return { unit: unitId, ok };
+	// the unit's own id (a branch, a commit subject) is never part of the key
+	const sig = (step: string, out: string) => errorSignature(step, out.replaceAll(unitId, "<unit>"));
+	const bad = crash ? { name: "exception", output: crash } : res?.gate?.steps.find((x) => !x.ok);
+	if (bad) {
+		const output = String(bad.output ?? "");
+		return { unit: unitId, ok, triage: crash ? "exception" : res?.triage?.cause, text: `${bad.name}: ${output}`, sig: sig(bad.name, output), step: bad.name, output };
+	}
+	// no failed gate step (a merge error, truth, a question): the reason of the unit's last transition says why
+	const reason = ledger.transitionsOf("unit", unitId).at(-1)?.reason ?? st;
+	return { unit: unitId, ok, triage: res?.triage?.cause, text: reason, sig: sig(st, reason), step: st };
+}
+
+/**
+ * What the circuit breaker does with the recent units: `same` when 3 failed with one key not tried yet (code heals,
+ * no model needed); otherwise, when most of them failed, the set to show the model. Its key is the set of error keys,
+ * so a set already healed is not asked again but a later storm with other errors is. undefined: nothing to do.
+ */
+export function breakerPick(recent: BreakerEntry[], tried: Set<string>): { same: boolean; key: string; failed: BreakerEntry[] } | undefined {
+	const failed = recent.filter((r) => !r.ok);
+	const bySig = new Map<string, BreakerEntry[]>();
+	for (const f of failed) if (f.sig) bySig.set(f.sig, [...(bySig.get(f.sig) ?? []), f]);
+	const same = [...bySig.entries()].find(([sig, fs]) => fs.length >= 3 && !tried.has(sig));
+	if (same) return { same: true, key: same[0], failed: same[1] };
+	if (failed.length < 3 || failed.length < recent.length / 2) return undefined;
+	const key = `set: ${[...new Set(failed.map((f) => f.sig ?? f.unit))].sort().join("\n")}`;
+	return tried.has(key) ? undefined : { same: false, key, failed };
+}
+
+/** Long text for a model: its start and its end (the error line is often at one of them). */
+function capText(t: string, max: number): string {
+	return t.length <= max ? t : `${t.slice(0, Math.floor(max * 0.4))}\n…\n${t.slice(-Math.floor(max * 0.6))}`;
 }
 
 const ledgerTime = (s: string) => Date.parse(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);

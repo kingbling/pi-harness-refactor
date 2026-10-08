@@ -347,25 +347,26 @@ const ASSERTION = /failed asserting|assertionerror|expected .+ to /i;
  * Same error, different unit → same key: step + the first line that says what went wrong. Paths are dropped
  * (worktree paths carry the unit id), file names and numbers too; names in quotes are kept (a missing class or
  * module is the cause). A line that names no cause (only a summary, an assertion) keeps the first file the output
- * names, so unrelated units never share it by key. Only a cheap first match: a model decides whether two
+ * names, so unrelated units never share it by key (not for a crash: step "exception"). Only a cheap first match: a model decides whether two
  * different keys are one cause (sameQuestion in src/jev/same.ts).
  */
 export function errorSignature(step: string, output: string): string {
 	const lines = output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 	// what follows a tool's closing summary is its footer (PHPStan's "how to read errors"), never the cause
 	const end = lines.reduce((e, l, i) => (SUMMARY_LINE.test(l) ? i : e), lines.length); // the last summary line
-	const cause = lines.findIndex((l, i) => i < end && /error|failed|cannot|not found/i.test(l) && !FRAME_LINE.test(l) && !SUMMARY_LINE.test(l));
+	const cause = lines.findIndex((l, i) => i < end && /error|failed|fatal|cannot|could not|not found|no such/i.test(l) && !FRAME_LINE.test(l) && !SUMMARY_LINE.test(l));
 	const at = cause >= 0 ? cause : Math.max(0, lines.findIndex((l) => SUMMARY_LINE.test(l)));
 	const line = lines[at] ?? "";
 	let key = normalizeErrorLine(line);
-	if (cause < 0 || ASSERTION.test(line)) {
+	// a crash message is its own cause: the file it names differs per unit, so it never goes into the key
+	if ((cause < 0 || ASSERTION.test(line)) && step !== "exception") {
 		const file = lines.slice(at + 1).concat(lines).flatMap((l) => l.match(/[^\s'"`()]*\/[^\s'"`():]+\.[a-z][a-z0-9]{0,4}\b/gi) ?? []).find((f) => !f.includes("://")); // not a docs link
 		if (file) key += ` in ${basename(file)}`;
 	}
 	return `${step}: ${key}`.slice(0, 200);
 }
 
-/** One error line without what differs per unit: paths (outside quotes any with a slash, inside only absolute ones), file names, numbers. */
+/** One error line without what differs per unit: paths (outside quotes any with a slash, inside only absolute ones), file names, commit ids, numbers. */
 function normalizeErrorLine(line: string): string {
 	return line
 		.replace(/^PHP (?=[A-Z][a-z]+(?: [a-z]+)?:)/, "") // "PHP Fatal error:" (stderr) and "Fatal error:" (stdout) are one message
@@ -373,6 +374,7 @@ function normalizeErrorLine(line: string): string {
 			q ? `${q}${inner!.replace(/(?<![\w@.-])(?:[a-z][\w+.-]*:\/\/|~\/|\/)[^\s'"`]*/gi, "<path>")}${q}` : "<path>",
 		)
 		.replace(/(["'`])((?:(?!\1).)*)\1|\b[\w-]+\.[a-z][a-z0-9]{0,4}\b/gi, (m, q: string | undefined) => (q ? m : "<file>"))
+		.replace(/\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b/g, "<sha>") // a commit id
 		.replace(/\b\d+\b/g, "N")
 		.replace(/\s+/g, " ")
 		.trim();

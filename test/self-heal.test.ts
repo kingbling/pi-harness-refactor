@@ -241,3 +241,49 @@ describe("area curation never touches migrated code", () => {
 		ledger.close();
 	});
 });
+
+describe("circuit breaker", () => {
+	it("every failure kind brings its text and a key; the same merge error in 3 units heals by code", async () => {
+		const { ledger, mk } = workspace();
+		const { breakerEntry, breakerPick } = await import("../src/run/run.ts");
+		const recent = ["U2415_a_cmd", "U0007_b", "U0100_c"].map((id) => {
+			mk(id, "billing", "implementing");
+			ledger.transitionUnit(id, "quarantined", `could not merge: could not rebase unit/${id} onto main: error: could not apply 1a2b3c4... ${id}\nfatal: no rebase in progress`);
+			return breakerEntry(ledger, id, "quarantined", undefined);
+		});
+		expect(recent[0]!.text).toMatch(/no rebase in progress/);
+		expect(new Set(recent.map((r) => r.sig)).size).toBe(1);
+		const pick = breakerPick(recent, new Set())!;
+		expect(pick).toMatchObject({ same: true, key: recent[0]!.sig });
+		expect(pick.failed).toHaveLength(3);
+		// a crash brings its message; the same crash in another file has the same key
+		const crash = (id: string, f: string) => breakerEntry(ledger, id, "implementing", undefined, `ENOENT: no such file or directory, open '/w/worktrees/${id}/src/${f}'`);
+		expect(crash("U0007_b", "a/A.test.tsx").text).toMatch(/ENOENT/);
+		expect(crash("U0007_b", "a/A.test.tsx").sig).toBe(crash("U0100_c", "b/B.php").sig);
+		ledger.close();
+	});
+
+	it("tried is per key: a healed error is not healed again, a later storm with another error still is", async () => {
+		const { breakerPick } = await import("../src/run/run.ts");
+		const f = (unit: string, sig: string) => ({ unit, ok: false, sig, text: sig });
+		const tried = new Set<string>();
+		const first = [f("U1", "a"), f("U2", "a"), f("U3", "a")];
+		tried.add(breakerPick(first, tried)!.key);
+		// the same error again: no code heal; the model sees it once more as a set
+		const again = breakerPick(first, tried)!;
+		expect(again.same).toBe(false);
+		tried.add(again.key);
+		expect(breakerPick(first, tried)).toBeUndefined();
+		// a new storm later in the run is still caught
+		expect(breakerPick([f("U4", "b"), f("U5", "b"), f("U6", "b")], tried)).toMatchObject({ same: true, key: "b" });
+		// mixed failures go to the model; a set it already healed is not asked again, a new one is
+		const mixed = [f("U7", "x"), f("U8", "y"), f("U9", "z")];
+		const ask = breakerPick(mixed, tried)!;
+		expect(ask.same).toBe(false);
+		tried.add(ask.key);
+		expect(breakerPick(mixed, tried)).toBeUndefined();
+		expect(breakerPick([f("U7", "x"), f("U8", "y"), f("U10", "w")], tried)).toMatchObject({ same: false });
+		// mostly green: nothing to do
+		expect(breakerPick([...mixed, ...["A", "B", "C", "D"].map((unit) => ({ unit, ok: true }))], new Set())).toBeUndefined();
+	});
+});

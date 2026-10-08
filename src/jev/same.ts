@@ -35,7 +35,7 @@ export async function sameQuestion(d: { ledger: Ledger; config: Config; client?:
 		const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "same_cause", { failure: failure.slice(-1500) }, {
 			same: {
 				type: "choice",
-				instructions: "Which open question describes a failure with the same cause as `failure`? Same cause means one fix (one setup change, one answer) solves both. The same kind of message about a different class, file, module or test is a different cause.",
+				instructions: "Which open question describes a failure with the same cause as `failure`? Same cause means one fix (one setup change, one answer) solves both.",
 				criteria,
 			},
 		}, ["same"], unitId);
