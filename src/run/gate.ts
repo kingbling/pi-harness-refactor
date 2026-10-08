@@ -107,7 +107,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
 		}
 		for (const f of othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
-		if (prodFiles.length === 0) problems.push("no production files were written");
+		if (prodFiles.length === 0) problems.push(NOTHING_WRITTEN);
 		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 	});
 	if (!agOk) return done();
@@ -399,3 +399,6 @@ export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ 
 	if (!takesFiles(adapter.lint(dir, [MARK]))) out.push({ step: "lint", ...adapter.lint(dir, []) });
 	return out;
 }
+
+/** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */
+export const NOTHING_WRITTEN = "no production files were written";

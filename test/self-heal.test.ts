@@ -210,6 +210,40 @@ describe("triage", () => {
 		ledger.close();
 	});
 
+	it("errors only in the ported tests go to the tester, whichever side of the path is longer; the command line is not an error", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug" }) });
+		const step = (name: string, output: string, testFiles: string[]) => ({ ok: false, failedStep: name, steps: [{ name, ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php", "tests/Billing/InvoiceTest.php"], testFiles }) as never;
+		const cmd = "$ vendor/bin/phpstan analyse src/Billing/Invoice.php tests/Billing/InvoiceTest.php\n";
+		// the tool prints project-relative paths, the test list is repo-relative
+		const t1 = await triageGate({ ledger, config, client }, "U1", step("lint_ok", `${cmd} tests/Billing/InvoiceTest.php:12 Call to an undefined method`, ["api/tests/Billing/InvoiceTest.php"]), undefined, 1);
+		expect(t1).toMatchObject({ action: "retest", cause: "test_bug" });
+		// the other way round
+		const t2 = await triageGate({ ledger, config, client }, "U1", step("build_ok", `${cmd}/work/api/tests/Billing/InvoiceTest.php(3,1): error`, ["tests/Billing/InvoiceTest.php"]), undefined, 1);
+		expect(t2.action).toBe("retest");
+		// an error in production code too: not the tester's alone
+		const t3 = await triageGate({ ledger, config, client }, "U1", step("build_ok", `${cmd}tests/Billing/InvoiceTest.php:12 x\nsrc/Billing/Invoice.php:3 y`, ["tests/Billing/InvoiceTest.php"]), undefined, 1);
+		expect(t3.action).toBe("retry");
+		expect((client.calls.at(-1)!.req as { state: { error_files: string[] } }).state.error_files).toEqual(["tests/Billing/InvoiceTest.php", "src/Billing/Invoice.php"]);
+		ledger.close();
+	});
+
+	it("an attempt that wrote nothing is retried with that message, twice or not; other identical anti-gaming failures ask", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const client = new FakeModelClient({});
+		const ag = (output: string) => ({ ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output, exitCode: 1 }], changedFiles: [] }) as never;
+		const none = await triageGate({ ledger, config, client }, "U1", ag("no production files were written"), ag("no production files were written"), 2);
+		expect(none).toMatchObject({ action: "retry" });
+		expect(none.questionId).toBeUndefined();
+		expect(ledger.openQuestions()).toEqual([]);
+		const out = await triageGate({ ledger, config, client }, "U1", ag("write outside unit scope: composer.json"), ag("write outside unit scope: composer.json"), 2);
+		expect(out.action).toBe("ask_human");
+		expect(out.questionId).toBeDefined();
+		ledger.close();
+	});
+
 	it("an environment cause returns ask_human without asking anyone: the doctor looks first", async () => {
 		const { config, ledger, mk } = workspace();
 		mk("U1", "billing", "implementing");

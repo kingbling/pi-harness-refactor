@@ -3,7 +3,7 @@ import { decide, setDecisionAction } from "../jev/decide.ts";
 import { choiceOf, JEV_ACT, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { DecisionAnswer, ModelClient } from "../models/types.ts";
-import { errorSignature, findingKey, type GateReport } from "./gate.ts";
+import { errorSignature, findingKey, NOTHING_WRITTEN, type GateReport } from "./gate.ts";
 import { askViaModel } from "../jev/ask.ts";
 
 /**
@@ -40,28 +40,31 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	// Deterministic shortcuts: the gate already knows these; no model needed.
 	if (failed?.name === "symbolproof_ok") return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", "unproven symbols — implementer must call ledger_prove");
 	if (failed?.name === "antigaming_ok") {
-		// The same code-level problems twice in a row (and no escalation) means the environment or the gate is wrong,
-		// not the model: stop burning attempts and ask (only this unit waits).
+		// The same problems twice in a row (and no escalation) means the environment or the gate is wrong, not the
+		// model: stop burning attempts and ask (only this unit waits). Not when the problem is the implementer's own
+		// to fix: having written nothing is answered by another attempt that is told so, never by the owner.
 		const prevFailed = previous?.steps.find((s) => !s.ok);
-		if (prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) {
+		const own = failed.output.split("\n").every((l) => l.trim() === NOTHING_WRITTEN);
+		if (!own && prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) {
 			const { id: q } = await askViaModel(d, { unitId, point: "gate_env", facts: `The anti-gaming check failed identically on two consecutive attempts of ${unitId}, so the implementer cannot fix it. Output:\n${failed.output.slice(-1500)}\nChanged files: ${gate.changedFiles.join(", ")}\nAfter a fix: br requeue ${unitId}.`, options: [{ value: "retry", facts: "I fixed the environment / protected globs: run the unit again" }, { value: "leave", facts: "leave the unit parked for a human" }], recommended: "retry", context: { output: failed.output.slice(-1500), changed: gate.changedFiles }, blocks: "unit", askedBy: "orchestrator" });
 			const t = deterministic(d, unitId, "env", "ask_human", "identical anti-gaming failure twice → not the model's fault");
 			return { ...t, questionId: q };
 		}
+		if (own) return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", `${NOTHING_WRITTEN}: the implementer is told and tries again`);
 		return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", "scope/test tampering caught by code");
-	}
-
-	// Build errors located only in protected test files are the tester's to fix: the implementer cannot edit them.
-	if (failed?.name === "build_ok" && gate.testFiles?.length) {
-		const errFiles = [...failed.output.matchAll(/^([^\s(:]+\.[A-Za-z0-9]+)[(:]/gm)].map((m) => m[1]!);
-		if (errFiles.length && errFiles.every((f) => gate.testFiles!.some((t) => f.endsWith(t)))) return deterministic(d, unitId, "test_bug", "retest", "build errors only in the ported tests → tester re-ports");
 	}
 
 	// State the decision model can actually reason on: not just the tail of the log, but what kind of failure it is.
 	const out = failed?.output ?? "";
 	const body = (out.startsWith("$ ") ? out.split("\n").slice(1).join("\n") : out).trim(); // drop the "$ cmd" line
-	const errFilesAll = [...new Set([...out.matchAll(/(?:^|\s)([\w./-]+\/[\w.-]+\.[A-Za-z0-9]{1,5})(?=[(:]| )/gm)].map((m) => m[1]!))];
+	// files the errors name (the command line lists every changed file: it is not an error)
+	const errFilesAll = [...new Set([...body.matchAll(/(?:^|\s)([\w./-]+\/[\w.-]+\.[A-Za-z0-9]{1,5})(?=[(:]| )/gm)].map((m) => m[1]!))];
 	const testFiles = gate.testFiles ?? [];
+	const inTests = errFilesAll.length > 0 && errFilesAll.every((f) => testFiles.some((t) => samePath(f, t)));
+
+	// Errors located only in protected test files are the tester's to fix: the implementer cannot edit them.
+	if ((failed?.name === "build_ok" || failed?.name === "lint_ok") && inTests) return deterministic(d, unitId, "test_bug", "retest", `${failed.name} errors only in the ported tests → tester re-ports`);
+
 	// the tests that failed, as the output names them: the ported test files it mentions, and test-runner failure lines
 	const failingTests = [...new Set([...testFiles.filter((t) => out.includes(t) || out.includes(t.split("/").pop()!)), ...[...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gm)].map((m) => m[1]!.trim())])].slice(0, 20);
 	const state = {
@@ -72,8 +75,8 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		timed_out: /\[timed out\]/.test(out),
 		error_files: errFilesAll.slice(0, 20),
 		failing_tests: failingTests,
-		errors_in_protected_tests_only: errFilesAll.length > 0 && errFilesAll.every((f) => testFiles.some((t) => f.endsWith(t))),
-		errors_in_changed_files: errFilesAll.filter((f) => gate.changedFiles.some((c) => f.endsWith(c))).length,
+		errors_in_protected_tests_only: inTests,
+		errors_in_changed_files: errFilesAll.filter((f) => gate.changedFiles.some((c) => samePath(f, c))).length,
 		gate_report: out.slice(-3000),
 		previous_report: previous?.steps.find((s) => !s.ok)?.output.slice(-1500) ?? "",
 		previous_stage: previous?.failedStep ?? null,
@@ -122,6 +125,13 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	// ask_human asks nobody yet: unit.ts lets the doctor and the setup model try first (most such failures never needed a person)
 	setDecisionAction(d.ledger, dec.decisionId, action);
 	return { action, cause, confidence: dec.confidence, sure, decisionId: dec.decisionId, reason };
+}
+
+/** One path names the other: tools print paths relative to the project, the repo or absolute, so either may be the longer one. */
+function samePath(a: string, b: string): boolean {
+	const x = a.replace(/^\.\//, "");
+	const y = b.replace(/^\.\//, "");
+	return x === y || x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
 }
 
 function deterministic(d: TriageDeps, unitId: string, cause: string, action: TriageAction, reason: string): Triage {

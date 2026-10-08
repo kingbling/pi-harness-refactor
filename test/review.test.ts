@@ -56,6 +56,47 @@ describe("wired_ok: the reviewer model", () => {
 		expect(seen[0]!.writeGlobs).toEqual([]);
 	});
 
+	it("judges against the facts: write scope, policy, decided quirks, truth, planned owners, legacy callers, packages; out-of-scope asks are not findings", async () => {
+		const { dir, ledger, config } = project();
+		const sym = (unit: string, file: string, name: string, kind = "class") => {
+			ledger.upsertFile({ path: file, hash: "h", lang: "php", loc: 10 });
+			ledger.upsertSymbol({ id: `${file}::${name}`, path: file, kind, name });
+			ledger.createUnit({ id: unit, tier: "T1", deps: [], meta: { files: [file] }, symbolIds: [`${file}::${name}`] });
+		};
+		sym("U10", "app/Campaign.php", "Campaign");
+		sym("U20", "app/Mailer.php", "Mailer");
+		sym("U30", "app/Factory.php", "Factory");
+		ledger.db.prepare("INSERT INTO index_deps(from_id, to_id, kind) VALUES (?, ?, ?)").run("app/Campaign.php::Campaign", "app/Mailer.php::Mailer", "new");
+		ledger.db.prepare("INSERT INTO index_deps(from_id, to_id, kind) VALUES (?, ?, ?)").run("app/Factory.php::Factory", "app/Campaign.php::Campaign", "new");
+		ledger.db.prepare("INSERT INTO index_literal_refs(name, path, line) VALUES (?, ?, ?)").run("Campaign", "app/registry.php", 4);
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('U10#1', 'U10', 'app/Campaign.php::Campaign', '[]', '1', 1, 'now')").run();
+		ledger.db.prepare("INSERT INTO quirks(unit_id, symbol_id, kind, behaviour, opinion, why, status, decided_by, created_at) VALUES ('U10', 'app/Campaign.php::Campaign', 'language_artifact', 'loose in_array matches \"1\" and 1', 'drop', 'type juggling only', 'dropped', 'tester', 'now')").run();
+		ledger.setMeta("framework_plan", JSON.stringify({ libraries: [{ name: "acme/mail", verdict: "replace", successor: "symfony/mailer" }] }));
+		let task = "";
+		let system = "";
+		const spawn = (async (opts: SpawnOptions) => {
+			system = opts.systemPrompt ?? "";
+			return {
+				run: async (t: string) => {
+					task = t;
+					await (opts.customTools!.find((x) => x.name === "review_verdict") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { ok: false, findings: [], outOfScope: [{ problem: "the manifest does not map the Campaign namespace", fix: "add the mapping" }] });
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			} as unknown as LeafSession;
+		}) as never;
+		const r = await reviewWithModel({ ledger, config, root: dir, unitId: "U10", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: ["app/Campaign.php"], changedFiles: ["src/features/campaign/campaign.service.ts"], writeGlobs: ["src/features/campaign/**"], spawn });
+		expect(task).toContain("The implementer may write only: src/features/campaign/**");
+		expect(task).toMatch(/Behaviour policy:[\s\S]*not pinned/);
+		expect(task).toMatch(/loose in_array .* → dropped/);
+		expect(task).toContain("app/Campaign.php::Campaign: 1 case(s)");
+		expect(task).toMatch(/app\/Mailer\.php::Mailer \(unit U20, planned, app\/Mailer\.php\)/);
+		expect(task).toMatch(/Can the new code be reached the way these callers reached the old code\?\n- app\/Factory\.php::Factory \(new, unit U30\)\n- app\/registry\.php names "Campaign"/);
+		expect(task).toContain("- acme/mail: replace → symfony/mailer");
+		expect(system).toMatch(/goes in outOfScope, never in findings/);
+		expect(r).toMatchObject({ ok: false, judged: true, outOfScope: "- the manifest does not map the Campaign namespace → add the mapping" });
+	});
+
 	it("no verdict (provider down, session cut) passes as not judged, marked in the evidence", async () => {
 		const { dir, ledger, config } = project();
 		const review = (changedFiles: string[]) => reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles, spawn: reviewerSession(undefined) });

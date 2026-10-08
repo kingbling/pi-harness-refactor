@@ -27,7 +27,7 @@ export function rulesText(root: string, stackId: string, moduleDir?: string): st
  * The migration policy (stack-neutral, decided by the owner): behaviour real callers observe is preserved;
  * artifacts of the old language are not; every quirk is recorded with an opinion and decided by the owner.
  */
-function behaviourPolicy(source: SourceAdapter, recorder = "record_quirk"): string {
+export function behaviourPolicy(source: SourceAdapter, recorder = "record_quirk"): string {
 	const artifacts = source.traits?.languageArtifacts;
 	return `Behaviour policy:
 - Preserve what real callers observe: outputs, side effects, errors, ordering, for the inputs the callers actually pass (who_calls shows them). Inputs outside the target's types (values of the wrong type or shape where the target declares one) are not pinned — the target's types exclude them.
