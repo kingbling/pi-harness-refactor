@@ -173,13 +173,17 @@ export interface FileIndex {
 	containers?: CodeContainer[];
 }
 
+/** What a data store is: relational and document stores hold data to migrate; the others are infrastructure. */
+export type StoreKind = "relational" | "document" | "cache" | "search" | "queue";
+export const STORE_KINDS: StoreKind[] = ["relational", "document", "cache", "search", "queue"];
+
 export interface SourceAdapter {
 	id: string;
 	/** File globs this adapter owns (relative to the source root). */
 	include: string[];
 	exclude: string[];
-	/** Language-specific data-store signals (package manifests, DSN strings) for `br init`'s survey. */
-	dbSignals?(root: string): Array<{ engine: string; evidence: string }>;
+	/** Language-specific data-store signals (package manifests, DSN strings) for `br init`'s survey. `kind` decides whether it holds data to migrate. */
+	dbSignals?(root: string): Array<{ engine: string; evidence: string; kind?: StoreKind }>;
 	/** Autodetect from the repo; returns a confidence 0..1 and detected framework/version if any. */
 	detect(root: string): Promise<{ confidence: number; framework?: string; version?: string }>;
 	indexFile(root: string, relPath: string, source: string): Promise<FileIndex>;

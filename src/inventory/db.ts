@@ -1,15 +1,20 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { open } from "node:fs/promises";
-import { basename, extname, join, relative } from "node:path";
+import { basename, extname, join, normalize, relative } from "node:path";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { DatabaseSync } from "node:sqlite";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { TARGET_ROLES } from "../adapters/registry.ts";
+import { findSourceAdapter, TARGET_ROLES } from "../adapters/registry.ts";
 import { answerValue, askViaModel } from "../jev/ask.ts";
 import { kebab } from "../run/areas.ts";
 import { progress } from "../progress.ts";
+import { PLAIN_LANGUAGE } from "../policy.ts";
+import { spawnLeaf } from "../sessions/spawn.ts";
+import { workspaceRoot } from "../spend.ts";
 
 /**
  * The database lane: only when the survey detected a data store (config.db.from) and the strategy is not
@@ -86,8 +91,23 @@ export interface DbPrompter {
 	log(line: string): void;
 }
 
-/** Engines with a SQL schema (DDL); the others (document/graph stores) get an export path instead. */
+/** Engines with a SQL schema (DDL); the others (document/graph stores) get an export path instead. Fallback only: the source adapter's store kind decides when it gives one. */
 export const RELATIONAL = new Set(["mariadb", "mysql", "postgresql", "sqlite", "sqlserver", "oracle"]);
+
+/** Has a SQL schema: the kind the source adapter gave the store (a generated adapter's model names it), else the fallback list. */
+export function relationalCheck(config: Config): (engine: string) => boolean {
+	let signals: Array<{ engine: string; kind?: string }> = [];
+	try {
+		signals = findSourceAdapter(config.source.stack)?.dbSignals?.(config.source.path) ?? [];
+	} catch {
+		/* no adapter: the fallback list decides */
+	}
+	const kinds = new Map(signals.filter((x) => x.kind).map((x) => [x.engine.toLowerCase(), x.kind]));
+	return (e) => {
+		const k = kinds.get(e.toLowerCase());
+		return k ? k === "relational" : RELATIONAL.has(e.toLowerCase());
+	};
+}
 const BIG = 50_000_000;
 
 /** Many files shown as their folders: "app/install/old/ (77 .sql files)"; few files as they are. */
@@ -112,8 +132,9 @@ type DbInputs = Pick<Config["db"], "schemaFiles" | "snapshot" | "url" | "exports
  */
 export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean, o: { client?: ModelClient; model?: string } = {}): Promise<DbInputs> {
 	const found = findDbFiles(config.source.path);
-	const sql = config.db.from.filter((e) => RELATIONAL.has(e.toLowerCase()));
-	const docs = config.db.from.filter((e) => !RELATIONAL.has(e.toLowerCase()));
+	const relational = relationalCheck(config);
+	const sql = config.db.from.filter(relational);
+	const docs = config.db.from.filter((e) => !relational(e));
 	const detected: DbInputs = { schemaFiles: sql.length ? found.schema : [], snapshot: sql.length ? found.dumps[0] : undefined, url: config.db.url, exports: {} };
 	if (yes) return detected;
 	const exists = (p: string) => existsSync(abs(config, p.replace(/\/$/, "")));
@@ -244,9 +265,10 @@ const scanned = new Map<string, DbTable[]>();
  * Tables from the schema inputs. SQL: CREATE TABLE statements (ALTERs are appended to their table), read as a
  * stream so a full data dump of any size works (INSERT lines are skipped without being kept); SQLite:
  * sqlite_master; Prisma: model blocks; migration code: Schema::create / createTable / create_table.
- * Unknown formats yield no tables (the files still reach the units as raw schema text).
+ * Unknown formats yield no tables here; then the tables a model found with tools are used (`findTablesByModel`),
+ * else none (the files still reach the units as raw schema text).
  */
-export async function readSchema(config: Config, log: (l: string) => void = (l) => progress.log(l)): Promise<DbTable[]> {
+export async function readSchema(config: Config, log: (l: string) => void = (l) => progress.log(l), root: string | undefined = workspaceRoot()): Promise<DbTable[]> {
 	const tables = new Map<string, DbTable>();
 	const add = (t: DbTable) => {
 		const key = t.name.toLowerCase();
@@ -267,7 +289,102 @@ export async function readSchema(config: Config, log: (l: string) => void = (l) 
 		}
 		for (const t of found) add(t);
 	}
+	if (!tables.size && root) for (const t of modelTables(config, root)) add(t);
 	return [...tables.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Where the tables a model found are kept (data, re-read by every readSchema). */
+export const foundTablesPath = (root: string) => join(root, ".bigrefactor", "db-tables.json");
+type FoundTables = { at: string; inputs: string[]; tables: Array<{ name: string; file: string; line: number }> };
+
+function loadFoundTables(root: string): FoundTables | undefined {
+	try {
+		return JSON.parse(readFileSync(foundTablesPath(root), "utf8")) as FoundTables;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The stored model-found tables, each with its definition read from the file it names (the source, not the model's words). */
+function modelTables(config: Config, root: string): DbTable[] {
+	const found = loadFoundTables(root);
+	if (!found) return [];
+	const files = new Map<string, string[]>();
+	const out: DbTable[] = [];
+	for (const t of found.tables) {
+		let lines = files.get(t.file);
+		if (!lines) {
+			try {
+				lines = readFileSync(join(config.source.path, t.file), "utf8").split("\n");
+			} catch {
+				continue;
+			}
+			files.set(t.file, lines);
+		}
+		out.push({ name: t.name, ddl: lines.slice(Math.max(0, t.line - 1), t.line + 59).join("\n").slice(0, 1500), from: `${t.file}:${t.line}`, dbs: [] });
+	}
+	return out;
+}
+
+/**
+ * When no parser reads a table from the schema inputs (Rails schema.rb, Django migrations, JPA entities, an ORM's
+ * model classes, …) but there is a database: ONE read-only tool session (read/grep/find/ls in the legacy repo)
+ * lists the tables or collections with the file and line that defines each. Code checks every file exists and
+ * stores the list as data (`.bigrefactor/db-tables.json`); readSchema reads the definitions from those files.
+ * Asked again only when the schema inputs change.
+ */
+export async function findTablesByModel(config: Config, root: string, o: { spawn?: typeof spawnLeaf; log?: (l: string) => void } = {}): Promise<{ tables: number; costUsd: number }> {
+	const prev = loadFoundTables(root);
+	if (prev && JSON.stringify(prev.inputs) === JSON.stringify(config.db.schemaFiles)) return { tables: prev.tables.length, costUsd: 0 };
+	const got = new Map<string, { name: string; file: string; line: number }>();
+	let rejected = 0;
+	const tool = {
+		name: "record_tables",
+		label: "Record tables",
+		description: "Record tables (or collections) of the app's database: name = the table name in the database (not the class name), file = path relative to the legacy repo root of the file that defines it (a migration, a schema dump, an ORM model or entity class), line = the line where the definition starts. Call it as often as you like.",
+		promptSnippet: "record_tables: record each table with the file and line that defines it",
+		parameters: Type.Object({ tables: Type.Array(Type.Object({ name: Type.String(), file: Type.String(), line: Type.Integer() })) }),
+		execute: async (_id: string, p: { tables: Array<{ name: string; file: string; line: number }> }) => {
+			let ok = 0;
+			for (const t of p.tables) {
+				const file = normalize(String(t.file ?? "").replace(/^\.\//, ""));
+				const name = String(t.name ?? "").trim();
+				if (!name || file.startsWith("..") || file.startsWith("/") || !existsSync(join(config.source.path, file)) || !(t.line >= 1)) {
+					rejected++;
+					continue;
+				}
+				got.set(name.toLowerCase(), { name, file, line: t.line });
+				ok++;
+			}
+			const bad = p.tables.length - ok;
+			return { content: [{ type: "text" as const, text: `recorded ${ok}${bad ? `; ${bad} not recorded: the file must exist under the legacy root (relative path) and line must be >= 1` : ""}; ${got.size} in all` }], details: {} };
+		},
+	} as unknown as ToolDefinition;
+	let cost = 0;
+	let session: Awaited<ReturnType<typeof spawnLeaf>> | undefined;
+	try {
+		session = await (o.spawn ?? spawnLeaf)({
+			role: "review",
+			cwd: config.source.path,
+			config,
+			writeGlobs: [],
+			customTools: [tool],
+			transcriptPath: join(root, ".bigrefactor", "sessions", `__init__.db-tables.${Date.now()}.jsonl`),
+			systemPrompt: `You list the database tables of a legacy ${config.source.stack}${config.source.framework ? `/${config.source.framework}` : ""} app (${config.source.path}, read-only). It uses ${config.db.from.join(" + ")}. No parser could read its schema, so find where the tables are defined in this stack: a schema dump, migrations, ORM model or entity classes, a schema file of the framework. Use your tools (ls, find, grep, read). For each table the app's database has, record its name as the database knows it, with the file and line that defines it (prefer the latest full definition, e.g. a schema dump over old migrations). Leave out tables of the framework itself only when you are sure. Record with record_tables as you go.\n\n${PLAIN_LANGUAGE}`,
+		});
+		const r = await session.run(`Schema inputs the owner gave: ${config.db.schemaFiles.join(", ") || "none"}.\nList every table with record_tables, then end with one line.`);
+		cost += r.usage.cost;
+		if (r.error) o.log?.(`  db tables: the session ended with an error (${r.error})`);
+	} catch (e) {
+		o.log?.(`  db tables: no session (${(e as Error).message.split("\n")[0]}); the units get the raw schema files`);
+		return { tables: 0, costUsd: cost };
+	} finally {
+		session?.dispose();
+	}
+	const data: FoundTables = { at: new Date().toISOString(), inputs: config.db.schemaFiles, tables: [...got.values()].sort((a, b) => a.name.localeCompare(b.name)) };
+	writeFileSync(foundTablesPath(root), JSON.stringify(data, null, 2) + "\n");
+	o.log?.(`  db tables: no parser read the schema; a model found ${data.tables.length} table(s)${rejected ? `, ${rejected} rejected (file not found)` : ""}, $${cost.toFixed(4)}`);
+	return { tables: data.tables.length, costUsd: cost };
 }
 
 async function scanFile(f: string, rel: string, size: number, log: (l: string) => void): Promise<DbTable[]> {
@@ -648,7 +765,7 @@ export interface DbUnitMeta {
  * area (applyTableJudgement checks it); without one (tests, simulations, --no-llm) tables are grouped by name.
  * Tables not migrated are kept with their reason in the ledger (meta `db_tables`).
  */
-export async function planDbLane(ledger: Ledger, config: Config, o: { client?: ModelClient; root?: string; log?: (l: string) => void } = {}): Promise<{ units: string[]; tables: number; dropped: number; wired: number; removed: string[]; costUsd: number }> {
+export async function planDbLane(ledger: Ledger, config: Config, o: { client?: ModelClient; root?: string; log?: (l: string) => void; spawn?: typeof spawnLeaf } = {}): Promise<{ units: string[]; tables: number; dropped: number; wired: number; removed: string[]; costUsd: number }> {
 	const existing = ledger.listUnits().filter((u) => isDbUnitKind(u.kind));
 	const removeStale = (keep: Set<string>) => {
 		const removed: string[] = [];
@@ -662,14 +779,19 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 		const removed = removeStale(new Set());
 		return { units: [], tables: 0, dropped: 0, wired: wireDbDeps(ledger), removed, costUsd: 0 };
 	}
-	const tables = await readSchema(config);
+	let tables = await readSchema(config, undefined, o.root ?? workspaceRoot());
+	let costUsd = 0;
+	// no parser read a table: a model with tools finds them (only when models are on: a client, or a test's scripted session)
+	if (!tables.length && o.root && (o.client || o.spawn)) {
+		costUsd += (await findTablesByModel(config, o.root, { spawn: o.spawn, log: o.log })).costUsd;
+		tables = await readSchema(config, undefined, o.root);
+	}
 	const refactor = config.db.strategy === "new-schema";
 	const kind = refactor ? "db_design" : "db_schema";
 	const unitId = (group: string) => `${DB_UNIT_PREFIX}${refactor ? "design" : "schema"}_${group}`;
 	const started = existing.filter((u) => u.state !== "planned" && u.kind !== "db_data");
 	const pinned = new Set(started.flatMap((u) => ((JSON.parse(u.meta) as DbUnitMeta).tables ?? []).map((t) => t.toLowerCase())));
 	const taken = new Set(started.flatMap((u) => (u.id.startsWith(unitId("")) ? [u.id.slice(unitId("").length)] : [])));
-	let costUsd = 0;
 	let judged: TableJudgement = { databases: [], tables: [] };
 	let answer: { include?: boolean; question?: number } = {};
 	if (o.client && tables.some((t) => !pinned.has(t.name.toLowerCase()))) {
