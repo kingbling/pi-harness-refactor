@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { Config } from "../config.ts";
 import { answerValue, askViaModel, repoBrief } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -7,26 +7,31 @@ import type { ModelClient } from "../models/types.ts";
 import { kebab } from "./areas.ts";
 import { getSourceAdapter } from "../adapters/registry.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
+import { codePlace, covers, setTaxonomyRules, type PlacementRule } from "./placement.ts";
 
 /**
- * Area taxonomy. Placement derives an area per file, which on a real repo yields one area per legacy file name
- * (`metadataids`, `clock`, `catch400http`) and utilities posing as features. A tidy target needs a deliberate set
- * of business areas, so after placement one model pass looks at ALL areas at once (unit counts, sample files,
- * repo brief) and returns, per stack, a curated area set and a mapping for every current area:
- *   area     → merge into a business area (same or other stack)
+ * Area taxonomy: which legacy files make up which business area of the new codebase. Names alone do not tell
+ * (a word list guessed one area per legacy file name: `metadataids`, `clock`), so one model pass looks at the whole
+ * legacy folder tree (file counts, the ui/server fact the source adapter knows, which folders use which file) plus
+ * the repo brief and the areas placed so far, and returns, per stack, a curated area set and prefix rules:
+ *   area     → the files under the prefix belong to that business area
  *   shared   → cross-cutting code, lives in the stack's shared dir under a topic
  *   exclude  → not application code to migrate (tooling stubs, entry scripts, framework bootstrap) — always asked
- * Confident mappings (no stack change against a surface the source adapter knows) are applied (source "taxonomy") as `.bigrefactor/placement.json` rules (placement's override mechanism) and
- * on the units' `meta.place`; the rest become questions (phrased by a model; only those units wait). The result
- * is kept in `.bigrefactor/areas.json` for review.
+ * Confident area/shared rules go into `.bigrefactor/placement.json` (by "taxonomy", replacing its earlier ones);
+ * code only applies them (placement.ts). Planned units they now cover are moved there (source "taxonomy"). Files no
+ * rule covers are left to Jev, one unit at a time. The result is kept in `.bigrefactor/areas.json` for review.
  */
-export interface AreaMapping {
-	from: string; // "<stack>:<area>"
+export interface AreaRule {
+	prefix: string;
 	to: "area" | "shared" | "exclude";
 	stack: string;
 	area: string; // business area, or shared topic
 	confidence: number;
 	why: string;
+}
+/** An older area question's context: a mapping of a whole placed area (`from` = "<stack>:<area>"). */
+export interface AreaMapping extends Omit<AreaRule, "prefix"> {
+	from: string;
 }
 
 interface Deps {
@@ -36,7 +41,7 @@ interface Deps {
 	client?: ModelClient;
 }
 
-type Meta = { files?: string[]; place?: { stack: string; area: string; shared: boolean; source: string }; exclude?: { question: number; why: string }; taxonomyQuestion?: number; taxonomyKeep?: number };
+type Meta = { files?: string[]; lane?: string; route?: { has_ui?: number }; place?: { stack: string; area: string; shared: boolean; source: string }; exclude?: { question: number; why: string }; taxonomyQuestion?: number; taxonomyKeep?: number };
 
 const ACT = 0.8;
 
@@ -52,7 +57,7 @@ export function currentAreas(ledger: Ledger): Array<{ key: string; stack: string
 	const rows = ledger.db.prepare("SELECT state, meta FROM units").all() as Array<{ state: string; meta: string }>;
 	const by = new Map<string, { key: string; stack: string; area: string; shared: boolean; units: number; files: string[]; fixed?: string }>();
 	for (const r of rows) {
-		const m = JSON.parse(r.meta) as Meta & { lane?: string };
+		const m = JSON.parse(r.meta) as Meta;
 		if (!m.place?.area || m.exclude || m.lane === "db") continue; // the DB lane is no feature area
 		const key = `${m.place.stack}:${m.place.shared ? "shared/" : ""}${m.place.area}`;
 		const e = by.get(key) ?? by.set(key, { key, stack: m.place.stack, area: m.place.area, shared: m.place.shared, units: 0, files: [] }).get(key)!;
@@ -65,16 +70,21 @@ export function currentAreas(ledger: Ledger): Array<{ key: string; stack: string
 	return [...by.values()].sort((a, b) => b.units - a.units);
 }
 
-export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } = {}): Promise<{ applied: number; asked: number; areas: Record<string, string[]>; costUsd: number }> {
+export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } = {}): Promise<{ applied: number; moved: number; asked: number; areas: Record<string, string[]>; costUsd: number }> {
 	const log = opts.log ?? (() => {});
-	const none = { applied: 0, asked: 0, areas: {}, costUsd: 0 };
+	const none = { applied: 0, moved: 0, asked: 0, areas: {}, costUsd: 0 };
 	if (!d.client) return none;
+	const units = (d.ledger.db.prepare("SELECT id, state, deps, meta FROM units").all() as Array<{ id: string; state: string; deps: string; meta: string }>)
+		.map((u) => ({ ...u, m: JSON.parse(u.meta) as Meta }))
+		.filter((u) => u.m.files?.length && u.m.lane !== "db" && !u.m.exclude); // the DB lane is no feature area
+	if (!units.length) return none;
 	const areas = currentAreas(d.ledger);
-	if (!areas.length) return none;
 	// idempotent: when every feature area is already in the curated set (and no area question is pending), nothing to do
 	const prev = existsSync(areasPath(d.root)) ? (JSON.parse(readFileSync(areasPath(d.root), "utf8")) as { stacks?: Array<{ stack: string; areas: Array<{ name: string }> }> }) : undefined;
 	const curated = new Set((prev?.stacks ?? []).flatMap((s) => s.areas.map((a) => `${s.stack}:${kebab(a.name)}`)));
 	if (prev && areas.every((a) => a.shared || a.fixed || curated.has(`${a.stack}:${a.area}`))) return { ...none, areas: Object.fromEntries((prev.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])) };
+	const source = getSourceAdapter(d.config.source.stack);
+	const surfaceOf = (f: string) => source.placeFile?.(f, d.config.source.path)?.surface;
 	const brief = await repoBrief(d);
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -84,17 +94,17 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		schema: {
 			type: "object",
 			additionalProperties: false,
-			required: ["stacks", "mappings"],
+			required: ["stacks", "rules"],
 			properties: {
 				stacks: { type: "array", items: { type: "object", additionalProperties: false, required: ["stack", "areas"], properties: { stack: { type: "string" }, areas: { type: "array", items: { type: "object", additionalProperties: false, required: ["name", "purpose"], properties: { name: { type: "string" }, purpose: { type: "string" } } } } } } },
-				mappings: {
+				rules: {
 					type: "array",
 					items: {
 						type: "object",
 						additionalProperties: false,
-						required: ["from", "to", "stack", "area", "confidence", "why"],
+						required: ["prefix", "to", "stack", "area", "confidence", "why"],
 						properties: {
-							from: { type: "string" },
+							prefix: { type: "string", description: "a folder ending in / or a folder + file name start, exactly as in the tree" },
 							to: { type: "string", enum: ["area", "shared", "exclude"] },
 							stack: { type: "string", enum: d.config.target.stacks },
 							area: { type: "string", description: "business area name, or shared topic; kebab-case" },
@@ -108,67 +118,122 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		messages: [
 			{
 				role: "system",
-				content: `You design the feature-module structure of the NEW codebase (${d.config.target.stacks.join(" + ")}) a legacy app is migrated into. A new developer must find code by business concept. Rules:
+				content: `You design the feature-module structure of the NEW codebase (${d.config.target.stacks.join(" + ")}) a legacy app is migrated into, and say which legacy files go into which area. A new developer must find code by business concept. Rules:
 - Areas are business domains of THIS app (campaigns, flights, players, billing …), kebab-case, plural nouns where natural, consistent naming. Never a legacy file name, class name, technical layer or tool name.
 - Per stack, aim for roughly 12–40 areas; an area with fewer than 3 units must be a genuinely separate domain, otherwise merge it.
 - Utilities, base classes, formatting, pagination, clocks, HTTP helpers → "shared" with a topic (dates, http, formatting, pagination, errors …).
-- Server logic (models, data access, commands, jobs, mail rendering) belongs on the server stack; pages, templates, widgets and client scripts on the UI stack. Move a mapping to the other stack when the current one is wrong.
+- Server logic (models, data access, commands, jobs, mail rendering) belongs on the server stack; pages, templates, widgets and client scripts on the UI stack. Where the tree shows a ui/server fact for a folder, that fact decides the stack; your stack is used only where it shows none.
+- Answer with prefix rules. A prefix ending in "/" covers the whole folder; any other prefix covers the files whose name starts with it up to a "." (\`app/model/classes/campaign\` covers campaign.model.php and campaign.facade.php, not campaigns.model.php). The longest matching prefix wins: a folder rule plus file rules for the exceptions is enough.
+- Folders that hold one kind of file for all features (models, components, helpers, controllers) need file rules: use the names and the "used from" counts (which folders' code uses the file, ×n) to put each file with the feature that uses it; used by many features → shared.
+- Write a rule only where you are sure; another model places the files no rule covers one at a time.
 - "exclude" only for things that are not application behaviour to migrate (static-analysis stubs, entry/bootstrap scripts the new framework replaces); these are confirmed by the owner.
-- Return a mapping for EVERY current area (also ones that stay as they are). confidence = how sure you are (0–1).`,
+- Areas placed so far are listed with their units; FIXED areas stay as they are (keep their files there), others may be renamed or merged. confidence = how sure you are (0–1).`,
 			},
-			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nCurrent areas (key, units, sample files; FIXED areas stay as they are — map others into them where they fit):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n")}` },
+			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nLegacy folder tree (folder, files, ui/server fact; then each file name up to its first dot, ← used from folder ×n):\n${treeFacts(units, surfaceOf)}\n\nAreas placed so far (key, units, sample files):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n") || "none yet"}` },
 		],
 	});
 	let cost = brief.costUsd + res.usage.costUsd;
-	const j = (res.json ?? {}) as { stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose: string }> }>; mappings?: AreaMapping[] };
-	const mappings = (j.mappings ?? []).map((m) => ({ ...m, area: kebab(m.area) })).filter((m) => m.area && areas.some((a) => a.key === m.from) && d.config.target.stacks.includes(m.stack));
-	const out = { stacks: j.stacks ?? [], mappings, at: new Date().toISOString(), by: res.usage.model };
+	const j = (res.json ?? {}) as { stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose: string }> }>; rules?: AreaRule[] };
+	const files = units.flatMap((u) => u.m.files!);
+	// guards: a rule must cover a real file of the inventory and name a target stack
+	const rules = (j.rules ?? []).map((r) => ({ ...r, prefix: r.prefix.replace(/^\.\//, ""), area: kebab(r.area) })).filter((r) => r.prefix && (r.area || r.to === "exclude") && d.config.target.stacks.includes(r.stack) && files.some((f) => covers(r.prefix, f)));
+	const out = { stacks: j.stacks ?? [], rules, at: new Date().toISOString(), by: res.usage.model };
 	mkdirSync(dirname(areasPath(d.root)), { recursive: true });
 	writeFileSync(areasPath(d.root), JSON.stringify(out, null, 2) + "\n");
 
-	const source = getSourceAdapter(d.config.source.stack);
-	const rule = (f: string, m: AreaMapping) => ({ prefix: f, area: m.area, ...(source.placeFile?.(f, d.config.source.path)?.surface ? {} : { stack: m.stack }), ...(m.to === "shared" ? { shared: true } : {}) });
-	let applied = 0;
+	// confident rules: code applies them; the stack only where the adapter knows no surface for the covered files
+	const write: PlacementRule[] = rules
+		.filter((r) => r.to !== "exclude" && r.confidence >= ACT)
+		.map((r) => ({ prefix: r.prefix, area: r.area, ...(files.some((f) => covers(r.prefix, f) && surfaceOf(f)) ? {} : { stack: r.stack }), ...(r.to === "shared" ? { shared: true } : {}) }));
+	setTaxonomyRules(d.root, write);
+
+	// planned units the rules now cover move there; answers, owner keeps, open questions and FIXED areas stay
+	const fixed = new Set(areas.filter((a) => a.fixed).map((a) => a.key));
+	let moved = 0;
+	for (const u of units) {
+		const p = u.m.place;
+		if (u.state !== "planned" || !p || p.source === "answer" || u.m.taxonomyKeep || u.m.taxonomyQuestion || fixed.has(`${p.stack}:${p.shared ? "shared/" : ""}${p.area}`)) continue;
+		const c = codePlace(d.config, { files: u.m.files, route: u.m.route }, d.root);
+		if (c.unsure || c.place.source !== "override" || (c.place.stackId === p.stack && c.place.area === p.area && c.place.shared === p.shared)) continue;
+		d.ledger.updateUnit(u.id, { meta: { place: { stack: c.place.stackId, area: c.place.area, shared: c.place.shared, source: "taxonomy" } } });
+		moved++;
+	}
+
+	// exclusions are the owner's call: one question per rule; its units wait for the answer
 	let asked = 0;
-	const rules: Array<{ prefix: string; area: string; stack?: string; shared?: boolean }> = [];
-	for (const m of mappings) {
-		const cur = areas.find((a) => a.key === m.from)!;
-		const unchanged = m.to !== "exclude" && m.stack === cur.stack && m.area === cur.area && (m.to === "shared") === cur.shared;
-		if (unchanged || cur.fixed) continue;
-		const units = unitsOf(d.ledger, m.from);
-		// a stack change against a surface the source adapter knows is the rare exception: always asked
-		const surfaceKnown = units.some((u) => ((JSON.parse(u.meta) as Meta).files ?? []).some((f) => !!source.placeFile?.(f, d.config.source.path)?.surface));
-		const stackChange = m.stack !== cur.stack && surfaceKnown;
-		if (m.to !== "exclude" && m.confidence >= ACT && !stackChange) {
-			for (const u of units) {
-				const meta = JSON.parse(u.meta) as Meta;
-				d.ledger.updateUnit(u.id, { meta: { place: { stack: m.stack, area: m.area, shared: m.to === "shared", source: "taxonomy" } } });
-				for (const f of meta.files ?? []) rules.push(rule(f, m));
-			}
-			applied++;
-			continue;
-		}
-		const options = m.to === "exclude"
-			? [{ value: "exclude", facts: "do not migrate these units" }, { value: "keep", facts: `keep them in ${cur.key}` }]
-			: [{ value: "apply", facts: `${m.to === "shared" ? "shared topic" : "area"} ${m.stack}:${m.area}` }, { value: "keep", facts: `keep ${cur.key}` }];
+	for (const r of rules.filter((x) => x.to === "exclude")) {
+		const hit = units.filter((u) => u.state === "planned" && !u.m.taxonomyKeep && !u.m.taxonomyQuestion && u.m.files!.every((f) => covers(r.prefix, f)));
+		if (!hit.length) continue;
+		const sample = hit.flatMap((u) => u.m.files!).slice(0, 4);
+		const options = [{ value: "exclude", facts: "do not migrate these units" }, { value: "keep", facts: "migrate them like the rest" }];
 		const q = await askViaModel(d, {
 			point: "area_taxonomy",
-			facts: `Area review of the new codebase: ${cur.key} (${units.length} unit(s), e.g. ${cur.files.join(", ")}) should ${m.to === "exclude" ? "not be migrated" : `become ${m.to === "shared" ? "the shared topic" : "part of area"} ${m.stack}:${m.area}`}. Reason: ${m.why}. Model confidence ${m.confidence.toFixed(2)}.`,
+			facts: `Area review of the new codebase: ${r.prefix} (${hit.length} unit(s), e.g. ${sample.join(", ")}) should not be migrated. Reason: ${r.why}. Model confidence ${r.confidence.toFixed(2)}.`,
 			options,
-			recommended: options[0]!.value,
-			agentOpinion: m.why,
+			recommended: "exclude",
+			agentOpinion: r.why,
 			blocks: "none",
 			askedBy: "taxonomy",
-			context: { mapping: m },
+			context: { mapping: { ...r, from: r.prefix } },
 		});
 		cost += q.costUsd;
 		asked++;
 		// the units wait for the answer: placement treats a unit with an open taxonomy question as unplaced
-		for (const u of units) d.ledger.updateUnit(u.id, { meta: { taxonomyQuestion: q.id } });
+		for (const u of hit) d.ledger.updateUnit(u.id, { meta: { taxonomyQuestion: q.id } });
 	}
-	addPlacementRules(d.root, rules);
-	log(`areas: ${mappings.length} mapped, ${applied} applied, ${asked} asked; ${(j.stacks ?? []).map((s) => `${s.stack} ${s.areas.length} areas`).join(", ")}`);
-	return { applied, asked, areas: Object.fromEntries((j.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])), costUsd: cost };
+	log(`areas: ${rules.length} rules from the folder tree, ${write.length} applied, ${moved} unit(s) moved, ${asked} asked; ${(j.stacks ?? []).map((s) => `${s.stack} ${s.areas.length} areas`).join(", ")}`);
+	return { applied: write.length, moved, asked, areas: Object.fromEntries((j.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])), costUsd: cost };
+}
+
+/**
+ * The legacy folder tree as the area model sees it: per folder the file count and the surface facts; per file name
+ * (up to its first dot) which other folders' code uses it (from unit deps). Long trees are cut, never silently.
+ */
+function treeFacts(units: Array<{ id: string; deps: string; m: Meta }>, surfaceOf: (f: string) => "server" | "ui" | undefined, max = 120_000): string {
+	const filesOf = new Map(units.map((u) => [u.id, u.m.files!]));
+	const stemOf = (f: string) => `${dirname(f)}/${basename(f).split(".")[0]}`;
+	const usedFrom = new Map<string, Map<string, number>>(); // dir/stem → using folder → count
+	for (const u of units) {
+		const from = new Set(u.m.files!.map(dirname));
+		for (const dep of JSON.parse(u.deps) as string[]) {
+			for (const f of filesOf.get(dep) ?? []) {
+				for (const dir of from) {
+					if (dir === dirname(f)) continue;
+					const t = usedFrom.get(stemOf(f)) ?? usedFrom.set(stemOf(f), new Map()).get(stemOf(f))!;
+					t.set(dir, (t.get(dir) ?? 0) + 1);
+				}
+			}
+		}
+	}
+	const dirs = new Map<string, { files: number; ui: number; server: number; stems: Map<string, number> }>();
+	for (const f of new Set(units.flatMap((u) => u.m.files!))) {
+		const d = dirs.get(dirname(f)) ?? dirs.set(dirname(f), { files: 0, ui: 0, server: 0, stems: new Map() }).get(dirname(f))!;
+		d.files++;
+		const s = surfaceOf(f);
+		if (s) d[s]++;
+		d.stems.set(stemOf(f), (d.stems.get(stemOf(f)) ?? 0) + 1);
+	}
+	const lines: string[] = [];
+	let size = 0;
+	const sorted = [...dirs].sort((a, b) => a[0].localeCompare(b[0]));
+	for (const [i, [dir, d]] of sorted.entries()) {
+		const facts = [d.ui ? `ui ${d.ui}` : "", d.server ? `server ${d.server}` : ""].filter(Boolean).join(", ");
+		const block = [`${dir}/  ${d.files} file(s)${facts ? `  [${facts}]` : ""}`];
+		const stems = [...d.stems].sort((a, b) => a[0].localeCompare(b[0]));
+		for (const [stem, n] of stems.slice(0, 150)) {
+			const from = [...(usedFrom.get(stem) ?? [])].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([f, c]) => `${f} ×${c}`);
+			block.push(`  ${basename(stem)}${n > 1 ? ` (${n})` : ""}${from.length ? `  ← ${from.join(", ")}` : ""}`);
+		}
+		if (stems.length > 150) block.push(`  … ${stems.length - 150} more file names not shown`);
+		const text = block.join("\n");
+		if (size + text.length > max) {
+			lines.push(`… ${sorted.length - i} more folder(s) not shown (tree too long)`);
+			break;
+		}
+		lines.push(text);
+		size += text.length + 1;
+	}
+	return lines.join("\n");
 }
 
 /** Answered taxonomy questions → placement (apply), unchanged (keep) or excluded units. */
@@ -219,14 +284,6 @@ export function taxonomyHold(metaJson: string): string | undefined {
 	if (m.exclude) return `excluded from the migration (question #${m.exclude.question}: ${m.exclude.why})`;
 	if (m.taxonomyQuestion) return `waits for area question #${m.taxonomyQuestion}`;
 	return undefined;
-}
-
-function unitsOf(ledger: Ledger, key: string): Array<{ id: string; meta: string }> {
-	const [stack, rest] = [key.slice(0, key.indexOf(":")), key.slice(key.indexOf(":") + 1)];
-	const shared = rest.startsWith("shared/");
-	const area = shared ? rest.slice(7) : rest;
-	// only units that have not started move: migrated code is never relabelled behind the ledger's back
-	return ledger.db.prepare("SELECT id, meta FROM units WHERE state = 'planned' AND json_extract(meta,'$.place.stack') = ? AND json_extract(meta,'$.place.area') = ? AND COALESCE(json_extract(meta,'$.place.shared'), 0) = ?").all(stack, area, shared ? 1 : 0) as Array<{ id: string; meta: string }>;
 }
 
 function addPlacementRules(root: string, add: Array<{ prefix: string; area: string; stack?: string; shared?: boolean }>): void {

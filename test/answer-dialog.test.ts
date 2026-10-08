@@ -44,7 +44,7 @@ describe("/br answer applies every question type", () => {
 				if (sys.includes("curate")) return { json: { body: "## Errors\n- throw HttpException", merged: [], rejected: [], breaking: [{ id: 2, impact: "accepted controllers throw" }] } };
 				if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flight-slots.ts"], why: "name says nothing" }], conventions: [] } };
 				if (sys.includes("feature-module structure"))
-					return { json: { stacks: [{ stack: "nestjs", areas: [{ name: "flights", purpose: "flight booking" }] }], mappings: [{ from: "nestjs:flights", to: "area", stack: "nestjs", area: "flights", confidence: 0.95, why: "domain" }, { from: "nestjs:phpstan-stubs", to: "exclude", stack: "nestjs", area: "none", confidence: 0.99, why: "static-analysis stubs" }] } };
+					return { json: { stacks: [{ stack: "nestjs", areas: [{ name: "flights", purpose: "flight booking" }] }], rules: [{ prefix: "app/model/classes/", to: "area", stack: "nestjs", area: "flights", confidence: 0.95, why: "domain" }, { prefix: "phpstan-stubs/", to: "exclude", stack: "nestjs", area: "none", confidence: 0.99, why: "static-analysis stubs" }] } };
 				return undefined; // phrasing falls back to the unphrased facts
 			},
 		});

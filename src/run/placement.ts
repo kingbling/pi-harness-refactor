@@ -8,19 +8,20 @@ import { decide } from "../jev/decide.ts";
 import { JEV_ACT as ACT, noulConfidence, type Battery } from "../jev/questions.ts";
 import type { Ledger, UnitRow } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { genericArea, kebab, SHARED_AREA } from "./areas.ts";
+import { folderArea, kebab, SHARED_AREA } from "./areas.ts";
 import { areasPath, curateAreas, syncTaxonomyAnswers, taxonomyHold } from "./taxonomy.ts";
 
 /**
  * Where a unit lands in the target: which stack, which legacy area (one area = one feature module per stack),
  * and whether it is shared (cross-cutting, lives in the stack's shared dir). Pipeline (resolvePlacements):
  *
- *   code      the source adapter places each file (area + surface); the unit takes the majority.
- *             `.bigrefactor/placement.json` rules override per file: { "rules": [{ "prefix", "area"?, "stack"?, "shared"? }] },
- *             longest prefix wins.
+ *   rules     `.bigrefactor/placement.json`: { "rules": [{ "prefix", "area"?, "stack"?, "shared"?, "by"? }] }, longest
+ *             prefix wins. The taxonomy model writes them from the folder tree (taxonomy.ts, by "taxonomy"), answers
+ *             add rules for similar files, the owner may add his own. Code only applies them, per file; the unit
+ *             takes the majority. The source adapter adds the facts it knows (surface ui/server, rarely an area).
  *   shared    a unit whose same-stack dependents span ≥ 2 other feature areas is shared (no question), unless its
  *             own area is a feature module (other units there): then the others import it from that module.
- *   model     code unsure (adapter has no answer, tied files, unknown surface) → Jev picks among candidate areas.
+ *   model     code unsure (no rule covers a file, tied files, unknown surface) → Jev picks among candidate areas.
  *   ask       Jev below ACT → one ledger question (phrased by askViaModel); only that unit waits. The answer is
  *             persisted on the unit and as a prefix rule so similar files are not asked again.
  *
@@ -43,11 +44,13 @@ interface StoredPlace {
 	confidence?: number;
 	decision?: number;
 }
-interface PlacementRule {
+export interface PlacementRule {
 	prefix: string;
 	area?: string;
 	stack?: string;
 	shared?: boolean;
+	/** "taxonomy": written by the area model; its next pass replaces them. Answers' and the owner's rules stay. */
+	by?: "taxonomy";
 }
 type UnitMeta = { files?: string[]; route?: { has_ui?: number }; place?: StoredPlace; placeQuestion?: number };
 
@@ -77,7 +80,7 @@ export function unplacedReason(config: Config, metaJson: string, root?: string):
 }
 
 /** A rule prefix covers a file only up to a name boundary: `a/list.` never matches `a/listing.x`, `a/sso` not `a/ssox`. */
-function covers(prefix: string, f: string): boolean {
+export function covers(prefix: string, f: string): boolean {
 	if (!f.startsWith(prefix)) return false;
 	return f.length === prefix.length || /[./]$/.test(prefix) || f[prefix.length] === "." || f[prefix.length] === "/";
 }
@@ -99,9 +102,9 @@ export function codePlace(config: Config, meta: UnitMeta, root?: string): { plac
 		const p = source.placeFile?.(f, config.source.path);
 		if (rule) fromRule = true;
 		if (rule?.shared) shared = true;
-		if (!p?.area && !rule?.area) why.push(`no adapter area for ${f}`);
+		if (!p?.area && !rule?.area) why.push(`no area rule for ${f}`);
 		const surface = p?.surface ?? labelled;
-		return { area: kebab(rule?.area ?? p?.area ?? genericArea(f, source.traits?.layerDirs)) || SHARED_AREA, stack: rule?.stack ?? (surface ? stackFor(config, surface) : undefined) };
+		return { area: kebab(rule?.area ?? p?.area ?? folderArea(f)) || SHARED_AREA, stack: rule?.stack ?? (surface ? stackFor(config, surface) : undefined) };
 	});
 	const area = majority(votes.map((v) => v.area));
 	const stacks = votes.map((v) => v.stack).filter((s): s is string => !!s);
@@ -149,7 +152,7 @@ export interface PlacementDeps {
 	log?: (l: string) => void;
 	/** Recompute units that already have a placement (planned ones only). */
 	force?: boolean;
-	/** Curate the whole area set (escalate model, taxonomy.ts) between the code and the model pass: label / br place only. */
+	/** Let the area model write the area rules from the folder tree (taxonomy.ts) between the code and the model pass: label / br place only. */
 	curate?: boolean;
 	concurrency?: number;
 }
@@ -522,6 +525,15 @@ export function pruneRules(root: string, config: Config): string[] {
 	writeFileSync(file, JSON.stringify({ rules: keep }, null, 2) + "\n");
 	rulesCache = undefined;
 	return rules.filter((r) => !keep.includes(r)).map((r) => `${r.prefix}${r.stack ? ` (${r.stack})` : ""}`);
+}
+
+/** The area model's rules replace its earlier ones; answers' and the owner's rules stay and win on the same prefix. */
+export function setTaxonomyRules(root: string, add: PlacementRule[]): void {
+	const kept = loadRules(root).filter((r) => r.by !== "taxonomy");
+	const file = rulesFile(root);
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(file, JSON.stringify({ rules: [...kept, ...add.filter((a) => !kept.some((r) => r.prefix === a.prefix)).map((a) => ({ ...a, by: "taxonomy" as const }))] }, null, 2) + "\n");
+	rulesCache = undefined;
 }
 
 function addRules(root: string, add: PlacementRule[]): void {

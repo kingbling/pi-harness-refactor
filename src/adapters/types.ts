@@ -83,7 +83,7 @@ export interface SourceTraits {
 	languageArtifacts?: string[];
 	/** Shell commands that would change the legacy checkout or its dependencies (refused in agent sessions). */
 	mutatingCommands?: RegExp;
-	/** Directory names that are technical layers of this ecosystem, never business areas (lowercase). */
+	/** Directory names that are technical layers of this ecosystem (lowercase). Not used for placement: the area model reads the folder tree. */
 	layerDirs?: string[];
 	/** Directories holding third-party dependencies or build output (skipped by surveys and scans). */
 	vendorDirs?: string[];
@@ -238,8 +238,8 @@ export interface SourceAdapter {
 	 * Where one source file belongs in the target: its legacy feature `area` (kebab-case, no dots; one area =
 	 * one feature module per target stack) and its `surface` (ui → the UI target, server → the backend).
 	 * `root` (the legacy source root) lets the adapter canonicalize names against the whole tree; callers go
-	 * through placeUnit (src/run/placement.ts), which always passes it. Undefined = not sure: the core falls back to a
-	 * generic guess and lets a model (then a human) decide. `area` may be missing while `surface` is certain (the
+	 * through placeUnit (src/run/placement.ts), which always passes it. Undefined = not sure. Areas normally come from
+	 * the area model's prefix rules (src/run/taxonomy.ts), not from the adapter; a file no rule covers goes to Jev (then a human). `area` may be missing while `surface` is certain (the
 	 * adapter knows a file is server code but not its feature): the model then picks only the area, never the stack.
 	 */
 	placeFile?(path: string, root?: string): { area?: string; surface: "server" | "ui" } | undefined;

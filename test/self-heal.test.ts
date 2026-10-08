@@ -214,10 +214,10 @@ describe("area curation never touches migrated code", () => {
 			chat: () => ({
 				json: {
 					stacks: [{ stack: "nestjs", areas: [{ name: "billing", purpose: "invoices" }] }],
-					mappings: [
-						{ from: "nestjs:metadataids", to: "area", stack: "nestjs", area: "billing", confidence: 0.99, why: "ids belong to billing" },
-						{ from: "nestjs:clock", to: "exclude", stack: "nestjs", area: "none", confidence: 0.9, why: "tooling" },
-						{ from: "nestjs:invoice-utils", to: "area", stack: "nestjs", area: "billing", confidence: 0.5, why: "maybe billing" },
+					rules: [
+						{ prefix: "src/A2", to: "area", stack: "nestjs", area: "billing", confidence: 0.99, why: "ids belong to billing" },
+						{ prefix: "src/B1", to: "exclude", stack: "nestjs", area: "none", confidence: 0.9, why: "tooling" },
+						{ prefix: "src/C1", to: "area", stack: "nestjs", area: "billing", confidence: 0.5, why: "maybe billing" },
 					],
 				},
 			}),
@@ -226,10 +226,11 @@ describe("area curation never touches migrated code", () => {
 		const r = await curateAreas(d);
 		// metadataids has an accepted unit: not relabelled, not asked
 		expect(JSON.parse(ledger.getUnit("A2")!.meta).place.area).toBe("metadataids");
-		expect(r.asked).toBe(2);
+		// a rule below the confidence to act is not applied and not asked: Jev places what no rule covers
+		expect(JSON.parse(ledger.getUnit("C1")!.meta).place.area).toBe("invoice-utils");
+		expect(r.asked).toBe(1);
 		const qs = ledger.openQuestions();
-		ledger.answerQuestion(qs.find((q) => q.question.includes("clock") || JSON.parse(q.context ?? "{}").mapping?.from === "nestjs:clock")!.id, "keep");
-		ledger.answerQuestion(qs.find((q) => JSON.parse(q.context ?? "{}").mapping?.from === "nestjs:invoice-utils")!.id, "keep");
+		ledger.answerQuestion(qs.find((q) => JSON.parse(q.context ?? "{}").mapping?.from === "src/B1")!.id, "keep");
 		syncTaxonomyAnswers(d);
 		// keep is remembered: a second curation pass asks nothing about these areas
 		expect(currentAreas(ledger).find((a) => a.area === "clock")!.fixed).toMatch(/owner kept/);

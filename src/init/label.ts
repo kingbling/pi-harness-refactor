@@ -6,7 +6,7 @@ import { decide } from "../jev/decide.ts";
 import { JEV_ACT as ACT, noulConfidence, ROUTE_UNIT, unitDifficulty, type Battery } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { planSlices, type SliceOverrides } from "../inventory/slices.ts";
+import { authWord, planSlices, type SliceOverrides } from "../inventory/slices.ts";
 import { resolvePlacements } from "../run/placement.ts";
 
 /**
@@ -93,7 +93,9 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 	const advised = (ov.advised ??= {});
 	let auth: string[] = advised.auth ?? [];
 	if (features.length && !advised.auth) {
-		const battery: Battery = Object.fromEntries(features.map((s) => [s.name.replace(/[^A-Za-z0-9_]/g, "_"), { type: "noul", instructions: `Is the feature slice "${s.name}" (entry points: ${s.entryPoints.slice(0, 12).join(", ")}) about authentication, login, sessions or user identity, so that other features depend on it?` }]));
+		// a name match is one fact for Jev (it also hits `authors`, `sessions` of a training app); Jev decides
+		const fact = (s: (typeof features)[number]) => { const w = authWord(s.name, s.entryPoints); return w ? ` Fact: its name or an entry point contains "${w}" (a word match only, not a verdict).` : ""; };
+		const battery: Battery = Object.fromEntries(features.map((s) => [s.name.replace(/[^A-Za-z0-9_]/g, "_"), { type: "noul", instructions: `Is the feature slice "${s.name}" (entry points: ${s.entryPoints.slice(0, 12).join(", ")}) about authentication, login, sessions or user identity, so that other features depend on it?${fact(s)}` }]));
 		const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_auth", { app: config.source.framework ?? config.source.stack }, battery, Object.keys(battery));
 		cost += r.costUsd;
 		auth = features.filter((s) => { const a = r.answers[s.name.replace(/[^A-Za-z0-9_]/g, "_")]; return a?.type === "noul" && a.noul >= 0.5 && noulConfidence(a.noul) >= ACT; }).map((s) => s.name);
