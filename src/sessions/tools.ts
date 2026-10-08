@@ -143,6 +143,9 @@ export function readFunctionTool(d: ToolDeps): ToolDefinition {
 	});
 }
 
+/** A stack without a symbol index (generated adapters): the lookups cannot tell what exists, so the model searches. */
+const noIndex = (d: ToolDeps) => (d.adapter.indexFile ? "" : `the ${d.adapter.id} stack has no symbol index, so this tool cannot tell what code exists: search the target project with grep, ls and read before writing anything new`);
+
 export function targetLookup(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "target_lookup",
@@ -153,6 +156,7 @@ export function targetLookup(d: ToolDeps): ToolDefinition {
 		execute: async (_id, p) => {
 			if (p.query === "*" && d.moduleDir) {
 				const rows = d.ledger.db.prepare("SELECT id, kind, path, line, signature FROM index_symbols WHERE side = 'target' AND path LIKE ? AND tags LIKE ? ORDER BY path, line LIMIT 60").all(`${d.moduleDir}/%`, stackTagLike(d.adapter.id)) as Array<any>;
+				if (!rows.length && noIndex(d)) return text(`${noIndex(d)} (start with ls ${d.moduleDir}/)`);
 				return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}] ${r.path}:${r.line}${r.signature ? ` ${r.signature}` : ""}`).join("\n") : `the area module ${d.moduleDir}/ is empty — you create its first files`);
 			}
 			const viaMoves = d.ledger.db.prepare("SELECT src_symbol, op, target_symbols, why FROM moves WHERE src_symbol = ? OR src_symbol LIKE ?").all(p.query, `%::${p.query}`) as Array<{ src_symbol: string; op: string; target_symbols: string; why: string }>;
@@ -162,6 +166,7 @@ export function targetLookup(d: ToolDeps): ToolDefinition {
 			const out: string[] = [];
 			for (const m of viaMoves) out.push(`${m.src_symbol} was ${m.op} → ${JSON.parse(m.target_symbols).join(", ")}  (${m.why})`);
 			for (const r of direct) out.push(`${r.id}  [${r.kind}] ${r.path}:${r.line}${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`);
+			if (noIndex(d)) out.push(`(${noIndex(d)})`);
 			return text(out.length ? out.join("\n") : `nothing in the target codebase matches "${p.query}" — you are creating it`);
 		},
 	});
@@ -178,7 +183,8 @@ export function patternExamples(d: ToolDeps): ToolDefinition {
 			const rows = d.ledger.db.prepare("SELECT path FROM index_symbols WHERE side = 'target' AND kind = ? AND tags LIKE ? GROUP BY path ORDER BY MAX(path LIKE ?) DESC, MAX(rowid) DESC LIMIT ?").all(p.kind, stackTagLike(d.adapter.id), d.moduleDir ? `${d.moduleDir}/%` : "", p.limit ?? 3) as Array<{ path: string }>;
 			if (!rows.length) {
 				const idioms = safeRead(join(rulesDir(d.root, d.adapter.id), "idioms.json"));
-				return text(`no accepted ${p.kind} yet. Follow RULES.md and the idiom table${idioms ? `:\n${idioms.slice(0, 3000)}` : ""}.`);
+				const head = noIndex(d) ? `no examples listed: ${noIndex(d)} (accepted files of this kind may exist).` : `no accepted ${p.kind} yet.`;
+				return text(`${head} Follow RULES.md and the idiom table${idioms ? `:\n${idioms.slice(0, 3000)}` : ""}.`);
 			}
 			return text(rows.map((r) => `### ${r.path}\n\`\`\`${d.adapter.layout.lang(r.path) ?? ""}\n${safeRead(join(d.targetProjectDir, r.path))?.slice(0, 4000) ?? "(missing)"}\n\`\`\``).join("\n\n"));
 		},
@@ -194,6 +200,7 @@ export function sharedLookup(d: ToolDeps): ToolDefinition {
 		parameters: Type.Object({ query: Type.Optional(Type.String()) }),
 		execute: async (_id, p) => {
 			const rows = sharedSymbols(d.ledger, d.adapter.layout.sharedDirs, p.query, 40, d.adapter.id);
+			if (!rows.length && noIndex(d)) return text(`${noIndex(d)}; shared helpers live in topic folders under ${d.adapter.layout.sharedDirs.join(" | ") || "the shared dir"}: list them and read the files there`);
 			return text(rows.length ? rows.map((r) => `${r.id}  [${r.kind}]${r.signature ? ` ${r.signature}` : ""}${r.doc ? `\n    ${r.doc}` : ""}`).join("\n") : `no shared helpers${p.query ? ` match "${p.query}"` : " yet"} — cross-cutting helpers live in topic folders named after what they do (${d.adapter.layout.sharedDirs[0] ? slashed(d.adapter.layout.sharedDirs[0]) : "the shared dir/"}<topic>/), never named after an area; add a file with a doc comment to an existing topic, or keep the code in your module`);
 		},
 	});

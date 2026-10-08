@@ -15,9 +15,9 @@ const DEFAULT_DATA_DIRS = ["db/", "migrations/"];
 
 const TASK: Record<string, (m: DbUnitMeta & { group?: string }, dataDir: string) => string> = {
 	db_schema: (m) =>
-		`Migration lane (keep-schema): port these tables 1:1 to ${m.to ?? m.from.join("/")}. Same table and column names, every column, primary/unique keys, indexes and foreign keys kept; types translated from ${m.from.join("/")} to ${m.to ?? "the target engine"} without loss (lengths, precision, signedness, defaults, nullability, charset/collation notes as comments). Write the ORM schema/entities for them and the initial migration that creates exactly this schema.`,
+		`Migration lane (keep-schema): port these tables 1:1 to ${m.to ?? m.from.join("/")}. Same table and column names, every column, primary/unique keys, indexes and foreign keys kept; types translated from ${m.from.join("/")} to ${m.to ?? "the target engine"} without loss (lengths, precision, signedness, defaults, nullability, charset/collation notes as comments). Write the schema for them in this stack's data-access approach (its ORM entities/models, or SQL/schema files when the stack has no ORM) and the initial migration that creates exactly this schema.`,
 	db_design: (m, dataDir) =>
-		`Refactor lane (new-schema): design the target schema for these tables in ${m.to ?? "the target engine"}: clear names, proper types, keys and constraints, normalized where the legacy schema duplicates data. Write the ORM schema/entities, the migration that creates it, and ${dataDir}MAPPING.md with one line per legacy column: \`old_table.old_column → new_table.new_column (transformation)\`, or \`→ dropped (why)\`. Every legacy column appears in the mapping.`,
+		`Refactor lane (new-schema): design the target schema for these tables in ${m.to ?? "the target engine"}: clear names, proper types, keys and constraints, normalized where the legacy schema duplicates data. Write the schema in this stack's data-access approach (its ORM entities/models, or SQL/schema files when the stack has no ORM), the migration that creates it, and ${dataDir}MAPPING.md with one line per legacy column: \`old_table.old_column → new_table.new_column (transformation)\`, or \`→ dropped (why)\`. Every legacy column appears in the mapping.`,
 	db_data: (m, dataDir) =>
 		`Data lane: write the data migration from ${m.from.join(" + ")} to ${m.to ?? "the target engine"} for every table (${m.strategy === "new-schema" ? `follow the MAPPING.md files under ${dataDir}` : "copy 1:1 into the ported schema"}). Idempotent and resumable (batches, upserts by key), keeps referential order, and verifies row counts per table at the end. Configuration by env vars only (source and target URLs), never hardcoded credentials.`,
 };
@@ -44,7 +44,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		`You are the database engineer of a legacy rewrite (${o.config.source.stack} → ${place.stackId}). You work in the target project; write ONLY under ${dataDirs.join(", ")}.`,
 		`Engines: ${meta.from.join(" + ")} → ${meta.to ?? "unchanged"}. Strategy: ${meta.strategy}. Stack choices: ${JSON.stringify(choices)}.`,
 		adapter.layout.dataAccessHint ? `Data access in this stack: ${adapter.layout.dataAccessHint}.` : "",
-		`Tests: ${adapter.layout.testHint} Write at least one test next to your files that proves the schema (entity/column metadata or the migration's DDL) — or for the data lane, the transformation on a small in-memory fixture. Tests must run without a live database.`,
+		`Tests: ${adapter.layout.testHint} Write at least one test next to your files that proves the schema (the tables' columns as the stack's data-access code declares them, or the migration's DDL) — or for the data lane, the transformation on a small in-memory fixture. Tests must run without a live database.`,
 		CODE_QUALITY,
 		goalsText(o.config.goals),
 		"Never write credentials. Never edit files outside your directories; other units build features on what you write, so names must match the legacy tables exactly unless your task says otherwise.",

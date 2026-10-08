@@ -305,6 +305,8 @@ export interface TargetLayout {
 	sharedDirs: string[];
 	/** Where the database lives in the project (schema, entities, migrations, data scripts): the DB lane writes only here. Trailing slash. */
 	dataDirs?: string[];
+	/** Files (globs, project-relative) where a feature is registered (route table, main module) when the adapter has no generateRegistration: the implementer may edit them to wire its unit. */
+	wiringFiles?: string[];
 	/** Globs (relative to the project) the tester may write ported tests to, for one module dir. */
 	testFileGlobs(moduleDir: string): string[];
 	isTestFile(path: string): boolean;

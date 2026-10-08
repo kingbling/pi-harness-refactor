@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -14,7 +15,7 @@ import { DEFAULT_FORBID_DIRS, normalize, slashed, validateLayoutRules, type Layo
  * manifest is verified on a scratch project: scaffold → build → probe test; failures go back to the model.
  *
  * Optional code hooks of hand-written adapters (symbol index, structure checks, registration wiring) are
- * absent: the gate runs without them, and units register their own wiring.
+ * absent: the gate runs without them, and units register their own wiring in the files layout.wiringFiles names.
  */
 export interface Cmd { cmd: string; args: string[] }
 export interface AdapterManifest {
@@ -36,8 +37,11 @@ export interface AdapterManifest {
 		packageName: string;
 		packageExamples: string[];
 		manifestFiles: string[];
-		/** Where installed package names are listed: a JSON manifest and the object keys holding them. */
-		installed: { file: string; keys: string[] };
+		/**
+		 * Where installed package names are listed: a JSON manifest and the object keys holding them, or (stacks without
+		 * a JSON manifest) a command printing them, one per line, with a regex whose first group is the name. Older manifests have no list.
+		 */
+		installed: { file: string; keys: string[]; list?: Cmd; listPattern?: string };
 		add: Cmd;
 		worktreeLinks: string[];
 		ignoredPaths: string[];
@@ -59,6 +63,10 @@ export interface AdapterManifest {
 		legacyMarker: string;
 		dataAccessHint: string;
 		ignoreDirs: string[];
+		/** Folders (trailing slash) where this stack keeps database code: schema/models, migrations, seeds. Older manifests have none. */
+		dataDirs?: string[];
+		/** Files (globs) where a feature is registered (route table, main module); empty when the framework finds features itself. Older manifests have none. */
+		wiringFiles?: string[];
 		/** The stack's official feature-folder convention as checkable data (proposed at onboarding; see rules/layout-rules.ts). Older manifests have none. */
 		rules?: LayoutRules;
 	};
@@ -116,14 +124,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 			packageExamples: m.toolchain.packageExamples,
 			isProjectReady: (dir) => existsSync(join(dir, m.scaffold.readyFile)),
 			manifestFiles: m.toolchain.manifestFiles,
-			installedPackages: (dir) => {
-				try {
-					const j = JSON.parse(readFileSync(join(dir, m.toolchain.installed.file), "utf8")) as Record<string, Record<string, unknown>>;
-					return m.toolchain.installed.keys.flatMap((k) => Object.keys(j[k] ?? {}));
-				} catch {
-					return [];
-				}
-			},
+			installedPackages: (dir) => installedPackages(m, dir),
 			addPackages: (_dir, packages) => expand(m.toolchain.add, { packages }),
 			worktreeLinks: m.toolchain.worktreeLinks,
 			ignoredPaths: m.toolchain.ignoredPaths,
@@ -141,6 +142,8 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 			testHint: m.layout.testHint,
 			legacyMarker: (why) => m.layout.legacyMarker.replace(/\{why\}/g, why),
 			dataAccessHint: m.layout.dataAccessHint || undefined,
+			...(m.layout.dataDirs?.length ? { dataDirs: m.layout.dataDirs.map(slashed) } : {}),
+			...(m.layout.wiringFiles?.length ? { wiringFiles: m.layout.wiringFiles } : {}),
 			ignoreDirs: m.layout.ignoreDirs,
 		},
 		probeTest: () => m.probeTest,
@@ -170,17 +173,40 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 	};
 }
 
+/** Package names the project has: from the JSON manifest when the stack has one, else from the list command's output. */
+function installedPackages(m: AdapterManifest, dir: string): string[] {
+	const inst = m.toolchain.installed;
+	if (inst.file && inst.keys?.length) {
+		try {
+			const j = JSON.parse(readFileSync(join(dir, inst.file), "utf8")) as Record<string, Record<string, unknown>>;
+			return inst.keys.flatMap((k) => Object.keys(j[k] ?? {}));
+		} catch {
+			/* not JSON: the list command, if any */
+		}
+	}
+	if (!inst.list?.cmd) return [];
+	const r = spawnSync(inst.list.cmd, inst.list.args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+	if (r.status !== 0 || !r.stdout) return [];
+	// the model's pattern names the package in group 1; without one, the package-name regex's match is the name
+	const re = new RegExp(inst.listPattern || m.toolchain.packageName);
+	const names = r.stdout.split("\n").map((l) => {
+		const x = re.exec(l.trim());
+		return inst.listPattern ? x?.[1] : x?.[0];
+	});
+	return [...new Set(names.filter((x): x is string => !!x))];
+}
+
 // ---- validation: model-written commands run on the owner's machine ------------------------------------
 
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "cmd", "cmd.exe", "powershell", "pwsh", "eval", "exec", "env", "xargs", "sudo", "su", "doas"]);
 /** Every command a manifest would run, for the owner to see before anything runs. */
 export function manifestCommands(m: AdapterManifest): string[] {
-	return [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`after scaffold ${i + 1}`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ["add packages", m.toolchain.add]].map(([k, c]) => `${k}: ${(c as Cmd).cmd} ${(c as Cmd).args.join(" ")}`);
+	return [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`after scaffold ${i + 1}`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ["add packages", m.toolchain.add], ...(m.toolchain.installed?.list?.cmd ? [["list packages", m.toolchain.installed.list] as const] : [])].map(([k, c]) => `${k}: ${(c as Cmd).cmd} ${(c as Cmd).args.join(" ")}`);
 }
 /** Problems that make a manifest unusable; empty = structurally sound (it still has to pass verification). */
 export function validateManifest(m: AdapterManifest): string[] {
 	const out: string[] = [];
-	for (const [k, c] of [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`postScaffold[${i}]`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ["toolchain.add", m.toolchain?.add]] as const) {
+	for (const [k, c] of [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`postScaffold[${i}]`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ["toolchain.add", m.toolchain?.add], ...(m.toolchain?.installed?.list?.cmd ? [["toolchain.installed.list", m.toolchain.installed.list] as const] : [])] as const) {
 		if (!c || typeof c.cmd !== "string" || !Array.isArray(c.args)) {
 			out.push(`${k}: needs cmd + args`);
 			continue;
@@ -190,7 +216,7 @@ export function validateManifest(m: AdapterManifest): string[] {
 		if (SHELLS.has(basename(c.cmd).toLowerCase())) out.push(`${k}.cmd "${c.cmd}" is a shell/launcher; name the tool itself`);
 		if (c.args.some((a) => typeof a !== "string" || /[;&|`$<>\n]/.test(a))) out.push(`${k}.args contain shell syntax; give plain arguments`);
 	}
-	for (const [k, re] of [["toolchain.packageName", m.toolchain?.packageName], ["layout.testFileRegex", m.layout?.testFileRegex], ["layout.skipMarker", m.layout?.skipMarker]] as const) {
+	for (const [k, re] of [["toolchain.packageName", m.toolchain?.packageName], ["layout.testFileRegex", m.layout?.testFileRegex], ["layout.skipMarker", m.layout?.skipMarker], ["toolchain.installed.listPattern", m.toolchain?.installed?.listPattern]] as const) {
 		try {
 			new RegExp(re ?? "");
 		} catch {
@@ -202,6 +228,7 @@ export function validateManifest(m: AdapterManifest): string[] {
 	if (!m.probeTest?.path || m.probeTest.path.startsWith("/") || m.probeTest.path.includes("..")) out.push("probeTest.path must be project-relative");
 	if (m.probeTest?.failing !== undefined && m.probeTest.failing.trim() === (m.probeTest.content ?? "").trim()) out.push("probeTest.failing must differ from probeTest.content (the same test with a wrong expected value)");
 	if (!m.layout?.sourceExtensions?.length) out.push("layout.sourceExtensions is empty");
+	for (const [k, ps] of [["layout.dataDirs", m.layout?.dataDirs], ["layout.wiringFiles", m.layout?.wiringFiles]] as const) for (const p of ps ?? []) if (!p || p.startsWith("/") || p.includes("..")) out.push(`${k} "${p}" must be project-relative`);
 	if (!m.patternKinds?.length) out.push("patternKinds is empty");
 	if (m.layout?.rules) {
 		const r = normalize(m.layout.rules);
@@ -270,8 +297,8 @@ export const MANIFEST_SCHEMA = obj({
 	build: CMD,
 	lint: CMD,
 	test: CMD,
-	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
-	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, rules: LAYOUT_RULES_SCHEMA }),
+	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA, list: CMD, listPattern: S }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
+	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
 	platform: MAP,
 	stackChoices: { type: "array", items: obj({ key: S, question: S, default: S, options: { type: "array", items: OPTION } }) },
 	protectedGlobs: SA,
@@ -285,11 +312,13 @@ const SYSTEM = [
 	"- scaffold: the stack's OFFICIAL project generator, non-interactive, run in the parent dir; {name} is the project folder. readyFile appears in a generated project. postScaffold: commands run inside the new project afterwards so build and test work (install dependencies, add the test runner if the generator has none).",
 	"- build/lint/test: commands run in the project dir. A {files} argument expands to file paths (may be empty). Build must fail on type/compile errors; test must run only the given files when there are some.",
 	"- EVERY command is ONE executable with plain arguments, run without a shell: no sh/bash/cmd -c, no pipes, &&, ;, $, redirects, loops or globs. When the stack has no single build command, use its main static checker as build (e.g. PHP: vendor/bin/phpstan analyse src; Python: mypy or python -m compileall; Ruby: bundle exec rubocop), its linter/formatter check as lint, and its test runner as test with {files} appended (e.g. vendor/bin/phpunit {files}). Tools installed into the project are called by their project-relative path (vendor/bin/…, node_modules/.bin/…, bin/console) and added in postScaffold.",
-	"- toolchain.installed: a JSON manifest file in the project and the object keys whose keys are package names. toolchain.packageName: a regex (anchored with ^) matching a package name.",
+	"- toolchain.installed: how the tool reads which packages the project has. When the stack's package manifest is JSON (package.json, composer.json): file = that manifest, keys = the object keys whose keys are package names, list = {cmd: \"\", args: []}, listPattern = \"\". Otherwise file = \"\", keys = [], list = the stack's own command that prints the installed packages one per line (one executable with plain args, e.g. go list -m all, pip list --format=freeze, bundle list), listPattern = a regex whose first group is the package name on one such line. toolchain.packageName: a regex (anchored with ^) matching a package name.",
 	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer.",
 	"- layout.sharedDirs: usually ONE folder for app code that several feature areas use (e.g. src/Shared/ next to the feature folders), spelled like the feature folders. Never the framework's own folders such as config, templates or tests: those are not shared app code.",
 	"- layout.testFileGlobs: where the stack's official convention keeps an area's tests ({moduleDir}, {area}, {Area}, {area_snake} expand). Next to the code ({moduleDir}/…) only where the framework expects that; where the app loads everything under its source dir as app code (service containers, autoloaded apps), tests go in the official tests dir mirrored per area (e.g. tests/{Area}/…), or the app will not start. The FIRST glob must be a place the test command without {files} runs (the tool checks this with the probe test).",
 	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name}/{name_snake} any kebab-case/PascalCase/snake_case name, use the one this stack names its files with; {sub} a sub-feature folder named after what it does, spelled like the feature folders; (a|b) either word), each with a short doc. require: only files the framework itself needs to load a feature folder (none when the framework finds the code on its own, e.g. autoloading or service discovery); never an empty class just to have one. place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
+	"- layout.dataDirs: the folders (project-relative, trailing slash) where this stack's official docs keep database code: schema/models/entities, migrations, seed scripts (e.g. a Spring project with Flyway: src/main/resources/db/migration/ plus the entity package folder). Database work may write only there. layout.dataAccessHint: one line on how data access is written in this stack (ORM entities, query builder, SQL with generated code, …).",
+	"- layout.wiringFiles: the files (project-relative paths or globs) where this stack registers a new feature by hand (router/route table, main module, URL config), from the official docs; [] when the framework finds handlers on its own (annotations, file-system routing). Units edit these files to wire what they add.",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up. failing: the same file with only the expected value made wrong (e.g. 1 + 1 expected to equal 3), so the test runs and FAILS; the tool checks that the test command fails on it.",
@@ -413,7 +442,7 @@ export async function verifyPendingAdapters(
 /** Executables a manifest runs that are not on PATH (project-relative ones appear after scaffolding). */
 export function missingTools(m: AdapterManifest): string[] {
 	const dirs = (process.env["PATH"] ?? "").split(delimiter).filter(Boolean);
-	const cmds = [m.scaffold, ...(m.postScaffold ?? []), m.build, m.lint, m.test, m.toolchain.add].map((c) => c.cmd).filter((c) => !c.includes("/"));
+	const cmds = [m.scaffold, ...(m.postScaffold ?? []), m.build, m.lint, m.test, m.toolchain.add, ...(m.toolchain.installed?.list?.cmd ? [m.toolchain.installed.list] : [])].map((c) => c.cmd).filter((c) => !c.includes("/"));
 	return [...new Set(cmds)].filter((c) => !dirs.some((d) => existsSync(join(d, c))));
 }
 

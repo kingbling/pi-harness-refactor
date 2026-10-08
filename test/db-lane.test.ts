@@ -252,6 +252,9 @@ describe("DB lane", () => {
 		expect(prompts[0]).toContain("CREATE TABLE invoices");
 		expect(prompts[0]).not.toContain("audit_log");
 		expect(prompts[0]).toContain("Migration lane (keep-schema)");
+		// no ORM assumed: the schema is written the way this stack accesses data
+		expect(prompts[0]).not.toContain("ORM schema/entities");
+		expect(prompts[0]).toContain("this stack's data-access approach");
 	});
 });
 
