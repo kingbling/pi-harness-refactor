@@ -424,7 +424,7 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 		},
 	};
 	// the adapter's own notes stay next to the layout written from layout.json
-	const doc = (r: LayoutRules) => [renderLayoutDoc(r, base.sharedDirs, base.testFileGlobs(expandModuleDir(r, "invoice"))), base.structureDoc.trim() && `Notes for this stack:\n${base.structureDoc.trim()}`].filter(Boolean).join("\n\n");
+	const doc = (r: LayoutRules) => [renderLayoutDoc(r, base.sharedDirs, base.testFileGlobs(expandModuleDir(r, "invoice"))), base.structureDoc.trim() && `Notes for this stack (where they name other folders or files than the layout above, the layout above wins):\n${base.structureDoc.trim()}`].filter(Boolean).join("\n\n");
 	Object.defineProperty(layout, "structureDoc", { enumerable: true, get: () => (rules() ? doc(rules()!) : base.structureDoc) });
 	return { ...adapter, layout };
 }

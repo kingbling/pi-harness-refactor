@@ -60,3 +60,21 @@ describe("init in a workspace with earlier work", () => {
 		expect(await offerFreshStart(mkdtempSync(join(tmpdir(), "br-fresh-")), never, { yes: false, fresh: false })).toBe(false);
 	});
 });
+
+describe("git: never commits a parent repo", () => {
+	it("commitAll refuses a folder inside another checkout", async () => {
+		const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { execFileSync } = await import("node:child_process");
+		const { commitAll, isRepoRoot } = await import("../src/git.ts");
+		const parent = mkdtempSync(join(tmpdir(), "br-parent-"));
+		execFileSync("git", ["init", "-q"], { cwd: parent });
+		const inner = join(parent, "target");
+		mkdirSync(inner);
+		writeFileSync(join(inner, "a.txt"), "x");
+		expect(isRepoRoot(parent)).toBe(true);
+		expect(isRepoRoot(inner)).toBe(false);
+		expect(() => commitAll(inner, "nope")).toThrow(/not the top of its own git repo/);
+	});
+});

@@ -198,7 +198,7 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 		const a = withLayoutRules(nestjsAdapter, root);
 		expect(a.layout.structureDoc).toContain(`Tests of an area go where the test runner finds them: ${nestjsAdapter.layout.testFileGlobs("src/invoice").join(" or ")}`);
 		expect(a.layout.structureDoc).not.toMatch(/Tests live beside the code/);
-		expect(a.layout.structureDoc).toContain(`Notes for this stack:\n${nestjsAdapter.layout.structureDoc.trim()}`);
+		expect(a.layout.structureDoc).toContain(`Notes for this stack (where they name other folders or files than the layout above, the layout above wins):\n${nestjsAdapter.layout.structureDoc.trim()}`);
 		// a test outside the feature folder (tests/{Area}/) is where the runner finds it, not a layout problem
 		expect(checkLayoutRules(["tests/Plans/PlanTest.php"], "src/Plans", "plans", "/nonexistent", sym, symOpts, NEW)).toEqual([]);
 	});

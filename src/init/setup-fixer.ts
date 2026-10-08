@@ -197,6 +197,12 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		});
 		const repo = o.config.target.path;
 		const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
+		const { isRepoRoot } = await import("../git.ts");
+		// the target must be its own repo: inside another checkout, undo and commit would act on the parent's files
+		if (!isRepoRoot(repo)) {
+			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "no_change", gateReport: { said, error: `${repo} is not its own git repo: nothing undone or committed` } });
+			return undefined;
+		}
 		const { sha, undone, changed } = await lock(async () => {
 			const undone = undoMigratedCode(repo, o.projectDir, o.adapter);
 			const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
