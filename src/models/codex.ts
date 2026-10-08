@@ -35,6 +35,26 @@ const EFFORT: Record<string, "minimal" | "low" | "medium" | "high" | "xhigh"> = 
  * was asked for), so the caller goes on to OpenRouter. Structured output is asked for in the prompt and checked
  * here (parses, has every required top-level key).
  */
+type Cost = { input: number; output: number; cacheRead: number; cacheWrite: number };
+type Tokens = { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+
+/** $ for these tokens at a model's per-million prices. */
+export function priceAt(cost: Cost | undefined, u: Tokens): number | undefined {
+	if (!cost) return undefined;
+	return ((u.input ?? 0) * cost.input + (u.output ?? 0) * cost.output + (u.cacheRead ?? 0) * cost.cacheRead + (u.cacheWrite ?? 0) * cost.cacheWrite) / 1e6;
+}
+
+/**
+ * A subscription call is counted in money like a paid one: what the same model and tokens cost on OpenRouter (so
+ * Codex and OpenRouter show the same value). Falls back to the subscription's list price when OpenRouter does not
+ * list the model.
+ */
+export async function openRouterCost(modelId: string): Promise<Cost | undefined> {
+	const rt = await modelRuntime().catch(() => undefined);
+	const id = modelId.includes("/") ? modelId : `openai/${modelId}`;
+	return (rt?.getModel("openrouter", id) as { cost?: Cost } | undefined)?.cost;
+}
+
 export async function codexChat(req: ChatRequest): Promise<ChatResponse | undefined> {
 	const model = await resolveCodexModel(req.model).catch(() => undefined);
 	if (!model) return undefined;
@@ -62,8 +82,8 @@ export async function codexChat(req: ChatRequest): Promise<ChatResponse | undefi
 			const required = (req.schema["required"] as string[] | undefined) ?? [];
 			if (!json || typeof json !== "object" || required.some((k) => !(k in (json as object)))) return undefined;
 		}
-		// subscription: no money spent, so no spend entry and no cost (budgets count paid calls only); the list price is shown
-		return { text, json, usage: { inputTokens: res.usage?.input ?? 0, outputTokens: res.usage?.output ?? 0, costUsd: 0, listUsd: res.usage?.cost?.total ?? 0, model: `${CODEX_PROVIDER}/${model.id}`, tierServed: "codex" } };
+		const costUsd = priceAt(await openRouterCost(req.model), res.usage ?? {}) ?? res.usage?.cost?.total ?? 0;
+		return { text, json, usage: { inputTokens: res.usage?.input ?? 0, outputTokens: res.usage?.output ?? 0, costUsd, subscription: true, model: `${CODEX_PROVIDER}/${model.id}`, tierServed: "codex" } };
 	} catch {
 		return undefined;
 	}

@@ -12,6 +12,8 @@ export interface SpendEntry {
 	usd: number;
 	source: string;
 	model?: string;
+	/** Served by a subscription (Codex): the OpenRouter value of the call, not money paid. */
+	subscription?: boolean;
 }
 
 /** The workspace this process works on: BR_WORKSPACE, else the cwd when it holds a bigrefactor config. */
@@ -24,10 +26,11 @@ export function workspaceRoot(): string | undefined {
 
 const file = (root: string) => join(root, ".bigrefactor", "spend.jsonl");
 
-export function recordSpend(usd: number, source: string, model?: string, root = workspaceRoot()): void {
+export function recordSpend(usd: number, source: string, model?: string, o: { subscription?: boolean; root?: string } = {}): void {
+	const root = o.root ?? workspaceRoot();
 	if (!root || !(usd > 0)) return;
 	try {
-		appendFileSync(file(root), JSON.stringify({ at: new Date().toISOString(), usd, source, model } satisfies SpendEntry) + "\n");
+		appendFileSync(file(root), JSON.stringify({ at: new Date().toISOString(), usd, source, model, ...(o.subscription ? { subscription: true } : {}) } satisfies SpendEntry) + "\n");
 	} catch {
 		/* spend tracking must never break a model call */
 	}
@@ -53,4 +56,21 @@ export function totalSpend(root: string): { usd: number; bySource: Record<string
 		}
 	}
 	return { usd, bySource, since };
+}
+
+/** Money actually paid since a time (subscription calls excluded): what the daily budget cap counts. */
+export function paidSince(root: string, sinceIso: string): number {
+	const f = file(root);
+	if (!existsSync(f)) return 0;
+	let usd = 0;
+	for (const line of readFileSync(f, "utf8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const e = JSON.parse(line) as SpendEntry;
+			if (!e.subscription && e.at >= sinceIso) usd += e.usd;
+		} catch {
+			/* torn line */
+		}
+	}
+	return usd;
 }

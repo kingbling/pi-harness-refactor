@@ -9,6 +9,8 @@ import { createBuilder, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
+import { progress } from "../progress.ts";
+import { paidSince } from "../spend.ts";
 import { loadConfig, type Config } from "../config.ts";
 import { addWorktree, emptyWorktreeTrash, headOf, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
@@ -208,6 +210,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let cost = 0;
 	let stop = false;
 	const startedAt = new Date().toISOString();
+	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
+	const usageAtStart = progress.tally();
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
 	if (!o.dry) {
 		const caught = decideOpenFromGoals(ledger, config);
@@ -560,7 +564,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		return undefined;
 	};
 
-	const spentToday = () => (ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM attempts WHERE started_at >= date('now')").get() as { c: number }).c + (ledger.db.prepare("SELECT COALESCE(SUM(cost_usd),0) c FROM decisions WHERE created_at >= date('now')").get() as { c: number }).c;
+	// the cap counts money actually paid today; subscription (Codex) calls carry an OpenRouter value but cost nothing
+	const spentToday = () => paidSince(o.root, `${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
 	let dayCapHit = false;
 
 	// ---- main loop
@@ -580,7 +585,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		if (!dayCapHit && spentToday() >= config.run.budgetUsdPerDay) {
 			dayCapHit = true;
-			await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Paid model spend today (OpenRouter fallback; the Codex subscription is not counted): $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
+			await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Paid model spend today (subscription calls are not counted): $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
 			log(pc.red(`daily budget cap reached ($${spentToday().toFixed(2)}); not starting new units`));
 		}
 		if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
@@ -669,6 +674,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const truthAhead = (id: string) => (ledger.db.prepare("SELECT 1 FROM evidence WHERE unit_id = ? AND type = 'truth_ahead' LIMIT 1").get(id) ? "planned, truth ready ahead" : undefined);
 	const lanes = stopRecord ? stopRecord.finishing.map((id) => { const st = ledger.getUnit(id)?.state ?? "?"; return { unit: id, state: (st === "planned" && truthAhead(id)) || st }; }) : [];
 	if (stopRecord) log(pc.yellow(`stopped (${stopRecord.reason}); lanes that finished: ${lanes.map((l) => `${l.unit} → ${l.state}`).join(", ") || "none were running"}`));
+	cost = Math.max(cost, progress.tally().costUsd - usageAtStart.costUsd);
 	log(`\nrun ${stopRecord ? "stopped" : "finished"}: ${acceptedNow} accepted, ${quarantined} quarantined, ${waiting} still planned${ledger.ownDecisions(startedAt).length ? `, ${ledger.ownDecisions(startedAt).length} routine question(s) decided from your goals` : ""}${ledger.openQuestions().length ? `, ${ledger.openQuestions().length} question(s) open → br questions` : ""}, $${cost.toFixed(3)}`);
 	if (!o.dry) log(pc.dim(renderForecastLine(forecast(ledger))));
 	if (!o.dry) writeRunRecord(ledger, o.root, { startedAt, endedAt: new Date().toISOString(), outcome: stopRecord ? "stopped" : "finished", stop: stopRecord ? { ...stopRecord, lanes } : undefined, accepted: acceptedNow, quarantined, planned: waiting, openQuestions: ledger.openQuestions().length, costUsd: Number(cost.toFixed(4)), units: ran.map((r) => ({ unit: r.unitId, state: r.state })) });

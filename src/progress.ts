@@ -34,17 +34,14 @@ export interface ProgressSnapshot {
 	/** Cost per unit/job label, accumulated over finished and live sessions. */
 	costByLabel: Record<string, number>;
 	costUsd: number;
-	/** Codex (subscription) calls at list price: not spent, shown so their size is visible. */
-	codexUsd: number;
 	tokensIn: number;
 	tokensOut: number;
 	error?: string;
 }
 
-/** Usage of one model call or a sum of them: paid dollars, Codex list price (not paid), tokens. */
+/** Usage of one model call or a sum of them: dollars (a Codex call at its OpenRouter price), tokens. */
 export interface UsageTally {
 	costUsd: number;
-	codexUsd: number;
 	tokensIn: number;
 	tokensOut: number;
 }
@@ -58,7 +55,6 @@ export interface AgentState {
 	toolCalls: number;
 	blocked: number;
 	costUsd: number;
-	codexUsd: number;
 	tokensIn: number;
 	tokensOut: number;
 	lastTool?: string;
@@ -69,7 +65,7 @@ type Abortable = { abort(): Promise<void> | void };
 const MAX_ACTIVITY = 200;
 
 class ProgressTracker {
-	private s: ProgressSnapshot = { plan: [], about: {}, running: false, stopping: false, steps: [], activity: [], agents: [], costByLabel: {}, costUsd: 0, codexUsd: 0, tokensIn: 0, tokensOut: 0 };
+	private s: ProgressSnapshot = { plan: [], about: {}, running: false, stopping: false, steps: [], activity: [], agents: [], costByLabel: {}, costUsd: 0, tokensIn: 0, tokensOut: 0 };
 	private listeners = new Set<(s: ProgressSnapshot) => void>();
 	private sessions = new Map<number, Abortable>();
 	private nextId = 1;
@@ -93,7 +89,7 @@ class ProgressTracker {
 
 	begin(job: string) {
 		this.abortingNow = false;
-		this.s = { job, plan: [], about: {}, running: true, stopping: false, startedAt: Date.now(), steps: [], activity: [], agents: [], costByLabel: {}, costUsd: 0, codexUsd: 0, tokensIn: 0, tokensOut: 0 };
+		this.s = { job, plan: [], about: {}, running: true, stopping: false, startedAt: Date.now(), steps: [], activity: [], agents: [], costByLabel: {}, costUsd: 0, tokensIn: 0, tokensOut: 0 };
 		this.emit();
 	}
 	setLanes(l: NonNullable<ProgressSnapshot["lanes"]>) {
@@ -145,7 +141,7 @@ class ProgressTracker {
 
 	/** A model session starts; returns its agent id for the calls below. */
 	agentStart(label: string, role: string, model: string | undefined): number {
-		const a: AgentState = { id: this.nextId++, label, role, model, toolCalls: 0, blocked: 0, costUsd: 0, codexUsd: 0, tokensIn: 0, tokensOut: 0, since: Date.now() };
+		const a: AgentState = { id: this.nextId++, label, role, model, toolCalls: 0, blocked: 0, costUsd: 0, tokensIn: 0, tokensOut: 0, since: Date.now() };
 		this.s.agents.push(a);
 		this.s.session = a;
 		this.emit();
@@ -184,11 +180,11 @@ class ProgressTracker {
 	}
 	/** Job totals so far; `usageSince(tally())` gives what a stretch of work used. */
 	tally(): UsageTally {
-		return { costUsd: this.s.costUsd, codexUsd: this.s.codexUsd, tokensIn: this.s.tokensIn, tokensOut: this.s.tokensOut };
+		return { costUsd: this.s.costUsd, tokensIn: this.s.tokensIn, tokensOut: this.s.tokensOut };
 	}
 	usageSince(before: UsageTally): string {
 		const n = this.tally();
-		return fmtUsage({ costUsd: n.costUsd - before.costUsd, codexUsd: n.codexUsd - before.codexUsd, tokensIn: n.tokensIn - before.tokensIn, tokensOut: n.tokensOut - before.tokensOut });
+		return fmtUsage({ costUsd: n.costUsd - before.costUsd, tokensIn: n.tokensIn - before.tokensIn, tokensOut: n.tokensOut - before.tokensOut });
 	}
 	agentEnd(id: number) {
 		this.sessions.delete(id);
@@ -242,7 +238,6 @@ export const progress = new ProgressTracker();
 
 function addTally(t: UsageTally, u: UsageTally) {
 	t.costUsd += u.costUsd;
-	t.codexUsd += u.codexUsd;
 	t.tokensIn += u.tokensIn;
 	t.tokensOut += u.tokensOut;
 }
@@ -252,11 +247,10 @@ export function fmtTokens(n: number): string {
 	return n < 1000 ? String(Math.round(n)) : n < 1e6 ? `${(n / 1000).toFixed(1)}k` : `${(n / 1e6).toFixed(1)}M`;
 }
 
-/** "$0.0123 · codex ≈$0.0410 · 12.3k in / 1.2k out" (the Codex part only when Codex served something). */
+/** "$0.0123 · 12.3k in / 1.2k out" */
 export function fmtUsage(u: UsageTally, digits = 4): string {
-	const codex = u.codexUsd > 0 ? ` · codex ≈$${u.codexUsd.toFixed(digits)}` : "";
 	const tokens = u.tokensIn || u.tokensOut ? ` · ${fmtTokens(u.tokensIn)} in / ${fmtTokens(u.tokensOut)} out` : "";
-	return `$${u.costUsd.toFixed(digits)}${codex}${tokens}`;
+	return `$${u.costUsd.toFixed(digits)}${tokens}`;
 }
 
 /** One-line summary of a tool call's arguments for the activity feed. */

@@ -43,7 +43,7 @@ export interface OpenRouterOptions {
 }
 
 /** Every direct call counts in the live job totals (paid dollars, Codex list price, tokens). */
-const tally = (u: Usage) => progress.callUsage({ costUsd: u.costUsd, codexUsd: u.listUsd ?? 0, tokensIn: u.inputTokens, tokensOut: u.outputTokens });
+const tally = (u: Usage) => progress.callUsage({ costUsd: u.costUsd, tokensIn: u.inputTokens, tokensOut: u.outputTokens });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -108,6 +108,7 @@ export class OpenRouterClient implements ModelClient {
 			if (viaCodex) {
 				this.onUsage?.({ ...viaCodex.usage, kind: "chat" });
 				tally(viaCodex.usage);
+				recordSpend(viaCodex.usage.costUsd, "api: chat", viaCodex.usage.model, { subscription: true });
 				return viaCodex;
 			}
 		}

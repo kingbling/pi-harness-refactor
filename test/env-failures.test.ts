@@ -120,18 +120,24 @@ describe("durable totals in the TUI", () => {
 		ledger.db.prepare("UPDATE units SET state='quarantined' WHERE id=?").run(b!.id);
 		ledger.db.prepare("INSERT INTO attempts(unit_id, role, model, cost_usd, started_at, ended_at, outcome) VALUES (?, 'implement', 'm', 0.5, '2026-10-01T10:00:00Z', '2026-10-01T10:10:00Z', 'gate_green')").run(a!.id);
 		// every paid call is in the spend log (the attempt above and an onboarding chat): 0.5 + 0.25
-		recordSpend(0.5, "session: implement", "m", ws);
-		recordSpend(0.25, "api: chat", "m", ws);
-		expect(totalSpend(ws).usd).toBeCloseTo(0.75);
+		recordSpend(0.5, "session: implement", "m", { root: ws });
+		recordSpend(0.25, "api: chat", "m", { root: ws });
+		// a subscription (Codex) call counts with its OpenRouter value in the totals, but is no money paid (the budget cap)
+		recordSpend(0.25, "session: test", "openai-codex/m", { root: ws, subscription: true });
+		expect(totalSpend(ws).usd).toBeCloseTo(1.0);
+		const { paidSince } = await import("../src/spend.ts");
+		expect(paidSince(ws, "2000-01-01")).toBeCloseTo(0.75);
+		const { priceAt } = await import("../src/models/codex.ts");
+		expect(priceAt({ input: 2, output: 8, cacheRead: 0.5, cacheWrite: 0 }, { input: 1_000_000, output: 500_000 })).toBeCloseTo(6);
 
 		const footer = statusLine(ledger, ws);
-		expect(footer).toMatch(/✓ 1\/\d+ accepted · ■ 1 quarantined · spent \$0\.75 total/);
+		expect(footer).toMatch(/✓ 1\/\d+ accepted · ■ 1 quarantined · spent \$1\.00 total/);
 
 		// a new run that has accepted nothing yet still shows the durable totals
 		const snap = { plan: [], about: {}, running: true, stopping: false, startedAt: Date.now(), steps: [], activity: [], agents: [], costByLabel: {}, costUsd: 0, job: "migration run" } as any;
 		const panel = renderProgress(snap, 140, durable(ledger, ws)).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
 		expect(panel).toMatch(/✓ 1 accepted\s+■ 1 quarantined/);
-		expect(panel).toMatch(/spent \$0\.75 total/);
+		expect(panel).toMatch(/spent \$1\.00 total/);
 		ledger.close();
 	});
 });
