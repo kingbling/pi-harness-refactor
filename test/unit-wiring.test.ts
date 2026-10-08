@@ -166,6 +166,35 @@ describe("runUnit wiring", () => {
 		expect(ledger.openQuestions()).toEqual([]);
 	});
 
+	it("in read mode the tester still tries a small script for its unit: green on the old code, its cases count as run", async () => {
+		rmSync(join(ws, ".bigrefactor", "truth", "u1"), { recursive: true, force: true });
+		ledger.db.prepare("DELETE FROM evidence").run();
+		// the workspace probe found no way to run the old app; this unit's own file still runs (runner: print the script's .json)
+		writeFileSync(join(ws, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read", run: { cmd: "sh", args: ["-c", 'cat "$0.json"', "{script}"] } }));
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		const prompts: string[] = [];
+		const tester = async (opts: { role: string; systemPrompt: string }): Promise<LeafSession> =>
+			({
+				run: async () => {
+					if (opts.role === "test") {
+						prompts.push(opts.systemPrompt);
+						write(join(truthDir, "cases.php"), "<?php require 'app/behaviour/commands/agency/create.cmd.php';\n");
+						write(join(truthDir, "cases.php.json"), '[{"symbol":"app/behaviour/commands/agency/create.cmd.php::create","inputs":[],"expected":1}]');
+						write(join(truthDir, "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
+						write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), "it('u1#1 creates', () => {});\n");
+					}
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: tester as never, gate, legacyFixer: false, log: () => {} });
+		expect(prompts[0]).toMatch(/First try a SMALL script for this unit only/);
+		expect(ledger.hasEvidence("u1", "truth_green_on_old")).toBe(true);
+		expect(ledger.hasEvidence("u1", "truth_read")).toBe(false);
+		expect(ledger.db.prepare("SELECT verified_on_old FROM truth_cases WHERE unit_id = 'u1'").all()).toEqual([{ verified_on_old: 1 }]);
+	});
+
 	it("every truth case needs a test naming its id: the tester adds what is missing, then the unit stops", async () => {
 		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t'), ('u1#2','u1','s','[]','2',1,'t')").run();
 		write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), "it('u1#1 a', () => {}); it('u1#12 b', () => {});\n");

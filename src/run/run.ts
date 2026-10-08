@@ -136,7 +136,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
 	// ---- truth: can the old code run here? decided once per workspace (run → truth from running it, read → from reading it)
 	if (!o.dry && !o.spawn) {
-		await probeLegacyEnv({ config, root: o.root, source: getSourceAdapter(config.source.stack), log }).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
+		await probeLegacyEnv({
+			config,
+			root: o.root,
+			source: getSourceAdapter(config.source.stack),
+			log,
+			// a red probe asks the owner once, blocking nothing: "retry" makes the next run probe again
+			ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "truth_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
+			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
+		}).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
 	}
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
 	if (!o.dry) await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) });

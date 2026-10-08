@@ -164,7 +164,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const testerWriteGlobs = [`${truthDirRel}/**`, ...testerTestGlobs];
 	const absGlob = (g: string) => join(o.root, g);
 	// the truth as code loads it now (the tester's check_ported_tests and the verification after its session)
-	const currentTruth = () => (truthMode === "run" ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : loadReadTruth(truthDirAbs));
+	// in read mode a small per-unit script the tester got running still counts as run when it is green on the old code
+	const currentTruth = () => {
+		if (truthMode === "run") return { ...verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files), madeBy: "run" as TruthMode };
+		const ran = existsSync(join(truthDirAbs, sourceAdapter.truth.scriptName)) ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
+		return ran?.ok ? { ...ran, madeBy: "run" as TruthMode } : { ...loadReadTruth(truthDirAbs), madeBy: "read" as TruthMode };
+	};
 	const truthFiles = [sourceAdapter.truth.scriptName, READ_CASES_FILE, NO_BEHAVIOUR_FILE];
 	const readTruthFiles = () => truthFiles.map((f) => (existsSync(join(truthDirAbs, f)) ? readFileSync(join(truthDirAbs, f), "utf8") : undefined));
 	/**
@@ -182,7 +187,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			config: o.config,
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
-			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
+			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
 			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && log(pc.dim(`  tester blocked: ${e.blocked}`)),
@@ -229,12 +234,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
 		// type the results in) and load the cases; read-not-run cases are only checked for shape.
 		const verified = currentTruth();
-		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: truthMode, cases: verified.cases.length, error: verified.error } });
+		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, cases: verified.cases.length, error: verified.error } });
 		if (!verified.ok) {
 			log(pc.red(`  truth (${truthMode}) failed: ${verified.error}`));
 			return false;
 		}
-		recordTruth(verified.cases, truthMode, verified.none);
+		recordTruth(verified.cases, verified.madeBy, "none" in verified ? verified.none : undefined);
 		return true;
 	};
 	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks).

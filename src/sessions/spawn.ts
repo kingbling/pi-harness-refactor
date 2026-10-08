@@ -208,6 +208,8 @@ export interface LeafSession {
 }
 
 export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
+	// tests and offline runs never start a real model session; callers fall back or inject their own `spawn`
+	if (process.env["BR_NO_LLM"]) throw new Error("model sessions are off (BR_NO_LLM)");
 	const role = opts.modelOverride ?? opts.config.models[opts.role === "setup" || opts.role === "review" ? "escalate" : opts.role];
 	const model = await resolveSessionModel(role);
 	const orCost = await openRouterCost(role.id);

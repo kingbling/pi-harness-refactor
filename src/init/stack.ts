@@ -1,5 +1,6 @@
 import type { Config } from "../config.ts";
 import type { ExternalDep, SourceAdapter, StackChoice, StackChoiceOption, TargetAdapter } from "../adapters/types.ts";
+import { legacyLibraries } from "../inventory/not-app.ts";
 
 /**
  * Stack decisions, stack-neutral: which option every target's StackChoice resolved to (from config, else the
@@ -36,7 +37,7 @@ export function effectiveDocs(target: TargetAdapter, choices: Config["target"]["
 
 /** Legacy libraries with decisions.json applied; `open` = non-dev libraries still under review. */
 export function libraryPlan(source: SourceAdapter, sourceRoot: string, decided: Record<string, { verdict: string; successor?: string }> = {}): { libraries: ExternalDep[]; open: ExternalDep[] } {
-	const libraries = (source.externalDeps?.(sourceRoot) ?? []).map((l) => {
+	const libraries = legacyLibraries(source, sourceRoot).map((l) => {
 		const d = decided[l.name];
 		if (!d) return l;
 		// A decided drop/platform/port has no successor package.

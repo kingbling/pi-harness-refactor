@@ -186,7 +186,8 @@ describe("where each part goes: rated from the analyzed repo, not from the adapt
 		expect(all.some((d) => d.id === "store:arangodb")).toBe(false); // rated as a dimension instead
 		// no model was told the provisional targets as fact, nor a code default to agree with
 		expect(prompts.join("\n")).not.toMatch(/targets: nestjs \+ react|code_default/);
-		expect(prompts.join("\n")).toMatch(/target: not decided yet/);
+		// the repo brief is about the legacy repo only: its facts carry no target at all (decided or not)
+		expect(prompts.find((p) => p.includes("Facts gathered from the legacy repo"))).not.toMatch(/target: |not decided yet/);
 		for (const c of client.calls.filter((c) => c.kind === "decide")) expect(JSON.stringify((c.req as { state: unknown }).state)).not.toMatch(/current_recommendation/);
 		for (const d of all) expect(d.options.length, d.id).toBeGreaterThan(1);
 		const { pointHash } = await import("../src/jev/ask.ts");

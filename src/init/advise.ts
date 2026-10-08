@@ -52,10 +52,9 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 	const decidedTargets = file.answers["target:server"] ? config.target.stacks.join(" + ") : undefined;
 	const { phraseDecisions, discoverDecisions, pointHash, repoBrief } = await import("../jev/ask.ts");
 	const deps = { ledger, config, root, client };
-	// every judgment below reads the repo: the brief is what a model understood of it. Until the target is
-	// decided, a brief written while provisional targets were stated as fact is rewritten.
-	const targetsOpen = !file.answers["target:server"] && !file.dimensions;
-	const b = await repoBrief(deps, { force: targetsOpen });
+	// every judgment below reads the repo: the brief is what a model understood of it (the legacy repo only;
+	// the owner's answers reach each model as their own input, so the brief never goes stale with them)
+	const b = await repoBrief(deps);
 	cost += b.costUsd;
 	const { surveySource, adviseStack, adviseDimensions } = await import("./survey.ts");
 	const survey = await surveySource(config.source.path, source);

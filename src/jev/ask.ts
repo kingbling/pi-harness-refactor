@@ -5,6 +5,7 @@ import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { QuestionBlocks, QuestionRow } from "../ledger/schema.ts";
 import type { ModelClient } from "../models/types.ts";
+import type { spawnLeaf } from "../sessions/spawn.ts";
 import { PLAIN_LANGUAGE, goalsText } from "../policy.ts";
 import { sameQuestion } from "./same.ts";
 
@@ -13,8 +14,9 @@ import { sameQuestion } from "./same.ts";
  * undecided (a point, facts, machine option values); the model turns that into a question about THIS repo,
  * labels the options in its words, recommends one and states its opinion. Nothing here holds question text.
  *
- *   repoBrief        — the model's understanding of the legacy repo (.bigrefactor/repo-brief.md), written once
- *                      from facts the code gathers; every other call gets it as context.
+ *   repoBrief        — the model's understanding of the legacy repo (.bigrefactor/repo-brief.md), written once by
+ *                      a session that reads the repo with tools (docs, manifests, compose files, code) on top of
+ *                      the code's facts. It is about the legacy repo only: owner decisions are a separate input.
  *   phraseDecisions  — onboarding: code-detected decision points → repo-specific questions.
  *   discoverDecisions— onboarding: decision points the code did not foresee, found by the model in the brief.
  *   askViaModel      — run time: one ledger question (quirks, placement, rule changes, environment …).
@@ -48,6 +50,8 @@ export interface AskDeps {
 	/** Workspace root (repo brief); without it questions are phrased from the facts alone. */
 	root?: string;
 	client?: ModelClient;
+	/** Starts the brief writer's tool session; default spawnLeaf (tests inject a scripted one). */
+	spawn?: typeof spawnLeaf;
 }
 
 // ---- repo brief ---------------------------------------------------------------------------------------
@@ -59,7 +63,21 @@ export function briefPath(root: string): string {
 export function loadBrief(root: string | undefined): string {
 	if (!root) return "";
 	const p = briefPath(root);
-	return existsSync(p) ? readFileSync(p, "utf8") : "";
+	return existsSync(p) ? readFileSync(p, "utf8").replace(BRIEF_MARK, "").trimStart() : "";
+}
+
+/** Marks a brief about the legacy repo only; an older brief (target talk, open points) is written again. */
+const BRIEF_MARK = "<!-- legacy repo brief v2 -->\n";
+
+/** The owner's answers so far, as their own input for models (never mixed into the repo brief). */
+export function ownerDecisions(root: string | undefined): string {
+	if (!root || !existsSync(join(root, ".bigrefactor", "decisions.json"))) return "";
+	try {
+		const answers = (JSON.parse(readFileSync(join(root, ".bigrefactor", "decisions.json"), "utf8")) as { answers?: Record<string, { answer: string }> }).answers ?? {};
+		return Object.entries(answers).map(([k, a]) => `- ${k} = ${a.answer}`).join("\n");
+	} catch {
+		return "";
+	}
 }
 
 /** Facts the code can gather about the source repo, stack-neutral: tree with counts, readme, ledger stats. */
@@ -91,15 +109,13 @@ export function repoFacts(config: Config, ledger?: Ledger, root?: string, vendor
 	};
 	walk(src, "", 0);
 	const readme = safeList(src).find((n) => /^readme(\.md|\.txt)?$/i.test(n));
-	const answers = root && existsSync(join(root, ".bigrefactor", "decisions.json")) ? (JSON.parse(readFileSync(join(root, ".bigrefactor", "decisions.json"), "utf8")) as { answers?: Record<string, { answer: string }> }).answers ?? {} : {};
-	// config holds provisional values until the owner decides: only decided ones are stated as facts
-	const L = [`stack: ${config.source.stack}${config.source.framework ? ` / ${config.source.framework}` : ""}`, `target: ${Object.entries(answers).filter(([k]) => k.startsWith("target:")).map(([k, a]) => `${k.slice(7)} → ${a.answer}`).join(", ") || "not decided yet"}`, `data stores: ${config.db.from.map((s) => `${s}${config.db.stores[s] ? ` (${config.db.stores[s]})` : ""}`).join(", ") || "none found"}${answers["db-strategy"] ? `; strategy ${answers["db-strategy"].answer}` : ""}`];
-	if (Object.keys(answers).length) L.push(`owner decisions already made (binding facts): ${Object.entries(answers).map(([k, a]) => `${k}=${a.answer}`).join("; ")}`);
+	// the legacy repo only: target and owner decisions are not facts about it (they go to models separately)
+	const L = [`language: ${config.source.stack}${config.source.framework ? ` / ${config.source.framework}` : ""}`, `data stores found: ${config.db.from.join(", ") || "none"}`];
 	if (ledger) {
-		const kinds = ledger.db.prepare("SELECT json_extract(meta,'$.kind') k, COUNT(*) n FROM units GROUP BY k ORDER BY n DESC LIMIT 12").all() as Array<{ k: string | null; n: number }>;
+		const kinds = ledger.db.prepare("SELECT kind k, COUNT(*) n FROM units GROUP BY k ORDER BY n DESC LIMIT 12").all() as Array<{ k: string | null; n: number }>;
 		if (kinds.length) L.push(`units by kind: ${kinds.map((k) => `${k.k ?? "?"}=${k.n}`).join(", ")}`);
 		const ext = ledger.db.prepare("SELECT lower(replace(path, rtrim(path, replace(path, '.', '')), '')) e, COUNT(*) n FROM files GROUP BY e ORDER BY n DESC LIMIT 12").all() as Array<{ e: string; n: number }>;
-		if (ext.length) L.push(`files by extension: ${ext.map((x) => `.${x.e}=${x.n}`).join(", ")}`);
+		if (ext.length) L.push(`indexed ${config.source.stack} files by extension (other files are not indexed): ${ext.map((x) => `.${x.e}=${x.n}`).join(", ")}`);
 		const slices = ledger.getMeta("slice_plan");
 		if (slices) L.push(`slices: ${(JSON.parse(slices) as Array<{ name: string; units: number }>).map((s) => `${s.name}(${s.units})`).join(", ")}`);
 		const routes = ledger.db.prepare("SELECT path FROM index_routes WHERE side = 'source' LIMIT 40").all() as Array<{ path: string }>;
@@ -110,28 +126,67 @@ export function repoFacts(config: Config, ledger?: Ledger, root?: string, vendor
 	return L.join("\n");
 }
 
-/** The model's understanding of the source repo; written once, refreshed with `force` (e.g. after re-inventory). */
+const BRIEF_SECTIONS = "What the app does; Runtime and versions (language version, services it needs, how it is started: from its own docs, manifests and container/compose files); Feature areas (name → directories); UI (how pages are produced, client-side code and its own apps/builds); Data (stores, how they are accessed); Cross-cutting (auth, i18n, jobs, files, external APIs); Odd patterns a migration will trip over";
+const BRIEF_RULE = "Describe the legacy repo as it is. Do not write about the migration target, target choices or what is still to be decided: those come from the owner, separately.";
+
+/**
+ * The model's understanding of the legacy repo; written once, refreshed with `force` (e.g. after re-inventory).
+ * A read-only tool session (read/grep/find/ls in the legacy repo) finds the repo's own docs, manifests and
+ * compose files itself; the code's facts are its starting point. Without a session: one call over the facts.
+ */
 export async function repoBrief(d: AskDeps, opts: { force?: boolean } = {}): Promise<{ brief: string; costUsd: number }> {
 	if (!d.root) throw new Error("repoBrief needs the workspace root");
-	const existing = loadBrief(d.root);
-	if (existing && !opts.force) return { brief: existing, costUsd: 0 };
+	const p = briefPath(d.root);
+	if (existsSync(p) && readFileSync(p, "utf8").startsWith(BRIEF_MARK) && !opts.force) return { brief: loadBrief(d.root), costUsd: 0 };
 	const { getSourceAdapter } = await import("../adapters/registry.ts");
 	const facts = repoFacts(d.config, d.ledger, d.root, getSourceAdapter(d.config.source.stack).traits?.vendorDirs);
 	if (!d.client) return { brief: facts, costUsd: 0 };
-	const role = d.config.models.escalate;
-	const res = await d.client.chat({
-		model: role.id,
-		tier: role.tier as "default" | "flex" | "priority",
-		effort: "medium",
-		messages: [
-			{ role: "system", content: "You are a senior engineer reading a legacy codebase before migrating it. Write what a migration lead must know, concretely, from the facts given. Owner decisions are settled facts: state them, never contradict them. No generic advice." },
-			{ role: "user", content: `Facts gathered from the legacy repo:\n\n${facts}\n\nWrite a brief (≤ 60 lines, markdown) with sections: What the app does; Feature areas (name → directories); UI (how pages are produced, client-side code); Data (stores, how they are accessed); Cross-cutting (auth, i18n, jobs, files, external APIs); Odd patterns a migration will trip over; Open points a human must decide.` },
-		],
+	let brief = "";
+	let costUsd = 0;
+	try {
+		const r = await briefSession(d, facts);
+		brief = r.text;
+		costUsd = r.cost;
+	} catch {
+		/* no session (offline, provider down): one call over the facts below */
+	}
+	if (!brief) {
+		const role = d.config.models.escalate;
+		const res = await d.client.chat({
+			model: role.id,
+			tier: role.tier as "default" | "flex" | "priority",
+			effort: "medium",
+			messages: [
+				{ role: "system", content: `You are a senior engineer reading a legacy codebase before migrating it. Write what a migration lead must know, concretely, from the facts given. ${BRIEF_RULE} No generic advice.` },
+				{ role: "user", content: `Facts gathered from the legacy repo:\n\n${facts}\n\nWrite a brief (≤ 60 lines, markdown) with sections: ${BRIEF_SECTIONS}.` },
+			],
+		});
+		brief = res.text.trim();
+		costUsd += res.usage.costUsd;
+	}
+	mkdirSync(dirname(p), { recursive: true });
+	writeFileSync(p, BRIEF_MARK + brief + "\n");
+	return { brief, costUsd };
+}
+
+/** The brief writer: a read-only session in the legacy repo that answers with the brief. */
+async function briefSession(d: AskDeps, facts: string): Promise<{ text: string; cost: number }> {
+	const spawn = d.spawn ?? (await import("../sessions/spawn.ts")).spawnLeaf;
+	const src = d.config.source.path;
+	const session = await spawn({
+		role: "review",
+		cwd: src,
+		config: d.config,
+		writeGlobs: [],
+		transcriptPath: join(d.root!, ".bigrefactor", "sessions", `__init__.brief.${Date.now()}.jsonl`),
+		systemPrompt: `You are a senior engineer reading a legacy codebase (${src}, read-only) before it is migrated. Use your tools (ls, find, grep, read): find and read the repo's own documentation (readme files, contributor or agent notes, docs folders), its manifests and lock files, container/compose and deploy files, the entry points and a few representative files of each area. Ground every statement in what you read and name the files and folders. ${BRIEF_RULE} No generic advice.\n\n${PLAIN_LANGUAGE}`,
 	});
-	const brief = res.text.trim();
-	mkdirSync(dirname(briefPath(d.root)), { recursive: true });
-	writeFileSync(briefPath(d.root), brief + "\n");
-	return { brief, costUsd: res.usage.costUsd };
+	try {
+		const r = await session.run(`Facts the code gathered (a starting point; the counts cover only the indexed files):\n\n${facts}\n\nRead the repo, then answer with the brief only (≤ 70 lines, markdown) with sections: ${BRIEF_SECTIONS}.`);
+		return { text: r.error ? "" : r.text.trim(), cost: r.usage.cost };
+	} finally {
+		session.dispose();
+	}
 }
 
 // ---- onboarding: phrase + discover --------------------------------------------------------------------
@@ -180,9 +235,10 @@ const PHRASE_SCHEMA = {
 export async function phraseDecisions(d: AskDeps, points: DecisionPoint[]): Promise<{ phrased: Record<string, PhrasedQuestion & { hash: string }>; costUsd: number }> {
 	const out: Record<string, PhrasedQuestion & { hash: string }> = {};
 	if (!d.client || !points.length) return { phrased: out, costUsd: 0 };
-	const { brief } = await repoBrief(d);
+	const { brief, costUsd: briefCost } = await repoBrief(d);
+	const decided = ownerDecisions(d.root);
 	const role = d.config.models.escalate;
-	let cost = 0;
+	let cost = briefCost;
 	for (let i = 0; i < points.length; i += 12) {
 		const batch = points.slice(i, i + 12);
 		const res = await d.client.chat({
@@ -192,7 +248,7 @@ export async function phraseDecisions(d: AskDeps, points: DecisionPoint[]): Prom
 			schema: PHRASE_SCHEMA,
 			messages: [
 				{ role: "system", content: `You turn migration decision points into questions for the person who owns this legacy app. Each question must be answerable by someone who knows the app but not this tool. Use the repo brief; mention concrete files, features or counts. Keep every option value exactly as given; relabel options in plain words, never drop or invent values. Always recommend one option and give your opinion; where an analysis already advised one (advised, advised_because), agree or disagree with it on the evidence.\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
-				{ role: "user", content: `Repo brief:\n${brief}\n\nDecision points (JSON):\n${JSON.stringify(batch.map((p) => ({ id: p.id, topic: p.topic, intent: p.intent, evidence: p.evidence, options: p.options, ...(p.reason ? { advised: p.recommended, advised_because: p.reason } : {}) })), null, 1)}` },
+				{ role: "user", content: `Repo brief (the legacy repo as it is):\n${brief}\n\n${decided ? `Owner decisions already made (binding: never argue from anything they settle, e.g. never call a decided target undecided):\n${decided}\n\n` : ""}Decision points (JSON):\n${JSON.stringify(batch.map((p) => ({ id: p.id, topic: p.topic, intent: p.intent, evidence: p.evidence, options: p.options, ...(p.reason ? { advised: p.recommended, advised_because: p.reason } : {}) })), null, 1)}` },
 			],
 		});
 		cost += res.usage.costUsd;
@@ -244,7 +300,7 @@ export async function discoverDecisions(d: AskDeps, covered: Array<{ id: string;
 		},
 		messages: [
 			{ role: "system", content: `You plan the migration of the legacy app described in the brief. Find decisions a human owner must make BEFORE agents migrate code, that are not already covered. Only decisions with real consequences for many files (behaviour, data, UX, scope). At most 6; none if nothing is missing. 2–4 options each, recommendation + opinion always.\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
-			{ role: "user", content: `Repo brief:\n${brief}\n\nTarget: ${d.config.target.stacks.join(" + ")} with ${JSON.stringify(d.config.target.choices)}.\n\nAlready asked:\n${covered.map((c) => `- ${c.id}: ${c.question}`).join("\n")}` },
+			{ role: "user", content: `Repo brief (the legacy repo as it is):\n${brief}\n\n${ownerDecisions(d.root) ? `Owner decisions already made (binding):\n${ownerDecisions(d.root)}\n\n` : ""}Target: ${d.config.target.stacks.join(" + ")} with ${JSON.stringify(d.config.target.choices)}.\n\nAlready asked:\n${covered.map((c) => `- ${c.id}: ${c.question}`).join("\n")}` },
 		],
 	});
 	const out: Record<string, PhrasedQuestion & { evidence: string }> = {};
@@ -387,6 +443,7 @@ export function optionFor(q: QuestionRow, picked: string): string {
 
 async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & { costUsd: number }> {
 	const brief = loadBrief(d.root);
+	const decided = ownerDecisions(d.root);
 	const role = d.config.models.implement;
 	try {
 		const res = await d.client!.chat({
@@ -396,7 +453,7 @@ async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & {
 			schema: { type: "object", additionalProperties: false, required: PHRASE_SCHEMA.properties.questions.items.required, properties: PHRASE_SCHEMA.properties.questions.items.properties },
 			messages: [
 				{ role: "system", content: `You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion${q.recommended || q.agentOpinion ? ` (agree or disagree with the ${q.agentOpinion ? "agent's opinion" : "current pick"}, with a reason)` : " (your own pick and why; no other pick was made)"}.${q.ownerAnswers ? " The owner's earlier answers on like questions show what they want; follow them where the case is the same." : ""}\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
-				{ role: "user", content: `${brief ? `Repo brief:\n${brief.slice(0, 4000)}\n\n` : ""}Point: ${q.point}${q.unitId ? ` (unit ${q.unitId})` : ""}\nFacts:\n${q.facts}\n\nOptions: ${JSON.stringify(q.options)}\n${q.recommended ? `Current pick: ${q.recommended}\n` : ""}${q.agentOpinion ? `Agent's opinion: ${q.agentOpinion}\n` : ""}${q.ownerAnswers ? `Owner's earlier answers:\n${q.ownerAnswers}\n` : ""}\nReturn id "${q.point}".` },
+				{ role: "user", content: `${brief ? `Repo brief (the legacy repo as it is):\n${brief.slice(0, 4000)}\n\n` : ""}${decided ? `Owner decisions already made (binding):\n${decided.slice(0, 2000)}\n\n` : ""}Point: ${q.point}${q.unitId ? ` (unit ${q.unitId})` : ""}\nFacts:\n${q.facts}\n\nOptions: ${JSON.stringify(q.options)}\n${q.recommended ? `Current pick: ${q.recommended}\n` : ""}${q.agentOpinion ? `Agent's opinion: ${q.agentOpinion}\n` : ""}${q.ownerAnswers ? `Owner's earlier answers:\n${q.ownerAnswers}\n` : ""}\nReturn id "${q.point}".` },
 			],
 		});
 		const j = (res.json ?? {}) as { question?: string; options?: Array<{ value: string; label: string; hint: string }>; recommended?: string; opinion?: string };

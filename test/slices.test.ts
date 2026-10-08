@@ -80,5 +80,9 @@ describe("dynamic units by directory", () => {
 		applyDecision(ledger, config, root, "dynamic-slice", "by-directory");
 		const ov = JSON.parse(readFileSync(join(root, ".bigrefactor", "slices.json"), "utf8"));
 		expect(ov.overrides).toEqual({ D1: "foundation", D2: "billing" });
+		// planned again right away: a run only plans when no plan exists, so the answer must not wait for one
+		const slice = (id: string) => JSON.parse(ledger.getUnit(id)!.meta).slice;
+		expect([slice("D1"), slice("D2")]).toEqual(["foundation", "billing"]);
+		expect(ledger.getMeta("slice_plan")).toBeTruthy();
 	});
 });

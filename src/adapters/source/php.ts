@@ -374,7 +374,9 @@ export const phpAdapter: SourceAdapter = {
 		vendorDirs: ["vendor"],
 	},
 	include: ["**/*.php", "**/*.phtml", "**/*.inc"],
-	exclude: ["**/vendor/**", "**/docs/**", "**/3rdparty/**", "**/third_party/**", "**/third-party/**", "**/node_modules/**", "**/.git/**", "**/tests/**", "**/test/**", "**/cache/**", "**/storage/**"],
+	// minimal defaults only (package manager, VCS, test suites, runtime caches): docs, vendored libraries, stubs and
+	// tooling are the framework-profile model's call (notApp), so entry points there are not lost
+	exclude: ["**/vendor/**", "**/node_modules/**", "**/.git/**", "**/tests/**", "**/test/**", "**/cache/**", "**/storage/**"],
 	docs: [
 		{ name: "PHP manual (language reference)", url: "https://www.php.net/manual/en/langref.php" },
 		{ name: "PHPUnit", url: "https://docs.phpunit.de/" },
