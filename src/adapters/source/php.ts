@@ -30,7 +30,6 @@ const DEP_QUERY = `
 const HTTP_MARKERS = ["$_GET", "$_POST", "$_REQUEST", "$_SERVER", "$_SESSION", "$_COOKIE", "header(", "http_response_code(", "ob_start("];
 const TEMPLATE_RE = /(^|\/)(templates?|views?|resources\/views)\/|\.phtml$|\.blade\.php$/i;
 const ROUTES_RE = /(^|\/)routes?(\/(web|api|console|channels|[a-z_]+))?\.php$/;
-const CROSS_CUTTING = /auth|session|middleware|cron|job|queue|logger|logging|csrf|guard/i;
 const SQL_RES: RegExp[] = [
 	/\bSELECT\b[\s\S]{0,400}?\bFROM\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
 	/\bINSERT\s+INTO\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
@@ -53,11 +52,13 @@ interface PhpFrameworkProfile {
 	loaders(scope: string | null, method: string, args: Array<string | undefined>): string[];
 	/** Files a file implies by convention (e.g. a model's commands directory reached through generic actions). */
 	impliedDeps?(relPath: string): string[];
-	/** Files discovered by directory scan at boot (controllers, access delegates…): alive without inbound edges. */
+	/** Files that run without other code including them (front controllers, CLI/cron scripts, files a directory scan loads at boot): alive without inbound edges. */
 	entryPoint?: RegExp;
 	/** `new SomethingRoute('url', $this, 'method', …)` → {urlArg, handlerArg} when the class is a route. */
 	routeClass?: RegExp;
 	concerns: FrameworkConcern[];
+	/** Legacy file kinds a target name must not carry (SourceAdapter.legacyWords). */
+	legacyWords?: string[];
 }
 
 let activeProfile: PhpFrameworkProfile | undefined | null = null; // null = not detected yet
@@ -106,6 +107,8 @@ export interface FrameworkProfileJson {
 	entryPoint?: string; // regex
 	routeClass?: string; // regex over `new X(` class names; args: first literal = url, next literal = handler method
 	concerns: Array<{ match: string; concern: string; legacy: string; verdict: FrameworkConcern["verdict"] }>;
+	/** Dotted file-name parts / extensions only legacy files carry (`x.cmd.php` → cmd), picked from the real suffixes. */
+	legacyWords?: string[];
 }
 
 export function profileFromJson(j: FrameworkProfileJson): PhpFrameworkProfile {
@@ -128,6 +131,7 @@ export function profileFromJson(j: FrameworkProfileJson): PhpFrameworkProfile {
 		entryPoint: re(j.entryPoint),
 		routeClass: re(j.routeClass),
 		concerns: j.concerns.map((c) => ({ match: new RegExp(c.match, "i"), concern: c.concern, legacy: c.legacy, verdict: c.verdict })),
+		legacyWords: j.legacyWords?.map((w) => w.toLowerCase()),
 	};
 }
 
@@ -151,7 +155,7 @@ export function exampleProfileJson(): FrameworkProfileJson {
 			{ scope: null, method: "include_template", globs: ["**/view/templates/**/$1.tpl.php", "**/view/templates/**/$1"] },
 		],
 		impliedDeps: [{ match: "(^|/)model/classes/([a-z0-9_]+)\\.model\\.php$", globs: ["**/behaviour/commands/$2/*.cmd.php"] }],
-		entryPoint: "(^|/)controller/[^/]+\\.controller\\.php$|(^|/)behaviour/accesscontrol/[^/]+\\.access\\.php$|(^|/)enabled\\.inc\\.php$",
+		entryPoint: "(^|/)www/index\\.php$|(^|/)run_console\\.php$|(^|/)controller/[^/]+\\.controller\\.php$|(^|/)behaviour/accesscontrol/[^/]+\\.access\\.php$|(^|/)enabled\\.inc\\.php$",
 		routeClass: "Route$",
 		concerns: [
 			{ match: "^(Load|Config|Constants?)$", concern: "loading", legacy: "convention loader (Load::models/components/commands) + constants", verdict: "platform" },
@@ -172,6 +176,7 @@ export function exampleProfileJson(): FrameworkProfileJson {
 			{ match: "^(Simpletest|.*Test|Mock.*|GyroUnitTestCase)", concern: "tests", legacy: "SimpleTest unit tests", verdict: "drop" },
 			{ match: "^(Doxygen|Tidy|Phpinfo|Robots|Gsitemap|Mime|Offline|StaticPage|Json|Ajax|Status)", concern: "misc", legacy: "misc framework modules", verdict: "review" },
 		],
+		legacyWords: ["tpl", "cmd", "cls", "facade", "inc", "php", "phtml"],
 	};
 }
 const CONTAINER_TYPES = ["class_declaration", "interface_declaration", "trait_declaration", "enum_declaration", "anonymous_class"];
@@ -581,7 +586,8 @@ export const phpAdapter: SourceAdapter = {
 
 	classifyTier(sym, file) {
 		const text = readFileSync(join(process.env["BR_SOURCE_ROOT"] ?? "", file.path), "utf8").slice(0, 100_000);
-		if (CROSS_CUTTING.test(file.path) || CROSS_CUTTING.test(sym.name)) return "T3";
+		// no name-based "cross-cutting" tier: one symbol like isCommandInQueue made a whole feature T3. Whether code is
+		// auth/jobs/logging is Jev's kind label (label_unit); tiers come from what the file does and its deps.
 		if (TEMPLATE_RE.test(file.path) || ROUTES_RE.test(file.path)) return "T2";
 		if (HTTP_MARKERS.some((m) => text.includes(m)) || /controllers?\//i.test(file.path)) return "T2";
 		if (sym.kind === "const") return "T0";
@@ -600,6 +606,9 @@ export const phpAdapter: SourceAdapter = {
 	},
 
 	isEntryPoint(path) {
+		// The framework profile names the entry points (its model read the repo: front controllers, CLI/cron scripts,
+		// scan-discovered files). The common front-controller names stay as a floor: keeping a file alive is the safe
+		// side, and before a file is dropped as dead Jev is asked about it (src/init/dead.ts).
 		return /(^|\/)(index|app|bootstrap|run_console|start)(\.inc)?\.php$/.test(path) || /(^|\/)www\//.test(path) || (activeProfile?.entryPoint?.test(path) ?? false);
 	},
 
@@ -623,7 +632,7 @@ export const phpAdapter: SourceAdapter = {
 	profileExample() {
 		return {
 			example: exampleProfileJson(),
-			schemaDoc: `The file is JSON with: id (string); frameworkDirs (string[] path prefixes of the framework, relative to the legacy root, trailing slash); loaders (array of {scope: string|null, method: string, globs: string[], each?: boolean}) — scope is the class of a static call (null for plain functions), method its name; impliedDeps (array of {match: regex over a file path, globs: string[] with $1… from the match groups}); entryPoint (regex over file paths discovered by directory scan at boot); routeClass (regex over class names whose constructor takes the URL as first string literal and the handler method name as the next string literal); concerns (array of {match: regex over class/interface/function names, concern: one of loading|orm|routing|auth|rendering|commands|cache|mail|jobs|events|helpers|i18n|logging|http|install|tests|misc, legacy: short description, verdict: platform|port|drop|review}).`,
+			schemaDoc: `The file is JSON with: id (string); frameworkDirs (string[] path prefixes of the framework, relative to the legacy root, trailing slash); loaders (array of {scope: string|null, method: string, globs: string[], each?: boolean}) — scope is the class of a static call (null for plain functions), method its name; impliedDeps (array of {match: regex over a file path, globs: string[] with $1… from the match groups}); entryPoint (regex over the file paths that run without other code including them: web front controllers, CLI/console and cron scripts, scripts that deploy or shell scripts call, and files the framework discovers by directory scan at boot; files nothing reaches are treated as dead code); legacyWords (string[], lowercase: the dotted file-name parts and extensions that mark a LEGACY file kind, e.g. "tpl" for x.tpl.php; only parts a well-named new codebase would never use, never ordinary words like controller, model, service, test, handler); routeClass (regex over class names whose constructor takes the URL as first string literal and the handler method name as the next string literal); concerns (array of {match: regex over class/interface/function names, concern: one of loading|orm|routing|auth|rendering|commands|cache|mail|jobs|events|helpers|i18n|logging|http|install|tests|misc, legacy: short description, verdict: platform|port|drop|review}).`,
 		};
 	},
 	validateProfile(json) {
@@ -631,20 +640,25 @@ export const phpAdapter: SourceAdapter = {
 		const problems: string[] = [];
 		if (!j || typeof j !== "object") return ["not an object"];
 		if (!j.id) problems.push("missing id");
-		if (!Array.isArray(j.frameworkDirs) || !j.frameworkDirs.length) problems.push("frameworkDirs must be a non-empty array");
-		if (!Array.isArray(j.loaders) || !j.loaders.length) problems.push("loaders must be a non-empty array");
+		if (!Array.isArray(j.frameworkDirs)) problems.push("frameworkDirs must be an array (empty when the app has no separate framework)");
+		// a framework has a loader and base-class families; an app without one (plain PHP) may have neither
+		const fw = (j.frameworkDirs?.length ?? 0) > 0;
+		if (!Array.isArray(j.loaders) || (fw && !j.loaders.length)) problems.push("loaders must be a non-empty array");
 		for (const l of j.loaders ?? []) if (!l.method || !Array.isArray(l.globs) || !l.globs.length) problems.push(`loader ${JSON.stringify(l)} needs method + globs`);
-		if (!Array.isArray(j.concerns) || j.concerns.length < 4) problems.push("concerns must list at least 4 class families");
+		if (!Array.isArray(j.concerns) || (fw && j.concerns.length < 4)) problems.push("concerns must list at least 4 class families");
 		const concernKeys = new Set(["loading", "orm", "routing", "auth", "rendering", "commands", "cache", "mail", "jobs", "events", "helpers", "i18n", "logging", "http", "install", "tests", "misc"]);
 		for (const c of j.concerns ?? []) {
 			if (!concernKeys.has(c.concern)) problems.push(`unknown concern key ${c.concern}`);
 			try { new RegExp(c.match); } catch { problems.push(`bad regex ${c.match}`); }
 		}
 		for (const r of [j.entryPoint, j.routeClass]) if (r) { try { new RegExp(r); } catch { problems.push(`bad regex ${r}`); } }
+		if (j.legacyWords !== undefined && (!Array.isArray(j.legacyWords) || j.legacyWords.some((w) => typeof w !== "string" || !/^[a-z0-9]+$/i.test(w)))) problems.push("legacyWords must be an array of single words");
 		return problems;
 	},
-	// gyro/PHP file kinds (x.tpl.php, x.cmd.php, x.cls.php, x.facade.php, x.inc.php): a target name carrying one is a ported file name
-	legacyWords: ["tpl", "cmd", "cls", "facade", "inc", "php", "phtml"],
+	// the profile's legacy file kinds (its model picked them from the real file suffixes); none without a profile
+	get legacyWords() {
+		return profileFor(process.env["BR_SOURCE_ROOT"] ?? "")?.legacyWords;
+	},
 	placeFile(path, root) {
 		return placePhpFile(path, root, isGyroRoot);
 	},

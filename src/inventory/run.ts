@@ -156,7 +156,10 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// ---- registration files: not units; the target adapter regenerates them from the ledger
 	const regenerated = indexes.filter((f) => adapter.isRegistrationFile?.(f.path)).map((f) => f.path);
 	// owner-confirmed exclusions (area questions → decisions.json `excluded`): same disposition, kept across re-inventories
-	const excluded = (loadDecisions(_root) as { excluded?: Record<string, string> }).excluded ?? {};
+	const decided = loadDecisions(_root) as ReturnType<typeof loadDecisions> & { excluded?: Record<string, string> };
+	const excluded = decided.excluded ?? {};
+	// files Jev judged reachable although nothing refers to them (cron, CLI, dynamic dispatch): entry points
+	const judgedAlive = new Set(Object.entries(decided.liveness ?? {}).filter(([, v]) => v.alive).map(([p]) => p));
 	for (const f of indexes) if (excluded[f.path] && !regenerated.includes(f.path)) regenerated.push(f.path);
 	// ---- framework files: indexed so names resolve, mapped per concern (br frameworks), never units
 	const framework = indexes.filter((f) => isFramework(f.path)).map((f) => f.path);
@@ -164,8 +167,9 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 
 	// ---- dead code, transitive: a file is dead when nothing refers to it, or when every file that refers to
 	// it (import, convention load, string-literal mention) is itself dead. Repeated to a fixpoint, so a
-	// template included only by a dead template is dead too. Entry points, route handlers, registration
-	// and framework files are always live. Cycles of only-dead files stay live (conservative).
+	// template included only by a dead template is dead too. Entry points (the adapter's, and files Jev judged
+	// reachable), route handlers, registration and framework files are always live. Cycles of only-dead files
+	// stay live (conservative).
 	const referrers = new Map<string, Set<string>>();
 	const refer = (from: string, to: string) => {
 		if (from === to) return;
@@ -176,7 +180,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	const literalSoft: Array<[string, string]> = [];
 	const candidates: typeof indexes = [];
 	for (const f of indexes) {
-		if (routeHit.has(f.path) || regenerated.includes(f.path) || frameworkSet.has(f.path) || adapter.isEntryPoint?.(f.path)) continue;
+		if (routeHit.has(f.path) || regenerated.includes(f.path) || frameworkSet.has(f.path) || judgedAlive.has(f.path) || adapter.isEntryPoint?.(f.path)) continue;
 		if (!f.symbols.length) continue; // nothing to drop
 		const names = f.symbols.map((s) => s.name.split("::").pop()!);
 		const aliases = adapter.fileAliases?.(f.path) ?? [];

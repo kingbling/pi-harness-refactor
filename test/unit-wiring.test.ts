@@ -1,6 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
+import { exampleProfileJson } from "../src/adapters/source/php.ts";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
@@ -28,6 +29,8 @@ beforeEach(() => {
 	write(join(ws, "migrated", "package.json"), "{}");
 	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
 	ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+	// the profile model picked the legacy file kinds; the gate gets them through the source adapter
+	writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify({ ...exampleProfileJson(), legacyWords: ["tpl", "cmd"] }));
 	ledger.createUnit({ id: "u1", tier: "T0", deps: [], meta: { files: ["app/behaviour/commands/agency/create.cmd.php"], place: { stack: "nestjs", area: "agency", shared: false, source: "code" } }, symbolIds: [] });
 	// truth captured before: the tester is skipped
 	write(join(ws, ".bigrefactor", "truth", "u1", "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");

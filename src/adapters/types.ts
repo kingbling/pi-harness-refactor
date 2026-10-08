@@ -245,9 +245,10 @@ export interface SourceAdapter {
 	placeFile?(path: string, root?: string): { area?: string; surface: "server" | "ui" } | undefined;
 	/**
 	 * Name parts only legacy file names carry (file kinds, extensions, lowercase). A target file or class name
-	 * containing one is named after a legacy file: structure_ok fails it.
+	 * containing one is named after a legacy file: structure_ok fails it. A model picks them from the real file
+	 * suffixes (framework profile): "facade" is a legacy kind in gyro (x.facade.php), an ordinary word in Laravel.
 	 */
-	legacyWords?: string[];
+	readonly legacyWords?: string[];
 	/** Official docs to fetch at init (llms.txt style URLs preferred). */
 	docs: Array<{ name: string; url: string }>;
 }
