@@ -12,7 +12,7 @@ import pc from "picocolors";
 import { progress } from "../progress.ts";
 import { paidSince } from "../spend.ts";
 import { loadConfig, type Config } from "../config.ts";
-import { addWorktree, emptyWorktreeTrash, headOf, removeWorktree } from "../git.ts";
+import { addWorktree, emptyWorktreeTrash, headOf, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getTargetAdapter } from "../adapters/registry.ts";
 import { resolveChoices } from "../init/stack.ts";
@@ -213,6 +213,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
+	const branchNow = mainBranch(config.target.path, config.target.git.branch);
+	if (branchNow !== config.target.git.branch) log(pc.yellow(`target branch ${config.target.git.branch} is gone from ${config.target.path}; units merge into ${branchNow} (the checked-out branch). Set target.git.branch to "${branchNow}" to make it permanent.`));
 	if (!o.dry) {
 		const caught = decideOpenFromGoals(ledger, config);
 		if (caught) log(pc.cyan(`decided ${caught} open routine question(s) from your goals (br questions lists them; br answer <id> changes one)`));
@@ -374,7 +376,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							const adapter = adapters.get(stackId)!;
 							const mainProject = projectDir(config, stackId);
 							const sha = mergeUnit(config, unitId, wt, branch, mainProject);
-							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${config.target.git.branch}` : "merged (no changes)");
+							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
 							if (sha) ledger.updateUnit(unitId, { meta: { ...JSON.parse(ledger.getUnit(unitId)!.meta), commit: sha } });
 							await indexTarget(ledger, adapter, mainProject, res!.gate?.changedFiles).catch(() => 0);
 							afterAccept(ledger, adapter, mainProject, stackId, placementOf(ledger.getUnit(unitId)!.meta).area, (l) => log(`  ${l}`));
@@ -682,8 +684,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 }
 
 /** Bring the unit branch up to date with the main branch and fast-forward it in. */
-function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string, message = `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`): string | undefined {
-	const main = config.target.git.branch;
+export function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string, message = `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`): string | undefined {
+	const main = mainBranch(config.target.path, config.target.git.branch);
 	const before = headOf(config.target.path);
 	gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
 	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -691,8 +693,15 @@ function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _
 	try {
 		execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", main], { stdio: "pipe" });
 	} catch (e: any) {
-		execFileSync("git", ["-C", wt, "rebase", "--abort"], { stdio: "pipe" });
-		throw new Error(`merge conflict rebasing ${branch} onto ${main}: ${String(e?.stderr ?? e?.message).slice(0, 400)}`);
+		const msg = String(e?.stderr ?? e?.message).trim();
+		try {
+			execFileSync("git", ["-C", wt, "rebase", "--abort"], { stdio: "pipe" });
+		} catch {
+			/* the rebase never started: nothing to abort, the message above says why */
+		}
+		// only a real conflict is a merge conflict (another implement pass helps); anything else is reported as it is
+		if (/conflict|could not apply/i.test(msg)) throw new Error(`merge conflict rebasing ${branch} onto ${main}: ${msg.slice(0, 400)}`);
+		throw new Error(`could not rebase ${branch} onto ${main}: ${msg.slice(0, 400)}`);
 	}
 	execFileSync("git", ["-C", config.target.path, "merge", "-q", "--ff-only", branch], { stdio: "pipe" });
 	const after = headOf(config.target.path);

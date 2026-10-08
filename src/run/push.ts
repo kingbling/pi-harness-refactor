@@ -2,6 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { join } from "node:path";
 import pc from "picocolors";
 import { loadConfig, saveConfig, type Config } from "../config.ts";
+import { mainBranch } from "../git.ts";
 
 /**
  * `target.git.push`: when "on" and the target repo has a remote, the migration branch is pushed after merges. On
@@ -61,10 +62,11 @@ export function createPusher(o: { config: Config; root: string; log: (l: string)
 		}
 		dirty = false;
 		last = Date.now();
-		running = pushOnce(o.config.target.path, remote, git.branch)
+		const branch = mainBranch(o.config.target.path, git.branch);
+		running = pushOnce(o.config.target.path, remote, branch)
 			.then((err) => {
 				if (!err) {
-					if (lastError) o.log(pc.green(`push: ${git.branch} → ${remote} works again`));
+					if (lastError) o.log(pc.green(`push: ${branch} → ${remote} works again`));
 					lastError = "";
 					return;
 				}
@@ -102,7 +104,7 @@ export function pushSetting(configPath: string, args: string[]): string {
 	} else if (mode) throw new Error("usage: br push [on|off] [remote]");
 	const g = config.target.git;
 	const found = pushRemote(config.target.path, g.remote);
-	return `push ${g.push}: ${g.branch} → ${found ?? (g.remote ? `${g.remote} (no such remote in ${config.target.path})` : `no remote in ${config.target.path}`)}${g.push === "on" ? " (after merges, at most once a minute, and when a run ends)" : ""}\nchange: br push on|off [remote]  ·  in Pi: /br push on|off [remote]`;
+	return `push ${g.push}: ${mainBranch(config.target.path, g.branch)} → ${found ?? (g.remote ? `${g.remote} (no such remote in ${config.target.path})` : `no remote in ${config.target.path}`)}${g.push === "on" ? " (after merges, at most once a minute, and when a run ends)" : ""}\nchange: br push on|off [remote]  ·  in Pi: /br push on|off [remote]`;
 }
 
 function remoteUrl(repo: string, remote: string): string | undefined {
@@ -133,7 +135,7 @@ export async function askPush(config: Config, ui: { select(m: string, o: Array<{
 	const url = remote ? remoteUrl(repo, remote) : undefined;
 	if (yes) return { push: config.target.git.push, remote: config.target.git.remote };
 	const pick = await ui.select(
-		url ? `The new repo has the remote ${remote} → ${url}. Push the ${config.target.git.branch} branch there after merges?` : `The new repo (${repo}) has no remote. Should the run push the ${config.target.git.branch} branch somewhere after merges?`,
+		url ? `The new repo has the remote ${remote} → ${url}. Push the ${mainBranch(repo, config.target.git.branch)} branch there after merges?` : `The new repo (${repo}) has no remote. Should the run push the ${mainBranch(repo, config.target.git.branch)} branch somewhere after merges?`,
 		[
 			...(url ? [{ value: "on", label: `yes, push to ${remote}`, hint: "on the side, at most once a minute and when a run ends" }] : []),
 			{ value: "url", label: url ? "push to another URL (type it)" : "yes: add a remote (type its URL)" },

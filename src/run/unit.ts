@@ -8,7 +8,7 @@ import { overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { commitAll } from "../git.ts";
+import { commitAll, mainBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { syntaxErrors } from "../inventory/treesitter.ts";
 import { describeCapabilities } from "../inventory/capabilities.ts";
@@ -506,7 +506,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 export function acceptUnit(o: { ledger: Ledger; config: Config; unitId: string }, targetProjectDir: string, area: string): string | undefined {
 	const sha = commitAll(o.config.target.path, `feat(${area}): migrate ${o.unitId}\n\n${o.ledger.symbolsOfUnit(o.unitId).map((s) => `- ${s.id} → ${s.state}`).join("\n")}\n\nbigrefactor: unit ${o.unitId}, target ${relative(o.config.target.path, targetProjectDir) || "."}`);
 	o.ledger.transitionUnit(o.unitId, "accepted", sha ? `committed ${sha.slice(0, 7)}` : "accepted (nothing new to commit)");
-	if (sha) o.ledger.updateUnit(o.unitId, { branch: o.config.target.git.branch, meta: { ...JSON.parse(o.ledger.getUnit(o.unitId)!.meta), commit: sha } });
+	if (sha) o.ledger.updateUnit(o.unitId, { branch: mainBranch(o.config.target.path, o.config.target.git.branch), meta: { ...JSON.parse(o.ledger.getUnit(o.unitId)!.meta), commit: sha } });
 	return sha;
 }
 

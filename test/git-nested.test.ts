@@ -48,3 +48,24 @@ describe("git: removing a unit worktree", () => {
 		expect(readdirSync(join(wt, "..", ".trash"))).toEqual([]);
 	});
 });
+
+describe("git: the branch units merge into", () => {
+	it("follows the checked-out branch when the configured one was renamed by hand; a merge onto it works", async () => {
+		const { addWorktree, mainBranch } = await import("../src/git.ts");
+		const { mergeUnit } = await import("../src/run/run.ts");
+		const { ConfigSchema } = await import("../src/config.ts");
+		const repo = realpathSync(mkdtempSync(join(tmpdir(), "br-branch-")));
+		ensureRepo(repo, "migration/main", []);
+		writeFileSync(join(repo, "a.txt"), "x\n");
+		commitAll(repo, "init");
+		expect(mainBranch(repo, "migration/main")).toBe("migration/main");
+		git(repo, ["branch", "-m", "migration/main", "main"]); // what the owner did to publish it as main
+		expect(mainBranch(repo, "migration/main")).toBe("main");
+		const config = ConfigSchema.parse({ source: { path: repo, stack: "php" }, target: { path: repo, stacks: ["nestjs"] }, models: {} });
+		const wt = join(repo, "..", `${repo.split("/").pop()}-wt`);
+		addWorktree(repo, wt, "unit/U1");
+		writeFileSync(join(wt, "b.txt"), "y\n");
+		expect(mergeUnit(config, "U1", wt, "unit/U1", repo)).toBeTruthy();
+		expect(git(repo, ["log", "-1", "--format=%s"])).toBe("feat: migrate U1");
+	});
+});

@@ -105,3 +105,20 @@ export function emptyWorktreeTrash(worktreesDir: string): void {
 	if (!existsSync(t)) return;
 	for (const n of readdirSync(t)) if (!n.includes(`-${process.pid}-`)) void rm(join(t, n), { recursive: true, force: true }).catch(() => {});
 }
+
+/**
+ * The branch units merge into: the configured one, or, when it is gone from the repo (renamed by hand, e.g.
+ * migration/main → main), the branch the target repo has checked out.
+ */
+export function mainBranch(repo: string, configured: string): string {
+	try {
+		git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${configured}`]);
+		return configured;
+	} catch {
+		try {
+			return git(repo, ["symbolic-ref", "--short", "HEAD"]) || configured;
+		} catch {
+			return configured;
+		}
+	}
+}
