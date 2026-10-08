@@ -23,7 +23,7 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 	return {
 		name: "set_gate_command",
 		label: "Set gate command",
-		description: `Replace the ${stackId} gate's build, lint or test command for this workspace, when the built-in one does not fit the installed tools. Use "{files}" as one arg where the files go (lint: files to lint; test: test files to run; may be empty). It must really build/lint/test: commands that cannot fail are refused.`,
+		description: `Replace the ${stackId} gate's build, lint or test command for this workspace, when the built-in one does not fit the installed tools. Use "{files}" as one arg where the unit's files go (build/lint: the files to check; test: the test files to run): each unit's gate then checks only its own files. A build or lint command without "{files}" checks the whole project: it is not run per unit but by the builder after merges, now and then. It must really build/lint/test: commands that cannot fail are refused.`,
 		promptSnippet: "set_gate_command: replace the stack's build/lint/test command for this workspace",
 		parameters: Type.Object({ step: Type.Union([Type.Literal("build"), Type.Literal("lint"), Type.Literal("test")]), cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
 		execute: async (_id: string, p: { step: "build" | "lint" | "test"; cmd: string; args: string[]; why: string }) => {

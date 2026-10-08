@@ -100,6 +100,9 @@ export const ConfigSchema = z.object({
 			maxImplementAttempts: z.number().int().min(1).default(3),
 			maxEscalateAttempts: z.number().int().min(0).default(2),
 			budgetUsdPerDay: z.number().positive().default(200),
+			/** The builder runs the whole-project checks after this many merges, or after this many minutes with merges, whichever comes first. */
+			buildEveryUnits: z.number().int().min(1).default(20),
+			buildEveryMinutes: z.number().min(1).default(30),
 			/** Packed task-card context above this triggers a pre-split; a session exceeding it in total usage is aborted. */
 			maxUnitTokens: z.number().int().default(250_000),
 			/** A leaf session with no model/tool activity for this long is aborted (outcome idle_timeout). */

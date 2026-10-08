@@ -386,7 +386,8 @@ export interface TargetAdapter {
 	scaffoldProject(root: string): Promise<void>;
 	/** How the project is created with the stack's official tools, for the setup model (it checks --help for the installed version). */
 	scaffoldHint?: string;
-	build(root: string): { cmd: string; args: string[] };
+	/** `files`: the unit's files, used when the command takes them ({files}); a command that ignores them checks the whole project and is run by the builder after merges, not per unit. */
+	build(root: string, files?: string[]): { cmd: string; args: string[] };
 	lint(root: string, files: string[]): { cmd: string; args: string[] };
 	test(root: string, relatedFiles: string[]): { cmd: string; args: string[] };
 	/** Paths the implementer may never write (protected). */

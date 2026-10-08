@@ -52,6 +52,25 @@ describe("answers are applied per option", () => {
 		expect(applyParkedAnswer("auto: the environment changed", opts)).toEqual({ action: "requeue" });
 	});
 
+	it("units hitting the same problem share one question: no new question, all wait, one answer releases them all", async () => {
+		const { root, config, ledger, mk } = workspace();
+		for (const id of ["U1", "U2", "U3"]) mk(id, "billing", "implementing");
+		const { askViaModel } = await import("../src/jev/ask.ts");
+		const req = (unitId: string, sameAs: string) => askViaModel({ ledger, config, root }, { unitId, point: "gate_env", facts: "phpstan: Allowed memory size exhausted", options: [{ value: "fixed" }, { value: "quarantine" }], sameAs, askedBy: "test" });
+		const first = await req("U1", "lint_ok: Allowed memory size of N bytes exhausted");
+		const second = await req("U2", "lint_ok: Allowed memory size of N bytes exhausted");
+		const other = await req("U3", "build_ok: something else");
+		expect(second).toMatchObject({ id: first.id, shared: true });
+		expect(other.id).not.toBe(first.id);
+		expect(ledger.openQuestions()).toHaveLength(2);
+		expect([...ledger.blockedUnits().entries()].filter(([, q]) => q.includes(first.id)).map(([u]) => u).sort()).toEqual(["U1", "U2"]);
+		const go = () => resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
+		expect(go()).toEqual([]);
+		ledger.answerQuestion(first.id, "fixed");
+		expect(go().sort()).toEqual(["U1", "U2"]);
+		expect(ledger.getUnit("U3")!.state).toBe("implementing");
+	});
+
 	it("quarantine quarantines, free text becomes the next attempt's note, wait holds, a non-blocking question never strands", () => {
 		const { root, config, ledger, mk } = workspace();
 		for (const id of ["U1", "U2", "U3", "U4"]) mk(id, "billing", "implementing");

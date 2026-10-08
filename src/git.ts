@@ -1,6 +1,7 @@
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
-import { existsSync, realpathSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 /**
  * Minimal git helpers. Two repos with opposite rules:
@@ -71,10 +72,36 @@ export function addWorktree(repo: string, worktreePath: string, branch: string):
 	git(repo, ["worktree", "add", "-q", "-B", branch, worktreePath]);
 }
 
+/**
+ * A worktree can hold thousands of files (a copied dependency dir): deleting it inline froze the run for a second
+ * per unit. It is moved aside instead (instant, same disk), git forgets it, and the files go in the background.
+ */
 export function removeWorktree(repo: string, worktreePath: string): void {
+	if (!existsSync(worktreePath)) return;
+	const trash = join(dirname(worktreePath), ".trash", `${basename(worktreePath)}-${process.pid}-${trashSeq++}`);
 	try {
-		git(repo, ["worktree", "remove", "--force", worktreePath]);
+		mkdirSync(dirname(trash), { recursive: true });
+		renameSync(worktreePath, trash);
 	} catch {
-		/* already gone */
+		try {
+			git(repo, ["worktree", "remove", "--force", worktreePath]);
+		} catch {
+			/* already gone */
+		}
+		return;
 	}
+	try {
+		git(repo, ["worktree", "prune"]);
+	} catch {
+		/* pruned on the next add */
+	}
+	void rm(trash, { recursive: true, force: true }).catch(() => {});
+}
+let trashSeq = 0;
+
+/** Worktrees moved aside by an earlier process that ended before deleting them. */
+export function emptyWorktreeTrash(worktreesDir: string): void {
+	const t = join(worktreesDir, ".trash");
+	if (!existsSync(t)) return;
+	for (const n of readdirSync(t)) if (!n.includes(`-${process.pid}-`)) void rm(join(t, n), { recursive: true, force: true }).catch(() => {});
 }

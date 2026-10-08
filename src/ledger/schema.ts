@@ -97,6 +97,14 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
+-- units that wait on a question another unit asked first (the same problem): one answer releases them all
+CREATE TABLE IF NOT EXISTS question_waiters (
+  question_id INTEGER NOT NULL,
+  unit_id TEXT NOT NULL,
+  PRIMARY KEY (question_id, unit_id)
+);
+CREATE INDEX IF NOT EXISTS question_waiters_unit ON question_waiters(unit_id);
+
 CREATE TABLE IF NOT EXISTS files (
   path TEXT PRIMARY KEY,
   hash TEXT NOT NULL,

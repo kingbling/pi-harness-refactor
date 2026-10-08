@@ -149,7 +149,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 				await runCommand(e.cmd, e.args, { cwd: root });
 			}
 		},
-		build: (root) => expand(m.build, { dir: root, files: [] }),
+		build: (root, files = []) => expand(m.build, { dir: root, files }),
 		lint: (root, files) => expand(m.lint, { dir: root, files }),
 		test: (root, related) => expand(m.test, { dir: root, files: related }),
 		protectedGlobs: m.protectedGlobs,

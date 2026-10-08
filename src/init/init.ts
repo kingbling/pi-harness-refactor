@@ -359,7 +359,7 @@ async function toolchainProblem(config: Config, adapter: TargetAdapter): Promise
 	const probePath = join(dir, probe.path);
 	try {
 		writeFileSync(probePath, probe.content);
-		for (const [step, c] of [["build", adapter.build(dir)], ["lint", adapter.lint(dir, [probe.path])], ["test", adapter.test(dir, [probe.path])]] as const) {
+		for (const [step, c] of [["build", adapter.build(dir, [probe.path])], ["lint", adapter.lint(dir, [probe.path])], ["test", adapter.test(dir, [probe.path])]] as const) {
 			const err = await runChecked(c, dir);
 			if (err !== undefined) return `${adapter.id}: the gate's ${step} command fails on a fresh project (${c.cmd} ${c.args.join(" ")}):\n${err}`;
 		}

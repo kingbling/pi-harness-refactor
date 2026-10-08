@@ -326,6 +326,15 @@ export class Ledger {
 	 * Units that must wait for open questions. Everything else keeps running.
 	 *  none → nothing; unit → that unit; dependents → the unit and its transitive dependents; module → every unit sharing its top-level dir.
 	 */
+	/** The unit waits on a question another unit asked about the same problem. */
+	addWaiter(questionId: number, unitId: string): void {
+		this.db.prepare("INSERT OR IGNORE INTO question_waiters(question_id, unit_id) VALUES (?, ?)").run(questionId, unitId);
+	}
+	/** An open question about the same problem (point + key), if one was asked already. */
+	openQuestionFor(point: string, sameAs: string): number | undefined {
+		const r = this.db.prepare("SELECT id FROM questions WHERE status = 'open' AND point = ? AND json_extract(context, '$.sameAs') = ? ORDER BY id LIMIT 1").get(point, sameAs) as { id: number } | undefined;
+		return r?.id;
+	}
 	blockedUnits(): Map<string, number[]> {
 		const blocked = new Map<string, number[]>();
 		const add = (unitId: string, qid: number) => blocked.set(unitId, [...(blocked.get(unitId) ?? []), qid]);
@@ -333,6 +342,7 @@ export class Ledger {
 		const dependents = new Map<string, string[]>();
 		for (const u of units) for (const d of JSON.parse(u.deps) as string[]) dependents.set(d, [...(dependents.get(d) ?? []), u.id]);
 		for (const q of this.openQuestions()) {
+			if (q.blocks !== "none") for (const w of this.db.prepare("SELECT unit_id FROM question_waiters WHERE question_id = ?").all(q.id) as Array<{ unit_id: string }>) add(w.unit_id, q.id);
 			if (q.blocks === "none" || !q.unit_id) continue;
 			add(q.unit_id, q.id);
 			if (q.blocks === "dependents") {

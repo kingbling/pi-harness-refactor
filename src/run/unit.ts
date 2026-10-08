@@ -19,7 +19,8 @@ import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, testerTools } from "../sessions/tools.ts";
-import { renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+import { errorSignature, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
@@ -133,7 +134,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let cost = 0;
 	let providerErrors = 0;
 	const askDeps = { ledger: o.ledger, config: o.config, root: o.root, client: o.client };
-	const ask = async (q: Pick<Parameters<typeof askViaModel>[1], "point" | "facts" | "options" | "context">): Promise<number> => {
+	const ask = async (q: Pick<Parameters<typeof askViaModel>[1], "point" | "facts" | "options" | "context" | "sameAs">): Promise<number> => {
 		const r = await askViaModel(askDeps, { unitId: o.unitId, askedBy: "orchestrator", blocks: "unit", ...q });
 		cost += r.costUsd;
 		return r.id;
@@ -217,6 +218,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (!truthOk) {
 			const q = await ask({
 				point: "truth_env",
+				// one question about the old code's environment, whichever unit hits it: one answer releases them all
+				sameAs: "legacy-env",
 				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time. Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
 				options: [
 					{ value: "fixed", facts: "the legacy environment (dependencies, module loading, DB) is fixed now: the tester runs again" },
@@ -393,6 +396,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		lastGateText = `failed step: ${gate.failedStep}\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
 
+		// the same error is already asked about for another unit: wait on that question (no triage, no doctor, no new question)
+		const signature = errorSignature(gate.failedStep ?? "", gate.steps.find((s) => !s.ok)?.output ?? "");
+		const sharedQ = o.ledger.openQuestionFor("gate_env", signature) ?? o.ledger.openQuestionFor("triage_gate", signature);
+		if (sharedQ !== undefined) {
+			o.ledger.addWaiter(sharedQ, o.unitId);
+			o.ledger.updateUnit(o.unitId, { meta: { parked: { question: sharedQ, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles, setupFiles(o.root, stackId)) } } });
+			log(pc.yellow(`  same failure as question #${sharedQ} (another unit): waits on that answer — other units keep running`));
+			return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, costUsd: cost };
+		}
+
 		// Jev picks the next step; code enforces caps and acts.
 		if (o.client) {
 			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo);
@@ -408,9 +421,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				const dx = await diagnoseFailure({ config: o.config, adapter, projectDir: targetProjectDir, failedStep: gate.failedStep ?? "", output: failedOut, client: o.client });
 				log(pc.dim(`  doctor (${dx.by}): ${dx.action} — ${dx.summary}`));
 				let qid = triage.questionId;
+				// a question shared with other units is theirs too: only the unit's own question is answered or withdrawn here
+				const ownQ = (id: number | undefined) => id !== undefined && o.ledger.getQuestion(id)?.unit_id === o.unitId;
 				if ((dx.action === "retest" || dx.action === "reimplement") && doctorActions < 2) {
 					doctorActions++;
-					if (qid) o.ledger.answerQuestion(qid, `auto: ${dx.action} (${dx.summary})`, "doctor");
+					if (ownQ(qid)) o.ledger.answerQuestion(qid!, `auto: ${dx.action} (${dx.summary})`, "doctor");
 					if (dx.action === "retest") {
 						const ok = await runTruth(`The gate failed with ${gate.failedStep}: ${dx.summary}. ${dx.note ?? ""} Fix the TESTS, not production code.\n${lastGateText}`);
 						if (ok) testFiles = loadTests();
@@ -424,7 +439,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
 					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
-						if (qid) o.ledger.withdrawQuestion(qid, `setup fixed by the model: ${fixed}`);
+						// the fix serves every unit that waits on this problem
+						if (qid) o.ledger.answerQuestion(qid, `auto: the setup model fixed it (${fixed})`, "setup model");
 						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
 						o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: dx.summary } } } });
 						log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
@@ -441,9 +457,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				}
 				if (qid) {
 					// the doctor knows more than triage did: the question is asked again with the diagnosis (phrased by a model)
-					o.ledger.withdrawQuestion(qid, `diagnosed: ${dx.summary}`);
+					if (ownQ(qid)) o.ledger.withdrawQuestion(qid, `diagnosed: ${dx.summary}`);
 					qid = await ask({
 						point: "gate_env",
+						sameAs: signature,
 						facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${setupTried}${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
 						options: [
 							{ value: "fixed", facts: dx.command ? `ran ${dx.command}; the unit runs again` : "the environment is fixed; the unit runs again" },
@@ -544,12 +561,6 @@ export function envFingerprint(config: Config, projectDir: string, manifestFiles
 	return h.update(JSON.stringify(config.target.choices)).update(JSON.stringify(config.target.stacks)).digest("hex").slice(0, 12);
 }
 
-/** Same error, different unit → same signature: step + first error line with paths, positions and names in quotes kept, file names dropped. */
-export function errorSignature(step: string, output: string): string {
-	const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
-	const line = clean.split(/\r?\n/).find((l) => /error|failed|cannot|not found/i.test(l)) ?? clean.split(/\r?\n/).find((l) => l.trim()) ?? "";
-	return `${step}: ${line.replace(/[\w./\\-]*[\w-]\.[a-z][a-z0-9]{0,5}(?::\d+)+|[\w.-]*[/\\][\w./\\-]+\.[a-z][a-z0-9]{0,5}\b/gi, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
-}
 
 function transcriptPath(root: string, unitId: string, role: string, attemptId: number): string {
 	const dir = join(root, ".bigrefactor", "sessions");

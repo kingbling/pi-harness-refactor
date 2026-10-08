@@ -106,4 +106,18 @@ describe("runUnit wiring", () => {
 		expect(ledger.getQuestion(other)!.answer).toMatch(/^auto: the old code's environment was set up/);
 		expect(ledger.openQuestions().filter((q) => q.point === "truth_env")).toEqual([]);
 	});
+
+	it("a gate failure already asked about for another unit waits on that question: no triage, no doctor, no new question", async () => {
+		ledger.createUnit({ id: "u0", tier: "T0", deps: [], meta: {}, symbolIds: [] });
+		const out = "phpstan: Allowed memory size of 134217728 bytes exhausted";
+		const { errorSignature } = await import("../src/run/gate.ts");
+		const q = ledger.askQuestion({ unitId: "u0", point: "gate_env", question: "more memory?", context: { sameAs: errorSignature("lint_ok", out) }, askedBy: "t" });
+		let calls = 0;
+		const client = new FakeModelClient({ chat: () => (calls++, { json: {} }) });
+		const gate = async (): Promise<GateReport> => ({ ok: false, steps: [{ name: "lint_ok", ok: false, ms: 1, output: out }], changedFiles: [], failedStep: "lint_ok", testFiles: [] });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, client, log: () => {} });
+		expect(calls).toBe(0);
+		expect(ledger.openQuestions().map((x) => x.id)).toEqual([q]);
+		expect(ledger.blockedUnits().get("u1")).toEqual([q]);
+	});
 });

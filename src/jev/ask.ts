@@ -276,6 +276,8 @@ export interface AskRequest {
 	context?: Record<string, unknown>;
 	/** The Jev decision this question labels (calibration). */
 	decisionId?: number;
+	/** The problem this asks about, the same in every unit it hits (e.g. an error signature): while one question about it is open, later units wait on that one instead of asking again. */
+	sameAs?: string;
 }
 
 /**
@@ -310,14 +312,19 @@ export const OWN_ANSWER = "auto (your goals)";
  * Phrase one question with a model and store it in the ledger. Options are stored as "value — label", recommendation
  * first. When the run can decide it itself (ownPick), the question is stored already answered and nobody waits.
  */
-export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: number; phrased: PhrasedQuestion; costUsd: number; decided?: string }> {
+export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: number; phrased: PhrasedQuestion; costUsd: number; decided?: string; shared?: boolean }> {
+	const same = q.sameAs ? d.ledger.openQuestionFor(q.point, q.sameAs) : undefined;
+	if (same !== undefined) {
+		if (q.unitId) d.ledger.addWaiter(same, q.unitId);
+		return { id: same, phrased: unphrased(q), costUsd: 0, shared: true };
+	}
 	const phrased = d.client ? await phraseOne(d, q) : unphrased(q);
 	const id = d.ledger.askQuestion({
 		unitId: q.unitId,
 		point: q.point,
 		question: phrased.question + (phrased.opinion ? `\nOpinion: ${phrased.opinion}` : ""),
 		options: phrased.options.map((o) => `${o.value} — ${o.label}${o.value === phrased.recommended ? " (recommended)" : ""}`),
-		context: { ...q.context, facts: q.facts, recommended: phrased.recommended, codePick: q.recommended, guess: q.guess, modelPick: phrased.modelPick, opinion: phrased.opinion, phrasedBy: phrased.by },
+		context: { ...q.context, sameAs: q.sameAs, facts: q.facts, recommended: phrased.recommended, codePick: q.recommended, guess: q.guess, modelPick: phrased.modelPick, opinion: phrased.opinion, phrasedBy: phrased.by },
 		blocks: q.blocks ?? "unit",
 		askedBy: q.askedBy,
 		decisionId: q.decisionId,

@@ -139,7 +139,7 @@ export async function simulateL1(): Promise<void> {
 	if (unaccounted.length) problems.push(`${unaccounted.length} symbols unaccounted outside the quarantined unit`);
 	const decisions = (ledger.db.prepare("SELECT action, COUNT(*) n FROM decisions GROUP BY action").all() as Array<{ action: string; n: number }>).map((d) => `${d.action}×${d.n}`);
 	const commits = (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE json_extract(meta,'$.commit') IS NOT NULL").get() as { n: number }).n;
-	const worktrees = existsSync(join(ws, ".bigrefactor", "worktrees")) ? readdirSync(join(ws, ".bigrefactor", "worktrees")).length : 0;
+	const worktrees = existsSync(join(ws, ".bigrefactor", "worktrees")) ? readdirSync(join(ws, ".bigrefactor", "worktrees")).filter((n) => n !== ".trash").length : 0;
 	if (worktrees) problems.push(`${worktrees} worktree(s) left behind`);
 	const mainLog = execFileSync("git", ["-C", target, "log", "--oneline"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n");
 	if (execFileSync("git", ["-C", target, "ls-files", "node_modules"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()) problems.push("node_modules got committed");

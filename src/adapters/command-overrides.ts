@@ -47,7 +47,7 @@ export function withCommandOverrides(adapter: TargetAdapter, root: string | unde
 	const o = () => loadCommandOverrides(root, adapter.id);
 	return {
 		...adapter,
-		build: (r) => o().build ?? adapter.build(r),
+		build: (r, files = []) => (o().build ? expand(o().build!, files) : adapter.build(r, files)),
 		lint: (r, files) => (o().lint ? expand(o().lint!, files) : adapter.lint(r, files)),
 		test: (r, files) => (o().test ? expand(o().test!, files) : adapter.test(r, files)),
 	};

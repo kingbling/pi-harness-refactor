@@ -4,10 +4,11 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, statSync, 
 import { dirname, join, relative } from "node:path";
 import { loadCommandOverrides } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
+import { createBuilder, type Repairer } from "./builder.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
 import { loadConfig, type Config } from "../config.ts";
-import { addWorktree, headOf, removeWorktree } from "../git.ts";
+import { addWorktree, emptyWorktreeTrash, headOf, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getTargetAdapter } from "../adapters/registry.ts";
 import { resolveChoices } from "../init/stack.ts";
@@ -72,6 +73,8 @@ export interface SchedulerOptions {
 	gate?: UnitRunOptions["gate"];
 	/** Heals shared setup failures (circuit breaker, gate failures); default the setup model, none when `spawn` is faked. */
 	setupFixer?: SetupFixer | false;
+	/** Fixes whole-project check failures after merges; default: the big model (none when `spawn` is faked). */
+	builderRepair?: Repairer | false;
 }
 
 export interface SchedulerResult {
@@ -172,6 +175,18 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 	reloadLanes();
 	const merge = new Semaphore(1);
+	// whole-project checks run on the side, now and then after merges (never in every unit's gate)
+	const builder = createBuilder({
+		config,
+		root: o.root,
+		ledger,
+		adapters,
+		client: o.client,
+		log,
+		linkAll,
+		repair: o.builderRepair ?? (o.spawn ? false : undefined),
+		mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)),
+	});
 	const curate = new Semaphore(1);
 	const ran: UnitRunResult[] = [];
 	const running = new Map<string, Promise<void>>();
@@ -179,6 +194,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let cost = 0;
 	let stop = false;
 	const startedAt = new Date().toISOString();
+	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
 	if (!o.dry) {
 		const caught = decideOpenFromGoals(ledger, config);
 		if (caught) log(pc.cyan(`decided ${caught} open routine question(s) from your goals (br questions lists them; br answer <id> changes one)`));
@@ -356,6 +372,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						});
 						acceptedNow++;
 						log(pc.green(`✓ ${unitId} accepted ($${res.costUsd.toFixed(4)})`));
+						if (!o.dry) builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 						// living rules: proposals from units are curated into a new rules version once enough piled up
 						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => Object.entries(r.versions).forEach(([s, v]) => log(pc.cyan(`  rules ${s} → v${v}`))), (e) => log(pc.yellow(`  rules curation failed: ${e?.message ?? e}`)));
 						// tidy review: every N accepts of an area a model reads its module; approved changes become tidy tasks
@@ -625,6 +642,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		await new Promise((r) => setImmediate(r));
 	}
 	process.off("SIGINT", onSigint);
+	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
+	if (!o.dry && !stopRecord) await builder.finish().catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
 
 	const quarantined = ran.filter((r) => r.state === "quarantined").length;
 	const waiting = ledger.listUnits({ state: "planned" }).length;
@@ -639,12 +658,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 }
 
 /** Bring the unit branch up to date with the main branch and fast-forward it in. */
-function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string): string | undefined {
+function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string, message = `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`): string | undefined {
 	const main = config.target.git.branch;
 	const before = headOf(config.target.path);
 	gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
 	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-	if (staged) execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`], { stdio: "pipe" });
+	if (staged) execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message], { stdio: "pipe" });
 	try {
 		execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", main], { stdio: "pipe" });
 	} catch (e: any) {
@@ -743,21 +762,26 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 		/* keep the run's config */
 	}
 	// the environment of the stack the unit parked in (its placement)
+	// one fingerprint per stack per pass: hundreds of waiting units must not each read the manifests again
+	const envs = new Map<string, string>();
 	const envNow = (meta: string) => {
 		const stackId = placeUnit(cfg, meta, root).stackId;
-		return envFingerprint(cfg, projectDir(cfg, stackId), manifests.get(stackId)?.toolchain.manifestFiles ?? [], setupFiles(root, stackId));
+		if (!envs.has(stackId)) envs.set(stackId, envFingerprint(cfg, projectDir(cfg, stackId), manifests.get(stackId)?.toolchain.manifestFiles ?? [], setupFiles(root, stackId)));
+		return envs.get(stackId)!;
 	};
+	const open = new Set(ledger.openQuestions().map((x) => x.id));
 	const parkedEnv = ledger.db.prepare("SELECT id, meta, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; meta: string; q: number | null; env: string }>;
 	for (const p of parkedEnv) {
 		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
-		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest, stack config or a setup fix)", "orchestrator");
+		if (p.q && open.has(p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest, stack config or a setup fix)", "orchestrator");
 	}
 	// waiting units whose blocking questions are all answered (non-blocking ones never hold a unit) get their answer applied
-	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.unit_id = units.id AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));
+	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE (q.unit_id = units.id OR q.id IN (SELECT question_id FROM question_waiters w WHERE w.unit_id = units.id)) AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));
 	const parked: typeof candidates = [];
 	for (const u of candidates) {
 		const meta = JSON.parse(u.meta) as { parked?: { question?: number; diagnosis?: { summary?: string; note?: string } }; hold?: number; applied?: number };
-		const q = ledger.db.prepare("SELECT id, point, answer, options FROM questions WHERE unit_id = ? AND status IN ('answered','auto') AND id > ? ORDER BY id DESC LIMIT 1").get(u.id, meta.applied ?? 0) as { id: number; point: string; answer: string; options: string | null } | undefined;
+		// its own question, or the one it waits on with other units
+		const q = ledger.db.prepare("SELECT id, point, answer, options FROM questions WHERE (unit_id = ? OR id IN (SELECT question_id FROM question_waiters WHERE unit_id = ?)) AND status IN ('answered','auto') AND id > ? ORDER BY id DESC LIMIT 1").get(u.id, u.id, meta.applied ?? 0) as { id: number; point: string; answer: string; options: string | null } | undefined;
 		if (meta.hold && (!q || q.id <= meta.hold)) continue; // the owner said wait: only a newer answer or br requeue moves it
 		const a = applyParkedAnswer(q?.answer, q?.options ? (JSON.parse(q.options) as string[]) : []);
 		if (a.action === "hold") {

@@ -26,3 +26,25 @@ describe("git: a target nested inside another checkout", () => {
 		expect(git(target, ["log", "--format=%s"])).toBe("chore: bootstrap (simulated)");
 	});
 });
+
+describe("git: removing a unit worktree", () => {
+	it("is instant: the folder moves aside, git forgets it, the files go in the background, and the unit can start again", async () => {
+		const { addWorktree, removeWorktree } = await import("../src/git.ts");
+		const { existsSync, readdirSync } = await import("node:fs");
+		const repo = realpathSync(mkdtempSync(join(tmpdir(), "br-wt-")));
+		ensureRepo(repo, "migration/main", []);
+		writeFileSync(join(repo, "a.txt"), "x\n");
+		commitAll(repo, "init");
+		const wt = join(repo, "..", `${repo.split("/").pop()}-wts`, "U1");
+		addWorktree(repo, wt, "unit/U1");
+		mkdirSync(join(wt, "vendor", "deep"), { recursive: true });
+		writeFileSync(join(wt, "vendor", "deep", "f.php"), "<?php\n");
+		removeWorktree(repo, wt);
+		expect(existsSync(wt)).toBe(false);
+		expect(git(repo, ["worktree", "list"])).not.toMatch(/U1/);
+		addWorktree(repo, wt, "unit/U1");
+		expect(existsSync(join(wt, "a.txt"))).toBe(true);
+		await new Promise((r) => setTimeout(r, 200));
+		expect(readdirSync(join(wt, "..", ".trash"))).toEqual([]);
+	});
+});

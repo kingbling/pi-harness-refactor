@@ -117,14 +117,14 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	});
 	if (!structureOk) return done();
 
-	// 4. build (type check)
-	const b = g.adapter.build(g.targetProjectDir);
-	if (!(await step("build_ok", () => run(b.cmd, b.args, g.targetProjectDir, timeout)))) return done();
-
-	// 5. lint on changed files only
-	const lintFiles = changed.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f)));
-	const l = g.adapter.lint(g.targetProjectDir, lintFiles);
-	if (!(await step("lint_ok", () => (lintFiles.length ? run(l.cmd, l.args, g.targetProjectDir, timeout) : Promise.resolve({ ok: true, output: "no lintable files" }))))) return done();
+	// 4. build and 5. lint on the unit's files only. A command that cannot take files checks the whole project:
+	//    the builder runs it after merges now and then, not every unit (it grew with the project and ran out of memory)
+	const unitFiles = changed.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f)));
+	const whole = wholeProjectSteps(g.adapter, g.targetProjectDir);
+	const scopedStep = (name: "build" | "lint", c: { cmd: string; args: string[] }) => () =>
+		whole.some((w) => w.step === name) ? Promise.resolve({ ok: true, output: `whole-project ${name}: the builder runs it after merges` }) : unitFiles.length ? run(c.cmd, c.args, g.targetProjectDir, timeout) : Promise.resolve({ ok: true, output: `no files to ${name}` });
+	if (!(await step("build_ok", scopedStep("build", g.adapter.build(g.targetProjectDir, unitFiles))))) return done();
+	if (!(await step("lint_ok", scopedStep("lint", g.adapter.lint(g.targetProjectDir, unitFiles))))) return done();
 
 	// 6. the stack's ast-grep rules on the changed production files
 	if (!(await step("rules_ok", () => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout)))) return done();
@@ -294,4 +294,21 @@ export function sha1(buf: Buffer | string): string {
 
 export function renderGate(r: GateReport): string {
 	return r.steps.map((s) => `${s.ok ? "✓" : "✗"} ${s.name.padEnd(20)} ${String(s.ms).padStart(6)}ms${s.ok ? "" : `\n${s.output}`}`).join("\n") + `\nchanged: ${r.changedFiles.join(", ") || "-"}`;
+}
+
+/** Same error, different unit → same signature: step + first error line with paths, positions and names in quotes kept, file names dropped. */
+export function errorSignature(step: string, output: string): string {
+	const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
+	const line = clean.split(/\r?\n/).find((l) => /error|failed|cannot|not found/i.test(l)) ?? clean.split(/\r?\n/).find((l) => l.trim()) ?? "";
+	return `${step}: ${line.replace(/[\w./\\-]*[\w-]\.[a-z][a-z0-9]{0,5}(?::\d+)+|[\w.-]*[/\\][\w./\\-]+\.[a-z][a-z0-9]{0,5}\b/gi, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
+}
+
+/** The stack's build/lint commands that ignore the files they are given: they check the whole project. */
+export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ step: "build" | "lint"; cmd: string; args: string[] }> {
+	const MARK = "\u0000unit-file";
+	const takesFiles = (c: { cmd: string; args: string[] }) => c.cmd === MARK || c.args.includes(MARK);
+	const out: Array<{ step: "build" | "lint"; cmd: string; args: string[] }> = [];
+	if (!takesFiles(adapter.build(dir, [MARK]))) out.push({ step: "build", ...adapter.build(dir, []) });
+	if (!takesFiles(adapter.lint(dir, [MARK]))) out.push({ step: "lint", ...adapter.lint(dir, []) });
+	return out;
 }

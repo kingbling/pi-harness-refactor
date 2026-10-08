@@ -3,7 +3,7 @@ import { decide, setDecisionAction } from "../jev/decide.ts";
 import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import type { GateReport } from "./gate.ts";
+import { errorSignature, type GateReport } from "./gate.ts";
 import { askViaModel } from "../jev/ask.ts";
 
 /**
@@ -133,6 +133,8 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 			options: HUMAN_ACTIONS,
 			recommended: cause === "env" || !state.tool_produced_output ? "fixed" : "retry",
 			context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files, cause },
+			// an environment problem is the same for every unit it hits: one question for all of them
+			sameAs: cause === "env" ? errorSignature(gate.failedStep ?? "", failed?.output ?? "") : undefined,
 			blocks: "unit",
 			askedBy: "orchestrator",
 			decisionId: dec.decisionId,
