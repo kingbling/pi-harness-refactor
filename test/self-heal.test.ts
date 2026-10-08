@@ -52,6 +52,16 @@ describe("answers are applied per option", () => {
 		expect(applyParkedAnswer("auto: the environment changed", opts)).toEqual({ action: "requeue" });
 	});
 
+	it("retry runs the unit again, leave parks it; old ledgers' fixed/quarantine answers still mean the same", () => {
+		const opts = ["retry — run it again", "leave — leave the unit parked for a human"];
+		expect(applyParkedAnswer("retry — run it again", opts)).toEqual({ action: "requeue", hint: undefined });
+		expect(applyParkedAnswer("leave — leave the unit parked for a human", opts)).toEqual({ action: "quarantine" });
+		const old = ["fixed — the environment is fixed", "quarantine — leave the unit quarantined"];
+		expect(applyParkedAnswer("fixed — the environment is fixed", old)).toEqual({ action: "requeue", hint: undefined });
+		expect(applyParkedAnswer("quarantine — leave the unit quarantined", old)).toEqual({ action: "quarantine" });
+		expect(applyParkedAnswer("the DB runs on port 5433 now", opts)).toEqual({ action: "requeue", hint: "the DB runs on port 5433 now" });
+	});
+
 	it("quarantined units go back every hour or after a fix, 5 times; then one question per kind of failure, and the answer is applied", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
@@ -157,6 +167,35 @@ describe("answers are applied per option", () => {
 		expect(requeueUnits(ledger, config, root, ["U3"], "test")).toEqual(["U3: requeued"]);
 		expect(ledger.getUnit("U3")!.state).toBe("planned");
 		expect(JSON.parse(ledger.getUnit("U3")!.meta).hold).toBeUndefined();
+		ledger.close();
+	});
+});
+
+describe("triage", () => {
+	const gate = (output: string) => ({ ok: false, failedStep: "ported_tests_green", steps: [{ name: "ported_tests_green", ok: false, output, exitCode: 1 }], changedFiles: ["src/a.ts"], testFiles: ["test/a.spec.ts"] }) as never;
+	it("asks only for the cause and whether the failure repeats; escalation comes from code", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug", same_as_previous: true }) });
+		const t1 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/a.spec.ts\nexpected 2, got 3"), undefined, 1);
+		const req = client.calls[0]!.req as { questions: Record<string, unknown>; state: { failing_tests: string[] } };
+		expect(Object.keys(req.questions).sort()).toEqual(["cause", "same_as_previous"]);
+		expect(req.state.failing_tests).toContain("test/a.spec.ts");
+		expect(t1.action).toBe("retry");
+		// the same failure class twice → a stronger model
+		const t2 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/a.spec.ts\nexpected 2, got 4"), gate("FAIL test/a.spec.ts\nexpected 2, got 3"), 2);
+		expect(t2.action).toBe("escalate");
+		ledger.close();
+	});
+
+	it("an environment cause returns ask_human without asking anyone: the doctor looks first", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const client = new FakeModelClient({ decide: () => ({ cause: "env" }) });
+		const t = await triageGate({ ledger, config, client }, "U1", gate("connect ECONNREFUSED 127.0.0.1:5432"), undefined, 1);
+		expect(t).toMatchObject({ action: "ask_human", cause: "env" });
+		expect(t.questionId).toBeUndefined();
+		expect(ledger.openQuestions()).toEqual([]);
 		ledger.close();
 	});
 });

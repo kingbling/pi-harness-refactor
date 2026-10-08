@@ -309,8 +309,9 @@ export class Ledger {
 		// a question the run decided itself (status auto) stays open to the owner: their answer replaces the run's
 		if (q.status !== "open" && !(q.status === "auto" && status === "answered")) throw new LedgerError(`question ${id} is already ${q.status}`);
 		this.db.prepare("UPDATE questions SET status = ?, answer = ?, answered_by = ?, answered_at = ? WHERE id = ?").run(status, answer, answeredBy, now(), id);
-		// A human answer to a question that mirrors a Jev decision is a calibration label for that decision.
-		if (q.decision_id !== null && status === "answered") this.db.prepare("UPDATE decisions SET label = ? WHERE id = ?").run(answer, q.decision_id);
+		// A person's answer to a question that mirrors a Jev decision is a calibration label for that decision
+		// (not the doctor's, the setup model's or the resolver's: they are models too).
+		if (q.decision_id !== null && status === "answered" && answeredBy.startsWith("human")) this.db.prepare("UPDATE decisions SET label = ? WHERE id = ?").run(answer, q.decision_id);
 	}
 	/** The resolver model tried an open question and could not settle it: it waits for the owner, with the model's reason. */
 	markForOwner(id: number, why: string): void {

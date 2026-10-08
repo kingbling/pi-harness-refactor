@@ -142,7 +142,7 @@ describe("/br answer applies every question type", () => {
 });
 
 describe("/br answer: many questions summed up in one card", () => {
-	it("taking the recommended answers answers every question that has one; the rest come one by one", async () => {
+	it("taking the recommended answers answers every question that has one, except those handed to the owner; the rest come one by one", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-sum-"));
 		mkdirSync(join(root, "legacy"), { recursive: true });
 		writeFileSync(join(root, "bigrefactor.config.json"), JSON.stringify({ version: 1, source: { path: join(root, "legacy"), stack: "php" }, target: { path: join(root, "new"), stacks: ["nestjs"] }, models: {} }));
@@ -150,6 +150,9 @@ describe("/br answer: many questions summed up in one card", () => {
 		const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
 		const q = (rec: string | undefined, n: number) => ledger.askQuestion({ point: "placement", question: `Where does file ${n} go?`, options: ["nestjs:shared/http — Shared HTTP", "nestjs:campaigns — Campaigns"], context: { recommended: rec }, blocks: "none", askedBy: "t" });
 		const ids = [q("nestjs:shared/http", 1), q("nestjs:shared/http", 2), q("nestjs:campaigns", 3), q(undefined, 4)];
+		// the resolver model could not settle this one: it has a recommendation but is never taken in bulk
+		const owner = ledger.askQuestion({ point: "placement", question: "Where does the billing export go?", options: ["nestjs:shared/http — Shared HTTP", "nestjs:billing — Billing"], context: { recommended: "nestjs:billing" }, blocks: "none", askedBy: "t" });
+		ledger.markForOwner(owner, "money is the owner's call");
 		ledger.close();
 		const titles: string[] = [];
 		const ctx = {
@@ -172,12 +175,12 @@ describe("/br answer: many questions summed up in one card", () => {
 		const pi = { appendEntry: () => {}, registerCommand: (n: string, def: any) => commands.set(n, def), registerTool: () => {}, registerEntryRenderer: () => {}, registerMessageRenderer: () => {}, on: () => {}, sendMessage: () => {} };
 		((await import("../src/pi/extension.ts")).default as (p: any) => void)(pi as any);
 		await commands.get("br")!.handler("answer", ctx);
-		expect(titles[0]).toMatch(/^4 open questions · 1 need you\n.*2× placement → nestjs:shared\/http/s);
-		expect(titles[1]).toMatch(/Where does file 4 go/); // no recommendation: the owner decides it
+		expect(titles[0]).toMatch(/^5 open questions · 2 need you\n.*2× placement → nestjs:shared\/http/s);
 		const l2 = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
 		try {
 			expect(ids.slice(0, 3).map((id) => l2.getQuestion(id)!.answer)).toEqual(["nestjs:shared/http — Shared HTTP", "nestjs:shared/http — Shared HTTP", "nestjs:campaigns — Campaigns"]);
 			expect(l2.getQuestion(ids[3]!)!.status).toBe("open");
+			expect(l2.getQuestion(owner)!.status).toBe("open");
 		} finally {
 			l2.close();
 		}

@@ -830,13 +830,14 @@ export default function (pi: ExtensionAPI) {
 						const { summarizeQuestions } = await import("../jev/ask.ts");
 						const { OpenRouterClient } = await import("../models/openrouter.ts");
 						const s = await summarizeQuestions({ config, client: process.env["BR_NO_LLM"] ? undefined : new OpenRouterClient() }, all);
-						const easy = all.filter((q) => !s.lookAt.includes(q.id));
+						// questions the resolver model handed to the owner (context.forOwner) are never taken in bulk
+						const easy = all.filter((q) => !s.lookAt.includes(q.id) && JSON.parse(q.context ?? "{}").forOwner === undefined);
 						const ACCEPT = "accept", EACH = "each";
 						const v = await askCard(ctx, {
-							message: `${all.length} open questions${s.lookAt.length ? ` · ${s.lookAt.length} need you` : ""}\n${s.summary.join("\n")}`,
+							message: `${all.length} open questions${all.length > easy.length ? ` · ${all.length - easy.length} need you` : ""}\n${s.summary.join("\n")}`,
 							recommended: easy.length ? ACCEPT : EACH,
 							options: [
-								...(easy.length ? [{ value: ACCEPT, label: `Take the recommended answer for ${easy.length}`, description: s.lookAt.length ? `then go through the ${s.lookAt.length} that need you` : "nothing left to answer after that" }] : []),
+								...(easy.length ? [{ value: ACCEPT, label: `Take the recommended answer for ${easy.length}`, description: all.length > easy.length ? `then go through the ${all.length - easy.length} that need you` : "nothing left to answer after that" }] : []),
 								{ value: EACH, label: "Go through them one by one" },
 							],
 						});

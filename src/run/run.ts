@@ -1005,7 +1005,8 @@ function takeRetryNote(ledger: Ledger, unitId: string): string | undefined {
 
 /**
  * What an answer tells a waiting unit to do. Stop words quarantine it, "wait" holds it until a newer answer or
- * `br requeue`; an answer that is none of the question's options is a free-text hint for the next attempt.
+ * `br requeue`; "retry" (older ledgers: "fixed") runs it again; an answer that is none of the question's options is
+ * a free-text hint for the next attempt.
  */
 export function applyParkedAnswer(answer: string | undefined, options: string[]): { action: "requeue" | "quarantine" | "hold"; hint?: string } {
 	const a = (answer ?? "").trim();

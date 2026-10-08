@@ -1,9 +1,9 @@
 import type { Config } from "../config.ts";
 import { decide, setDecisionAction } from "../jev/decide.ts";
-import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
+import { choiceOf, JEV_ACT, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { DecisionAnswer, ModelClient } from "../models/types.ts";
-import { errorSignature, type GateReport } from "./gate.ts";
+import type { GateReport } from "./gate.ts";
 import { askViaModel } from "../jev/ask.ts";
 
 /**
@@ -12,13 +12,15 @@ import { askViaModel } from "../jev/ask.ts";
  * whether code acts, asks for a label, or hands over. Jev never auto-accepts code; it only picks the
  * next step of the unit's playbook.
  */
+// ask_human without a questionId: unit.ts lets the doctor and the setup model try first and asks only when they cannot help.
 export type TriageAction = "retry" | "escalate" | "retest" | "quarantine" | "ask_human";
 
 export interface Triage {
 	action: TriageAction;
 	cause: string;
 	confidence: number;
-	band: "act" | "check" | "escalate";
+	/** confidence at or above JEV_ACT: code acts on Jev's answer */
+	sure: boolean;
 	decisionId: number;
 	questionId?: number;
 	reason: string;
@@ -42,7 +44,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		// not the model: stop burning attempts and ask (only this unit waits).
 		const prevFailed = previous?.steps.find((s) => !s.ok);
 		if (prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) {
-			const { id: q } = await askViaModel(d, { unitId, point: "gate_env", facts: `The anti-gaming check failed identically on two consecutive attempts of ${unitId}, so the implementer cannot fix it. Output:\n${failed.output.slice(-1500)}\nChanged files: ${gate.changedFiles.join(", ")}\nAfter a fix: br requeue ${unitId}.`, options: [{ value: "fixed", facts: "I fixed the environment / protected globs; requeue the unit" }, { value: "quarantine", facts: "leave the unit quarantined" }], recommended: "fixed", context: { output: failed.output.slice(-1500), changed: gate.changedFiles }, blocks: "unit", askedBy: "orchestrator" });
+			const { id: q } = await askViaModel(d, { unitId, point: "gate_env", facts: `The anti-gaming check failed identically on two consecutive attempts of ${unitId}, so the implementer cannot fix it. Output:\n${failed.output.slice(-1500)}\nChanged files: ${gate.changedFiles.join(", ")}\nAfter a fix: br requeue ${unitId}.`, options: [{ value: "retry", facts: "I fixed the environment / protected globs: run the unit again" }, { value: "leave", facts: "leave the unit parked for a human" }], recommended: "retry", context: { output: failed.output.slice(-1500), changed: gate.changedFiles }, blocks: "unit", askedBy: "orchestrator" });
 			const t = deterministic(d, unitId, "env", "ask_human", "identical anti-gaming failure twice → not the model's fault");
 			return { ...t, questionId: q };
 		}
@@ -60,6 +62,8 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	const body = (out.startsWith("$ ") ? out.split("\n").slice(1).join("\n") : out).trim(); // drop the "$ cmd" line
 	const errFilesAll = [...new Set([...out.matchAll(/(?:^|\s)([\w./-]+\/[\w.-]+\.[A-Za-z0-9]{1,5})(?=[(:]| )/gm)].map((m) => m[1]!))];
 	const testFiles = gate.testFiles ?? [];
+	// the tests that failed, as the output names them: the ported test files it mentions, and test-runner failure lines
+	const failingTests = [...new Set([...testFiles.filter((t) => out.includes(t) || out.includes(t.split("/").pop()!)), ...[...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gm)].map((m) => m[1]!.trim())])].slice(0, 20);
 	const state = {
 		stage: failed?.name ?? "unknown",
 		attempt: attemptNo,
@@ -67,6 +71,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		exit_code: failed?.exitCode ?? null,
 		timed_out: /\[timed out\]/.test(out),
 		error_files: errFilesAll.slice(0, 20),
+		failing_tests: failingTests,
 		errors_in_protected_tests_only: errFilesAll.length > 0 && errFilesAll.every((f) => testFiles.some((t) => f.endsWith(t))),
 		errors_in_changed_files: errFilesAll.filter((f) => gate.changedFiles.some((c) => f.endsWith(c))).length,
 		gate_report: out.slice(-3000),
@@ -74,12 +79,10 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		previous_stage: previous?.failedStep ?? null,
 		diff_stats: { changed_files: gate.changedFiles.length, files: gate.changedFiles.slice(0, 20) },
 	};
-	// what code does with Jev's answers (the confidence band comes after)
+	// what code does with Jev's answers (how sure it is comes after)
 	const playbook = (answers: Record<string, DecisionAnswer>): { action: TriageAction; reason: string } => {
 		const cause = choiceOf(answers["cause"]) ?? "other";
-		const retryHelps = noulOf(answers["retry_likely_to_help"]);
 		const same = previous ? noulOf(answers["same_as_previous"]) : 0;
-		const needsEscalation = noulOf(answers["escalate"]);
 		if (attemptNo >= maxTotal) return { action: "quarantine", reason: `attempt cap ${maxTotal} reached` };
 		if (cause === "test_bug" || cause === "interface_mismatch") return { action: "retest", reason: `${cause}: tester re-ports interface/tests` };
 		if (cause === "env") return { action: "ask_human", reason: "environment problem, not code" };
@@ -87,9 +90,9 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		if (!state.tool_produced_output && state.exit_code !== null) return { action: "ask_human", reason: `gate tool exited ${state.exit_code} without output` };
 		// Byte-identical failure twice: a stronger model is not the answer, a human is (only this unit waits).
 		if (state.previous_report && state.previous_report === out.slice(-1500)) return { action: "ask_human", reason: "identical failure on consecutive attempts" };
-		if (needsEscalation > 0.7 || (same > 0.7 && attemptNo >= 2)) return { action: "escalate", reason: needsEscalation > 0.7 ? "needs cross-unit understanding" : "same failure class twice → stronger model" };
+		if (same > JEV_ACT && attemptNo >= 2) return { action: "escalate", reason: "same failure class twice → stronger model" };
 		if (attemptNo >= maxImpl) return { action: "escalate", reason: "implement attempts exhausted" };
-		return { action: "retry", reason: retryHelps >= 0.5 ? "retry with the exact gate output" : "retry (escalation needs positive evidence)" };
+		return { action: "retry", reason: "retry with the exact gate output" };
 	};
 	let dec;
 	try {
@@ -106,49 +109,20 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		return deterministic(d, unitId, "other", action, `decision model unavailable (${String((e as Error)?.message ?? e).slice(0, 120)}); playbook by attempt count`);
 	}
 	const cause = choiceOf(dec.answers["cause"]) ?? "other";
-	const b = band(dec.confidence, DEFAULT_THRESHOLDS["triage_gate"]!);
+	const sure = dec.confidence >= JEV_ACT;
 	let { action, reason } = playbook(dec.answers);
-	// Very low confidence on anything but a cheap retry: hand over instead of guessing. Otherwise code acts and
-	// nobody is asked: the outcome of the next attempt is the label, not an owner's guess at a cause code.
-	if (b === "escalate" && action !== "retry" && action !== "quarantine") {
+	// Unsure on anything but a cheap retry: hand over instead of guessing. Otherwise code acts and nobody is asked:
+	// the outcome of the next attempt is the label, not an owner's guess at a cause code.
+	if (!sure && action !== "retry" && action !== "quarantine") {
 		action = "ask_human";
 		reason = `${reason} (decision model unsure: ${dec.confidence.toFixed(2)})`;
 	}
-
-	let questionId: number | undefined;
-	if (action === "ask_human") {
-		const asked = await askViaModel(d, {
-			unitId,
-			point: "triage_gate",
-			facts: `Gate step ${state.stage} failed on attempt ${attemptNo} of ${unitId}: ${reason}.${cause === "other" ? "" : ` Likely cause: ${cause}.`} Only this unit waits; the answer is applied when it arrives. Any other text you type is handed to the next attempt as a hint.\nGate output tail:\n${state.gate_report.slice(-1500)}`,
-			options: HUMAN_ACTIONS,
-			recommended: cause === "env" || !state.tool_produced_output ? "fixed" : "retry",
-			context: { gate_tail: state.gate_report.slice(-1500), exit_code: state.exit_code, files: state.diff_stats.files, cause },
-			// an environment problem is the same for every unit it hits: one question for all of them
-			sameAs: cause === "env" ? errorSignature(gate.failedStep ?? "", failed?.output ?? "") : undefined,
-			blocks: "unit",
-			askedBy: "orchestrator",
-			decisionId: dec.decisionId,
-		});
-		questionId = asked.id;
-		// the run answered it itself (model and triage agree on a plain retry): nobody waits
-		if (asked.decided === "retry") {
-			action = "retry";
-			reason = `${reason}; retried without asking (question #${asked.id})`;
-		}
-	}
+	// ask_human asks nobody yet: unit.ts lets the doctor and the setup model try first (most such failures never needed a person)
 	setDecisionAction(d.ledger, dec.decisionId, action);
-	return { action, cause, confidence: dec.confidence, band: b, decisionId: dec.decisionId, questionId, reason };
+	return { action, cause, confidence: dec.confidence, sure, decisionId: dec.decisionId, reason };
 }
-
-/** What an owner can tell a parked unit to do; the scheduler applies the answer (applyParkedAnswer in run.ts). */
-export const HUMAN_ACTIONS: Array<{ value: string; facts: string }> = [
-	{ value: "fixed", facts: "the environment or setup is fixed: run the unit again" },
-	{ value: "retry", facts: "run the unit again as it is (type a hint instead to steer it)" },
-	{ value: "quarantine", facts: "stop: leave the unit for a human to port" },
-];
 
 function deterministic(d: TriageDeps, unitId: string, cause: string, action: TriageAction, reason: string): Triage {
 	const id = d.ledger.recordDecision({ unitId, point: "triage_gate", model: "code", stateHash: "deterministic", answers: { cause }, confidence: 1, action });
-	return { action, cause, confidence: 1, band: "act", decisionId: id, reason };
+	return { action, cause, confidence: 1, sure: true, decisionId: id, reason };
 }

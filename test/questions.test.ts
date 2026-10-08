@@ -44,4 +44,12 @@ describe("human questions in the ledger", () => {
 		expect(row.label).toBe("test_bug");
 		expect(() => l.answerQuestion(q, "again")).toThrow(/already answered/);
 	});
+
+	it("an answer by a model (doctor, setup model, resolver) is no label", () => {
+		const l = seed();
+		const d = l.recordDecision({ unitId: "U2", point: "triage", model: "typesafe/jev-1.13", stateHash: "abc", answers: { cause: "env" }, confidence: 0.55 });
+		const q = l.askQuestion({ unitId: "U2", point: "triage", question: "Gate failed", options: ["retry", "leave"], askedBy: "orchestrator", decisionId: d });
+		l.answerQuestion(q, "auto: reimplement (wrong import)", "doctor");
+		expect((l.db.prepare("SELECT label FROM decisions WHERE id = ?").get(d) as { label: string | null }).label).toBeNull();
+	});
 });
