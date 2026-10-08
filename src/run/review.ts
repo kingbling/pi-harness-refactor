@@ -29,6 +29,8 @@ export interface ReviewInput {
 	/** The unit's legacy files (relative to the legacy repo). */
 	legacyFiles: string[];
 	changedFiles: string[];
+	/** Classes whose names only look like an existing one (the gate's reuse check): the reviewer judges "same record?". */
+	nearDuplicates?: string[];
 	/** Review an accepted unit: its commit is the diff (br recheck). */
 	commit?: string;
 	transcriptPath?: string;
@@ -93,6 +95,7 @@ function facts(o: ReviewInput): string {
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
 		`\nStack choices of the owner (${o.adapter.id}):\n${choices.join("\n") || "- none recorded"}`,
 		`\nAlready migrated code this unit's legacy code calls:\n${deps.join("\n") || "- none"}`,
+		...(o.nearDuplicates?.length ? [`\nLook-alike class names the reuse check found (a guess from the names, not proof). For each, read both classes: when they are the same record or class, it is a finding (reuse the existing one); when they hold different things, it is fine:\n${o.nearDuplicates.map((n) => `- ${n}`).join("\n")}`] : []),
 		`\nWhat the unit changed:\n${o.commit ? show(o.config.target.path, o.commit) : diff(o.targetProjectDir, o.changedFiles)}`,
 	].join("\n");
 }

@@ -331,10 +331,18 @@ export class Ledger {
 	addWaiter(questionId: number, unitId: string): void {
 		this.db.prepare("INSERT OR IGNORE INTO question_waiters(question_id, unit_id) VALUES (?, ?)").run(questionId, unitId);
 	}
-	/** An open question about the same problem (point + key), if one was asked already. */
+	/** An open question about the same problem (point + key, or a key the decision model joined to it), if one was asked already. */
 	openQuestionFor(point: string, sameAs: string): number | undefined {
-		const r = this.db.prepare("SELECT id FROM questions WHERE status = 'open' AND point = ? AND json_extract(context, '$.sameAs') = ? ORDER BY id LIMIT 1").get(point, sameAs) as { id: number } | undefined;
+		const r = this.db
+			.prepare("SELECT id FROM questions WHERE status = 'open' AND point = ? AND (json_extract(context, '$.sameAs') = ? OR EXISTS (SELECT 1 FROM json_each(context, '$.alsoSameAs') WHERE value = ?)) ORDER BY id LIMIT 1")
+			.get(point, sameAs, sameAs) as { id: number } | undefined;
 		return r?.id;
+	}
+	/** Another key with the same cause (the decision model said so): the next unit with it matches by code, no model call. */
+	addSameAs(questionId: number, sameAs: string): void {
+		this.db
+			.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.alsoSameAs', json_insert(COALESCE(json_extract(context, '$.alsoSameAs'), '[]'), '$[#]', ?)) WHERE id = ? AND NOT EXISTS (SELECT 1 FROM json_each(context, '$.alsoSameAs') WHERE value = ?)")
+			.run(sameAs, questionId, sameAs);
 	}
 	blockedUnits(): Map<string, number[]> {
 		const blocked = new Map<string, number[]>();

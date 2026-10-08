@@ -102,6 +102,34 @@ describe("answers are applied per option", () => {
 		expect(ledger.getUnit("U3")!.state).toBe("implementing");
 	});
 
+	it("a different key with the same cause joins the open question only when the decision model is sure; the join is remembered", async () => {
+		const { root, config, ledger, mk } = workspace();
+		for (const id of ["U1", "U2", "U3", "U4"]) mk(id, "billing", "implementing");
+		const { askViaModel } = await import("../src/jev/ask.ts");
+		let pick: { choice: string; confidence: number } = { choice: "none", confidence: 0.9 };
+		const client = new FakeModelClient({ decide: (req) => ("same" in req.questions ? { same: { type: "choice", choice: pick.choice, probabilities: {}, confidence: pick.confidence } } : {}) });
+		const req = (unitId: string, sameAs: string, facts: string, c?: FakeModelClient) => askViaModel({ ledger, config, root, client: c }, { unitId, point: "gate_env", facts, options: [{ value: "fixed" }, { value: "quarantine" }], sameAs, askedBy: "test" });
+		const first = await req("U1", "build_ok: memory exhausted in phpstan", "PHPStan ran out of memory (128M)", client);
+		const sameCalls = () => client.calls.filter((c) => c.kind === "decide" && "same" in (c.req as any).questions).length;
+		expect(sameCalls()).toBe(0); // nothing open to compare with yet
+		// the model says the same cause, but not surely enough: a question of its own
+		pick = { choice: `q${first.id}`, confidence: 0.5 };
+		const unsure = await req("U2", "lint_ok: memory exhausted", "php-cs-fixer ran out of memory", client);
+		expect(unsure.id).not.toBe(first.id);
+		ledger.withdrawQuestion(unsure.id, "test");
+		// sure: U3 waits on U1's question; the decision is recorded and the key remembered
+		pick = { choice: `q${first.id}`, confidence: 0.9 };
+		const joined = await req("U3", "build_ok: PHP memory limit reached", "PHPStan crashed at the 128M memory limit", client);
+		expect(joined).toMatchObject({ id: first.id, shared: true });
+		const dec = ledger.db.prepare("SELECT action FROM decisions WHERE point = 'same_cause' ORDER BY id DESC LIMIT 1").get() as { action: string };
+		expect(dec.action).toBe(`join #${first.id}`);
+		const calls = sameCalls();
+		// U4 with the joined key matches by code, without a model and without asking the model again
+		expect(await req("U4", "build_ok: PHP memory limit reached", "same")).toMatchObject({ id: first.id, shared: true });
+		expect(sameCalls()).toBe(calls);
+		expect([...ledger.blockedUnits().entries()].filter(([, q]) => q.includes(first.id)).map(([u]) => u).sort()).toEqual(["U1", "U3", "U4"]);
+	});
+
 	it("quarantine quarantines, free text becomes the next attempt's note, wait holds, a non-blocking question never strands", () => {
 		const { root, config, ledger, mk } = workspace();
 		for (const id of ["U1", "U2", "U3", "U4"]) mk(id, "billing", "implementing");

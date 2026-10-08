@@ -40,8 +40,9 @@ export interface GateInput {
 	/**
 	 * wired_ok: a reviewer model with tools judges whether the new code is real (no stubs), connected (reached by
 	 * the framework, uses the migrated code) and on the chosen stack. Without one the step passes as "not judged".
+	 * `nearDuplicates`: classes whose names only look alike (Repo/Repository …) — facts for the reviewer to judge.
 	 */
-	review?: (changedFiles: string[]) => Promise<{ ok: boolean; output: string; judged: boolean }>;
+	review?: (changedFiles: string[], nearDuplicates?: string[]) => Promise<{ ok: boolean; output: string; judged: boolean }>;
 	/** Gate pool slot for the CPU-bound commands (build, lint, rules, tests); the review never holds one. */
 	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 	timeoutMs?: number;
@@ -113,6 +114,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// 3. structure + reuse: files follow the stack layout (one module per area, no per-legacy-file folders) and
 	//    nothing re-creates a class or function body that already exists in the target
 	//    (deleted files are not checked: a sanctioned tidy move removes a misnamed file; the write scope covers deletes)
+	let nearDuplicates: string[] = [];
 	const structureOk = await step("structure_ok", async () => {
 		const present = changed.filter((f) => existsSync(join(g.targetProjectDir, f)));
 		const ctx = { isNew: (f: string) => !tracked.has(f), sanctioned: g.sanctioned ?? [], legacyWords: g.legacyWords };
@@ -120,8 +122,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const warnings = lines.filter((l) => l.startsWith("warning:"));
 		// drift checks (size cap, one class per responsibility …) on the touched files; drift elsewhere is reported, not failed
 		const tree = checkTree(g.targetProjectDir, g.adapter, present);
-		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed));
-		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings].join("\n") };
+		const reuse = await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed);
+		nearDuplicates = reuse.near;
+		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(reuse.problems);
+		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings, ...reuse.near.map((n) => `note: ${n} (the reviewer judges it)`)].join("\n") };
 	});
 	if (!structureOk) return done();
 
@@ -138,7 +142,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	if (!(await step("rules_ok", () => cpu(() => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout))))) return done();
 
 	// 7. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
-	if (!(await step("wired_ok", () => (g.review ? g.review(changed) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
+	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
 
 	// 8. the ported characterization tests (one per truth case)
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
@@ -170,7 +174,7 @@ function sharedTopicProblems(g: GateInput, present: string[], tracked: Set<strin
 	return out;
 }
 
-/** Canonical class name for the reuse check: aliases of one kind collapse (Repo = Repository, Agency = AgencyEntity). */
+/** Canonical class name to find look-alike classes (Repo = Repository, Agency = AgencyEntity): a hint, never proof. */
 export function classKey(name: string): string {
 	return name
 		.toLowerCase()
@@ -180,32 +184,37 @@ export function classKey(name: string): string {
 }
 
 /**
- * Reuse, decided by code: a new class whose canonical name already exists in this stack's target index (or in another
+ * Reuse, decided by code on facts: a new class whose name already exists in this stack's target index (or in another
  * changed file), and a function/method whose normalized body equals one in another file, fail with a pointer to the
  * original. Same-name DTOs/entities in different areas count too: one record = one class; a different record needs
  * an area-specific name. Files the unit changed are compared against their fresh parse, not the index; fresh bodies
  * include non-exported functions and private methods (tag "internal"), so a copy hidden there fails too.
+ * A name that only looks alike (classKey: AgencyRepo next to AgencyRepository) is a guess, not a fact: it goes to
+ * the reviewer model as `near`, which judges whether it is the same record.
  */
-async function reuseProblems(g: GateInput, prodFiles: string[], allChanged: string[]): Promise<string[]> {
-	if (!g.adapter.indexFile) return [];
+async function reuseProblems(g: GateInput, prodFiles: string[], allChanged: string[]): Promise<{ problems: string[]; near: string[] }> {
+	if (!g.adapter.indexFile) return { problems: [], near: [] };
 	// every changed path, deleted ones too: a tidy move's old path is still indexed but no original any more
 	const changed = new Set(allChanged);
 	const fresh: TargetSymbol[] = [];
 	for (const f of prodFiles) if (g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))) fresh.push(...(await g.adapter.indexFile(g.targetProjectDir, f).catch(() => [])));
 	const problems: string[] = [];
+	const near: string[] = [];
 	const indexed = targetClasses(g.ledger, g.adapter.id).filter((r) => !changed.has(r.path));
 	for (const s of fresh) {
 		if (s.tags.includes("class")) {
-			const key = classKey(s.name);
-			const dup = !key ? undefined : indexed.find((r) => classKey(r.name) === key) ?? fresh.find((o) => o.path !== s.path && o.tags.includes("class") && classKey(o.name) === key);
-			if (dup) problems.push(`reuse ${dup.path}::${dup.name} — ${s.path} declares ${s.name} again; extend/import the existing class (a different record needs an area-specific name)`);
+			const others = [...indexed, ...fresh.filter((o) => o.path !== s.path && o.tags.includes("class"))];
+			const same = others.find((o) => o.name.toLowerCase() === s.name.toLowerCase());
+			const alike = !same && classKey(s.name) ? others.find((o) => classKey(o.name) === classKey(s.name)) : undefined;
+			if (same) problems.push(`reuse ${same.path}::${same.name} — ${s.path} declares ${s.name} again; extend/import the existing class (a different record needs an area-specific name)`);
+			else if (alike) near.push(`${s.path} declares ${s.name}, and ${alike.path} has ${alike.name}: if it is the same record or class, reuse the existing one`);
 		}
 		if (s.bodyHash) {
 			const dup = targetBodies(g.ledger, g.adapter.id, s.bodyHash).find((r) => !changed.has(r.path)) ?? fresh.find((o) => o.path !== s.path && o.bodyHash === s.bodyHash);
 			if (dup) problems.push(`reuse ${dup.path}::${dup.name} — ${s.path}::${s.name} has the same body; call or move it to a shared helper instead of copying`);
 		}
 	}
-	return [...new Set(problems)];
+	return { problems: [...new Set(problems)], near: [...new Set(near)] };
 }
 
 /**
@@ -307,11 +316,46 @@ export function renderGate(r: GateReport): string {
 	return r.steps.map((s) => `${s.ok ? "✓" : "✗"} ${s.name.padEnd(20)} ${String(s.ms).padStart(6)}ms${s.ok ? "" : `\n${s.output}`}`).join("\n") + `\nchanged: ${r.changedFiles.join(", ") || "-"}`;
 }
 
-/** Same error, different unit → same signature: step + first error line with paths, positions and names in quotes kept, file names dropped. */
+/** Lines that only say that something failed, not why ("There were 2 errors:"): the key looks past them. */
+const SUMMARY_LINE = /^(?:there (?:was|were) \d+ (?:errors?|failures?)|\[error\] found \d+ errors?|instructions for interpreting errors|errors!|failures!|tests?:? +\d+|test files\b|⎯+ failed|an error occurred inside phpunit)/i;
+/** Stack frames and the echoed command: where it happened, not what. */
+const FRAME_LINE = /^(?:#\d+ |at |❯ |\$ )/;
+/** An assertion message is about the unit's own behaviour, not a shared cause. */
+const ASSERTION = /failed asserting|assertionerror|expected .+ to /i;
+
+/**
+ * Same error, different unit → same key: step + the first line that says what went wrong. Paths are dropped
+ * (worktree paths carry the unit id), file names and numbers too; names in quotes are kept (a missing class or
+ * module is the cause). A line that names no cause (only a summary, an assertion) keeps the first file the output
+ * names, so unrelated units never share it by key. Only a cheap first match: a model decides whether two
+ * different keys are one cause (sameQuestion in src/jev/same.ts).
+ */
 export function errorSignature(step: string, output: string): string {
-	const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
-	const line = clean.split(/\r?\n/).find((l) => /error|failed|cannot|not found/i.test(l)) ?? clean.split(/\r?\n/).find((l) => l.trim()) ?? "";
-	return `${step}: ${line.replace(/[\w./\\-]*[\w-]\.[a-z][a-z0-9]{0,5}(?::\d+)+|[\w.-]*[/\\][\w./\\-]+\.[a-z][a-z0-9]{0,5}\b/gi, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
+	const lines = output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+	// what follows a tool's closing summary is its footer (PHPStan's "how to read errors"), never the cause
+	const end = lines.reduce((e, l, i) => (SUMMARY_LINE.test(l) ? i : e), lines.length); // the last summary line
+	const cause = lines.findIndex((l, i) => i < end && /error|failed|cannot|not found/i.test(l) && !FRAME_LINE.test(l) && !SUMMARY_LINE.test(l));
+	const at = cause >= 0 ? cause : Math.max(0, lines.findIndex((l) => SUMMARY_LINE.test(l)));
+	const line = lines[at] ?? "";
+	let key = normalizeErrorLine(line);
+	if (cause < 0 || ASSERTION.test(line)) {
+		const file = lines.slice(at + 1).concat(lines).flatMap((l) => l.match(/[^\s'"`()]*\/[^\s'"`():]+\.[a-z][a-z0-9]{0,4}\b/gi) ?? []).find((f) => !f.includes("://")); // not a docs link
+		if (file) key += ` in ${basename(file)}`;
+	}
+	return `${step}: ${key}`.slice(0, 200);
+}
+
+/** One error line without what differs per unit: paths (outside quotes any with a slash, inside only absolute ones), file names, numbers. */
+function normalizeErrorLine(line: string): string {
+	return line
+		.replace(/^PHP (?=[A-Z][a-z]+(?: [a-z]+)?:)/, "") // "PHP Fatal error:" (stderr) and "Fatal error:" (stdout) are one message
+		.replace(/(["'`])((?:(?!\1).)*)\1|[^\s'"`()<>[\]{},;|]*\/[^\s'"`()<>[\]{},;|]*/g, (m, q: string | undefined, inner: string | undefined) =>
+			q ? `${q}${inner!.replace(/(?<![\w@.-])(?:[a-z][\w+.-]*:\/\/|~\/|\/)[^\s'"`]*/gi, "<path>")}${q}` : "<path>",
+		)
+		.replace(/(["'`])((?:(?!\1).)*)\1|\b[\w-]+\.[a-z][a-z0-9]{0,4}\b/gi, (m, q: string | undefined) => (q ? m : "<file>"))
+		.replace(/\b\d+\b/g, "N")
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 /** The stack's build/lint commands that ignore the files they are given: they check the whole project. */

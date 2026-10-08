@@ -14,6 +14,7 @@ import { syntaxErrors } from "../inventory/treesitter.ts";
 import { describeCapabilities } from "../inventory/capabilities.ts";
 import { indexTarget } from "../inventory/target.ts";
 import { askViaModel } from "../jev/ask.ts";
+import { sameQuestion } from "../jev/same.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
@@ -219,7 +220,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// setup model prepares its environment once for all units; code re-runs this script to decide it worked.
 		const legacyFixer = o.legacyFixer === false ? undefined : (o.legacyFixer ?? (o.spawn ? undefined : fixLegacyEnvWithModel));
 		if (!truthOk && truthMode === "run" && legacyFixer && lastErr) {
-			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: lastErr, truthDir: truthDirAbs, signature: errorSignature("truth", lastErr), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
+			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: lastErr, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(lastErr)), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
 			const verified = fixed ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 			if (fixed && verified?.ok) {
 				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
@@ -230,9 +231,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			}
 		}
 		// running it still fails for this unit: truth from reading the old code instead, marked as not run
+		const runErr = truthMode === "run" ? lastErr : undefined;
 		if (!truthOk && truthMode === "run") {
 			truthMode = "read";
-			const runErr = lastErr;
 			log(pc.yellow(`  truth does not run green on the old code; the tester writes it from reading the code (marked: read, not run)`));
 			for (let t = 1; t <= 2 && !truthOk; t++) {
 				truthOk = await runTruth(`Running ${sourceAdapter.truth.scriptName} on the old code failed${runErr ? `:\n${runErr.slice(-1500)}` : ""}\nWrite ${truthDirRel}/${READ_CASES_FILE} instead (see step 3).${t > 1 && lastErr ? `\nYour previous ${READ_CASES_FILE} was rejected:\n${lastErr}` : ""}`);
@@ -242,9 +243,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (!truthOk) {
 			const q = await ask({
 				point: "truth_env",
-				// one question about the old code's environment, whichever unit hits it: one answer releases them all
-				sameAs: "legacy-env",
-				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time. Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
+				// units whose old code fails the same way share one question: one answer releases them all
+				sameAs: errorSignature("truth", truthError(runErr ?? lastErr ?? "")),
+				facts: `The tester ran twice for ${o.unitId} (legacy files ${card.files.join(", ")}); the characterization script did not run green on the old code either time.${runErr && runErr !== lastErr ? ` Running it failed with:\n${truthError(runErr).slice(-1000)}\nWriting the cases from reading the code failed too.` : ""} Last error:\n${lastErr?.slice(-1500) ?? "(none)"}`,
 				options: [
 					{ value: "fixed", facts: "the legacy environment (dependencies, module loading, DB) is fixed now: the tester runs again" },
 					{ value: "quarantine", facts: "the code cannot run here: leave the unit for a human (type a hint instead to steer the tester)" },
@@ -444,9 +445,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
 		const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
 		const review = reviewer
-			? async (changedFiles: string[]) => {
+			? async (changedFiles: string[], nearDuplicates?: string[]) => {
 					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
 					cost += r.costUsd ?? 0;
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					return r;
@@ -463,11 +464,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		// the same error is already asked about for another unit: wait on that question (no triage, no doctor, no new question)
 		const signature = errorSignature(gate.failedStep ?? "", gate.steps.find((s) => !s.ok)?.output ?? "");
-		const sharedQ = o.ledger.openQuestionFor("gate_env", signature) ?? o.ledger.openQuestionFor("triage_gate", signature);
+		const same = await sameQuestion(askDeps, ["gate_env", "triage_gate"], signature, `Gate step ${gate.failedStep} failed:\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`, o.unitId);
+		cost += same.costUsd;
+		const sharedQ = same.id;
 		if (sharedQ !== undefined) {
 			o.ledger.addWaiter(sharedQ, o.unitId);
 			o.ledger.updateUnit(o.unitId, { meta: { parked: { question: sharedQ, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles, setupFiles(o.root, stackId)) } } });
-			log(pc.yellow(`  same failure as question #${sharedQ} (another unit): waits on that answer — other units keep running`));
+			log(pc.yellow(`  same failure as question #${sharedQ} (another unit${same.by === "model" ? "; same cause, says the decision model" : ""}): waits on that answer — other units keep running`));
 			return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, costUsd: cost };
 		}
 
@@ -626,6 +629,15 @@ export function envFingerprint(config: Config, projectDir: string, manifestFiles
 	return h.update(JSON.stringify(config.target.choices)).update(JSON.stringify(config.target.stacks)).digest("hex").slice(0, 12);
 }
 
+
+/** The error of a tester attempt's report (stored as {mode, cases, error}), or the text as it is. */
+function truthError(report: string): string {
+	try {
+		return String(JSON.parse(report).error ?? report);
+	} catch {
+		return report;
+	}
+}
 
 function transcriptPath(root: string, unitId: string, role: string, attemptId: number): string {
 	const dir = join(root, ".bigrefactor", "sessions");

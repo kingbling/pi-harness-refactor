@@ -114,6 +114,16 @@ describe("gate structure_ok", () => {
 		write("src/features/campaign/dto/create-campaign-request.dto.ts", "export class CreateCampaignRequestDto {}\n");
 		expect(step(await gate("campaign"), "structure_ok")!.ok).toBe(true);
 	});
+	it("a name that only looks like an existing class is no hard fail: the reviewer gets it as a fact to judge", async () => {
+		write("src/features/campaign/dto/create-agency-request-record.dto.ts", "export class CreateAgencyRequestDtoRecord {}\n");
+		const seen: string[][] = [];
+		const review = async (_files: string[], near?: string[]) => (seen.push(near ?? []), { ok: true, output: "fine", judged: true });
+		const r = await gate("campaign", { review });
+		const s = step(r, "structure_ok")!;
+		expect(s.ok, s.output).toBe(true);
+		expect(s.output).toMatch(/note: .*declares CreateAgencyRequestDtoRecord, and .* has CreateAgencyRequestDto: if it is the same record or class, reuse the existing one \(the reviewer judges it\)/);
+		expect(seen).toEqual([[expect.stringMatching(/declares CreateAgencyRequestDtoRecord, and src\/features\/agency\/dto\/create-agency-request\.dto\.ts has CreateAgencyRequestDto/)]]);
+	});
 	it("fails a function body copied into another file", async () => {
 		write("src/features/campaign/campaign.service.ts", COPIED);
 		const s = step(await gate("campaign"), "structure_ok")!;
