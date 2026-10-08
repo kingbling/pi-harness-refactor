@@ -273,8 +273,9 @@ export function tsDiagnose(projectDir: string, failedStep: string, output: strin
 }
 
 /** Probe spec for the setup check: written in the style the project's runner expects. */
-export function tsProbeTest(projectDir: string): { path: string; content: string } {
+export function tsProbeTest(projectDir: string): { path: string; content: string; failing: string } {
 	const runner = tsTestRunner(projectDir);
 	const imp = runner === "vitest" ? 'import { describe, it, expect } from "vitest";\n' : runner === "jest" ? 'import { describe, it, expect } from "@jest/globals";\n' : "";
-	return { path: "src/__br_probe__.spec.ts", content: `${imp}describe("bigrefactor toolchain probe", () => {\n\tit("runs", () => {\n\t\texpect(1 + 1).toBe(2);\n\t});\n});\n` };
+	const spec = (n: number) => `${imp}describe("bigrefactor toolchain probe", () => {\n\tit("runs", () => {\n\t\texpect(1 + 1).toBe(${n});\n\t});\n});\n`;
+	return { path: "src/__br_probe__.spec.ts", content: spec(2), failing: spec(3) };
 }

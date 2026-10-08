@@ -17,7 +17,7 @@ function stack(over: Partial<TargetAdapter> = {}) {
 	const adapter = {
 		id: "fixme",
 		toolchain: { isProjectReady: () => true },
-		probeTest: () => ({ path: "src/probe.spec.txt", content: "expect(1 + 1).toBe(2)\n" }),
+		probeTest: () => ({ path: "src/probe.spec.txt", content: "expect(1 + 1).toBe(2)\n", failing: "expect(1 + 1).toBe(3)\n" }),
 		build: () => ({ cmd: "true", args: [] }),
 		lint: () => ({ cmd: "true", args: [] }),
 		// the "old flag": always fails, like vitest 5 on --related

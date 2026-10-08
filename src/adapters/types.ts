@@ -373,8 +373,11 @@ export interface TargetAdapter {
 	 * fault and what fixes it. Undefined = no rule matched (the orchestrator asks a model).
 	 */
 	diagnose?(projectDir: string, failedStep: string, output: string, isTestFile: (p: string) => boolean, expectedPackages: string[]): Diagnosis | undefined;
-	/** A minimal test file proving the toolchain works on a fresh project (setup probe). */
-	probeTest?(projectDir: string): { path: string; content: string };
+	/**
+	 * A minimal test file proving the toolchain works on a fresh project (setup probe). `failing` is the same file
+	 * with a wrong expected value: the test command must fail on it (a test command that cannot fail proves nothing).
+	 */
+	probeTest?(projectDir: string): { path: string; content: string; failing?: string };
 	/** Problems where the bootstrapped project does not match the stack choices (empty = consistent). */
 	verifyChoices?(projectDir: string, chosen: Array<{ key: string; id: string; packages?: string[] }>): ChoiceProblem[];
 	/** Facts read from the project config that agents must respect (module resolution, strict flags…). */
