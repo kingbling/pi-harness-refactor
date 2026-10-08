@@ -379,7 +379,7 @@ async function modelPlace(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Retu
 		},
 	};
 	if (!code.surfaceKnown && d.config.target.stacks.length > 1) battery["ui"] = { type: "noul", instructions: "Does the code in `summary` render HTML, templates, or browser-side scripts or styles?" };
-	const r = await decide({ client: d.client!, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, POINT, { summary: excerpt(d.config, files), path: files[0], neighbours: Object.fromEntries(neighbours), uses: Object.fromEntries(uses), used_by: Object.fromEntries(usedBy) }, battery, Object.keys(battery), u.id);
+	const r = await decide({ client: d.client!, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id, secondWhen: (a) => a["area"]?.type === "choice" && a["area"].choice !== "other" }, POINT, { summary: excerpt(d.config, files), path: files[0], neighbours: Object.fromEntries(neighbours), uses: Object.fromEntries(uses), used_by: Object.fromEntries(usedBy) }, battery, Object.keys(battery), u.id);
 	const a = r.answers["area"];
 	const choice = a?.type === "choice" ? a.choice : "other";
 	const ui = r.answers["ui"];

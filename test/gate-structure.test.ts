@@ -258,3 +258,26 @@ describe("tsCheckStructure (ui)", () => {
 		expect(bad).toHaveLength(4);
 	});
 });
+
+describe("accepted behaviour stays proven", () => {
+	it("a unit with truth cases but no ported test file fails ported_tests_green", async () => {
+		write("src/features/agency/agency.controller.ts", "export class AgencyController {}\n");
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
+		const s = step(await gate("agency"), "ported_tests_green")!;
+		expect(s.ok).toBe(false);
+		expect(s.output).toMatch(/1 truth case\(s\) but no ported test file/);
+	});
+	it("changing a test of an earlier unit fails antigaming; its own tests and tidy-sanctioned ones do not", async () => {
+		write("src/features/agency/agency.service.spec.ts", "it('u0#1 totals', () => {});\n");
+		write("src/features/agency/own.spec.ts", "it('u1#1 names', () => {});\n");
+		commit();
+		write("src/features/agency/agency.service.spec.ts", "it('u0#1 totals', () => { /* weaker */ });\n");
+		write("src/features/agency/own.spec.ts", "it('u1#1 names it', () => {});\n");
+		write("src/features/agency/agency.controller.ts", "export class AgencyController {}\n");
+		const s = step(await gate("agency"), "antigaming_ok")!;
+		expect(s.ok).toBe(false);
+		expect(s.output).toMatch(/changed a test of an earlier unit: src\/features\/agency\/agency\.service\.spec\.ts/);
+		expect(s.output).not.toMatch(/own\.spec/);
+		expect(step(await gate("agency", { sanctioned: ["src/features/agency/agency.service.spec.ts"] }), "antigaming_ok")!.output).not.toMatch(/earlier unit/);
+	});
+});

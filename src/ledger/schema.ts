@@ -208,6 +208,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   label TEXT,                         -- human/pilot ground truth for calibration
   cost_usd REAL NOT NULL DEFAULT 0,
   latency_ms INTEGER,
+  state TEXT,                         -- the input the model saw (capped), so a decision can be replayed
   created_at TEXT NOT NULL
 );
 

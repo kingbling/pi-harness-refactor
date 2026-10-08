@@ -10,10 +10,10 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { errorSignature, wholeProjectSteps } from "./gate.ts";
+import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 
 /**
- * The builder: whole-project checks (a type check of everything, a linter that cannot take files) do not run in
+ * The builder: whole-project checks (a type check of everything, a linter that cannot take files, all tests) do not run in
  * every unit's gate, they grew with the project. One builder runs them on the side, now and then after merges, in
  * its own worktree of main. When they fail (units that each passed on their own, together they do not), the big
  * model fixes the code there, code re-runs the checks, and the fix is merged like a unit. Lanes never wait for it.
@@ -32,7 +32,7 @@ export const repairWithModel: Repairer = async (o) => {
 		writeGlobs: ["**"],
 		protectedGlobs: [".git/**", ...o.adapter.protectedGlobs],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__builder__.${o.adapter.id}.${Date.now()}.${o.attempt}.jsonl`),
-		systemPrompt: `You are the BUILDER of an automated migration to ${o.adapter.id}. Many units were migrated separately and each passed its own checks; the whole-project checks now fail. Fix the CODE so they pass: imports, types, signatures and calls between modules, missing exports. Keep behaviour. Never edit tests (test changes are thrown away), never weaken the checks (no excluded paths, lower levels, ignore comments, baseline files, config changes that hide errors). Never interactive prompts or servers. Run the failing commands yourself to confirm. End with one sentence saying what you fixed.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You are the BUILDER of an automated migration to ${o.adapter.id}. Many units were migrated separately and each passed its own checks; the whole-project checks now fail. Fix the CODE so they pass: imports, types, signatures and calls between modules, missing exports. A failing test is behaviour of an accepted unit that a later change broke: find that change and fix the code, not the test. Keep behaviour. Never edit tests (test changes are thrown away), never weaken the checks (no excluded paths, lower levels, ignore comments, baseline files, config changes that hide errors). Never interactive prompts or servers. Run the failing commands yourself to confirm. End with one sentence saying what you fixed.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const r = await session.run(`The whole-project checks fail:\n${o.problem.slice(-6000)}\n\nFix the code, then run the commands again.`);
@@ -106,7 +106,10 @@ export function createBuilder(o: {
 		try {
 			o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, stackId)));
-			const steps = wholeProjectSteps(adapter, dir);
+			// every accepted unit's tests too: later units, tidy and repairs change accepted code, and a unit's gate
+			// only runs the tests of its own area
+			const hasTests = trackedFiles(dir).some((f) => adapter.layout.isTestFile(f));
+			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(hasTests ? [{ step: "test", ...adapter.test(dir, []) }] : [])];
 			if (!steps.length) return;
 			const check = async () => {
 				const out: string[] = [];

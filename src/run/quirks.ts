@@ -95,7 +95,7 @@ async function precedentFor(d: AskDeps, q: QuirkRow): Promise<{ id?: number; dec
 	const criteria: Record<string, string> = Object.fromEntries(decided.map((p) => [`p${p.id}`, `${p.kind}: ${p.behaviour} → the owner chose ${p.status === "kept" ? "keep" : "drop"}`]));
 	criteria["none"] = "No earlier decision covers it: the behaviour or what callers depend on differs";
 	try {
-		const r = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, "quirk_precedent", { quirk: { kind: q.kind, behaviour: q.behaviour, example: q.example, symbol: q.symbol_id } }, { precedent: { type: "choice", instructions: "The old code has the quirk in `quirk`. Does one of the owner's earlier decisions cover the same behaviour with the same stakes, so that its answer applies unchanged?", criteria } }, ["precedent"], q.unit_id);
+		const r = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id, secondWhen: (a) => a["precedent"]?.type === "choice" && a["precedent"].choice !== "none" }, "quirk_precedent", { quirk: { kind: q.kind, behaviour: q.behaviour, example: q.example, symbol: q.symbol_id } }, { precedent: { type: "choice", instructions: "The old code has the quirk in `quirk`. Does one of the owner's earlier decisions cover the same behaviour with the same stakes, so that its answer applies unchanged?", criteria } }, ["precedent"], q.unit_id);
 		const pick = r.answers["precedent"]?.type === "choice" ? (r.answers["precedent"] as { choice: string }).choice : "none";
 		const p = decided.find((x) => `p${x.id}` === pick);
 		if (!p || r.confidence < JEV_ACT) return { costUsd: r.costUsd };

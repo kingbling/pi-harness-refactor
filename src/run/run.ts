@@ -510,7 +510,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		if (!o.client || tried.has("systemic") || failed.length < 3 || failed.length < recent.length / 2) return;
 		try {
-			const r = await decide({ client: o.client, ledger, model: config.models.decide.id, second: config.models.escalate.id }, "systemic_failure", { recent_failures: failed.map((f) => ({ unit: f.unit, cause: f.cause, gate: f.gate })) }, SYSTEMIC_FAILURE, ["systemic"]);
+			const r = await decide({ client: o.client, ledger, model: config.models.decide.id, second: config.models.escalate.id, secondWhen: (a) => a["systemic"]?.type === "noul" && a["systemic"].noul >= 0.5 }, "systemic_failure", { recent_failures: failed.map((f) => ({ unit: f.unit, cause: f.cause, gate: f.gate })) }, SYSTEMIC_FAILURE, ["systemic"]);
 			const sys = r.answers["systemic"];
 			const kind = r.answers["kind"]?.type === "choice" ? (r.answers["kind"] as { choice: string }).choice : "other";
 			if (sys?.type === "noul" && sys.noul >= 0.5 && r.confidence >= JEV_ACT && kind !== "hard_batch") {

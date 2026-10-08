@@ -18,7 +18,15 @@ export interface Decision {
  * `primary` names the questions whose confidence gates the action; the rest are speculative.
  */
 export async function decide(
-	deps: { client: ModelClient; ledger: Ledger; model: string; /** model for the second opinion below JEV_ACT */ second?: string },
+	deps: {
+		client: ModelClient;
+		ledger: Ledger;
+		model: string;
+		/** model for the second opinion below JEV_ACT */
+		second?: string;
+		/** Only ask it when Jev's answer, once confirmed, would change what the caller does (default: always). */
+		secondWhen?: (answers: Record<string, DecisionAnswer>) => boolean;
+	},
 	point: string,
 	state: unknown,
 	battery: Battery,
@@ -35,10 +43,13 @@ export async function decide(
 	let cost = res.usage.costUsd;
 	let model = res.usage.model;
 	let secondOpinion: Decision["secondOpinion"];
-	if (confidence < JEV_ACT && deps.second && primary.length) {
+	let second: { verdict: string; model: string; answers?: unknown; jevConfidence: number } | undefined;
+	if (confidence < JEV_ACT && deps.second && primary.length && (deps.secondWhen?.(res.answers) ?? true)) {
 		const so = await askSecondOpinion(deps.client, deps.second, state, battery, primary, res.answers);
 		cost += so.costUsd;
 		secondOpinion = so.verdict;
+		// kept either way: a disagreeing answer is what calibration and template changes learn from
+		second = { verdict: so.verdict, model: so.model, answers: so.raw, jevConfidence: confidence };
 		if (so.verdict === "agreed") {
 			answers = so.answers;
 			confidence = JEV_ACT;
@@ -50,10 +61,11 @@ export async function decide(
 		point,
 		model,
 		stateHash,
-		answers: secondOpinion ? { ...answers, _second_opinion: secondOpinion } : answers,
+		answers: second ? { ...answers, _jev: res.answers, _second_opinion: second } : answers,
 		confidence,
 		costUsd: cost,
 		latencyMs: Date.now() - t0,
+		state: stateJson,
 	});
 	return { answers, confidence, costUsd: cost, decisionId, secondOpinion };
 }
@@ -63,7 +75,7 @@ export async function decide(
  * It agrees when every primary choice matches and every yes/no lands on the same side; then the answers stand.
  * Score questions are not second-guessed (they never agree by construction).
  */
-async function askSecondOpinion(client: ModelClient, model: string, state: unknown, battery: Battery, primary: string[], jev: Record<string, DecisionAnswer>): Promise<{ verdict: "agreed" | "disagreed" | "unavailable"; answers: Record<string, DecisionAnswer>; costUsd: number; model: string }> {
+async function askSecondOpinion(client: ModelClient, model: string, state: unknown, battery: Battery, primary: string[], jev: Record<string, DecisionAnswer>): Promise<{ verdict: "agreed" | "disagreed" | "unavailable"; answers: Record<string, DecisionAnswer>; costUsd: number; model: string; raw?: unknown }> {
 	const qs = primary.filter((q) => battery[q] && battery[q]!.type !== "score");
 	if (!qs.length) return { verdict: "unavailable", answers: jev, costUsd: 0, model };
 	const properties: Record<string, unknown> = {};
@@ -97,7 +109,7 @@ async function askSecondOpinion(client: ModelClient, model: string, state: unkno
 				if (a.type === "choice") lifted[q] = { ...a, confidence: Math.max(a.confidence, JEV_ACT) };
 				else if (a.type === "noul") lifted[q] = { ...a, noul: a.noul >= 0.5 ? Math.max(a.noul, 0.5 + JEV_ACT / 2) : Math.min(a.noul, 0.5 - JEV_ACT / 2) };
 			}
-		return { verdict: agreed ? "agreed" : "disagreed", answers: lifted, costUsd: r.usage.costUsd, model: r.usage.model };
+		return { verdict: agreed ? "agreed" : "disagreed", answers: lifted, costUsd: r.usage.costUsd, model: r.usage.model, raw: j };
 	} catch {
 		return { verdict: "unavailable", answers: jev, costUsd: 0, model };
 	}

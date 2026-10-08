@@ -53,7 +53,7 @@ export async function labelUnits(config: Config, root: string, ledger: Ledger, c
 			const meta = JSON.parse(u.meta) as { files: string[]; loc: number; queries: number; dynamic_markers?: unknown[]; cutDeps?: string[] };
 			const state = { summary: excerpt(meta.files), path: meta.files[0] };
 			try {
-				const r = await decide({ client, ledger, model, second: config.models.escalate.id }, "label_unit", state, ROUTE_UNIT, ["kind"], u.id);
+				const r = await decide({ client, ledger, model }, "label_unit", state, ROUTE_UNIT, ["kind"], u.id);
 				cost += r.costUsd;
 				const a = r.answers;
 				const kind = a["kind"]?.type === "choice" ? a["kind"] : undefined;

@@ -2,7 +2,7 @@ import type { Config } from "../config.ts";
 import { decide, setDecisionAction } from "../jev/decide.ts";
 import { band, choiceOf, DEFAULT_THRESHOLDS, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
-import type { ModelClient } from "../models/types.ts";
+import type { DecisionAnswer, ModelClient } from "../models/types.ts";
 import { errorSignature, type GateReport } from "./gate.ts";
 import { askViaModel } from "../jev/ask.ts";
 
@@ -74,49 +74,40 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		previous_stage: previous?.failedStep ?? null,
 		diff_stats: { changed_files: gate.changedFiles.length, files: gate.changedFiles.slice(0, 20) },
 	};
+	// what code does with Jev's answers (the confidence band comes after)
+	const playbook = (answers: Record<string, DecisionAnswer>): { action: TriageAction; reason: string } => {
+		const cause = choiceOf(answers["cause"]) ?? "other";
+		const retryHelps = noulOf(answers["retry_likely_to_help"]);
+		const same = previous ? noulOf(answers["same_as_previous"]) : 0;
+		const needsEscalation = noulOf(answers["escalate"]);
+		if (attemptNo >= maxTotal) return { action: "quarantine", reason: `attempt cap ${maxTotal} reached` };
+		if (cause === "test_bug" || cause === "interface_mismatch") return { action: "retest", reason: `${cause}: tester re-ports interface/tests` };
+		if (cause === "env") return { action: "ask_human", reason: "environment problem, not code" };
+		// A tool that printed nothing is an environment problem, whatever the model thinks.
+		if (!state.tool_produced_output && state.exit_code !== null) return { action: "ask_human", reason: `gate tool exited ${state.exit_code} without output` };
+		// Byte-identical failure twice: a stronger model is not the answer, a human is (only this unit waits).
+		if (state.previous_report && state.previous_report === out.slice(-1500)) return { action: "ask_human", reason: "identical failure on consecutive attempts" };
+		if (needsEscalation > 0.7 || (same > 0.7 && attemptNo >= 2)) return { action: "escalate", reason: needsEscalation > 0.7 ? "needs cross-unit understanding" : "same failure class twice → stronger model" };
+		if (attemptNo >= maxImpl) return { action: "escalate", reason: "implement attempts exhausted" };
+		return { action: "retry", reason: retryHelps >= 0.5 ? "retry with the exact gate output" : "retry (escalation needs positive evidence)" };
+	};
 	let dec;
 	try {
-		dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
+		// a second opinion only where an unsure answer changes the action: retry and quarantine happen either way,
+		// an environment cause is asked either way
+		const matters = (a: Record<string, DecisionAnswer>) => {
+			const p = playbook(a);
+			return p.action === "retest" || p.action === "escalate";
+		};
+		dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id, secondWhen: matters }, "triage_gate", state, TRIAGE_GATE, ["cause"], unitId);
 	} catch (e) {
 		// the decision model is unavailable: the playbook still runs, by code (retry → escalate → quarantine)
 		const action: TriageAction = attemptNo >= maxTotal ? "quarantine" : attemptNo >= maxImpl ? "escalate" : "retry";
 		return deterministic(d, unitId, "other", action, `decision model unavailable (${String((e as Error)?.message ?? e).slice(0, 120)}); playbook by attempt count`);
 	}
 	const cause = choiceOf(dec.answers["cause"]) ?? "other";
-	const retryHelps = noulOf(dec.answers["retry_likely_to_help"]);
-	const same = previous ? noulOf(dec.answers["same_as_previous"]) : 0;
-	const needsEscalation = noulOf(dec.answers["escalate"]);
 	const b = band(dec.confidence, DEFAULT_THRESHOLDS["triage_gate"]!);
-
-	let action: TriageAction;
-	let reason: string;
-	if (attemptNo >= maxTotal) {
-		action = "quarantine";
-		reason = `attempt cap ${maxTotal} reached`;
-	} else if (cause === "test_bug" || cause === "interface_mismatch") {
-		action = "retest";
-		reason = `${cause}: tester re-ports interface/tests`;
-	} else if (cause === "env") {
-		action = "ask_human";
-		reason = "environment problem, not code";
-	} else if (!state.tool_produced_output && state.exit_code !== null) {
-		// A tool that printed nothing is an environment problem, whatever the model thinks.
-		action = "ask_human";
-		reason = `gate tool exited ${state.exit_code} without output`;
-	} else if (state.previous_report && state.previous_report === out.slice(-1500)) {
-		// Byte-identical failure twice: a stronger model is not the answer, a human is (only this unit waits).
-		action = "ask_human";
-		reason = "identical failure on consecutive attempts";
-	} else if (needsEscalation > 0.7 || (same > 0.7 && attemptNo >= 2)) {
-		action = "escalate";
-		reason = needsEscalation > 0.7 ? "needs cross-unit understanding" : "same failure class twice → stronger model";
-	} else if (attemptNo >= maxImpl) {
-		action = "escalate";
-		reason = "implement attempts exhausted";
-	} else {
-		action = "retry";
-		reason = retryHelps >= 0.5 ? "retry with the exact gate output" : "retry (escalation needs positive evidence)";
-	}
+	let { action, reason } = playbook(dec.answers);
 	// Very low confidence on anything but a cheap retry: hand over instead of guessing. Otherwise code acts and
 	// nobody is asked: the outcome of the next attempt is the label, not an owner's guess at a cause code.
 	if (b === "escalate" && action !== "retry" && action !== "quarantine") {

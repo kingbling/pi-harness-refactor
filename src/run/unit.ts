@@ -20,7 +20,7 @@ import type { ModelClient } from "../models/types.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, testerTools } from "../sessions/tools.ts";
-import { errorSignature, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+import { errorSignature, othersTestsChanged, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
@@ -180,6 +180,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		cost += res.usage.cost;
 		lastTesterText = res.text;
+		// tests of earlier units prove accepted behaviour: the tester may not rewrite them (undone, and it is told)
+		const others = othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), tidyPaths);
+		if (others.length) {
+			execFileSync("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir, stdio: "pipe" });
+			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
+			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. If one is wrong, say which and why in your final answer.)` };
+			lastTesterText = res.text;
+		}
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not

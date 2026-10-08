@@ -32,6 +32,8 @@ function setup() {
 		// the "type check" of everything: it cannot take files
 		build: () => ({ cmd: "grep", args: ["-q", "ok", "src/a.txt"] }),
 		lint: (_r: string, files: string[]) => ({ cmd: "true", args: files }),
+		// the accepted units' tests: a.test.txt expects a.txt to say ok
+		test: () => ({ cmd: "grep", args: ["-q", "ok", "src/a.txt"] }),
 	} as unknown as TargetAdapter;
 	const ledger = new Ledger(":memory:");
 	const mergeFix = async (wt: string, branch: string, what: string) => {
@@ -71,6 +73,23 @@ describe("the builder", () => {
 		expect(readFileSync(join(target, "src", "a.test.txt"), "utf8")).toBe("expects ok\n");
 		expect(git(target, ["log", "-1", "--format=%s"])).toMatch(/whole-project check/);
 		expect(ledger.openQuestions()).toEqual([]);
+	});
+
+	it("runs every accepted unit's tests too: a later change that broke one is fixed in the code", async () => {
+		const { root, target, config, adapter, ledger, mergeFix } = setup();
+		const buildOk = { ...adapter, build: () => ({ cmd: "true", args: [] }) } as TargetAdapter;
+		const logs: string[] = [];
+		let problem = "";
+		const repair: Repairer = async (o) => {
+			problem = o.problem;
+			writeFileSync(join(o.dir, "src", "a.txt"), "ok\n");
+			return "restored a.txt";
+		};
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", buildOk]]), log: (l) => logs.push(l), linkAll: () => {}, mergeFix, repair, every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await b.finish();
+		expect(problem).toMatch(/\(test\)/);
+		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
 	});
 
 	it("what the model cannot fix becomes one question that blocks nothing", async () => {

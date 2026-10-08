@@ -106,6 +106,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
 			else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
 		}
+		for (const f of othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
 		if (prodFiles.length === 0) problems.push("no production files were written");
 		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 	});
@@ -146,7 +147,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 
 	// 8. the ported characterization tests (one per truth case)
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
-	if (!(await step("ported_tests_green", () => cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout))))) return done();
+	const cases = (g.ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ?").get(g.unitId) as { n: number }).n;
+	if (!(await step("ported_tests_green", () => (cases && !g.testFiles.length ? Promise.resolve({ ok: false, output: `${cases} truth case(s) but no ported test file: nothing proves the behaviour` }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
 
 	return done();
 
@@ -297,6 +299,24 @@ export function changedFiles(dir: string, ignored: string[] = []): string[] {
 	} catch {
 		return [];
 	}
+}
+
+/**
+ * Tests of earlier units this unit changed or removed: test files git already tracks whose committed version does
+ * not name one of this unit's truth cases (`<unit>#N`). Only their own unit's tester may change them (a reopen);
+ * a test that looks wrong is reported (dispute_test, report_migrated_bug), not rewritten. Tidy-sanctioned paths pass.
+ */
+export function othersTestsChanged(dir: string, unitId: string, isTestFile: (f: string) => boolean, sanctioned: string[] = []): string[] {
+	const tracked = new Set(trackedFiles(dir));
+	const own = new RegExp(`(?<![\\w-])${unitId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}#\\d`);
+	return changedFiles(dir).filter((f) => {
+		if (!isTestFile(f) || !tracked.has(f) || sanctioned.includes(f)) return false;
+		try {
+			return !own.test(execFileSync("git", ["show", `HEAD:./${f}`], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 }));
+		} catch {
+			return false; // not in HEAD: new in this worktree
+		}
+	});
 }
 
 /** Files git already tracks under `dir` (relative to `dir`). */

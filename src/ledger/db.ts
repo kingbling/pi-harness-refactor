@@ -67,6 +67,8 @@ export class Ledger {
 	constructor(path: string) {
 		this.db = new DatabaseSync(path);
 		this.db.exec(DDL);
+		// ledgers from before decisions.state
+		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = 'state'").get())) this.db.exec("ALTER TABLE decisions ADD COLUMN state TEXT");
 	}
 
 	close(): void {
@@ -285,10 +287,10 @@ export class Ledger {
 		return this.db.prepare("SELECT * FROM evidence WHERE unit_id = ? ORDER BY id").all(unitId) as Array<{ id: number; type: EvidenceType; payload: string; created_at: string }>;
 	}
 
-	recordDecision(d: { unitId?: string; point: string; model: string; stateHash: string; answers: unknown; confidence?: number; action?: string; costUsd?: number; latencyMs?: number }): number {
+	recordDecision(d: { unitId?: string; point: string; model: string; stateHash: string; answers: unknown; confidence?: number; action?: string; costUsd?: number; latencyMs?: number; state?: string }): number {
 		const r = this.db
-			.prepare("INSERT INTO decisions(unit_id, point, model, state_hash, answers, confidence, action, cost_usd, latency_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-			.run(d.unitId ?? null, d.point, d.model, d.stateHash, JSON.stringify(d.answers), d.confidence ?? null, d.action ?? null, d.costUsd ?? 0, d.latencyMs ?? null, now());
+			.prepare("INSERT INTO decisions(unit_id, point, model, state_hash, answers, confidence, action, cost_usd, latency_ms, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			.run(d.unitId ?? null, d.point, d.model, d.stateHash, JSON.stringify(d.answers), d.confidence ?? null, d.action ?? null, d.costUsd ?? 0, d.latencyMs ?? null, d.state?.slice(0, 16_000) ?? null, now());
 		return Number(r.lastInsertRowid);
 	}
 
