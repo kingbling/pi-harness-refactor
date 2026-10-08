@@ -4,10 +4,11 @@ import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
-import { saveCommandOverride, saveWorktreeCopy } from "../adapters/command-overrides.ts";
+import { loadCommandOverrides, saveCommandOverride, saveWorktreeCopy, setupLogPath } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
+import { commitAll, isRepoRoot } from "../git.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 
@@ -187,8 +188,6 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 	fixes.set(problemKey, (fixes.get(problemKey) ?? 0) + 1);
 	fixes.set(key, (fixes.get(key) ?? 0) + 1);
 	const p = (async () => {
-		const { commitAll } = await import("../git.ts");
-		const { loadCommandOverrides, setupLogPath } = await import("../adapters/command-overrides.ts");
 		const before = JSON.stringify(loadCommandOverrides(o.root, key));
 		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
 		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
@@ -197,7 +196,6 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		});
 		const repo = o.config.target.path;
 		const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
-		const { isRepoRoot } = await import("../git.ts");
 		// the target must be its own repo: inside another checkout, undo and commit would act on the parent's files
 		if (!isRepoRoot(repo)) {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "no_change", gateReport: { said, error: `${repo} is not its own git repo: nothing undone or committed` } });

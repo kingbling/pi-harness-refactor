@@ -14,12 +14,23 @@ const inWorkspace = (id: string) => {
 	return ws === undefined || !process.env["BR_WORKSPACE"] || ws === process.env["BR_WORKSPACE"];
 };
 /**
+ * One import per process: units in parallel lanes ask for the adapter at the same time, and a loader without
+ * module cache (Pi's) would evaluate the module once per call, handing some callers a half-loaded copy.
+ */
+function once<T>(load: () => Promise<T>): () => Promise<T> {
+	let p: Promise<T> | undefined;
+	return () => (p ??= load().catch((e) => {
+		p = undefined;
+		throw e;
+	}));
+}
+/**
  * Target adapters load lazily; what init and placement need synchronously is declared next to the loader.
  * A test asserts every manifest matches its adapter (role, subdir, aliases).
  */
 const targetManifest: Record<string, { role: "server" | "ui"; subdir: string; aliases: string[]; generated?: boolean; load: () => Promise<TargetAdapter> }> = {
-	nestjs: { role: "server", subdir: "api", aliases: ["nest"], load: async () => (await import("./target/nestjs.ts")).nestjsAdapter },
-	react: { role: "ui", subdir: "web", aliases: ["reactjs"], load: async () => (await import("./target/react.ts")).reactAdapter },
+	nestjs: { role: "server", subdir: "api", aliases: ["nest"], load: once(async () => (await import("./target/nestjs.ts")).nestjsAdapter) },
+	react: { role: "ui", subdir: "web", aliases: ["reactjs"], load: once(async () => (await import("./target/react.ts")).reactAdapter) },
 };
 const targets: Record<string, () => Promise<TargetAdapter>> = Object.fromEntries(Object.entries(targetManifest).map(([id, m]) => [id, m.load]));
 
