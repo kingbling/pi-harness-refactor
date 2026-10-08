@@ -86,3 +86,14 @@ describe("br recheck", () => {
 		expect(renderStatus(ledger, { color: false })).not.toMatch(/not rechecked/);
 	});
 });
+
+describe("br recheck: findings outside the unit's files", () => {
+	it("keep the unit accepted and become one owner note", async () => {
+		const { root, config, ledger } = workspace();
+		const reviewer: Reviewer = async () => ({ ok: false, judged: true, output: "outside the unit's files (setup fixer, else the owner):\n- composer.json lacks a mapping → add it", outOfScope: "- composer.json lacks a mapping → add it" });
+		const r = await recheckAccepted({ ledger, config, root, reviewer, runTests: green, log: () => {} });
+		expect(r.reopened).not.toContain("stub");
+		expect(ledger.getUnit("stub")!.state).toBe("accepted");
+		expect(ledger.openQuestions().some((q) => q.point === "review_outside" && q.unit_id === "stub")).toBe(true);
+	});
+});

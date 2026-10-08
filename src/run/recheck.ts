@@ -82,8 +82,13 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 					const ra = o.ledger.startAttempt(u.id, "review", o.config.models.escalate.id);
 					const r = await (o.reviewer ?? reviewWithModel)({ ledger: o.ledger, config: o.config, root: o.root, unitId: u.id, adapter, targetProjectDir: main, moduleDir: placementDir(adapter.layout, place), legacyFiles: meta.files ?? [], changedFiles: files, testFiles: tests, commit: meta.commit, recheck: true, transcriptPath: join(o.root, ".bigrefactor", "sessions", `${u.id}.recheck.${ra}.jsonl`) }).catch((e) => ({ ok: true, judged: false, output: `not judged: ${e?.message ?? e}`, costUsd: 0 }));
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output, recheck: true } });
+					const rr = r as { outOfScope?: string; weakTests?: string };
 					if (!r.judged) notJudged++;
-					else if (!r.ok) findings.push(r.output);
+					// only things outside the unit's files: re-running the unit cannot fix them; one note for the owner (the resolver tries first)
+					else if (!r.ok && rr.outOfScope && !rr.weakTests && !/^reviewer findings:/m.test(r.output)) {
+						o.ledger.askQuestion({ unitId: u.id, point: "review_outside", question: `The reviewer found problems outside ${u.id}'s files (setup, config, packages):\n${rr.outOfScope}`, options: ["done — fixed outside the code", "ignore — leave it"], blocks: "none", askedBy: "recheck" });
+						log(pc.yellow(`? ${u.id}: problems outside its files — asked, unit stays accepted`));
+					} else if (!r.ok) findings.push(r.output);
 				}
 				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString() } });
 				if (!findings.length) return;
