@@ -80,6 +80,15 @@ describe("environment failures (the @jest/globals incident)", () => {
 		expect(errorSignature("build_ok", stan("A/One.php"))).not.toBe(errorSignature("build_ok", stan("B/Two.php")));
 		expect(errorSignature("build_ok", stan("A/One.php"))).not.toMatch(/identifier/);
 	});
+
+	it("the same crash or merge error in different units has one key, whatever file or branch it names", () => {
+		const enoent = (u: string, f: string) => `ENOENT: no such file or directory, open '/w/.bigrefactor/worktrees/${u}/web/src/${f}:12'`;
+		expect(errorSignature("exception", enoent("U1", "a/ArangodbCommandBaseTest.php"))).toBe(errorSignature("exception", enoent("U2", "b/NetworkCpmFields.test.tsx")));
+		expect(errorSignature("exception", enoent("U1", "a/X.php"))).not.toMatch(/ in /);
+		const merge = (u: string, sha: string) => `could not merge: could not rebase unit/${u} onto main: error: could not apply ${sha}... migrate\nhint: rebase --abort\nfatal: no rebase in progress`;
+		expect(errorSignature("quarantined", merge("U2415_campaign_mailchanges_cmd", "1a2b3c4"))).toBe(errorSignature("quarantined", merge("U0007_b", "9f8e7d6c")));
+		expect(errorSignature("quarantined", merge("U2415_campaign_mailchanges_cmd", "1a2b3c4"))).not.toMatch(/U2415/);
+	});
 });
 
 describe("parked units resubmit themselves", () => {
