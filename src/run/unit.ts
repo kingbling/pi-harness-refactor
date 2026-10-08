@@ -307,7 +307,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				return false;
 			}
 			log(pc.yellow(`  ${missing.length} truth case(s) have no ported test — retest`));
-			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. Every case gets its own test whose name contains the case id (e.g. "${missing[0]} …"), asserting the case's expected value.`);
+			const seen = findTests(targetProjectDir, moduleDir, adapter.layout);
+			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. The orchestrator searches the test files for each case id as exact text, "#" included (e.g. "${missing[0]}"); a changed spelling does not count. ${seen.length ? `It searched ${seen.join(", ")} and did not find these ids.` : "It found no test files where this unit's tests belong."} Every case gets its own test asserting the case's expected value, with the exact id in its name, or next to it in a comment or test description where a name cannot hold it.`);
 		}
 	};
 
