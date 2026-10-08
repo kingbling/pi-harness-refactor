@@ -78,6 +78,9 @@ describe("generated source adapters", () => {
 		const a = getSourceAdapter("javascript");
 		expect((await a.detect(legacy)).confidence).toBeGreaterThan(0);
 		expect(a.truth.run(legacy, "/x/cases.cjs")).toEqual({ cmd: "node", args: ["/x/cases.cjs"] });
+		// packages and data stores the model read from the repo feed the library questions and the survey
+		expect(a.externalDeps?.(legacy)).toEqual([{ name: "pg", version: "^8.11.0", dev: false, verdict: "review" }, { name: "jest", version: "^29.0.0", dev: true, verdict: "review" }]);
+		expect(a.dbSignals?.(legacy)).toEqual([{ engine: "postgresql", evidence: "package.json depends on pg" }]);
 
 		// symbols, deps, functions with comments and calls, containers with their parent class
 		const read = (p: string) => readFileSync(join(legacy, p), "utf8");

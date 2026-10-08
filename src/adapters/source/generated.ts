@@ -49,6 +49,10 @@ export interface SourceManifest {
 	truth: { scriptName: string; run: Cmd; instructions: string; probe: string };
 	/** Command the tester may run for the legacy test suite. */
 	oldTestCommand?: string;
+	/** Third-party packages the legacy repo declares (its package manifest, read by the model). */
+	packages?: Array<{ name: string; version?: string; dev?: boolean }>;
+	/** Data stores the legacy code talks to, each with where the model saw it (a driver package, a DSN, a compose service). */
+	dataStores?: Array<{ engine: string; evidence: string }>;
 }
 
 // ---- grammar ----------------------------------------------------------------------------------------------
@@ -355,6 +359,8 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 			instructions: m.truth.instructions,
 		},
 		...(m.oldTestCommand ? { oldTestCommand: () => m.oldTestCommand! } : {}),
+		externalDeps: () => (m.packages ?? []).map((p) => ({ name: p.name, version: p.version, dev: !!p.dev, verdict: "review" as const })),
+		dbSignals: () => m.dataStores ?? [],
 	};
 }
 
@@ -432,6 +438,8 @@ export function validateSourceManifest(m: SourceManifest): string[] {
 		if (!t.run.args.some((a) => a.includes("{script}"))) out.push("truth.run.args must contain {script}");
 	}
 	if (!t?.probe) out.push("truth.probe (a script that prints []) is missing");
+	if (m.packages !== undefined && (!Array.isArray(m.packages) || m.packages.some((p) => !p || typeof p.name !== "string" || !p.name))) out.push("packages must be an array of {name, version?, dev?}");
+	if (m.dataStores !== undefined && (!Array.isArray(m.dataStores) || m.dataStores.some((d) => !d || !/^[a-z0-9]+$/.test(d.engine ?? "") || typeof d.evidence !== "string"))) out.push("dataStores must be an array of {engine (one lowercase word, e.g. mysql), evidence}");
 	for (const [k, r] of [["traits.globalState", m.traits?.globalState], ["traits.mutatingCommands", m.traits?.mutatingCommands]] as const) {
 		if (!r) continue;
 		try {
@@ -555,6 +563,8 @@ export function exampleSourceManifest(): SourceManifest {
 		nodes: { comments: ["comment"], strings: ["string", "template_string"] },
 		dynamicCalls: ["eval", "Function"],
 		traits: { globalState: "\\b(window|globalThis|document\\.cookie|localStorage|sessionStorage|process\\.env)\\b", languageArtifacts: ["loose equality (==) and truthiness", "prototype patching"], mutatingCommands: "\\b(npm|yarn|pnpm)\\s+(install|i|add|remove|update|ci)\\b", vendorDirs: ["node_modules"] },
+		packages: [{ name: "pg", version: "^8.11.0" }, { name: "jest", version: "^29.0.0", dev: true }],
+		dataStores: [{ engine: "postgresql", evidence: "package.json depends on pg" }],
 		docs: [{ name: "MDN JavaScript reference", url: "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference" }],
 		truth: {
 			scriptName: "cases.cjs",
@@ -589,6 +599,8 @@ Manifest fields:
 - docs: official language docs URLs.
 - truth: how a tester runs a script against the OLD code: scriptName (file name with the language's extension), run {cmd, args} — ONE executable, plain args, no shell; {script} is the script path, {root} the legacy root (the command runs there) — instructions (one sentence: how the script loads legacy code and prints ONE JSON array), probe (the smallest script that prints [] ). Try the command yourself with bash on a probe script in ${root}/.bigrefactor/scratch/ (never in the legacy repo).
 - oldTestCommand (optional): the legacy test runner command.
+- packages: the third-party packages the repo declares, read from its package manifest(s) (whatever this language uses): [{name, version, dev}]. Leave out the language runtime itself.
+- dataStores: the databases, caches and queues the code talks to: [{engine: one lowercase word (mysql, postgresql, sqlite, mongodb, redis …), evidence: where you saw it (a driver package, a connection string, a compose service)}]. An empty array when there are none.
 Do not describe framework conventions (entry points, routes, templates): another step reads them from the code.
 Worked example (JavaScript):
 ${JSON.stringify(exampleSourceManifest(), null, 2)}
