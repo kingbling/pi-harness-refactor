@@ -221,8 +221,9 @@ export class Ledger {
 		}
 		if (!skipEvidenceCheck && (to === "tested" || to === "accepted") && s.unit_id) {
 			const required = to === "tested" ? REQUIRED_FOR_TESTED : REQUIRED_FOR_ACCEPTED;
-			// read-not-run truth stands in for truth run on the old code (marked as such in truth_cases)
-			const missing = required.filter((t) => !this.hasEvidence(s.unit_id!, t) && !(t === "truth_green_on_old" && this.hasEvidence(s.unit_id!, "truth_read")));
+			// read-not-run truth stands in for truth run on the old code (marked as such in truth_cases), and so does
+			// the tester's reasoned "no runtime behaviour to pin" (a pure contract or constants: nothing to run)
+			const missing = required.filter((t) => !this.hasEvidence(s.unit_id!, t) && !(t === "truth_green_on_old" && (this.hasEvidence(s.unit_id!, "truth_read") || this.hasEvidence(s.unit_id!, "truth_none"))));
 			if (missing.length) throw new LedgerError(`${id} -> ${to} needs evidence: ${missing.join(", ")}`);
 		}
 		this.db

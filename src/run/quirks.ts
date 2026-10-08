@@ -1,6 +1,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { answerValue, askViaModel, type AskDeps } from "../jev/ask.ts";
+import { decide, setDecisionAction } from "../jev/decide.ts";
+import { answerConfidence, choiceOf, JEV_ACT } from "../jev/questions.ts";
 
 /**
  * Legacy quirks. The tester does not pin every oddity of the old code; it records each one with an opinion
@@ -32,7 +34,48 @@ export interface QuirkRow {
 	created_at: string;
 }
 
-export function recordQuirk(d: Pick<AskDeps, "ledger"> & { root: string }, q: { unitId: string; symbolId: string; kind: QuirkKind; behaviour: string; example?: string; opinion: "drop" | "keep"; why: string }): { id: number; status: QuirkRow["status"] } {
+/** Behaviour text compared without case, punctuation or spacing ("Returns '0' for []" = "returns 0 for"). */
+const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+/**
+ * A quirk of the unit that already records this behaviour, or undefined. Code first: the same symbol with the same
+ * behaviour text (case, punctuation and spacing ignored). Then, with a client, the decision model reads the unit's
+ * quirks and picks the one that describes the same behaviour (one owner answer covers both), or none.
+ */
+export async function sameQuirk(d: Pick<AskDeps, "ledger" | "config" | "client">, q: { unitId: string; symbolId: string; behaviour: string; example?: string }): Promise<{ row?: QuirkRow; costUsd: number }> {
+	const mine = quirksOf(d, q.unitId);
+	const exact = mine.find((x) => x.symbol_id === q.symbolId && norm(x.behaviour) === norm(q.behaviour));
+	if (exact || !d.client || !mine.length) return { row: exact, costUsd: 0 };
+	const open = mine.slice(-MAX_SAME_CANDIDATES);
+	const criteria: Record<string, string> = { none: "None of them: a different behaviour, or cannot tell" };
+	for (const x of open) criteria[`q${x.id}`] = `${x.symbol_id} (${x.kind}): ${x.behaviour}${x.example ? ` — e.g. ${x.example}` : ""}`.slice(0, 400);
+	try {
+		const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "same_quirk", { quirk: `${q.symbolId}: ${q.behaviour}${q.example ? ` — e.g. ${q.example}` : ""}` }, {
+			same: {
+				type: "choice",
+				instructions: "Which recorded quirk describes the same behaviour of the old code as `quirk`? Same means one answer (keep or drop) decides both: the same oddity, maybe in other words or on another symbol of the same code path.",
+				criteria,
+			},
+		}, ["same"], q.unitId);
+		const pick = choiceOf(dec.answers["same"]);
+		const row = pick && pick !== "none" && dec.answers["same"] && answerConfidence(dec.answers["same"]) >= JEV_ACT ? open.find((x) => `q${x.id}` === pick) : undefined;
+		setDecisionAction(d.ledger, dec.decisionId, row ? `same as quirk #${row.id}` : "new quirk");
+		return { row, costUsd: dec.costUsd };
+	} catch {
+		return { costUsd: 0 }; // the decision model is unavailable: code's check only
+	}
+}
+const MAX_SAME_CANDIDATES = 12;
+
+/** The unit's quirks as lines for the tester (so it does not record one twice). */
+export function quirkList(d: Pick<AskDeps, "ledger">, unitId: string): string {
+	return quirksOf(d, unitId).map((q) => `- #${q.id} ${q.symbol_id} (${q.kind}, ${q.status}${q.status === "pending" || q.status === "asked" ? `, tests follow "${q.applied ?? q.opinion}"` : ""}): ${q.behaviour}`).join("\n");
+}
+
+export function recordQuirk(d: Pick<AskDeps, "ledger"> & { root: string }, q: { unitId: string; symbolId: string; kind: QuirkKind; behaviour: string; example?: string; opinion: "drop" | "keep"; why: string }): { id: number; status: QuirkRow["status"]; duplicate?: boolean } {
+	// the same behaviour recorded twice is one quirk (one question, one answer)
+	const dup = quirksOf(d, q.unitId).find((x) => x.symbol_id === q.symbolId && norm(x.behaviour) === norm(q.behaviour));
+	if (dup) return { id: dup.id, status: dup.status, duplicate: true };
 	// dropping an old-language artifact or an unused edge case changes nothing a caller relies on: the tester decides
 	const auto = (q.kind === "language_artifact" || q.kind === "edge_case") && q.opinion === "drop";
 	const status = auto ? "dropped" : "pending";

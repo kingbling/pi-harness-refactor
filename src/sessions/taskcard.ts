@@ -8,6 +8,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import { placeUnit, type Placement } from "../run/placement.ts";
 import { tidyTaskCard } from "../run/tidy.ts";
 import { slashed } from "../rules/layout-rules.ts";
+import { noBehaviour } from "../run/gate.ts";
 import { callTree } from "../inventory/codemap.ts";
 
 /**
@@ -36,6 +37,8 @@ export interface TaskCard {
 	truthCases: number;
 	/** Cases written from reading the old code (it could not run): weaker, marked as such. */
 	truthRead?: number;
+	/** The tester's reason why the unit has no runtime behaviour to pin (truth_none), if it said so. */
+	noBehaviour?: string;
 	/** Cross-cutting helpers that already exist in the target (reuse, never reimplement). */
 	sharedHelpers: Array<{ id: string; kind: string; signature: string | null; doc: string | null }>;
 	/** Target symbols whose names resemble this unit's legacy symbols — check before creating. */
@@ -154,7 +157,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -227,7 +230,7 @@ function renderAreaModule(a: AreaModule, L: string[]): void {
 export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSource?: boolean } = { includeSource: true }): string {
 	const L: string[] = [];
 	L.push(`# Unit ${card.unit.id}  (tier ${card.unit.tier}${card.unit.kind ? `, kind ${card.unit.kind}` : ""})`);
-	L.push(`Source files (${config.source.stack}, read-only): ${card.files.join(", ")}`);
+	L.push(`Source files (${config.source.stack}, read-only, relative to ${config.source.path}): ${card.files.join(", ")}`);
 	L.push(`Target: ${card.place?.stackId ?? config.target.stacks.join(" + ")} project at ${card.targetProjectDir}. You may write only: ${card.writeGlobs.join(", ")}`);
 	if (card.areaModule) renderAreaModule(card.areaModule, L);
 	if (card.tidyTasks) L.push("", "## Tidy tasks for this area (do these too)", card.tidyTasks, "Moves whose source is already gone were done by the orchestrator: update the imports. Merged sources are removed once every target exists.");
@@ -279,6 +282,7 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		for (const h of card.reuseHints) L.push(`- ${h.legacy} ~ ${h.id} [${h.kind}]`);
 	}
 	L.push("", `## Truth: ${card.truthCases} characterization cases verified on the old code${card.truthRead ? `, ${card.truthRead} read from the old code but not run (it cannot run here)` : ""} (truth_lookup tool)`);
+	if (card.noBehaviour && !card.truthCases && !card.truthRead) L.push(`The tester found no runtime behaviour to pin in this unit (no cases, no ported tests): ${card.noBehaviour}`);
 	if (opts.includeSource) {
 		for (const f of card.files) {
 			L.push("", `## Source: ${f}`, "```" + config.source.stack);

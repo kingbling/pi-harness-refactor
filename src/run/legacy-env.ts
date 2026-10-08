@@ -74,19 +74,41 @@ export type TruthCase = { symbol: string; inputs: unknown; expected: unknown };
 export const READ_CASES_FILE = "cases.json";
 
 /**
+ * Where the tester declares that a unit has no runtime behaviour to pin (only a contract, type declarations or
+ * constants): {"reason": "..."}. With it, a missing or empty case list is accepted instead of rejected.
+ */
+export const NO_BEHAVIOUR_FILE = "no-behaviour.json";
+
+/** The tester's reason why this unit has no runtime behaviour, or undefined when it did not declare that. */
+export function noBehaviourReason(truthDirAbs: string): string | undefined {
+	try {
+		const r = String((JSON.parse(readFileSync(join(truthDirAbs, NO_BEHAVIOUR_FILE), "utf8")) as { reason?: unknown }).reason ?? "").trim();
+		return r || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** `none`: the unit has no runtime behaviour to pin (the tester's reason); `cases` is then empty. */
+export type TruthResult = { ok: boolean; cases: TruthCase[]; error?: string; none?: string };
+
+const NO_CASES_HINT = "(when the unit has no runtime behaviour at all, say so with no_behaviour_to_pin instead)";
+
+/**
  * Code runs the tester's script on the old code and loads the cases: the tester never decides that truth is green.
  * With `legacyFiles` (the unit's legacy files) the script must load one of them and must not type the expected
  * values in: truth that the old code did not produce is no truth.
  */
-export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter, root?: string, legacyFiles?: string[]): { ok: boolean; cases: TruthCase[]; error?: string } {
+export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter, root?: string, legacyFiles?: string[]): TruthResult {
 	const script = join(truthDirAbs, source.truth.scriptName);
-	if (!existsSync(script)) return { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
+	const none = noBehaviourReason(truthDirAbs);
+	if (!existsSync(script)) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
 	try {
 		const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script);
 		const out = execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 		const start = out.indexOf("[");
 		const cases = JSON.parse(out.slice(start)) as TruthCase[];
-		if (!Array.isArray(cases) || !cases.length) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases` };
+		if (!Array.isArray(cases) || !cases.length) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases ${NO_CASES_HINT}` };
 		const bad = cases.filter((c) => typeof c.symbol !== "string");
 		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
 		const invented = legacyFiles ? notFromOldCode(readFileSync(script, "utf8"), cases, legacyFiles) : undefined;
@@ -120,12 +142,13 @@ export function notFromOldCode(script: string, cases: TruthCase[], legacyFiles: 
 }
 
 /** Read-not-run truth: the tester's cases.json, checked for shape only (nothing ran). */
-export function loadReadTruth(truthDirAbs: string): { ok: boolean; cases: TruthCase[]; error?: string } {
+export function loadReadTruth(truthDirAbs: string): TruthResult {
 	const file = join(truthDirAbs, READ_CASES_FILE);
-	if (!existsSync(file)) return { ok: false, cases: [], error: `tester did not write ${READ_CASES_FILE}` };
+	const none = noBehaviourReason(truthDirAbs);
+	if (!existsSync(file)) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `tester did not write ${READ_CASES_FILE}` };
 	try {
 		const cases = JSON.parse(readFileSync(file, "utf8")) as TruthCase[];
-		if (!Array.isArray(cases) || !cases.length) return { ok: false, cases: [], error: `${READ_CASES_FILE} holds no cases` };
+		if (!Array.isArray(cases) || !cases.length) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `${READ_CASES_FILE} holds no cases ${NO_CASES_HINT}` };
 		if (cases.some((c) => typeof c?.symbol !== "string" || !("expected" in c))) return { ok: false, cases: [], error: `every case in ${READ_CASES_FILE} needs a symbol and an expected value` };
 		return { ok: true, cases };
 	} catch (e: any) {

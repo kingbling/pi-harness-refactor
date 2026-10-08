@@ -1,5 +1,8 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ModelClient } from "../models/types.ts";
+import { NO_BEHAVIOUR_FILE, type TruthResult } from "../run/legacy-env.ts";
+import { caseCoverage, lintTests } from "../run/ported.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { Config } from "../config.ts";
@@ -10,7 +13,7 @@ import { callersOf, callsFrom, findFunction, readFunction } from "../inventory/c
 import { getSourceAdapter } from "../adapters/registry.ts";
 import { sharedSymbols, stackTagLike } from "../inventory/target.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
-import { QUIRK_KINDS, recordQuirk, type QuirkKind } from "../run/quirks.ts";
+import { QUIRK_KINDS, quirkList, recordQuirk, sameQuirk, type QuirkKind } from "../run/quirks.ts";
 import { proposeRule } from "../rules/living.ts";
 import { rulesDir } from "../rules/layout.ts";
 import { slashed } from "../rules/layout-rules.ts";
@@ -35,6 +38,12 @@ export interface ToolDeps {
 	onDispute?: (d: { test: string; why: string; evidence: string }) => void;
 	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
 	onReport?: (r: { owner: string; target: string; problem: string; evidence: string }) => void;
+	/** Decision model for cheap judgements in tools (record_quirk: is this quirk already recorded?). */
+	client?: ModelClient;
+	/** Tester: the unit's truth dir (absolute), where no_behaviour_to_pin writes its declaration. */
+	truthDir?: string;
+	/** Tester: the truth cases as code would load them now (runs the truth script / reads cases.json), for check_ported_tests. */
+	currentTruth?: () => TruthResult;
 }
 
 const text = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details });
@@ -266,7 +275,7 @@ export function recordQuirkTool(d: ToolDeps): ToolDefinition {
 		name: "record_quirk",
 		label: "Record quirk",
 		description:
-			"Record an oddity of the OLD code instead of pinning it blindly: a language artifact (loose emptiness/truthiness, implicit coercion), an edge case, a suspected bug, or intentional-looking odd behaviour. Give your opinion: drop (the new code implements the intended behaviour) or keep (callers depend on it). Language artifacts with opinion drop are dropped without asking; everything else is asked to the owner. Write your test cases the way your opinion says.",
+			"Record an oddity of the OLD code instead of pinning it blindly: a language artifact (loose emptiness/truthiness, implicit coercion), an edge case nobody may rely on, or a suspected bug. Ordinary behaviour — what the code plainly does on purpose, even when it looks unusual — is a test case, not a quirk. One behaviour is one quirk: record it once, not per symbol or per case (the reply lists what this unit already has; an already recorded behaviour is returned, not added). Give your opinion: drop (the new code implements the intended behaviour) or keep (callers depend on it). Language artifacts and edge cases with opinion drop are dropped without asking; everything else is asked to the owner. Write your test cases the way your opinion says.",
 		promptSnippet: "record_quirk: note a legacy oddity with your opinion (drop|keep) instead of pinning it",
 		parameters: Type.Object({
 			symbolId: Type.String({ description: "legacy symbol id from the task card" }),
@@ -279,8 +288,14 @@ export function recordQuirkTool(d: ToolDeps): ToolDefinition {
 		execute: async (_id, p) => {
 			const sym = d.ledger.getSymbol(p.symbolId);
 			if (!sym || sym.unit_id !== d.unitId) return text(`${p.symbolId} is not a symbol of ${d.unitId}; use ids from the task card`, { error: true });
+			const all = () => `\nQuirks of ${d.unitId} so far:\n${quirkList(d, d.unitId)}`;
+			const same = await sameQuirk(d, { unitId: d.unitId, symbolId: p.symbolId, behaviour: p.behaviour, example: p.example });
+			if (same.row) {
+				const follow = same.row.status === "kept" ? "keep" : same.row.status === "dropped" ? "drop" : (same.row.applied ?? same.row.opinion);
+				return text(`already recorded as quirk #${same.row.id} (${same.row.symbol_id}: ${same.row.behaviour}); not added again. Write the cases following "${follow}".${all()}`, { id: same.row.id, status: same.row.status, duplicate: true });
+			}
 			const r = recordQuirk(d, { unitId: d.unitId, symbolId: p.symbolId, kind: p.kind as QuirkKind, behaviour: p.behaviour, example: p.example, opinion: p.opinion as "drop" | "keep", why: p.why });
-			return text(r.status === "dropped" ? `quirk #${r.id} dropped (language artifact): do not pin it; test the intended behaviour.` : `quirk #${r.id} recorded; the owner will be asked. Write the cases following your opinion (${p.opinion}).`, r);
+			return text(`${r.status === "dropped" ? `quirk #${r.id} dropped (no caller relies on it): do not pin it; test the intended behaviour.` : `quirk #${r.id} recorded; the owner will be asked. Write the cases following your opinion (${p.opinion}).`}${all()}`, r);
 		},
 	});
 }
@@ -348,11 +363,65 @@ export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 	});
 }
 
+/**
+ * The tester checks its own ported tests the way the orchestrator will: every truth case id as exact text in a test
+ * file where this unit's tests belong, and the stack's lint/static check on those test files (run from the target
+ * project dir; the implementer cannot edit tests, so a test that fails the check fails every attempt).
+ */
+export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "check_ported_tests",
+		label: "Check ported tests",
+		description: "Run the orchestrator's own checks on your ported tests: which truth case ids (\"<unit>#N\", searched as exact text) no test file mentions, where it searched, and the output of the target stack's lint/static check on the test files (run in the target project dir). Call it before you finish and fix what it reports.",
+		promptSnippet: "check_ported_tests: the orchestrator's checks on your tests (case ids found, lint) — call before TESTER DONE",
+		parameters: Type.Object({}),
+		execute: async () => {
+			const moduleDir = d.moduleDir ?? "";
+			const out: string[] = [];
+			const truth = d.currentTruth?.();
+			let ids: string[];
+			if (truth?.ok) {
+				ids = truth.cases.map((_, i) => `${d.unitId}#${i + 1}`);
+				if (truth.none) out.push(`No runtime behaviour declared (${truth.none}): no case needs a test.`);
+			} else {
+				ids = (d.ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(d.unitId) as Array<{ id: string }>).map((r) => r.id);
+				if (truth) out.push(`Your truth cases do not load yet: ${truth.error ?? "unknown error"}${ids.length ? `\nChecked the ${ids.length} case id(s) recorded earlier instead.` : ""}`);
+			}
+			const cov = caseCoverage(d.targetProjectDir, moduleDir, d.adapter.layout, ids);
+			out.push(`Searched for test files matching ${cov.globs.join(", ")} in ${d.targetProjectDir}: ${cov.files.length ? cov.files.join(", ") : "none found"}.`);
+			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
+			if (cov.files.length) {
+				const lint = await lintTests(d.targetProjectDir, d.adapter, cov.files);
+				out.push(lint.error ? `LINT FAILED (\`${lint.command}\`, run in ${d.targetProjectDir}); fix the test files (formatting/static issues only, behaviour unchanged):\n${lint.error}` : `Lint/static check clean (\`${lint.command}\`, run in ${d.targetProjectDir}).`);
+			}
+			return text(out.join("\n"), { missing: cov.missing, files: cov.files });
+		},
+	});
+}
+
+/** A unit with nothing to run (a pure contract, type declarations, constants): the tester says so with a reason instead of inventing cases. */
+export function noBehaviourTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "no_behaviour_to_pin",
+		label: "No behaviour to pin",
+		description: "Declare that this unit has NO runtime behaviour a test could pin: it only declares a contract (interface, abstract signatures), types or constant values — nothing is computed, decided or changed when it runs. Then write no truth cases and no ported tests for it (still draft interface.md). Give the reason a reviewer can check against the legacy code. Never use it to skip behaviour that is hard to test.",
+		promptSnippet: "no_behaviour_to_pin: the unit only declares a contract/types/constants — nothing to test (with the reason)",
+		parameters: Type.Object({ reason: Type.String({ description: "what the unit consists of and why nothing in it runs" }) }),
+		execute: async (_id, p) => {
+			if (!d.truthDir) return text("not available in this session", { error: true });
+			if (!p.reason.trim()) return text("a reason is required", { error: true });
+			mkdirSync(d.truthDir, { recursive: true });
+			writeFileSync(join(d.truthDir, NO_BEHAVIOUR_FILE), JSON.stringify({ reason: p.reason.trim() }, null, 2) + "\n");
+			return text("recorded: no truth cases and no ported tests are expected for this unit; the reviewer checks your reason. If you write cases anyway, they count instead.");
+		},
+	});
+}
+
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
 	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), reportMigratedBugTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d), checkPortedTestsTool(d), noBehaviourTool(d)];
 }
 
 function safeRead(p: string): string | undefined {

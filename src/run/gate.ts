@@ -148,13 +148,26 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// 8. the ported characterization tests (one per truth case)
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
 	const cases = (g.ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ?").get(g.unitId) as { n: number }).n;
-	if (!(await step("ported_tests_green", () => (cases && !g.testFiles.length ? Promise.resolve({ ok: false, output: `${cases} truth case(s) but no ported test file: nothing proves the behaviour` }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
+	// a unit the tester found without runtime behaviour (a pure contract, constants) has nothing to pin: no tests to run
+	const none = !cases && !g.testFiles.length ? noBehaviour(g.ledger, g.unitId) : undefined;
+	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : cases && !g.testFiles.length ? Promise.resolve({ ok: false, output: `${cases} truth case(s) but no ported test file: nothing proves the behaviour` }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
 
 	return done();
 
 	function done(): GateReport {
 		const failed = steps.find((s) => !s.ok);
 		return { ok: !failed, steps, changedFiles: changed, failedStep: failed?.name, testFiles: g.testFiles.map((t) => t.path) };
+	}
+}
+
+/** The tester's reason why the unit has no runtime behaviour to pin (latest truth_none evidence), or undefined. */
+export function noBehaviour(ledger: Ledger, unitId: string): string | undefined {
+	const row = ledger.db.prepare("SELECT payload FROM evidence WHERE unit_id = ? AND type = 'truth_none' ORDER BY id DESC LIMIT 1").get(unitId) as { payload: string } | undefined;
+	if (!row) return undefined;
+	try {
+		return String((JSON.parse(row.payload) as { reason?: unknown }).reason ?? "") || "no reason given";
+	} catch {
+		return "no reason given";
 	}
 }
 
