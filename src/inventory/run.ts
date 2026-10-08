@@ -1,5 +1,5 @@
 import { globToRegExp } from "../sessions/spawn.ts";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import pc from "picocolors";
 import type { Config } from "../config.ts";
@@ -36,6 +36,8 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// folders the profile model found are not the app (tooling, stubs, vendored libraries, docs, one-off scripts,
 	// tests) are left out on top of the adapter's minimal defaults; a file the adapter calls an entry point stays
 	const notApp = loadNotApp(_root);
+	const profilePath = join(_root, ".bigrefactor", "framework-profile.json");
+	if (existsSync(profilePath) && !/"notApp"\s*:/.test(readFileSync(profilePath, "utf8"))) console.log(pc.yellow("the framework profile names no folders that are not app code (it predates that field): docs, tooling and vendored copies are indexed as app code; br profile --force writes it again"));
 	const files = listFiles(srcRoot, adapter).filter((f) => {
 		const n = notAppOf(f, notApp);
 		return !n || (n.kind !== "vendored" && !!adapter.isEntryPoint?.(f));
