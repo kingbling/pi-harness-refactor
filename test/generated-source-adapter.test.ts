@@ -151,6 +151,12 @@ describe("generated source adapters", () => {
 		expect(py(".")).toBe("billing/__init__.py");
 		expect(py("billing.models")).toBe("billing/models.py");
 		expect(py("django.db.models")).toBe("django.db.models"); // installed package: kept as written
+		// a declared package's module never lands on an app file that only shares its tail
+		const auth = ["auth/models.py"];
+		mkdirSync(join(root, "auth"), { recursive: true });
+		writeFileSync(join(root, "auth/models.py"), "");
+		expect(resolveImport(root, "x.py", "django.contrib.auth.models", [".py"], auth)).toBe("auth/models.py");
+		expect(resolveImport(root, "x.py", "django.contrib.auth.models", [".py"], auth, ["Django"])).toBe("django.contrib.auth.models");
 		expect(resolveImport(root, "x.py", "app.models", [".py"], files)).toBe("app.models"); // two files end in models: no edge
 		expect(resolveImport(root, "src/main/java/com/acme/App.java", "com.acme.billing.Invoice", [".java"], files)).toBe("src/main/java/com/acme/billing/Invoice.java");
 		expect(resolveImport(root, "cmd/main.go", "example.com/shop/internal/tax", [".go"], files)).toBe("internal/tax/tax.go");

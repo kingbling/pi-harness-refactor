@@ -119,7 +119,8 @@ function stringArgs(nameNode: Node, strings: string[]): Array<string | undefined
  * and the ONE indexed file whose path ends with those parts is taken (a Java source root, a Go module prefix
  * are dropped from the left, two parts kept at least). Several matches give no edge: never a guess.
  */
-export function resolveImport(root: string, fromRel: string, spec: string, exts: string[], files: string[]): string {
+/** `packages`: the repo's declared third-party packages: an import starting with one is theirs, never an app file with the same tail. */
+export function resolveImport(root: string, fromRel: string, spec: string, exts: string[], files: string[], packages: string[] = []): string {
 	const exists = (b: string): string | undefined => {
 		for (const c of [b, ...exts.map((e) => b + e), ...exts.map((e) => join(b, `index${e}`)), ...exts.map((e) => join(b, `__init__${e}`))]) {
 			try {
@@ -141,6 +142,7 @@ export function resolveImport(root: string, fromRel: string, spec: string, exts:
 	}
 	const direct = exists(join(root, ...parts));
 	if (direct) return direct;
+	if (packages.some((p) => p.toLowerCase() === parts[0]?.toLowerCase() || p.toLowerCase().endsWith(`/${parts[0]?.toLowerCase()}`))) return spec;
 	const stems = files.map((f) => `/${f.replace(/\.[^./]+$/, "").replace(/\/(index|__init__)$/, "")}`);
 	for (let from = 0; parts.length - from >= 2; from++) {
 		const tail = `/${parts.slice(from).join("/")}`;
@@ -274,7 +276,7 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 				switch (c.name) {
 					case "import": {
 						const spec = m.nodes.strings.includes(c.node.type) ? unquote(text) : text;
-						if (spec) deps.push({ from: relPath, to: resolveImport(srcRoot, relPath, spec, exts, await filesOf(srcRoot)), kind: "include" });
+						if (spec) deps.push({ from: relPath, to: resolveImport(srcRoot, relPath, spec, exts, await filesOf(srcRoot), (m.packages ?? []).map((p) => p.name)), kind: "include" });
 						break;
 					}
 					case "call":
