@@ -391,8 +391,37 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// what other models said about the TESTS during an attempt: the implementer disputes one, the reviewer finds some weak
 	let disputes: Array<{ test: string; why: string; evidence: string }> = [];
 	let reviewWeak: string | undefined;
+	// what the reviewer says must change outside the unit's files (setup, config, plugin): never the implementer's
+	let reviewOutOfScope: string | undefined;
 	let testRounds = 0;
 	const reports: Array<{ owner: string; target: string; problem: string; evidence: string }> = [];
+	const outOfScopeRoute = async (problem: string): Promise<UnitRunResult | undefined> => {
+		const signature = errorSignature("wired_ok", problem);
+		const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
+		let setupTried = "";
+		if (setupFixer) {
+			const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, signature, problem: `The reviewer of unit ${o.unitId} (code in ${moduleDir}/) found what must change outside the unit's files; the unit's implementer may write only ${writeGlobs.join(", ")}. Fix it in the project setup if it belongs there, not in the unit's code:\n${problem}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+			if (fixed) {
+				o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: problem.slice(0, 500) } } } });
+				log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
+				return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, costUsd: cost };
+			}
+			setupTried = " The setup model tried and could not fix it.";
+		}
+		const qid = await ask({
+			point: "gate_env",
+			sameAs: signature,
+			facts: `The reviewer of ${o.unitId} says something must change outside the unit's files (the implementer may write only ${writeGlobs.join(", ")}), so another attempt cannot fix it.${setupTried}\n${problem.slice(0, 1500)}`,
+			options: [
+				{ value: "retry", facts: "I changed it (or it is not needed — say so in a hint): run the unit again" },
+				{ value: "leave", facts: "leave the unit parked for a human" },
+			],
+			context: { failedStep: "wired_ok", outOfScope: problem.slice(0, 1500) },
+		});
+		o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles, setupFiles(o.root, stackId)), diagnosis: { summary: "the reviewer asks for a change outside the unit's files", note: problem.slice(0, 500) } } } });
+		log(pc.yellow(`  waiting for human question #${qid} — other units keep running`));
+		return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, costUsd: cost };
+	};
 	while (attemptNo < maxTotal) {
 		attemptNo++;
 		// the tests as they are on disk now: the tester (it has a shell) may have renamed or removed one since they
@@ -486,9 +515,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const review = reviewer
 			? async (changedFiles: string[], nearDuplicates?: string[]) => {
 					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
 					cost += r.costUsd ?? 0;
 					reviewWeak = r.weakTests;
+					reviewOutOfScope = r.outOfScope;
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					return r;
 				}
@@ -501,6 +531,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		lastGateText = `failed step: ${gate.failedStep}\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
+
+		// the reviewer found something that must change outside the unit's files: another attempt cannot fix it.
+		// Like a setup problem: the setup model first, then one owner question; only this unit waits.
+		if (gate.failedStep === "wired_ok" && reviewOutOfScope) {
+			const problem = reviewOutOfScope;
+			reviewOutOfScope = undefined;
+			log(pc.yellow(`  the reviewer asks for changes outside the unit's files: setup fixer, else the owner`));
+			const parked = await outOfScopeRoute(problem);
+			if (parked) return parked;
+		}
 
 		// another model says the TESTS are wrong: the tester re-checks them against the legacy code first, and its
 		// answer goes into the implementer's next prompt (twice per unit; then triage decides as usual)

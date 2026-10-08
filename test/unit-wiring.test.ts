@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -177,5 +178,37 @@ describe("runUnit wiring", () => {
 		expect(tasks[0]).toMatch(/u1#2/);
 		expect(r.state).toBe("quarantined");
 		expect(gates).toBe(0);
+	});
+
+	describe("reviewer findings outside the unit's files", () => {
+		const outOfScope = "- the autoload map does not cover src/Agency → add the mapping to the project manifest";
+		const reviewer = async () => ({ ok: false, judged: true, output: `outside the unit's files (setup fixer, else the owner):\n${outOfScope}`, outOfScope });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!(["src/features/agency/agency.service.ts"]);
+			return { ok: false, steps: [{ name: "wired_ok", ok: false, ms: 1, output: r.output }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "wired_ok", testFiles: [] };
+		};
+
+		it("go to the setup fixer first, then one owner question; no second attempt for the implementer", async () => {
+			const fixerSaw: string[] = [];
+			const setupFixer = async (o: { problem: string }) => void fixerSaw.push(o.problem);
+			let reviewIn: { writeGlobs?: string[] } | undefined;
+			const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer: async (i) => ((reviewIn = i), reviewer()), setupFixer, log: () => {} });
+			expect(reviewIn!.writeGlobs).toEqual(["src/features/agency/**"]);
+			expect(r.attempts).toBe(1);
+			expect(fixerSaw[0]).toContain("autoload map does not cover src/Agency");
+			const qs = ledger.db.prepare("SELECT point, status, question FROM questions WHERE unit_id = 'u1'").all() as Array<{ point: string; status: string; question: string }>;
+			expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "open"]]);
+			expect(qs[0]!.question).toContain("autoload map does not cover src/Agency");
+			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
+		});
+
+		it("a setup fix parks the unit for a fresh run without asking anyone", async () => {
+			execFileSync("git", ["init", "-q"], { cwd: join(ws, "migrated") });
+			const setupFixer = async () => (write(join(ws, "migrated", "autoload.json"), "{}\n"), "added the autoload mapping");
+			const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, setupFixer, log: () => {} });
+			expect(r.attempts).toBe(1);
+			expect(ledger.openQuestions()).toEqual([]);
+			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.diagnosis.summary).toMatch(/setup was fixed \(added the autoload mapping\)/);
+		});
 	});
 });
