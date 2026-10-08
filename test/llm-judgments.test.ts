@@ -97,9 +97,9 @@ describe("model judgments", () => {
 					return { kind: "domain_logic", dynamic_refs: risky, raw_sql: risky, global_state: risky, external_io: risky, branching: false };
 				}
 				if (q["slice"]) return { slice: Object.keys((q["slice"] as any).criteria)[0] };
-				// auth battery: every feature question → yes for the first feature only
-				const keys = Object.keys(q);
-				return Object.fromEntries(keys.map((k, i) => [k, i === 0 ? 0.95 : 0.05]));
+				// auth: one choice among the slices → the first feature
+				if (q["auth"]) return { auth: Object.keys((q["auth"] as any).criteria)[0] };
+				return undefined;
 			},
 		});
 		const r = await labelUnits(config, d, ledger, client, { log: () => {} });
@@ -121,7 +121,7 @@ describe("model judgments", () => {
 		const n = (ledger.db.prepare("SELECT COUNT(*) n FROM decisions WHERE point = 'label_unit'").get() as { n: number }).n;
 		expect(n).toBe(r.units);
 		const ov = JSON.parse(readFileSync(join(d, ".bigrefactor", "slices.json"), "utf8"));
-		expect(ov.advised).toBeTruthy();
+		expect(ov.advised.auth).toEqual(["invoices"]);
 		const after = planSlices(ledger, ov);
 		const dynBefore = before.slices.find((s) => s.name === "dynamic")?.units.length ?? 0;
 		const dynAfter = after.slices.find((s) => s.name === "dynamic")?.units.length ?? 0;
@@ -133,6 +133,52 @@ describe("model judgments", () => {
 		expect(again.units).toBe(0);
 		expect(client.calls.length - calls).toBeLessThanOrEqual(dynAfter); // only still-unplaced units are asked again
 		expect(firstUnit).toBeTruthy();
+		ledger.close();
+	});
+
+	it("label: every slice is offered for an unreached unit, with how many files of each name it; an unsure auth answer stays undecided", async () => {
+		const d = ws("llm-label-slices");
+		mkdirSync(join(d, ".bigrefactor"), { recursive: true });
+		// a second feature (login) that names a helper only in a comment; the helper and a registry name each other
+		// by string, so they are alive but no route reaches them (the dynamic slice)
+		writeFileSync(join(d, "legacy", "src", "controllers", "LoginController.php"), `<?php\n// the registry cleans names with StringHelper\nclass LoginController\n{\n    public function show(): string\n    {\n        return 'ok';\n    }\n}\n`);
+		mkdirSync(join(d, "legacy", "lib"), { recursive: true });
+		writeFileSync(join(d, "legacy", "lib", "StringHelper.php"), `<?php\nclass StringHelper\n{\n    /** Trims and lower-cases a login name. */\n    public static function clean(string $s): string\n    {\n        $r = 'Registry';\n        return strtolower(trim($s));\n    }\n}\n`);
+		writeFileSync(join(d, "legacy", "lib", "Registry.php"), `<?php\nclass Registry\n{\n    public static function get(): string\n    {\n        return 'StringHelper';\n    }\n}\n`);
+		const routes = readFileSync(join(d, "legacy", "routes.php"), "utf8").replace("require_once", "require_once __DIR__ . '/src/controllers/LoginController.php';\nrequire_once").replace("];", "    ['GET', '/login', [LoginController::class, 'show']],\n];");
+		writeFileSync(join(d, "legacy", "routes.php"), routes);
+		const config = ConfigSchema.parse({ source: { path: join(d, "legacy"), stack: "php" }, target: { path: join(d, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(join(d, ".bigrefactor", "ledger.sqlite"));
+		await inventory(config, d, ledger);
+		const helper = ledger.listUnits().find((u) => JSON.parse(u.meta).files?.includes("lib/StringHelper.php"))!;
+		expect(planSlices(ledger, {}).slices.find((s) => s.name === "dynamic")?.units).toContain(helper.id);
+		const asked: any[] = [];
+		const client = new FakeModelClient({
+			decide: (req) => {
+				const q = req.questions as any;
+				if (q["slice"] || q["auth"]) asked.push(req);
+				// Jev leans to login but is not sure
+				if (q["auth"]) return { auth: { type: "choice", choice: "login", probabilities: { login: 0.6, invoices: 0.3, none: 0.1 }, confidence: 0.4 } };
+				if (q["slice"]) return { slice: "login" };
+				return undefined;
+			},
+		});
+		await labelUnits(config, d, ledger, client, { log: () => {} });
+		const slice = asked.find((r) => r.questions.slice && r.state.path === "lib/StringHelper.php");
+		// every feature slice is offered, not only the folder neighbours'
+		expect(Object.keys(slice.questions.slice.criteria).sort()).toEqual(["foundation", "invoices", "login", "other"]);
+		expect(slice.state.usedBy).toEqual({ login: 1 });
+		// the code map: the function's signature and doc line, then the file's start
+		expect(slice.state.summary).toContain("StringHelper:\n  public static function clean(string $s): string  // Trims and lower-cases a login name.");
+		// one choice question for auth; unsure → not stored, the name match stands in, asked again next time
+		const auth = asked.find((r) => r.questions.auth);
+		expect(Object.keys(auth.questions.auth.criteria).sort()).toEqual(["invoices", "login", "none"]);
+		const ov = JSON.parse(readFileSync(join(d, ".bigrefactor", "slices.json"), "utf8"));
+		expect(ov.advised.auth).toBeUndefined();
+		expect(ov.advised.units[helper.id]).toBe("login");
+		expect(planSlices(ledger, ov).slices.find((s) => s.name === "login")!.kind).toBe("auth");
+		await labelUnits(config, d, ledger, client, { log: () => {} });
+		expect(asked.filter((r) => r.questions.auth)).toHaveLength(2);
 		ledger.close();
 	});
 

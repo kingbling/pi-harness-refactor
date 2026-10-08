@@ -309,12 +309,15 @@ function findCompose(root: string): string | undefined {
 	return undefined;
 }
 
-/** dynamic units → feature owning the longest shared directory prefix (else foundation); written as slices.json overrides. */
+/**
+ * dynamic units → the slice owning the longest shared directory prefix (else foundation); written as slices.json
+ * overrides. Foundation owns folders too: a helper next to shared code is shared code, not the nearest feature's.
+ */
 function writeDynamicOverrides(ledger: Ledger, root: string, mode: string): string {
 	const units = ledger.listUnits().map((u) => ({ id: u.id, meta: JSON.parse(u.meta) as { files?: string[]; slice?: string } }));
 	const dirOwner = new Map<string, Map<string, number>>();
 	for (const u of units) {
-		if (!u.meta.slice || u.meta.slice === "dynamic" || u.meta.slice === "foundation") continue;
+		if (!u.meta.slice || u.meta.slice === "dynamic") continue;
 		for (const f of u.meta.files ?? []) {
 			const parts = f.split("/");
 			for (let i = 1; i < parts.length; i++) {

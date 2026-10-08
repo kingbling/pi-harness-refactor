@@ -53,3 +53,32 @@ describe("vertical slices over the dependency DAG", () => {
 		expect(kind({ overrides: authors, advised: { auth: ["authors"] } })).toBe("auth");
 	});
 });
+
+describe("dynamic units by directory", () => {
+	it("foundation owns folders too: a helper next to shared code goes to foundation, not the feature one folder up", async () => {
+		const { mkdtempSync, mkdirSync, readFileSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { applyDecision } = await import("../src/inventory/decisions.ts");
+		const root = mkdtempSync(join(tmpdir(), "br-dyn-"));
+		mkdirSync(join(root, ".bigrefactor"), { recursive: true });
+		const raw = { version: 1, source: { path: join(root, "legacy"), stack: "php" }, target: { path: join(root, "new"), stacks: ["nestjs"] }, models: {} };
+		writeFileSync(join(root, "bigrefactor.config.json"), JSON.stringify(raw));
+		const config = ConfigSchema.parse(raw);
+		const ledger = new Ledger(":memory:");
+		const mk = (id: string, file: string, slice: string) => {
+			ledger.upsertFile({ path: file, hash: "h", lang: "php", loc: 1 });
+			ledger.upsertSymbol({ id: `${file}::f`, path: file, kind: "function", name: "f" });
+			ledger.createUnit({ id, tier: "T0", symbolIds: [`${file}::f`], meta: { files: [file], slice } });
+		};
+		mk("F1", "app/lib/strings.php", "foundation");
+		mk("F2", "app/lib/dates.php", "foundation");
+		mk("B1", "app/billing/invoice.php", "billing");
+		mk("B2", "app/billing/pay.php", "billing");
+		mk("D1", "app/lib/helper.php", "dynamic");
+		mk("D2", "app/billing/extra/x.php", "dynamic");
+		applyDecision(ledger, config, root, "dynamic-slice", "by-directory");
+		const ov = JSON.parse(readFileSync(join(root, ".bigrefactor", "slices.json"), "utf8"));
+		expect(ov.overrides).toEqual({ D1: "foundation", D2: "billing" });
+	});
+});
