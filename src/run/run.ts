@@ -24,7 +24,7 @@ import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel } from "../jev/ask.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
-import { afterAccept, envFingerprint, runUnit, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
+import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 
 /**
  * The scheduler: many agent sessions, few gate workers, one merge at a time.
@@ -423,7 +423,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const dx = await diagnoseFailure({ config, adapter, projectDir: dir, failedStep: first.step ?? "", output: first.output ?? "", client: o.client }).catch(() => undefined);
 			if (dx) log(pc.dim(`  diagnosis (${dx.by}): ${dx.action} — ${dx.summary}`));
 			if (!dx || dx.action === "fix" || dx.action === "unknown")
-				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output of ${first.unit}:\n${(first.output ?? first.gate ?? "").slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output of ${first.unit}:\n${(first.output ?? first.gate ?? "").slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 		}
 		recent.length = 0;
 		if (fixed) {
@@ -724,12 +724,8 @@ export async function run(opts: { units?: string[]; slice?: string; limit?: numb
 	process.exitCode = r.quarantined && !r.accepted ? 1 : 0;
 }
 
-/** Same error, different unit → same signature: step + first error line with paths, positions and names in quotes kept, file names dropped. */
-export function errorSignature(step: string, output: string): string {
-	const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
-	const line = clean.split(/\r?\n/).find((l) => /error|failed|cannot|not found/i.test(l)) ?? clean.split(/\r?\n/).find((l) => l.trim()) ?? "";
-	return `${step}: ${line.replace(/[\w./\\-]*[\w-]\.[a-z][a-z0-9]{0,5}(?::\d+)+|[\w.-]*[/\\][\w./\\-]+\.[a-z][a-z0-9]{0,5}\b/gi, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
-}
+
+export { errorSignature };
 
 /**
  * Parked units (state kept, attempt closed, waiting on a question) go back to planned as soon as the cause is
@@ -745,12 +741,12 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 	// the environment of the stack the unit parked in (its placement)
 	const envNow = (meta: string) => {
 		const stackId = placeUnit(cfg, meta, root).stackId;
-		return envFingerprint(cfg, projectDir(cfg, stackId), manifests.get(stackId)?.toolchain.manifestFiles ?? []);
+		return envFingerprint(cfg, projectDir(cfg, stackId), manifests.get(stackId)?.toolchain.manifestFiles ?? [], setupFiles(root, stackId));
 	};
 	const parkedEnv = ledger.db.prepare("SELECT id, meta, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; meta: string; q: number | null; env: string }>;
 	for (const p of parkedEnv) {
 		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
-		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest / stack config)", "orchestrator");
+		if (p.q && ledger.openQuestions().some((x) => x.id === p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest, stack config or a setup fix)", "orchestrator");
 	}
 	// waiting units whose blocking questions are all answered (non-blocking ones never hold a unit) get their answer applied
 	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.unit_id = units.id AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));

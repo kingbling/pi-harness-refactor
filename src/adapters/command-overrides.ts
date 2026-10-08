@@ -18,6 +18,11 @@ export function overridesPath(root: string, stackId: string): string {
 	return join(root, ".bigrefactor", "commands", `${stackId}.json`);
 }
 
+/** One line per setup fix made during the run: a new line means parked units may work now. */
+export function setupLogPath(root: string, stackId: string): string {
+	return join(root, ".bigrefactor", "commands", `${stackId}.fixes.log`);
+}
+
 export function loadCommandOverrides(root: string | undefined, stackId: string): CommandOverrides {
 	if (!root || !existsSync(overridesPath(root, stackId))) return {};
 	try {

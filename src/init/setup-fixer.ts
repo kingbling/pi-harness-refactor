@@ -1,5 +1,5 @@
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
@@ -118,29 +118,38 @@ export const createProjectWithModel: ProjectCreator = async (o) => {
 
 const fixing = new Map<string, Promise<string | undefined>>();
 const fixes = new Map<string, number>();
-/** Setup fixes per stack in one process: a problem the model keeps not fixing goes to the owner. */
-export const MAX_RUN_FIXES = 3;
+/** Fix sessions per problem: a problem the model does not fix in this many tries goes to the owner. */
+export const MAX_FIXES_PER_PROBLEM = 2;
+/** Fix sessions per stack in one process, all problems together (a cost guard, not a stop: the run goes on). */
+export const MAX_RUN_FIXES = 20;
 
 /**
  * A gate failure diagnosed as a setup problem of the new project: the setup model fixes the stack's main project
  * (not the unit's worktree) and the change is committed, so every unit started from now on has it. One fix per
- * stack at a time: units failing on the same problem meanwhile wait for that fix instead of starting their own.
- * Returns what changed, or undefined when nothing did (the owner is asked then).
+ * stack at a time: units failing meanwhile wait for that fix instead of starting their own. Each different problem
+ * (`signature`, the same error in different units) gets its own tries. A fix is logged to the stack's fixes log,
+ * which wakes the units parked on a setup problem. Returns what changed, or undefined when nothing did.
  */
-export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; fixer?: SetupFixer }): Promise<string | undefined> {
+export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer }): Promise<string | undefined> {
 	const key = o.adapter.id;
 	const running = fixing.get(key);
 	if (running) return running;
-	if ((fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return undefined;
+	const problemKey = `${key}|${o.signature ?? o.problem.slice(0, 200)}`;
+	if ((fixes.get(problemKey) ?? 0) >= MAX_FIXES_PER_PROBLEM || (fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return undefined;
+	fixes.set(problemKey, (fixes.get(problemKey) ?? 0) + 1);
 	fixes.set(key, (fixes.get(key) ?? 0) + 1);
 	const p = (async () => {
 		const { commitAll } = await import("../git.ts");
-		const { loadCommandOverrides } = await import("../adapters/command-overrides.ts");
+		const { loadCommandOverrides, setupLogPath } = await import("../adapters/command-overrides.ts");
 		const before = JSON.stringify(loadCommandOverrides(o.root, key));
-		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(key)! });
+		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! });
 		const sha = commitAll(o.config.target.path, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
 		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
-		return sha || override ? said || "the setup was changed" : undefined;
+		if (!sha && !override) return undefined;
+		const what = said || "the setup was changed";
+		mkdirSync(dirname(setupLogPath(o.root, key)), { recursive: true });
+		appendFileSync(setupLogPath(o.root, key), `${new Date().toISOString()} ${sha ?? "override"} ${what.replace(/\s+/g, " ")}\n`);
+		return what;
 	})().finally(() => fixing.delete(key));
 	fixing.set(key, p);
 	return p;

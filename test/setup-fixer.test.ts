@@ -86,6 +86,26 @@ describe("setup fixes during the run", () => {
 	});
 });
 
+describe("setup fixes during the run: tries per problem", () => {
+	it("a problem the model cannot fix stops being tried; a different problem still gets its tries, and a fix is logged", async () => {
+		const { fixRunSetup, MAX_FIXES_PER_PROBLEM } = await import("../src/init/setup-fixer.ts");
+		const { setupLogPath } = await import("../src/adapters/command-overrides.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { readFileSync } = await import("node:fs");
+		const { root, target, adapter, config } = stack({ id: "perproblem" } as never);
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		let calls = 0;
+		const nothing: SetupFixer = async () => (calls++, "looked around");
+		const run = (signature: string, fixer: SetupFixer) => fixRunSetup({ config, root, adapter, projectDir: target, problem: signature, signature, fixer });
+		for (let i = 0; i < MAX_FIXES_PER_PROBLEM + 2; i++) expect(await run("lint_ok: out of memory", nothing)).toBeUndefined();
+		expect(calls).toBe(MAX_FIXES_PER_PROBLEM);
+		const fix: SetupFixer = async (o) => (writeFileSync(join(o.projectDir, "phpstan.neon"), "memory\n"), "raised the memory limit");
+		expect(await run("build_ok: class not found", fix)).toBe("raised the memory limit");
+		expect(readFileSync(setupLogPath(root, "perproblem"), "utf8")).toMatch(/raised the memory limit/);
+	});
+});
+
 describe("setup: the model creates the project", () => {
 	const manifest = (id: string) => ({
 		id, role: "server", subdir: "api", aliases: [], docs: [],

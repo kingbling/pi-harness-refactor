@@ -4,6 +4,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
+import { overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
@@ -400,7 +401,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				let setupTried = "";
 				const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
-					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
 						if (qid) o.ledger.withdrawQuestion(qid, `setup fixed by the model: ${fixed}`);
 						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
@@ -431,7 +432,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					});
 				}
 				// remember the environment the failure happened in: a change (package.json/config) resubmits the unit
-				o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles), diagnosis: dx } } });
+				o.ledger.updateUnit(o.unitId, { meta: { parked: { question: qid, env: envFingerprint(o.config, projectDir(o.config, stackId), adapter.toolchain.manifestFiles, setupFiles(o.root, stackId)), diagnosis: dx } } });
 				log(pc.yellow(`  waiting for human question #${qid} — other units keep running`));
 				return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
 			}
@@ -502,8 +503,13 @@ export function tidyLeftovers(dir: string, tasks: TidyTask[], moved: string[]): 
 		.flatMap((t) => t.from.filter((f) => !t.to.includes(f) && existsSync(join(dir, f))));
 }
 
-/** What a parked environment failure depends on: the target's dependency manifests (adapter-declared) and the workspace config. */
-export function envFingerprint(config: Config, projectDir: string, manifestFiles: string[]): string {
+/** The workspace files a setup fix changes: the stack's command overrides and its fixes log. */
+export function setupFiles(root: string, stackId: string): string[] {
+	return [overridesPath(root, stackId), setupLogPath(root, stackId)];
+}
+
+/** What a parked environment failure depends on: the target's dependency manifests (adapter-declared), the workspace config and the setup fixes made since. */
+export function envFingerprint(config: Config, projectDir: string, manifestFiles: string[], setup: string[] = []): string {
 	const read = (p: string) => {
 		try {
 			return readFileSync(p, "utf8");
@@ -513,7 +519,15 @@ export function envFingerprint(config: Config, projectDir: string, manifestFiles
 	};
 	const h = createHash("sha1");
 	for (const f of manifestFiles) h.update(read(join(projectDir, f)));
+	for (const f of setup) h.update(read(f));
 	return h.update(JSON.stringify(config.target.choices)).update(JSON.stringify(config.target.stacks)).digest("hex").slice(0, 12);
+}
+
+/** Same error, different unit → same signature: step + first error line with paths, positions and names in quotes kept, file names dropped. */
+export function errorSignature(step: string, output: string): string {
+	const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
+	const line = clean.split(/\r?\n/).find((l) => /error|failed|cannot|not found/i.test(l)) ?? clean.split(/\r?\n/).find((l) => l.trim()) ?? "";
+	return `${step}: ${line.replace(/[\w./\\-]*[\w-]\.[a-z][a-z0-9]{0,5}(?::\d+)+|[\w.-]*[/\\][\w./\\-]+\.[a-z][a-z0-9]{0,5}\b/gi, "<file>").replace(/\b\d+\b/g, "N").replace(/\s+/g, " ").trim().slice(0, 160)}`;
 }
 
 function transcriptPath(root: string, unitId: string, role: string, attemptId: number): string {

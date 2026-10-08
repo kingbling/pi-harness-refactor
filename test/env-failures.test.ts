@@ -155,4 +155,37 @@ describe("br lanes", () => {
 		expect(lanes(f, { lanes: 24 })).toMatch(/lanes 8 → 24/);
 		expect(loadConfig(f).config.run.agentConcurrency).toBe(24);
 	});
+
+	it("a setup fix made during the run wakes the units parked on a setup problem", async () => {
+		const { cpSync, mkdirSync, rmSync, appendFileSync } = await import("node:fs");
+		const { ConfigSchema } = await import("../src/config.ts");
+		const { inventory } = await import("../src/inventory/run.ts");
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { resubmitParkedUnits } = await import("../src/run/run.ts");
+		const { envFingerprint, setupFiles } = await import("../src/run/unit.ts");
+		const { setupLogPath } = await import("../src/adapters/command-overrides.ts");
+		const { projectDir } = await import("../src/init/init.ts");
+		const ws = join(import.meta.dirname, "..", ".sim", "env-setupfix");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "commands"), { recursive: true });
+		cpSync(join(import.meta.dirname, "..", "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
+		const api = projectDir(config, "nestjs");
+		mkdirSync(api, { recursive: true });
+		writeFileSync(join(api, "package.json"), "{}");
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await inventory(config, ws, ledger);
+		const nest = await getTargetAdapter("nestjs");
+		const unit = ledger.listUnits()[0]!.id;
+		ledger.transitionUnit(unit, "truth", "test");
+		ledger.transitionUnit(unit, "implementing", "test");
+		const q = ledger.askQuestion({ unitId: unit, point: "gate_env", question: "lint runs out of memory", askedBy: "test" });
+		appendFileSync(setupLogPath(ws, "nestjs"), "earlier fix\n");
+		ledger.updateUnit(unit, { meta: { parked: { question: q, env: envFingerprint(config, api, nest.toolchain.manifestFiles, setupFiles(ws, "nestjs")) } } });
+		const adapters = new Map([["nestjs", nest]]);
+		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
+		appendFileSync(setupLogPath(ws, "nestjs"), "lint gets more memory\n"); // what fixRunSetup writes after a fix
+		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([unit]);
+	});
 });
