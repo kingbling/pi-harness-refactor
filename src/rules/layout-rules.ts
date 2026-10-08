@@ -35,6 +35,7 @@ export interface LayoutRules {
 }
 
 /** Banned folder names on every stack: names that say nothing about what the code does. */
+/** Catch-all folder names the layout writer is told to consider banning; a stack whose convention uses one (Angular core/) keeps it. */
 export const DEFAULT_FORBID_DIRS = ["extended", "misc", "common", "helpers", "utils", "other", "core"];
 
 const KEBAB = "[a-z0-9]+(?:-[a-z0-9]+)*";
@@ -372,7 +373,7 @@ export function saveLayoutRules(root: string, stackId: string, r: LayoutRules): 
 }
 
 export function normalize(r: Partial<LayoutRules>): LayoutRules {
-	return { moduleDir: r.moduleDir ?? "", files: r.files ?? [], require: r.require ?? [], forbidDirs: [...new Set([...(r.forbidDirs ?? []), ...DEFAULT_FORBID_DIRS])], place: r.place ?? [], ...(r.maxLines ? { maxLines: r.maxLines } : {}), ...(r.source ? { source: r.source } : {}) };
+	return { moduleDir: r.moduleDir ?? "", files: r.files ?? [], require: r.require ?? [], forbidDirs: [...new Set(r.forbidDirs ?? [])], place: r.place ?? [], ...(r.maxLines ? { maxLines: r.maxLines } : {}), ...(r.source ? { source: r.source } : {}) };
 }
 
 /**
@@ -393,7 +394,7 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 			const r = rules();
 			if (r) return checkLayoutRules(files, moduleDir, area, projectDir, r, opts, ctx);
 			const own = base.checkStructure?.(files, moduleDir, area, projectDir, ctx) ?? [];
-			return [...own, ...bannedDirs(files.filter((f) => ctx?.isNew?.(f) === true), moduleDir, base.sharedDirs)];
+			return own;
 		},
 		checkTree: (projectDir: string, only?: string[]) => {
 			const r = rules();
@@ -402,19 +403,6 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 	};
 	Object.defineProperty(layout, "structureDoc", { enumerable: true, get: () => (rules() ? renderLayoutDoc(rules()!, base.sharedDirs) : base.structureDoc) });
 	return { ...adapter, layout };
-}
-
-/** Without a layout.json: only the banned folder names for new files, inside the feature folder and as shared topics. */
-function bannedDirs(files: string[], moduleDir: string, sharedDirs: string[]): string[] {
-	const mod = `${moduleDir.replace(/\/$/, "")}/`;
-	const out: string[] = [];
-	for (const f of files) {
-		const base = f.startsWith(mod) ? mod : sharedDirs.find((d) => f.startsWith(d));
-		if (!base) continue;
-		const bad = f.slice(base.length).split("/").slice(0, -1).find((d) => DEFAULT_FORBID_DIRS.includes(d.toLowerCase()));
-		if (bad) out.push(`${f}: folder "${bad}" is not allowed (banned names: ${DEFAULT_FORBID_DIRS.join(", ")}); name the folder after what the code does (e.g. creation/, tracking/)`);
-	}
-	return out;
 }
 
 // ---- helpers ------------------------------------------------------------------------------------------------

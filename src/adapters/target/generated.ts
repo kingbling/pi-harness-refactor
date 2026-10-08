@@ -5,7 +5,7 @@ import { runCommand } from "../../proc.ts";
 import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
 import type { StackChoice, TargetAdapter } from "../types.ts";
-import { normalize, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
+import { DEFAULT_FORBID_DIRS, normalize, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
 
 /**
  * A target adapter for a stack bigrefactor has no hand-written adapter for, written as DATA by a model that
@@ -271,7 +271,7 @@ const SYSTEM = [
 	"- toolchain.installed: a JSON manifest file in the project and the object keys whose keys are package names. toolchain.packageName: a regex (anchored with ^) matching a package name.",
 	"- layout.moduleDir: where one feature area of the app lives ({area}, {Area}, {area_snake} expand); one directory per area, not per layer.",
 	"- layout.testFileGlobs: where the stack's official convention keeps an area's tests ({moduleDir}, {area}, {Area}, {area_snake} expand). Next to the code ({moduleDir}/…) only where the framework expects that; where the app loads everything under its source dir as app code (service containers, autoloaded apps), tests go in the official tests dir mirrored per area (e.g. tests/{Area}/…), or the app will not start.",
-	"- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does; (a|b) either word), each with a short doc. require: files every feature folder has (its entry point, e.g. the controller). place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: []. maxLines: 400. source: where the convention comes from (the docs page or generator).",
+	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does; (a|b) either word), each with a short doc. require: files every feature folder has (its entry point, e.g. the controller). place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up.",

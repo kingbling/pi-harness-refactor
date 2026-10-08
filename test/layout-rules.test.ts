@@ -79,7 +79,7 @@ describe("layout rules", () => {
 	});
 
 	it("works for any stack: Pascal-case PHP folders (Symfony-style)", () => {
-		const sym = normalize({ moduleDir: "src/{Area}", files: [{ path: "Controller/{Area}Controller.php", doc: "" }, { path: "Service/{Area}{Name}Service.php", doc: "" }, { path: "Service/{Area}Service.php", doc: "" }], require: ["Controller/{Area}Controller.php"] });
+		const sym = normalize({ moduleDir: "src/{Area}", files: [{ path: "Controller/{Area}Controller.php", doc: "" }, { path: "Service/{Area}{Name}Service.php", doc: "" }, { path: "Service/{Area}Service.php", doc: "" }], require: ["Controller/{Area}Controller.php"], forbidDirs: ["extended"] });
 		expect(validateLayoutRules(sym)).toEqual([]);
 		const r = checkLayoutRules(["src/Campaign/Controller/CampaignController.php", "src/Campaign/Service/CampaignCreationService.php", "src/Campaign/Extended/X.php"], "src/Campaign", "campaign", "/nonexistent", sym, { sharedDirs: [], isTestFile: () => false });
 		expect(r).toEqual([expect.stringMatching(/^src\/Campaign\/Extended\/X\.php: folder "Extended" is not allowed/)]); // banned names in any case
@@ -92,13 +92,13 @@ describe("layout rules", () => {
 });
 
 describe("every adapter goes through the layout rules", () => {
-	it("without layout.json: the built-in layout plus the banned folder names", () => {
+	it("without layout.json: the built-in layout; no folder names banned by the tool (the layout writer picks them per stack)", () => {
 		const root = mkdtempSync(join(tmpdir(), "br-lw-"));
 		const a = withLayoutRules(nestjsAdapter, root);
 		expect(a.layout.moduleDir("campaign")).toBe("src/features/campaign");
-		expect(a.layout.checkStructure!(["src/features/campaign/extended/campaign.service.ts"], "src/features/campaign", "campaign", root, { isNew: () => true })).toContainEqual(expect.stringMatching(/folder "extended" is not allowed/));
-		// files that are already there keep working: the ban is for new ones
-		expect(a.layout.checkStructure!(["src/shared/utils/format.ts"], "src/features/campaign", "campaign", root, { isNew: () => false })).toEqual([]);
+		expect(a.layout.checkStructure!(["src/shared/utils/format.ts"], "src/features/campaign", "campaign", root, { isNew: () => true }).join("\n")).not.toMatch(/banned names/);
+		// a stack whose convention uses core/ (Angular) is not overruled
+		expect(normalize({ moduleDir: "src/app/{area}", forbidDirs: ["misc"] }).forbidDirs).toEqual(["misc"]);
 	});
 
 	it("a layout.json written mid-run applies to the next check (read at call time); a broken file keeps the last good one and is reported", () => {

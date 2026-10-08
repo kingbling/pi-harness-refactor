@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { StructureContext } from "../types.ts";
-import type { LayoutRules } from "../../rules/layout-rules.ts";
+import { DEFAULT_FORBID_DIRS, type LayoutRules } from "../../rules/layout-rules.ts";
 import { tsLayoutBase } from "./ts-index.ts";
 
 /**
@@ -259,7 +259,7 @@ export const NEST_LAYOUT: LayoutRules = {
 		{ path: "{sub}/dto/{name}.dto.ts", doc: "request/response classes of a sub-feature" },
 	],
 	require: ["{area}.module.ts", "{area}.controller.ts", "{area}.service.ts"],
-	forbidDirs: [],
+	forbidDirs: DEFAULT_FORBID_DIRS, // neither convention uses catch-all folders
 	place: [
 		{ text: "^\\s*(?:export\\s+(?:default\\s+)?)?(?:abstract\\s+)?class\\s+\\w+(?:Dto|Request|Response)\\b", in: ["dto/{name}.dto.ts", "{sub}/dto/{name}.dto.ts"], doc: "request/response classes live in dto/" },
 		{ text: "@Controller\\(", in: ["{area}.controller.ts", "{area}-{name}.controller.ts", "{sub}/{area}-{sub}.controller.ts"], doc: "controllers only in controller files" },
@@ -286,6 +286,6 @@ export const REACT_LAYOUT: LayoutRules = {
 		{ path: "lib/{name}.ts", doc: "helper functions only this feature uses" },
 	],
 	require: [],
-	forbidDirs: [],
+	forbidDirs: DEFAULT_FORBID_DIRS, // neither convention uses catch-all folders
 	place: [],
 };
