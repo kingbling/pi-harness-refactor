@@ -43,7 +43,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
   br reopen <unit...> [--why text]   accepted units back to planned, code kept (e.g. DB units after br order changed the table plan)
-  br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, the reviewer model); failures go back to planned, code kept
+  br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, ported tests on main, the reviewer model on the code as it is now); failures go back to planned, code kept
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
   br push [on|off] [remote]    push the migration branch to the target repo's remote after merges

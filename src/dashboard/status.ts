@@ -43,6 +43,9 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 			SUM(NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_green_on_old') AND EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_read')) read,
 			COUNT(*) n FROM units u WHERE u.state = 'accepted'`).get() as { run: number | null; read: number | null; n: number };
 		if (t.n) lines.push(`truth of accepted  run on old code ${t.run ?? 0}  ${c.yellow(`read, not run ${t.read ?? 0}`)}  none ${t.n - (t.run ?? 0) - (t.read ?? 0)}`);
+		// br recheck holds accepted units to the newer checks; meta.rechecked marks the ones it saw
+		const notRechecked = ledger.listUnits().filter((u) => u.state === "accepted" && !JSON.parse(u.meta).rechecked).length;
+		if (notRechecked) lines.push(c.yellow(`${notRechecked} accepted unit${notRechecked > 1 ? "s" : ""} not rechecked since the checks changed → br recheck`));
 	}
 	const accepted = u["accepted"] ?? 0;
 	lines.push(`first-pass accepted ${s.firstPassAccepted}/${accepted}${accepted ? ` (${Math.round((100 * s.firstPassAccepted) / accepted)}%)` : ""}   cost $${s.costUsd.toFixed(3)}`);

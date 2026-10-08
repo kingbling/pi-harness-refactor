@@ -31,7 +31,9 @@ export interface ReviewInput {
 	changedFiles: string[];
 	/** Classes whose names only look like an existing one (the gate's reuse check): the reviewer judges "same record?". */
 	nearDuplicates?: string[];
-	/** Review an accepted unit: its commit is the diff (br recheck). */
+	/** br recheck: judge changedFiles as they are now (later units, tidy and repairs change accepted code). */
+	recheck?: boolean;
+	/** br recheck: the unit's original commit, context only. */
 	commit?: string;
 	/** The ported tests (the tester's): weak ones go back to the tester, not the implementer. */
 	testFiles?: string[];
@@ -102,17 +104,27 @@ function facts(o: ReviewInput): string {
 		`\nStack choices of the owner (${o.adapter.id}):\n${choices.join("\n") || "- none recorded"}`,
 		`\nAlready migrated code this unit's legacy code calls:\n${deps.join("\n") || "- none"}`,
 		...(o.nearDuplicates?.length ? [`\nLook-alike class names the reuse check found (a guess from the names, not proof). For each, read both classes: when they are the same record or class, it is a finding (reuse the existing one); when they hold different things, it is fine:\n${o.nearDuplicates.map((n) => `- ${n}`).join("\n")}`] : []),
-		`\nWhat the unit changed:\n${o.commit ? show(o.config.target.path, o.commit) : diff(o.targetProjectDir, o.changedFiles)}`,
+		o.recheck
+			? `\nThis unit was accepted earlier; later units, tidy and repairs may have changed its code since. Judge its files as they are now:\n${current(o.targetProjectDir, o.changedFiles)}${o.commit ? `\n\nIts original commit (context only, may be outdated): ${summary(o.config.target.path, o.commit)}` : ""}`
+			: `\nWhat the unit changed:\n${diff(o.targetProjectDir, o.changedFiles)}`,
 	].join("\n");
 }
 
-/** An accepted unit's commit as a diff; capped like diff(). */
-function show(repo: string, sha: string): string {
+/** The unit's files as they are now; capped like diff(). */
+function current(dir: string, files: string[]): string {
+	const all = files
+		.filter((f) => existsSync(join(dir, f)))
+		.map((f) => `--- ${f}\n${readFileSync(join(dir, f), "utf8")}`)
+		.join("\n");
+	return all.length > 60_000 ? `${all.slice(0, 60_000)}\n[… cut: read the rest with your tools]` : all || "(nothing)";
+}
+
+/** A commit's subject and the files it touched (cheap context, no diff). */
+function summary(repo: string, sha: string): string {
 	try {
-		const all = execFileSync("git", ["show", "--format=%s", sha], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
-		return all.length > 60_000 ? `${all.slice(0, 60_000)}\n[… cut: read the rest with your tools]` : all;
+		return execFileSync("git", ["show", "--stat", "--format=%h %s", sha], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 	} catch {
-		return `(commit ${sha} not found: read the files with your tools)`;
+		return `${sha} (not found)`;
 	}
 }
 
