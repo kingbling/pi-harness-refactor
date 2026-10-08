@@ -9,9 +9,9 @@ import { getTargetAdapter, knownTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdF
 import { applyPlacementAnswers, codePlace, placeUnit, pruneRules, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
- * Placement: one legacy area → one feature module per stack. Code places clear cases (gyro layout), placement.json
- * overrides, orphan helpers used by ≥ 2 areas go shared, Jev places what code cannot, a question what Jev cannot;
- * the answer becomes a prefix rule.
+ * Placement: one legacy area → one feature module per stack. The area model writes prefix rules (placement.json)
+ * from the folder tree; code applies them with the adapter's ui/server fact, orphan helpers used by ≥ 2 areas go
+ * shared, Jev places what no rule covers, a question what Jev cannot; the answer becomes a prefix rule.
  */
 const here = resolve(import.meta.dirname, "..");
 const FILES = [
@@ -31,6 +31,19 @@ const FILES = [
 	"app/lib/components/fpdf.cls.php",
 	"app/lib/components/uuid.cls.php",
 ];
+/** What the area model writes for the gyro layout above (taxonomy.ts); money, fpdf and uuid are left to Jev. */
+const TAXONOMY = [
+	{ prefix: "app/view/templates/default/agency/", area: "agency" },
+	{ prefix: "app/view/templates/default/campaign/", area: "campaign" },
+	{ prefix: "app/view/templates/default/vue/", area: "widgets", shared: true },
+	{ prefix: "app/behaviour/commands/agency/", area: "agency" },
+	{ prefix: "app/behaviour/commands/campaign/", area: "campaign" },
+	{ prefix: "app/model/classes/agency", area: "agency" },
+	{ prefix: "app/model/classes/campaigns", area: "campaign" },
+	{ prefix: "app/lib/components/agencytool", area: "agency" },
+].map((r) => ({ ...r, by: "taxonomy" }));
+const rulesPath = () => join(ws, ".bigrefactor", "placement.json");
+const addRules = (...rules: object[]) => writeFileSync(rulesPath(), JSON.stringify({ rules: [...JSON.parse(readFileSync(rulesPath(), "utf8")).rules, ...rules] }));
 let ws: string;
 let config: Config;
 let ledger: Ledger;
@@ -47,6 +60,7 @@ beforeEach(() => {
 		writeFileSync(join(legacy, f), "<?php\n");
 	}
 	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+	writeFileSync(rulesPath(), JSON.stringify({ rules: TAXONOMY }));
 	config = ConfigSchema.parse({ source: { path: legacy, stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs", "react"] }, models: {} });
 	ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
 	unit("money", ["app/controller/money.controller.php"]);
@@ -66,30 +80,29 @@ beforeEach(() => {
 });
 
 describe("placement", () => {
-	it("code: areas are legacy features, templates go to the UI stack, never kind suffixes", () => {
-		expect(place("agency_list")).toMatchObject({ stackId: "react", area: "agency", moduleKey: "react:agency", shared: false, source: "code" });
+	it("code applies the area rules; the adapter's ui/server fact picks the stack", () => {
+		expect(place("agency_list")).toMatchObject({ stackId: "react", area: "agency", moduleKey: "react:agency", shared: false, source: "override" });
 		expect(place("agency_edit")).toMatchObject({ stackId: "react", area: "agency" });
 		expect(place("agency_filter")).toMatchObject({ stackId: "react", area: "agency" });
 		expect(place("agency_cmd")).toMatchObject({ stackId: "nestjs", area: "agency" });
 		expect(place("agency_model")).toMatchObject({ stackId: "nestjs", area: "agency" });
 		expect(place("agency_tool")).toMatchObject({ stackId: "nestjs", area: "agency" });
-		// singular/plural converge on the spelling the app uses for its feature dirs
 		expect(place("campaign_model")).toMatchObject({ stackId: "nestjs", area: "campaign" });
 		expect(place("progressbar")).toMatchObject({ stackId: "react", shared: true });
 		for (const u of ledger.listUnits()) expect(place(u.id).area).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
 	});
 
-	it("code never names an area after a single legacy file, but always knows the surface of a framework file", () => {
+	it("code never guesses an area from a name, but always knows the surface of a framework file", () => {
 		for (const f of ["app/model/classes/base/status.base.php", "app/lib/components/clock.cls.php", "app/controller/catch400http.controller.php"]) {
 			const c = codePlace(config, { files: [f] }, ws);
-			expect(c.unsure, f).toMatch(/no adapter area/);
+			expect(c.unsure, f).toMatch(/no area rule/);
 			expect(c.surfaceKnown, f).toBe(true); // Jev only picks the area: server code never lands on the UI stack
 			expect(c.place.stackId, f).toBe("nestjs");
 		}
 	});
 
-	it("overrides: placement.json prefix rules win over code", () => {
-		writeFileSync(join(ws, ".bigrefactor", "placement.json"), JSON.stringify({ rules: [{ prefix: "app/view/templates/default/campaign/", area: "billing" }] }));
+	it("overrides: the longest prefix wins, an owner's file rule beats the area model's folder rule", () => {
+		addRules({ prefix: "app/view/templates/default/campaign/list.", area: "billing" });
 		expect(place("campaign_list")).toMatchObject({ stackId: "react", area: "billing", source: "override" });
 		expect(place("agency_list").area).toBe("agency");
 	});
@@ -146,13 +159,13 @@ describe("placement", () => {
 		ledger.answerQuestion(q, "nestjs:agency-admin", "human");
 		applyPlacementAnswers(ledger, config, ws);
 		expect(place("agency_list")).toMatchObject({ stackId: "nestjs", area: "agency-admin", source: "answer" });
-		expect(JSON.parse(readFileSync(join(ws, ".bigrefactor", "placement.json"), "utf8")).rules).toEqual([{ prefix: "app/view/templates/default/agency/list.", area: "agency-admin" }]);
+		expect(JSON.parse(readFileSync(join(ws, ".bigrefactor", "placement.json"), "utf8")).rules.at(-1)).toEqual({ prefix: "app/view/templates/default/agency/list.", area: "agency-admin" });
 		for (const f of ["app/view/templates/default/agency/list.vue.tpl.php", "app/view/templates/default/agency/listing.tpl.php"]) writeFileSync(join(config.source.path, f), "<?php\n");
 		unit("agency_list_vue", ["app/view/templates/default/agency/list.vue.tpl.php"]);
 		unit("agency_listing", ["app/view/templates/default/agency/listing.tpl.php"]);
 		// same stem: the answer's area, but the adapter's surface (UI stays on the UI stack); a longer name is not covered
 		expect(place("agency_list_vue")).toMatchObject({ stackId: "react", area: "agency-admin", source: "override" });
-		expect(place("agency_listing")).toMatchObject({ stackId: "react", area: "agency", source: "code" });
+		expect(place("agency_listing")).toMatchObject({ stackId: "react", area: "agency", source: "override" });
 	});
 
 	it("unsure units never run on code's guess: without Jev or when Jev fails they are asked; an answer places similar waiting units", async () => {
@@ -210,6 +223,47 @@ describe("placement + taxonomy", () => {
 		expect(plan.get("agency_cmd")).toMatchObject({ stored: true, place: { area: "accounts", source: "taxonomy" } });
 	});
 
+	it("onboarding: the area model writes the rules from the folder tree, code applies them, Jev places the rest", async () => {
+		writeFileSync(rulesPath(), JSON.stringify({ rules: [{ prefix: "app/lib/components/uuid.", area: "ids", shared: true }] })); // an answer's rule
+		const client = new FakeModelClient({
+			chat: (req) => {
+				if (!req.messages[0]!.content.includes("feature-module structure")) return undefined;
+				return { json: {
+					stacks: [{ stack: "nestjs", areas: [{ name: "agencies", purpose: "agency accounts" }, { name: "campaigns", purpose: "ad campaigns" }] }, { stack: "react", areas: [{ name: "agencies", purpose: "" }, { name: "campaigns", purpose: "" }] }],
+					rules: [
+						{ prefix: "app/view/templates/default/agency/", to: "area", stack: "nestjs", area: "agencies", confidence: 0.95, why: "agency pages" },
+						{ prefix: "app/behaviour/commands/agency/", to: "area", stack: "nestjs", area: "agencies", confidence: 0.95, why: "" },
+						{ prefix: "app/model/classes/agency", to: "area", stack: "nestjs", area: "agencies", confidence: 0.9, why: "" },
+						{ prefix: "app/view/templates/default/campaign/", to: "area", stack: "react", area: "campaigns", confidence: 0.95, why: "" },
+						{ prefix: "app/behaviour/commands/campaign/", to: "area", stack: "nestjs", area: "campaigns", confidence: 0.95, why: "" },
+						{ prefix: "app/model/classes/campaigns", to: "area", stack: "nestjs", area: "campaigns", confidence: 0.9, why: "" },
+						{ prefix: "app/view/templates/default/vue/", to: "shared", stack: "react", area: "widgets", confidence: 0.9, why: "" },
+						{ prefix: "app/lib/components/agencytool", to: "area", stack: "nestjs", area: "agencies", confidence: 0.5, why: "maybe" },
+						{ prefix: "app/lib/components/uuid.", to: "shared", stack: "nestjs", area: "misc", confidence: 0.9, why: "" },
+					],
+				} };
+			},
+			decide: () => ({ area: "agencies" }),
+		});
+		const r = await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		// the adapter's surface wins over the model's stack: the agency pages stay on the UI stack
+		expect(place("agency_list")).toMatchObject({ stackId: "react", area: "agencies", source: "override" });
+		expect(place("agency_cmd")).toMatchObject({ stackId: "nestjs", area: "agencies" });
+		expect(place("campaign_model")).toMatchObject({ stackId: "nestjs", area: "campaigns" });
+		expect(place("progressbar")).toMatchObject({ stackId: "react", area: "widgets", shared: true });
+		// an answer's rule stays and wins on its prefix; a rule below the confidence to act is left to Jev
+		expect(place("uuid")).toMatchObject({ area: "ids", shared: true });
+		expect(place("agency_tool")).toMatchObject({ area: "agencies", source: "model" });
+		const rules = JSON.parse(readFileSync(rulesPath(), "utf8")).rules as Array<{ prefix: string; stack?: string; by?: string }>;
+		expect(rules.filter((x) => x.prefix === "app/lib/components/uuid.")).toEqual([{ prefix: "app/lib/components/uuid.", area: "ids", shared: true }]);
+		expect(rules.filter((x) => x.by === "taxonomy").every((x) => !x.stack)).toBe(true); // gyro: the surface is known for every file
+		expect(r.byModel).toBeGreaterThan(0);
+		// a second pass: everything placed, nothing curated again
+		const calls = client.calls.length;
+		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		expect(client.calls.length).toBe(calls);
+	});
+
 	it("curation runs between the code and the model pass, only when something was placed", async () => {
 		const client = new FakeModelClient({
 			decide: () => ({ area: "shared" }),
@@ -230,7 +284,7 @@ describe("placement + taxonomy", () => {
 		// an area question on a code-placed unit, then a rule that now places fpdf for sure
 		const tq = ledger.askQuestion({ point: "taxonomy", unitId: "agency_cmd", question: "area?", blocks: "unit", askedBy: "taxonomy" });
 		ledger.updateUnit("agency_cmd", { meta: { taxonomyQuestion: tq } });
-		writeFileSync(join(ws, ".bigrefactor", "placement.json"), JSON.stringify({ rules: [{ prefix: "app/lib/components/fpdf.", area: "campaign" }] }));
+		addRules({ prefix: "app/lib/components/fpdf.", area: "campaign" });
 		await resolvePlacements({ ledger, config, root: ws, force: true });
 		expect(place("fpdf")).toMatchObject({ area: "campaign", source: "override" });
 		for (const u of ledger.listUnits()) {
@@ -246,17 +300,17 @@ describe("placement + taxonomy", () => {
 		expect(open()).toEqual(["money"]);
 	});
 
-	it("fresh repo (no curated areas, nothing code-sure): code's guesses are proposals for Jev, not a question per unit", async () => {
+	it("fresh repo (no curated areas, no rules): folder names are proposals for Jev, not a question per unit", async () => {
 		const plain = join(ws, "plain");
-		for (const f of ["src/InvoiceController.php", "src/Pricing.php"]) (mkdirSync(dirname(join(plain, f)), { recursive: true }), writeFileSync(join(plain, f), "<?php\n"));
+		for (const f of ["src/billing/InvoiceController.php", "src/pricing/Pricing.php"]) (mkdirSync(dirname(join(plain, f)), { recursive: true }), writeFileSync(join(plain, f), "<?php\n"));
 		const cfg = ConfigSchema.parse({ source: { path: plain, stack: "php" }, target: { path: join(ws, "migrated2"), stacks: ["nestjs"] }, models: {} });
 		const l2 = new Ledger(join(ws, ".bigrefactor", "fresh.sqlite"));
-		l2.createUnit({ id: "inv", tier: "T1", deps: [], meta: { files: ["src/InvoiceController.php"] }, symbolIds: [] });
-		l2.createUnit({ id: "pricing", tier: "T1", deps: [], meta: { files: ["src/Pricing.php"] }, symbolIds: [] });
-		const client = new FakeModelClient({ decide: (req) => ({ area: (req.state as { path: string }).path.includes("Invoice") ? "invoice" : "pricing" }) });
+		l2.createUnit({ id: "inv", tier: "T1", deps: [], meta: { files: ["src/billing/InvoiceController.php"] }, symbolIds: [] });
+		l2.createUnit({ id: "pricing", tier: "T1", deps: [], meta: { files: ["src/pricing/Pricing.php"] }, symbolIds: [] });
+		const client = new FakeModelClient({ decide: (req) => ({ area: (req.state as { path: string }).path.includes("Invoice") ? "billing" : "pricing" }) });
 		const r = await resolvePlacements({ ledger: l2, config: cfg, root: join(ws, "fresh-root"), client });
 		expect(r).toMatchObject({ placed: 2, byModel: 2, asked: 0 });
-		expect(placeUnit(cfg, l2.getUnit("inv")!.meta)).toMatchObject({ area: "invoice", source: "model" });
+		expect(placeUnit(cfg, l2.getUnit("inv")!.meta)).toMatchObject({ area: "billing", source: "model" });
 		l2.close();
 	});
 });
