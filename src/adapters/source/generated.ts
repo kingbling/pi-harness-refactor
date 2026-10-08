@@ -6,7 +6,7 @@ import { basename, dirname, join, normalize, relative } from "node:path";
 import { Query } from "web-tree-sitter";
 import type { Config } from "../../config.ts";
 import { getLanguage, matches, normalizedAst, parse, registerGrammar, walk, type Node } from "../../inventory/treesitter.ts";
-import type { CodeCall, CodeComment, CodeContainer, CodeFunction, FileIndex, IndexedDep, IndexedQuery, IndexedSymbol, SourceAdapter, StoreKind } from "../types.ts";
+import type { CodeCall, CodeComment, CodeContainer, CodeFunction, FileIndex, IndexedDep, IndexedQuery, IndexedRoute, IndexedSymbol, SourceAdapter, StoreKind } from "../types.ts";
 import { STORE_KINDS } from "../types.ts";
 import { exampleProfileJson, phpAdapter, profileFromJson, type FrameworkProfileJson } from "./php.ts";
 import { sqlTables } from "./sql.ts";
@@ -37,6 +37,8 @@ export interface SourceManifest {
 		deps: string;
 		/** Optional, per match: one of @function @member @static @new on the called name, plus @receiver (member) or @scope (static). */
 		calls?: string;
+		/** Optional, per match one route: @route_path (the URL), @handler (the handling function/method name or reference), @method (HTTP verb). */
+		routes?: string;
 	};
 	/** Node types of comments and string literals in this grammar. */
 	nodes: { comments: string[]; strings: string[] };
@@ -110,18 +112,45 @@ function stringArgs(nameNode: Node, strings: string[]): Array<string | undefined
 	return [];
 }
 
-/** `import` target → a legacy file when it resolves inside the repo, else the name as written. */
-function resolveImport(root: string, fromRel: string, spec: string, exts: string[]): string {
-	const bases = spec.startsWith(".") || spec.startsWith("/") ? [normalize(join(dirname(join(root, fromRel)), spec))] : [join(root, spec), join(root, spec.replace(/\./g, "/"))];
-	for (const b of bases)
+/**
+ * `import` target → a legacy file when it resolves inside the repo, else the spec as written.
+ * Language-neutral: a path (./x, ../x, /x, a/b.js) is tried as a path; otherwise the spec is split into name
+ * parts at / . :: \ — leading dots mean the importing file's folder and one parent per extra dot (Python) —
+ * and the ONE indexed file whose path ends with those parts is taken (a Java source root, a Go module prefix
+ * are dropped from the left, two parts kept at least). Several matches give no edge: never a guess.
+ */
+export function resolveImport(root: string, fromRel: string, spec: string, exts: string[], files: string[]): string {
+	const exists = (b: string): string | undefined => {
 		for (const c of [b, ...exts.map((e) => b + e), ...exts.map((e) => join(b, `index${e}`)), ...exts.map((e) => join(b, `__init__${e}`))]) {
 			try {
-				if (statSync(c).isFile()) return relative(root, c);
+				if (statSync(c).isFile()) return relative(root, c).split("\\").join("/");
 			} catch {
 				/* next candidate */
 			}
 		}
-	return basename(spec);
+		return undefined;
+	};
+	const fromDir = dirname(fromRel);
+	if (/^\.{1,2}\//.test(spec) || spec.startsWith("/")) return exists(normalize(join(root, fromDir, spec))) ?? basename(spec);
+	const dots = /^\.*/.exec(spec)![0].length;
+	const parts = spec.slice(dots).split(/::|[/\\.]/).filter(Boolean);
+	if (exts.some((e) => spec.endsWith(e)) && parts.length > 1) parts.pop(); // a/b.py → a/b
+	if (dots) {
+		const base = join(root, fromDir, ...Array<string>(dots - 1).fill(".."), ...parts);
+		return exists(base) ?? spec;
+	}
+	const direct = exists(join(root, ...parts));
+	if (direct) return direct;
+	const stems = files.map((f) => `/${f.replace(/\.[^./]+$/, "").replace(/\/(index|__init__)$/, "")}`);
+	for (let from = 0; parts.length - from >= 2; from++) {
+		const tail = `/${parts.slice(from).join("/")}`;
+		// a file named by the parts, else (Go: a package is its folder) the one file in a folder named so
+		let hits = files.filter((_, i) => stems[i]!.endsWith(tail));
+		if (!hits.length) hits = files.filter((f) => `/${dirname(f)}`.endsWith(tail));
+		if (hits.length === 1) return hits[0]!;
+		if (hits.length > 1) break;
+	}
+	return spec;
 }
 
 let profileCache: { key: string; profile?: ReturnType<typeof profileFromJson> } = { key: "" };
@@ -147,6 +176,16 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 	const exts = [...new Set(m.include.map((g) => /(\.[A-Za-z0-9]+)$/.exec(g)?.[1]).filter((x): x is string => !!x))];
 	const dynamic = new Set(m.dynamicCalls ?? []);
 	const re = (s?: string) => (s ? new RegExp(s, "m") : undefined);
+	/** The files this manifest owns under a root (for import resolution), listed once per root. */
+	const fileLists = new Map<string, string[]>();
+	const filesOf = async (srcRoot: string): Promise<string[]> => {
+		let hit = fileLists.get(srcRoot);
+		if (!hit) {
+			const { listFiles } = await import("../../inventory/run.ts");
+			fileLists.set(srcRoot, (hit = listFiles(srcRoot, m)));
+		}
+		return hit;
+	};
 
 	return {
 		id: m.id,
@@ -235,7 +274,7 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 				switch (c.name) {
 					case "import": {
 						const spec = m.nodes.strings.includes(c.node.type) ? unquote(text) : text;
-						if (spec) deps.push({ from: relPath, to: resolveImport(srcRoot, relPath, spec, exts), kind: "include" });
+						if (spec) deps.push({ from: relPath, to: resolveImport(srcRoot, relPath, spec, exts, await filesOf(srcRoot)), kind: "include" });
 						break;
 					}
 					case "call":
@@ -289,6 +328,22 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 				}
 			}
 
+			// --- routes the manifest's query finds (a urls table, a router call, an annotation on the handler)
+			const routes: IndexedRoute[] = [];
+			if (m.queries.routes)
+				for (const match of await matches(lang, tree, m.queries.routes)) {
+					const text = (name: string) => {
+						const n = match.find((c) => c.name === name)?.node;
+						return n ? (m.nodes.strings.includes(n.type) ? unquote(n.text) : n.text) : undefined;
+					};
+					const path = text("route_path");
+					if (!path) continue;
+					const handler = text("handler");
+					// a handler declared in this file is its symbol; else its last name part (views.list → list), resolved by name later
+					const local = handler ? [...declOf.values()].find((d) => isFn(d) && (d.short === handler || d.id.endsWith(`::${handler}`))) : undefined;
+					routes.push({ id: `${relPath}#${routes.length + 1}`, method: text("method")?.toUpperCase(), path, handlerSymbol: local?.id ?? handler?.split(/::|[.#/\\]/).filter(Boolean).pop() });
+				}
+
 			// --- comments, string literals (resource keys, class names), SQL
 			const comments: Node[] = [];
 			walk(tree.rootNode, (n) => {
@@ -333,12 +388,14 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 				functions.push({ id: d.id, container: d.kind === "method" ? d.container : undefined, name: d.short, line: start + 1, endLine: d.node.endPosition.row + 1, signature: headOf(d.node), comments: [...doc, ...inner], calls: callsOf.get(d.id) ?? [], locals: {}, assigned: {} });
 			}
 			const containers: CodeContainer[] = [...new Set(containerName.values())].map((name) => ({ name, parent: parents.get(name) }));
-			return { path: relPath, lang: m.language, loc: source.split("\n").length, hash: createHash("sha1").update(source).digest("hex"), symbols, deps, routes: [], queries, literalRefs: [...literalRefs], dynamicMarkers: [...dynamicMarkers], functions, containers };
+			return { path: relPath, lang: m.language, loc: source.split("\n").length, hash: createHash("sha1").update(source).digest("hex"), symbols, deps, routes, queries, literalRefs: [...literalRefs], dynamicMarkers: [...dynamicMarkers], functions, containers };
 		},
 
 		classifyKind(file) {
 			return file.queries.length ? "data_access" : undefined;
 		},
+		// a function a route of its own file names (an annotated controller method) serves HTTP
+		classifyTier: (sym, file) => (file.routes.some((r) => r.handlerSymbol === sym.id) ? "T2" : undefined),
 		isEntryPoint: (path) => profile()?.entryPoint?.test(path) ?? false,
 		frameworkDirs: () => profile()?.frameworkDirs ?? [],
 		get frameworkConcerns() {
@@ -428,6 +485,7 @@ export function validateSourceManifest(m: SourceManifest): string[] {
 	if (!m.grammar?.package || !m.grammar?.wasm) out.push("grammar needs package and wasm");
 	if (!m.queries?.symbols) out.push("queries.symbols is missing");
 	if (typeof m.queries?.deps !== "string") out.push("queries.deps is missing (may be an empty string)");
+	if (m.queries?.routes !== undefined && (typeof m.queries.routes !== "string" || (m.queries.routes && !m.queries.routes.includes("@route_path")))) out.push("queries.routes must be a query string that captures @route_path");
 	if (!Array.isArray(m.nodes?.comments) || !Array.isArray(m.nodes?.strings)) out.push("nodes.comments and nodes.strings must be arrays of node types");
 	const t = m.truth;
 	if (!t?.scriptName || /[/\\]/.test(t.scriptName)) out.push("truth.scriptName must be a plain file name");
@@ -470,7 +528,7 @@ export async function verifySourceManifest(m: SourceManifest, o: { root: string;
 	}
 	const problems: string[] = [];
 	for (const t of [...m.nodes.comments, ...m.nodes.strings]) if (language.idForNodeType(t, true) === null) problems.push(`node type "${t}" does not exist in this grammar`);
-	for (const [k, q] of [["symbols", m.queries.symbols], ["deps", m.queries.deps], ["calls", m.queries.calls]] as const) {
+	for (const [k, q] of [["symbols", m.queries.symbols], ["deps", m.queries.deps], ["calls", m.queries.calls], ["routes", m.queries.routes]] as const) {
 		if (!q) continue;
 		try {
 			new Query(language, q).delete();
@@ -560,6 +618,7 @@ export function exampleSourceManifest(): SourceManifest {
 				"(call_expression function: (member_expression object: (_) @receiver property: (property_identifier) @member))",
 				"(new_expression constructor: (identifier) @new)",
 			].join("\n"),
+			routes: '(call_expression function: (member_expression property: (property_identifier) @method) arguments: (arguments . (string) @route_path . (identifier) @handler) (#match? @method "^(get|post|put|patch|delete)$"))',
 		},
 		nodes: { comments: ["comment"], strings: ["string", "template_string"] },
 		dynamicCalls: ["eval", "Function"],
@@ -593,6 +652,7 @@ Manifest fields:
 - queries.symbols: tree-sitter query that captures the NAME node of each declaration; the capture name is the kind: @class @function @method @const @interface @trait @enum @other. The declaration is the name node's parent.
 - queries.deps: captures @import (the string or name of an imported module/file), @call (name of a called function), @new (name of a constructed class), @extends, @implements, @use (mixins/traits). Use predicates like (#eq? @_x "require") with captures starting with _ for helpers.
 - queries.calls (optional, for the code map): per pattern one of @function (plain call name), @member (method name, with @receiver on the object), @static (class-level call name, with @scope on the class), @new.
+- queries.routes (optional, when the code declares HTTP routes): one match per route, capturing @route_path (the URL string), @handler (the function/method that serves it, or the reference to it such as views.invoice_list) and @method (the HTTP verb, when written). Write it for however THIS repo declares routes: a urls/routes table file, router calls, or annotations/decorators on the handler (then @handler is the decorated function's name). Leave it out when there are no routes.
 - nodes.comments / nodes.strings: the grammar's node types for comments and string literals.
 - dynamicCalls: called names that dispatch dynamically in this language (eval, getattr, send, reflection).
 - caseInsensitiveNames: true only when the language matches names regardless of case. indentSignificant: true when indentation is syntax.
@@ -602,7 +662,7 @@ Manifest fields:
 - oldTestCommand (optional): the legacy test runner command.
 - packages: the third-party packages the repo declares, read from its package manifest(s) (whatever this language uses): [{name, version, dev}]. Leave out the language runtime itself.
 - dataStores: the databases, caches and queues the code talks to: [{engine: one lowercase word (mysql, postgresql, sqlite, mongodb, redis …), kind: relational (SQL tables) | document (document/graph/wide-column store) | cache | search | queue, evidence: where you saw it (a driver package, a connection string, a compose service)}]. An empty array when there are none.
-Do not describe framework conventions (entry points, routes, templates): another step reads them from the code.
+Do not describe other framework conventions (entry points, framework folders, templates): another step reads them from the code.
 Worked example (JavaScript):
 ${JSON.stringify(exampleSourceManifest(), null, 2)}
 End the session right after writing the file.`;

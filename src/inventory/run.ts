@@ -174,6 +174,19 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 			if (!to) continue;
 			addEdge(f.path, symFile.get(to) ?? (fileOf.has(to) ? to : undefined));
 		}
+	// names the app imports, extends or builds that nothing in the repo declares (an installed framework or
+	// library: models.Model, ActiveRecord::Base): kept per file so `br frameworks` can count concern use
+	const external: Record<string, Array<[string, number, number]>> = {};
+	for (const f of indexes)
+		for (const d of f.deps) {
+			if (!["extends", "implements", "use", "include", "new", "static_call"].includes(d.kind) || d.to.startsWith("glob:") || resolve(d.to) || ambiguousFiles(d.to).length) continue;
+			const rows = (external[d.to] ??= []);
+			const row = rows.find((r) => r[0] === f.path) ?? (rows.push([f.path, 0, 0]), rows.at(-1)!);
+			row[1]++;
+			if (d.kind === "extends" || d.kind === "implements") row[2]++;
+		}
+	ledger.setMeta("external_refs", JSON.stringify(external));
+
 	// routes count as inbound references to their handler files (and make them live roots)
 	const routeHit = new Set<string>();
 	for (const r of routes) {

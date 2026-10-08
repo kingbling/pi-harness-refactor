@@ -122,13 +122,29 @@ export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: So
 	}
 }
 
+const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Whether the script names a legacy file the way some language loads it: by path or file name (require 'x.php'),
+ * or by its last folder + name without the extension, joined by / . :: \ or " import " (billing.models,
+ * from billing import models, com.acme.Invoice, require_relative 'app/models/invoice'), or by its folder as the
+ * end of a quoted import (Go: "example.com/app/internal/billing").
+ */
+export function loadsFile(script: string, file: string): boolean {
+	if (script.includes(file) || script.includes(basename(file))) return true;
+	const segs = file.replace(/\.[^./]+$/, "").split("/").filter(Boolean);
+	const sep = String.raw`(?:/|\.|::|\\|\s+import\s+)`;
+	if (new RegExp(String.raw`(?<![\w])${segs.slice(-2).map(esc).join(sep)}(?![\w])`).test(script)) return true;
+	const dir = segs.slice(0, -1);
+	return dir.length > 0 && new RegExp(String.raw`(?<![\w])${dir.slice(-2).map(esc).join("/")}["'` + "`]").test(script);
+}
+
 /**
  * Why these cases were not produced by the old code, or undefined. Two cheap checks on the script text:
  * it names none of the unit's legacy files, or most expected values are written into the script itself
  * (a value that is also an input — a setter read back — does not count).
  */
 export function notFromOldCode(script: string, cases: TruthCase[], legacyFiles: string[]): string | undefined {
-	if (legacyFiles.length && !legacyFiles.some((f) => script.includes(f) || script.includes(basename(f)))) return `the script loads none of this unit's legacy files (${legacyFiles.join(", ")}): the expected values must come from running them`;
+	if (legacyFiles.length && !legacyFiles.some((f) => loadsFile(script, f))) return `the script loads none of this unit's legacy files (${legacyFiles.join(", ")}): the expected values must come from running them`;
 	const leaves = (v: unknown): string[] =>
 		typeof v === "string" ? (v.length >= 4 ? [v] : []) : typeof v === "number" ? (String(v).length >= 4 ? [String(v)] : []) : v && typeof v === "object" ? Object.values(v).flatMap(leaves) : [];
 	let checked = 0;

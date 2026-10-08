@@ -67,6 +67,18 @@ describe("the old code's environment", () => {
 		expect(notFromOldCode(real, [{ symbol: "x", inputs: ["Acme Ltd"], expected: ["Acme Ltd", 84.03] }], files)).toBeUndefined();
 	});
 
+	it("a script loading the unit by module or class name (Python, Java, Ruby, Go) loads the legacy file", () => {
+		const loads = (script: string, file: string) => notFromOldCode(script, [], [file]) === undefined;
+		expect(loads("from billing.models import Invoice\nprint(json.dumps([]))", "billing/models.py")).toBe(true);
+		expect(loads("from billing import models", "billing/models.py")).toBe(true);
+		expect(loads("import com.acme.billing.Invoice;", "src/main/java/com/acme/billing/Invoice.java")).toBe(true);
+		expect(loads("require_relative 'app/models/invoice'", "app/models/invoice.rb")).toBe(true);
+		expect(loads('import "example.com/shop/internal/billing"', "internal/billing/invoice.go")).toBe(true);
+		// still rejected: a script that names none of them
+		expect(loads("import json\nprint(json.dumps([]))", "billing/models.py")).toBe(false);
+		expect(loads("from billing.models_old import X", "billing/models.py")).toBe(false);
+	});
+
 	it("whether the old code runs is decided once per workspace by a probe the setup model writes", async () => {
 		const { root, config, source } = workspace();
 		let calls = 0;
