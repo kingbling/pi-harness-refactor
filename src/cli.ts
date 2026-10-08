@@ -37,7 +37,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br frameworks                what the legacy framework/libraries do, app reliance per concern, platform/port/drop verdicts
   br rule [<stack>:] <words>   change how the new code is organised, in plain words (checked by code, shown before it applies); no words: show the layouts
   br layout                    layout preflight: units per stack, top areas, shared units, target tree, problems (br run refuses on problems)
-  br order                     vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
+  br order [--no-llm]          database units from the schema, then vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
   br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
@@ -333,9 +333,13 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		for (const l of renderLayout(r)) console.log(l.startsWith("problem:") ? pc.red(l) : l.startsWith("warning:") ? pc.yellow(l) : l);
 		if (r.problems.length) process.exitCode = 1;
 	},
-	order: async () => {
+	order: async (args) => {
 		const { planSlices, applySlicePlan, renderSlicePlan } = await import("./inventory/slices.ts");
-		const { ledger, root } = open();
+		const { ledger, root, config } = open();
+		// the DB units first (tables judged by a model, the owner's answer about unclear databases applied)
+		const { planDbLane } = await import("./inventory/db.ts");
+		const dbl = await planDbLane(ledger, config, { client: args.includes("--no-llm") ? undefined : makeClient(), root, log: (l) => console.log(l) });
+		if (dbl.units.length) console.log(`database: ${dbl.units.length} unit(s) for ${dbl.tables - dbl.dropped} table(s), ${dbl.dropped} not migrated, ${dbl.removed.length} removed`);
 		const p = join(root, ".bigrefactor", "slices.json");
 		const overrides = existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {};
 		const plan = planSlices(ledger, overrides);

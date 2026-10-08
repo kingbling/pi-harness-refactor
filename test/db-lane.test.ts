@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
-import { askDbInputs, dbDetected, findDbFiles, groupTables, planDbLane, readSchema } from "../src/inventory/db.ts";
+import { applyTableJudgement, askDbInputs, dbDetected, findDbFiles, groupTables, planDbLane, readSchema, TABLE_PLAN_KEY, type TableJudgement } from "../src/inventory/db.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
@@ -101,6 +101,91 @@ describe("DB lane", () => {
 		db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)");
 		db.close();
 		expect((await readSchema(cfg({ from: ["sqlite"], schemaFiles: ["app.sqlite"] }))).map((x) => x.name)).toEqual(["users"]);
+	});
+
+	it("a dump of several databases: each table knows its databases (USE lines, db.table names)", async () => {
+		write(join(ws, "legacy", "db", "all.sql"), "USE `app`;\nCREATE TABLE `agency` (\n  `id` int NOT NULL\n);\nUSE `mysql`;\nCREATE TABLE `help_topic` (id int);\nCREATE TABLE `app_staging`.`agency` (\n  `id` int NOT NULL\n);\n");
+		const t = await readSchema(cfg({ from: ["mariadb"], schemaFiles: ["db/all.sql"] }));
+		expect(t.map((x) => [x.name, x.dbs])).toEqual([["agency", ["app", "app_staging"]], ["help_topic", ["mysql"]]]);
+	});
+
+	it("code guards on the model's table judgement: every table once or not migrated with a reason, at most 8 per group, left-out tables grouped by name", () => {
+		const t = (name: string, dbs = ["app"]) => ({ name, ddl: `CREATE TABLE ${name} (id int);`, from: "x.sql", dbs });
+		const tables = [...Array.from({ length: 10 }, (_, i) => t(`campaign${i}`)), t("agency"), t("agencyextras"), t("old_agency"), t("invoice_a"), t("invoice_b"), t("help_topic", ["mysql"]), t("archived", ["archive"])];
+		const judged: TableJudgement = {
+			databases: [{ name: "app", include: true, sure: true, why: "the app" }, { name: "mysql", include: false, sure: true, why: "engine system database" }, { name: "archive", include: false, sure: false, why: "maybe old data" }],
+			tables: [
+				...Array.from({ length: 10 }, (_, i) => ({ name: `campaign${i}`, area: "campaigns", group: "campaigns", drop: "" })),
+				{ name: "agency", area: "agencies", group: "agencies", drop: "" },
+				{ name: "AgencyExtras", area: "agencies", group: "agencies", drop: "" },
+				{ name: "agencyextras", area: "users", group: "other", drop: "" }, // twice: the first counts
+				{ name: "old_agency", area: "agencies", group: "agencies", drop: "backup copy of agency" },
+				{ name: "ghost", area: "x", group: "x", drop: "" }, // not in the schema: ignored
+			],
+		};
+		const plan = applyTableJudgement(tables, judged, { question: 7 });
+		expect(plan.groups.map((g) => [g.name, g.area, g.tables.length])).toEqual([["campaigns1", "campaigns", 8], ["campaigns2", "campaigns", 2], ["agencies", "agencies", 2], ["invoice", undefined, 2]]);
+		expect(plan.dropped).toEqual([
+			{ table: "old_agency", reason: "backup copy of agency" },
+			{ table: "help_topic", reason: "database mysql is not migrated: engine system database" },
+			{ table: "archived", reason: "database archive: waiting for the owner's answer (question #7)" },
+		]);
+		const all = [...plan.groups.flatMap((g) => g.tables.map((x) => x.name)), ...plan.dropped.map((d) => d.table)];
+		expect(all.sort()).toEqual(tables.map((x) => x.name).sort());
+		// the owner's answer includes the unclear database; tables in a started unit stay there; its name stays taken
+		const again = applyTableJudgement(tables, judged, { include: true, pinned: new Set(["agency", "agencyextras"]), taken: new Set(["invoice"]) });
+		expect(again.groups.map((g) => g.name)).toEqual(["campaigns1", "campaigns2", "invoice2", "misc"]);
+	});
+
+	it("with a model: system databases and staging copies get no units, app tables are grouped by business area, one question for an unclear database", async () => {
+		write(join(ws, "legacy", "db", "all.sql"), [
+			"USE `app`;", "CREATE TABLE `agency` (`id` int);", "CREATE TABLE `agencyextras` (", "  `id` int,", "  `agency_id` int REFERENCES agency(id)", ");", "CREATE TABLE `campaign` (`id` int);",
+			"USE `app_staging`;", "CREATE TABLE `agency` (`id` int);",
+			"USE `mysql`;", "CREATE TABLE `help_topic` (`id` int);", "CREATE TABLE `time_zone` (`id` int);",
+			"USE `reports_old`;", "CREATE TABLE `monthly` (`id` int);", "",
+		].join("\n"));
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		writeFileSync(join(ws, ".bigrefactor", "areas.json"), JSON.stringify({ stacks: [{ stack: "nestjs", areas: [{ name: "agencies", purpose: "agency accounts" }, { name: "campaigns", purpose: "campaigns" }] }] }));
+		const config = cfg({ from: ["mariadb"], to: "postgresql", schemaFiles: ["db/all.sql"] });
+		const ledger = new Ledger(":memory:");
+		ledger.db.prepare("INSERT INTO index_literal_refs(name, path, line) VALUES ('agencyextras', 'app/model/agencyextras.php', 3)").run();
+		const prompts: string[] = [];
+		const client = new FakeModelClient({
+			chat: (req) => {
+				if (!JSON.stringify(req.schema ?? {}).includes('"databases"')) return undefined; // the question's phrasing: stays unphrased
+				prompts.push(req.messages.map((m) => m.content).join("\n"));
+				return { json: {
+					databases: [{ name: "app", include: true, sure: true, why: "production" }, { name: "app_staging", include: false, sure: true, why: "staging copy of app" }, { name: "mysql", include: false, sure: true, why: "engine system database" }, { name: "reports_old", include: false, sure: false, why: "no code names its tables" }],
+					tables: [{ name: "agency", area: "agencies", group: "agencies", drop: "" }, { name: "agencyextras", area: "agencies", group: "agencies", drop: "" }, { name: "campaign", area: "campaigns", group: "campaigns", drop: "" }, { name: "help_topic", area: "x", group: "x", drop: "system table" }, { name: "time_zone", area: "x", group: "x", drop: "system table" }, { name: "monthly", area: "reports", group: "reports", drop: "" }],
+				} };
+			},
+		});
+		const r = await planDbLane(ledger, config, { client, root: ws });
+		expect(r.units).toEqual(["DB_schema_agencies", "DB_schema_campaigns", "DB_data"]);
+		expect(JSON.parse(ledger.getUnit("DB_schema_agencies")!.meta)).toMatchObject({ tables: ["agency", "agencyextras"], businessArea: "agencies" });
+		expect(JSON.parse(ledger.getUnit("DB_data")!.meta).tables).toEqual(["agency", "agencyextras", "campaign"]);
+		// facts by code in the one model call: databases, code references, columns, foreign keys, the areas
+		expect(prompts).toHaveLength(1);
+		expect(prompts[0]).toContain("agencyextras  db: app  code: 1 file(s), e.g. app/model/agencyextras.php  columns: id,agency_id  fk: agency");
+		expect(prompts[0]).toContain("agency  db: app,app_staging");
+		expect(prompts[0]).toContain("agencies: agency accounts");
+		const dropped = JSON.parse(ledger.getMeta(TABLE_PLAN_KEY)!).dropped as Array<{ table: string; reason: string }>;
+		expect(dropped.map((d) => d.table)).toEqual(["help_topic", "monthly", "time_zone"]);
+		expect(dropped.find((d) => d.table === "monthly")!.reason).toMatch(/^database reports_old: waiting for the owner's answer \(question #\d+\)/);
+		const asked = ledger.openQuestions().filter((q) => q.point === "db_include");
+		expect(asked).toHaveLength(1);
+
+		// asked once; the judgement is reused; the owner's answer brings the database in
+		await planDbLane(ledger, config, { client, root: ws });
+		expect(ledger.openQuestions().filter((q) => q.point === "db_include")).toHaveLength(1);
+		expect(prompts).toHaveLength(1);
+		ledger.answerQuestion(asked[0]!.id, "include — migrate them");
+		expect((await planDbLane(ledger, config, { client, root: ws })).units).toEqual(["DB_schema_agencies", "DB_schema_campaigns", "DB_schema_reports", "DB_data"]);
+
+		// without a model (tests, --no-llm): every table, grouped by name as before
+		const offline = await planDbLane(new Ledger(":memory:"), config);
+		expect(offline.tables).toBe(6);
+		expect(offline.dropped).toBe(0);
 	});
 
 	it("migration lane: schema units + data unit, code units wait on their tables, data slice right after foundation; survives re-inventory", async () => {
