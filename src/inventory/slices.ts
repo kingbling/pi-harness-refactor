@@ -3,13 +3,15 @@ import type { Ledger } from "../ledger/db.ts";
 /**
  * Vertical slices: the human order (foundation → auth → one feature at a time) as a *priority* over
  * the dependency DAG, never a barrier. Pure code over the ledger (routes, units, deps); same index →
- * same plan. Units get meta.slice / meta.sliceRank / meta.depth; the scheduler sorts by (rank, depth desc).
+ * same plan. Units get meta.slice / meta.sliceRank / meta.depth; the scheduler orders ready units by blockingOrder.
  *
  * Rules (from the orchestration review):
  *  - feature key = first path segment of the route (`/invoices/{id}` → invoices); handlers sharing a
  *    file are merged into one feature; `.bigrefactor/slices.json` overrides win.
- *  - closure(feature) = units reachable from its handler units over unit deps.
+ *  - closure(feature) = units reachable from its handler units over unit deps (real code edges).
  *  - foundation = units reached by ≥ max(2, ceil(0.3·features)) features, or T0 units with ≥2 dependents.
+ *    Soft edges (string mentions, convention loads) never make a unit shared; they only help place a unit
+ *    no real edge reaches into a feature.
  *  - auth = the features Jev named (`advised.auth`, br label) → rank 1. Without that advice (no model ran) a
  *    name match (login, auth, session …) stands in; with it, the match is only one fact in Jev's input.
  *  - remaining features: topological order of the slice graph, tie-break by new LOC ascending.
@@ -65,7 +67,7 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	const dependents = new Map<string, Set<string>>(units.map((u) => [u.id, new Set()]));
 	for (const u of units) for (const d of u.deps) dependents.get(d)?.add(u.id);
 
-	// depth = longest path to a leaf (leaves 0); scheduler runs deep units first inside a slice
+	// depth = longest path to a leaf (leaves 0): a fact for the plan and dashboard (the scheduler uses blockingOrder)
 	const depth = new Map<string, number>();
 	const depthOf = (id: string): number => {
 		if (depth.has(id)) return depth.get(id)!;
@@ -104,18 +106,33 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 		}
 	}
 
-	// closures
+	// closures: over real deps (what a feature truly shares), and over real + soft deps (where a unit may belong)
 	const closure = new Map<string, Set<string>>();
-	for (const [name, f] of featureOf) closure.set(name, reach(byId, [...f.handlers])); // over hard + soft deps
+	const hardClosure = new Map<string, Set<string>>();
+	for (const [name, f] of featureOf) {
+		closure.set(name, reach(byId, [...f.handlers], true));
+		hardClosure.set(name, reach(byId, [...f.handlers], false));
+	}
+	const reachedByOf = (cl: Map<string, Set<string>>) => {
+		const m = new Map<string, Set<string>>();
+		for (const [name, c] of cl) for (const u of c) (m.get(u) ?? m.set(u, new Set()).get(u)!).add(name);
+		return m;
+	};
+	const hardReachedBy = reachedByOf(hardClosure);
+	const softReachedBy = reachedByOf(closure);
+	// features a unit belongs to: the ones reaching it over real deps, else the ones reaching it only softly
 	const reachedBy = new Map<string, Set<string>>();
-	for (const [name, c] of closure) for (const u of c) (reachedBy.get(u) ?? reachedBy.set(u, new Set()).get(u)!).add(name);
+	for (const u of units) {
+		const rb = hardReachedBy.get(u.id)?.size ? hardReachedBy.get(u.id)! : softReachedBy.get(u.id);
+		if (rb?.size) reachedBy.set(u.id, rb);
+	}
 
 	// foundation
 	const nFeatures = featureOf.size;
 	const threshold = Math.max(2, Math.ceil(0.3 * nFeatures));
 	const unitSlice = new Map<string, string>();
 	for (const u of units) {
-		const rb = reachedBy.get(u.id)?.size ?? 0;
+		const rb = hardReachedBy.get(u.id)?.size ?? 0;
 		const shared = rb >= threshold || (u.tier === "T0" && (dependents.get(u.id)?.size ?? 0) >= 2) || (nFeatures === 1 && rb === 1 && u.tier === "T0");
 		if (shared) unitSlice.set(u.id, "foundation");
 	}
@@ -142,7 +159,7 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	const featureNames = [...featureOf.keys()];
 	const isAuth = (n: string) => (overrides.advised?.auth ? overrides.advised.auth.includes(n) : !!authWord(n, featureOf.get(n)?.entryPoints ?? []));
 	const sliceEdges = new Map<string, Set<string>>(featureNames.map((n) => [n, new Set()]));
-	for (const a of featureNames) for (const u of closure.get(a)!) {
+	for (const a of featureNames) for (const u of hardClosure.get(a)!) {
 		const owner = unitSlice.get(u);
 		if (owner && owner !== a && featureOf.has(owner)) sliceEdges.get(a)!.add(owner);
 	}
@@ -187,6 +204,33 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	};
 }
 
+/**
+ * Run order among units that are ready: what waits on a unit decides how urgent it is. `rank` is the best
+ * (lowest) slice rank of the unit and of every unit that needs it, directly or through others — a DB unit the
+ * foundation needs runs with the foundation. `blocks` is how many units need it. Sort by rank, then blocks
+ * (most first), then id.
+ */
+export function blockingOrder(units: Array<{ id: string; deps: string[]; rank: number }>): Map<string, { rank: number; blocks: number }> {
+	const needs = new Map<string, string[]>(units.map((u) => [u.id, []]));
+	for (const u of units) for (const d of u.deps) needs.get(d)?.push(u.id);
+	const rankOf = new Map(units.map((u) => [u.id, u.rank]));
+	const out = new Map<string, { rank: number; blocks: number }>();
+	for (const u of units) {
+		const seen = new Set<string>();
+		const stack = [...needs.get(u.id)!];
+		let rank = u.rank;
+		while (stack.length) {
+			const id = stack.pop()!;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			rank = Math.min(rank, rankOf.get(id)!);
+			stack.push(...needs.get(id)!);
+		}
+		out.set(u.id, { rank, blocks: seen.size });
+	}
+	return out;
+}
+
 /** Persist the plan into unit meta so the scheduler and dashboard can use it without recomputing. */
 export function applySlicePlan(ledger: Ledger, plan: SlicePlan): void {
 	const rank = new Map(plan.slices.map((s) => [s.name, s.rank]));
@@ -211,7 +255,7 @@ function featureKey(path: string): string | undefined {
 	return seg?.toLowerCase().replace(/\.[a-z0-9]+$/, "");
 }
 
-function reach(byId: Map<string, { deps: string[]; soft?: string[] }>, roots: string[]): Set<string> {
+function reach(byId: Map<string, { deps: string[]; soft?: string[] }>, roots: string[], soft: boolean): Set<string> {
 	const seen = new Set<string>();
 	const stack = [...roots];
 	while (stack.length) {
@@ -220,7 +264,7 @@ function reach(byId: Map<string, { deps: string[]; soft?: string[] }>, roots: st
 		seen.add(id);
 		const u = byId.get(id);
 		for (const d of u?.deps ?? []) stack.push(d);
-		for (const d of u?.soft ?? []) stack.push(d);
+		if (soft) for (const d of u?.soft ?? []) stack.push(d);
 	}
 	return seen;
 }

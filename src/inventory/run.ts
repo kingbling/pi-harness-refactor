@@ -64,14 +64,27 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	};
 	const frameworkPrefixes = adapter.frameworkDirs?.(srcRoot) ?? [];
 	const isFramework = (p: string) => frameworkPrefixes.some((d) => p.startsWith(d));
+	/**
+	 * One target for a name, or none. Several files declaring the name (a bare file name like `enabled.inc.php`
+	 * that every module has, a class declared twice) give no edge: picking the first one made one 3-line file
+	 * a dependency of a thousand units. App declarations win over framework ones (as in the code map).
+	 */
+	const unique = (cands: IndexedSymbol[] | undefined): string | undefined => {
+		if (!cands?.length) return undefined;
+		const files = new Set(cands.map((s) => s.path));
+		if (files.size === 1) return cands[0]!.id;
+		const own = cands.filter((s) => !isFramework(s.path));
+		return new Set(own.map((s) => s.path)).size === 1 ? own[0]!.id : undefined;
+	};
 	const resolve = (to: string): string | undefined => {
-		if (to.startsWith("glob:")) return resolveGlob(to.slice(5))[0];
+		if (to.startsWith("glob:")) {
+			const hit = resolveGlob(to.slice(5));
+			return hit.length === 1 ? hit[0] : undefined;
+		}
 		if (fileOf.has(to)) return to; // include edge to a file
-		const cands = byName.get(to);
-		if (cands?.length) return cands[0]!.id;
+		if (byName.has(to)) return unique(byName.get(to));
 		// Class::method → fall back to the class
-		const cls = to.split("::")[0]!;
-		return byName.get(cls)?.[0]?.id;
+		return unique(byName.get(to.split("::")[0]!));
 	};
 
 	// ---- write index tables
@@ -178,16 +191,26 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	for (const [a, b] of fileEdges) refer(a, b);
 	for (const [a, b] of softEdges) refer(a, b);
 	const literalSoft: Array<[string, string]> = [];
+	// String mentions. Liveness stays generous: any name of the file in a string (method names too) keeps it alive.
+	// Soft edges (slicing) are strict: only a class/function name, an alias or the file name, and only a key that
+	// no other file offers — method names like `create` and bare names shared by many files pointed everywhere.
+	const DECLARED = new Set(["class", "interface", "trait", "enum", "function"]);
+	const edgeKeysOf = (f: FileIndex) => new Set([...f.symbols.filter((s) => DECLARED.has(s.kind)).map((s) => s.name.split("::").pop()!), ...(adapter.fileAliases?.(f.path) ?? []), f.path.split("/").pop()!.replace(/\.[A-Za-z0-9]+$/, "")]);
+	const keyFiles = new Map<string, number>();
+	for (const f of indexes) for (const k of edgeKeysOf(f)) keyFiles.set(k, (keyFiles.get(k) ?? 0) + 1);
 	const candidates: typeof indexes = [];
 	for (const f of indexes) {
 		if (routeHit.has(f.path) || regenerated.includes(f.path) || frameworkSet.has(f.path) || judgedAlive.has(f.path) || adapter.isEntryPoint?.(f.path)) continue;
 		if (!f.symbols.length) continue; // nothing to drop
+		const edgeKeys = [...edgeKeysOf(f)].filter((k) => keyFiles.get(k) === 1);
 		const names = f.symbols.map((s) => s.name.split("::").pop()!);
-		const aliases = adapter.fileAliases?.(f.path) ?? [];
-		const keys = [...names, ...aliases, f.path.split("/").pop()!.replace(/\.[A-Za-z0-9]+$/, "")].filter((k) => literalHits.has(k));
-		for (const k of keys) for (const src of literalWhere.get(k) ?? []) if (src !== f.path) {
-			refer(src, f.path);
-			literalSoft.push([src, f.path]);
+		for (const k of new Set([...names, ...edgeKeysOf(f)])) {
+			if (!literalHits.has(k)) continue;
+			const edge = edgeKeys.includes(k);
+			for (const src of literalWhere.get(k) ?? []) if (src !== f.path) {
+				refer(src, f.path);
+				if (edge) literalSoft.push([src, f.path]);
+			}
 		}
 		candidates.push(f);
 	}
@@ -210,7 +233,12 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	const deadSet = new Set(dead);
 	// ---- tiers
 	const locOfFile = new Map(indexes.map((f) => [f.path, f.loc]));
-	const raw = buildGraph(indexes.map((f) => f.path), fileEdges);
+	// Unit deps and cycles are built over the files that become units only: an edge into framework (or dead,
+	// regenerated) code is no unit dependency, and a cycle through the framework (app → framework loader → app
+	// file it includes) must not weld app files to it — that made a 3-line app file a dep of a thousand units.
+	const all = buildGraph(indexes.map((f) => f.path), fileEdges);
+	const unitFiles = indexes.map((f) => f.path).filter((p) => !frameworkSet.has(p) && !deadSet.has(p) && !regenerated.includes(p));
+	const raw = buildGraph(unitFiles, fileEdges);
 	const groupOf = (p: string) => adapter.unitGroupOf?.(p);
 	if (config.inventory.mergeGroups) for (const f of indexes) { const ga = groupOf(f.path); if (ga) for (const h of indexes) if (h !== f && groupOf(h.path) === ga) { fileEdges.push([f.path, h.path]); fileEdges.push([h.path, f.path]); } }
 	const { graph: g, cut } = cutLargeCycles(raw.nodes.length ? buildGraph(raw.nodes, fileEdges) : raw, config.inventory.maxSccFiles, (p) => locOfFile.get(p) ?? 0, groupOf);
@@ -219,17 +247,14 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	for (const [a, b] of cut) (cutFrom.get(a) ?? cutFrom.set(a, []).get(a)!).push(b);
 	const tierOf = new Map<string, Tier>();
 	for (const f of indexes) {
-		let tier: Tier | undefined;
+		// The adapter may say a file is HTTP/UI-facing (T2+). Otherwise deps decide, never symbol kinds: a leaf
+		// (uses no other code, framework included, runs no queries) is T0, everything else T1 — a 2,800-line file
+		// with 45 deps is not T0 because it also declares a constant.
+		let tier: Tier = (all.edges.get(f.path)?.size ?? 0) === 0 && f.queries.length === 0 ? "T0" : "T1";
 		for (const s of f.symbols) {
 			const t = adapter.classifyTier?.(s, f);
-			if (t && (!tier || t > tier)) tier = t; // T3 > T2 > T1 > T0 lexicographically
+			if (t && t > "T1" && t > tier) tier = t; // T3 > T2 > T1 > T0 lexicographically
 		}
-		if (!tier) {
-			const outDeps = (g.edges.get(f.path) ?? new Set()).size;
-			const onlyConstsAndFunctions = f.symbols.every((s) => s.kind === "const" || s.kind === "function");
-			tier = outDeps === 0 && onlyConstsAndFunctions && f.queries.length === 0 ? "T0" : "T1";
-		}
-		if (f.queries.length && tier === "T0") tier = "T1";
 		tierOf.set(f.path, tier);
 	}
 
@@ -328,7 +353,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	}
 
 	// code units' deps were rewritten above: their DB deps (tables their SQL names) are wired again
-	wireDbDeps(ledger, config);
+	wireDbDeps(ledger);
 
 	// Drift: units already past planning whose source files changed upstream are flagged stale (not reset —
 	// a human decides whether to redo them). Removed files stay in the ledger with a note.

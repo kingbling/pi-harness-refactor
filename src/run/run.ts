@@ -18,7 +18,7 @@ import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import { probeLegacyEnv } from "./legacy-env.ts";
 import { resolveChoices } from "../init/stack.ts";
 import { indexTarget } from "../inventory/target.ts";
-import { applySlicePlan, planSlices, renderSlicePlan, type SliceOverrides } from "../inventory/slices.ts";
+import { applySlicePlan, blockingOrder, planSlices, renderSlicePlan, type SliceOverrides } from "../inventory/slices.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
@@ -37,7 +37,7 @@ import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type 
  * The scheduler: many agent sessions, few gate workers, one merge at a time.
  *
  *  ready(unit)  = planned ∧ not stale ∧ not waiting on a question ∧ every dep accepted (merged)
- *  priority     = (sliceRank asc, depth desc, id)  — slices order the work, the DAG keeps it correct
+ *  priority     = (best sliceRank among the units waiting on it, units it blocks desc, id) — blockingOrder
  *  isolation    = one git worktree per running unit under .bigrefactor/worktrees/<unit> (outside the repo),
  *                 dependency dirs symlinked from the main project; accept = rebase onto the main branch, ff-merge
  *  recovery     = attempts left open by a crash are closed as aborted at start; their units go back to planned
@@ -260,6 +260,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 
 	let decisionBlocked = new Map<string, string[]>();
 	let waitingNote = "";
+	// urgency: how many units wait on a unit and the best slice among them (deps barely change in a run: once)
+	let urgency: ReturnType<typeof blockingOrder> | undefined;
+	const urgencyOf = (id: string) => {
+		if (!urgency?.has(id)) urgency = blockingOrder(ledger.listUnits().map((u) => ({ id: u.id, deps: JSON.parse(u.deps) as string[], rank: (JSON.parse(u.meta) as { sliceRank?: number }).sliceRank ?? 99 })));
+		return urgency.get(id) ?? { rank: 99, blocks: 0 };
+	};
+	const blocksNote = (id: string) => {
+		const n = urgencyOf(id).blocks;
+		return n ? ` — blocks ${n} unit${n === 1 ? "" : "s"}` : "";
+	};
 	const ready = (): string[] => {
 		applyPlacementAnswers(ledger, config, o.root); // an answered placement question places its unit before it can start
 		syncTaxonomyAnswers({ ledger, root: o.root }); // answered area questions: new area, or the owner excluded the unit
@@ -286,9 +296,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			if (o.slice && JSON.parse(u.meta).slice !== o.slice) return false;
 			return true;
 		});
+		// what many units (or an early slice) wait on goes first, not the alphabet
 		return units
-			.map((u) => ({ id: u.id, m: JSON.parse(u.meta) as { sliceRank?: number; depth?: number } }))
-			.sort((a, b) => (a.m.sliceRank ?? 99) - (b.m.sliceRank ?? 99) || (b.m.depth ?? 0) - (a.m.depth ?? 0) || a.id.localeCompare(b.id))
+			.map((u) => ({ id: u.id, w: urgencyOf(u.id) }))
+			.sort((a, b) => a.w.rank - b.w.rank || b.w.blocks - a.w.blocks || a.id.localeCompare(b.id))
 			.map((u) => u.id);
 	};
 
@@ -348,8 +359,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			// a unit still waiting for its placement (an area question) cannot start, not even its tester
 			.filter((u) => u.open > 0 && !running.has(u.id) && !aheadDone.has(u.id) && !blocked.has(u.id) && !decisionBlocked.has(u.id) && !unplacedReason(config, u.meta, o.root))
 			.filter((u) => (!o.units || o.units.includes(u.id)) && (!o.slice || JSON.parse(u.meta).slice === o.slice))
-			.map((u) => ({ id: u.id, open: u.open, rank: (JSON.parse(u.meta) as { sliceRank?: number }).sliceRank ?? 99 }))
-			.sort((a, b) => a.open - b.open || a.rank - b.rank || a.id.localeCompare(b.id))
+			.map((u) => ({ id: u.id, open: u.open, w: urgencyOf(u.id) }))
+			.sort((a, b) => a.open - b.open || a.w.rank - b.w.rank || b.w.blocks - a.w.blocks || a.id.localeCompare(b.id))
 			.map((u) => u.id);
 	};
 
@@ -435,7 +446,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					} catch (e: any) {
 						if (!/merge conflict/.test(String(e?.message)) || round === 3) {
 							ledger.transitionUnit(unitId, "quarantined", `could not merge: ${String(e?.message).slice(0, 300)}`);
-							log(pc.red(`■ ${unitId}: quarantined (${String(e?.message).split("\n")[0]})`));
+							log(pc.red(`■ ${unitId}: quarantined (${String(e?.message).split("\n")[0]})${blocksNote(unitId)}`));
 							break;
 						}
 						conflictNote = `Your previous pass could not be merged: ${String(e?.message).split("\n")[0]}. The main branch has moved (another unit of the same module landed). The worktree now starts from the current main; re-apply the migration of this unit on top of the existing code (extend files, do not overwrite other units' work).`;
@@ -447,7 +458,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				if (res && res.state !== "review" && ledger.getUnit(unitId)!.state !== "accepted") {
 					const st = ledger.getUnit(unitId)!.state;
 					const q = ledger.openQuestions().find((x) => x.unit_id === unitId);
-					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
+					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined${blocksNote(unitId)}`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
 				}
 			} catch (e: any) {
 				// a crash is not a gate failure: end the open attempts, count it, and stop after the second one so a
@@ -458,7 +469,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				const crashes = ((JSON.parse(ledger.getUnit(unitId)!.meta) as { crashes?: number }).crashes ?? 0) + 1;
 				ledger.updateUnit(unitId, { meta: { crashes } });
 				const st = ledger.getUnit(unitId)!.state;
-				if (crashes >= 2 && st !== "accepted" && st !== "quarantined") ledger.transitionUnit(unitId, "quarantined", `crashed ${crashes} times: ${msg.slice(0, 300)}`);
+				if (crashes >= 2 && st !== "accepted" && st !== "quarantined") {
+					ledger.transitionUnit(unitId, "quarantined", `crashed ${crashes} times: ${msg.slice(0, 300)}`);
+					log(pc.red(`■ ${unitId}: quarantined after ${crashes} crashes${blocksNote(unitId)}`));
+				}
 				crash = msg;
 			} finally {
 				const st = ledger.getUnit(unitId)!.state;

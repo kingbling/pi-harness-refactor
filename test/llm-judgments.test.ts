@@ -88,13 +88,15 @@ describe("model judgments", () => {
 		await inventory(config, d, ledger);
 		const before = planSlices(ledger, {});
 		const firstUnit = ledger.listUnits({ state: "planned" })[0]!.id;
+		const kindsBefore = ledger.listUnits().map((u) => [u.id, u.kind]);
 		const client = new FakeModelClient({
 			decide: (req) => {
 				const q = req.questions;
-				if (q["kind"]) {
-					// facts, not a difficulty judgment: four risk facts → code computes "hard"
+				if (q["needs_db"]) {
+					// facts, not a difficulty judgment: risk facts → code computes "hard"; no kind question any more
+					expect(q["kind"]).toBeUndefined();
 					const risky = (req.state as any).summary.includes("class");
-					return { kind: "domain_logic", dynamic_refs: risky, raw_sql: risky, global_state: risky, external_io: risky, branching: false };
+					return { needs_db: risky, has_ui: false, external_io: risky, branching: risky };
 				}
 				if (q["slice"]) return { slice: Object.keys((q["slice"] as any).criteria)[0] };
 				// auth: one choice among the slices → the first feature
@@ -106,11 +108,11 @@ describe("model judgments", () => {
 		expect(r.units).toBe(ledger.listUnits({ state: "planned" }).length);
 		for (const u of ledger.listUnits({ state: "planned" })) {
 			const route = JSON.parse(u.meta).route;
-			expect(route?.kind).toBe("domain_logic");
-			expect(route.confidence.kind).toBeGreaterThan(0.5); // stored per question
+			expect(route?.kind).toBeUndefined();
+			expect(route.confidence.has_ui).toBeGreaterThan(0.5); // stored per question
 			expect(["mechanical", "moderate", "hard"]).toContain(route.difficulty);
 		}
-		expect(ledger.listUnits({ state: "planned" }).every((u) => u.kind === "domain_logic")).toBe(true);
+		expect(ledger.listUnits().map((u) => [u.id, u.kind])).toEqual(kindsBefore); // the model no longer relabels kinds
 		// hard count = units Jev+code rate hard with a probable level
 		const hardUnits = ledger.listUnits({ state: "planned" }).filter((u) => { const x = JSON.parse(u.meta).route; return x.difficulty === "hard" && x.difficultyConfidence >= 0.75; });
 		expect(r.hard).toBe(hardUnits.length);

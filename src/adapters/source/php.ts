@@ -582,8 +582,7 @@ export const phpAdapter: SourceAdapter = {
 		// auth/jobs/logging is Jev's kind label (label_unit); tiers come from what the file does and its deps.
 		if (TEMPLATE_RE.test(file.path) || ROUTES_RE.test(file.path)) return "T2";
 		if (HTTP_MARKERS.some((m) => text.includes(m)) || /controllers?\//i.test(file.path)) return "T2";
-		if (sym.kind === "const") return "T0";
-		return undefined; // deps decide between T0 and T1
+		return undefined; // deps decide between T0 and T1 (src/inventory/run.ts), never a constant
 	},
 
 	classifyKind(file) {

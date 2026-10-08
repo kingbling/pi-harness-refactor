@@ -17,6 +17,8 @@ import { callTree } from "../inventory/codemap.ts";
  */
 export interface TaskCard {
 	unit: UnitRow;
+	/** Plain facts about the unit (size, UI, database, I/O, only interfaces, pure data): see unitFacts. */
+	facts: string[];
 	files: string[];
 	symbols: Array<{ id: string; name: string; kind: string; exported: boolean; signature?: string; line: number }>;
 	/** Outgoing deps already migrated: source symbol → target symbol(s), so the implementer imports instead of re-porting. */
@@ -157,7 +159,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -226,10 +228,44 @@ function renderAreaModule(a: AreaModule, L: string[]): void {
 	if (others.length > shown.length) L.push(`- (${others.length - shown.length} more units omitted)`);
 }
 
+/**
+ * Plain facts about a unit for the implementer and reviewer, from the index, the code map and the labels —
+ * no category word. Language-neutral: symbol kinds, line counts, literal density.
+ */
+export function unitFacts(ledger: Ledger, unit: UnitRow, sourceRoot: string): string[] {
+	const meta = JSON.parse(unit.meta) as { files?: string[]; loc?: number; queries?: number; route?: { has_ui?: number; needs_db?: number; external_io?: number } };
+	const files = meta.files ?? [];
+	const out: string[] = [];
+	if (meta.loc) out.push(`${meta.loc} lines`);
+	const yes = (p: number | undefined) => (p ?? 0) >= 0.5;
+	if (yes(meta.route?.has_ui)) out.push("renders UI");
+	if (yes(meta.route?.needs_db) || (meta.queries ?? 0) > 0) out.push("reads/writes a database");
+	if (yes(meta.route?.external_io)) out.push("external I/O (mail, HTTP, files or queues)");
+	if (!files.length) return out;
+	const kinds = (ledger.db.prepare(`SELECT kind FROM index_symbols WHERE side = 'source' AND path IN (${files.map(() => "?").join(",")})`).all(...files) as Array<{ kind: string }>).map((r) => r.kind);
+	const types = kinds.filter((k) => ["class", "interface", "trait", "enum"].includes(k));
+	if (types.length && types.every((k) => k === "interface")) out.push("declares only interfaces (signatures, no behaviour)");
+	// pure data: no functions or types, and nearly every line carries a literal → generate it, never retype it
+	if (kinds.length && kinds.every((k) => k === "const" || k === "other")) {
+		let lines: string[] = [];
+		for (const f of files) {
+			try {
+				lines = lines.concat(readFileSync(join(sourceRoot, f), "utf8").split("\n").filter((l) => l.trim()));
+			} catch {
+				/* unreadable */
+			}
+		}
+		const literal = lines.filter((l) => /["'`]|\b\d/.test(l)).length;
+		if (lines.length >= 50 && literal / lines.length >= 0.8) out.push("the file is pure data: convert it with a script, don't retype it");
+	}
+	return out;
+}
+
 /** Markdown rendering of the card for the prompt. Source files are appended in full (whole file in one pass). */
 export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSource?: boolean } = { includeSource: true }): string {
 	const L: string[] = [];
-	L.push(`# Unit ${card.unit.id}  (tier ${card.unit.tier}${card.unit.kind ? `, kind ${card.unit.kind}` : ""})`);
+	L.push(`# Unit ${card.unit.id}  (tier ${card.unit.tier})`);
+	if (card.facts.length) L.push(`Facts: ${card.facts.join("; ")}`);
 	L.push(`Source files (${config.source.stack}, read-only, relative to ${config.source.path}): ${card.files.join(", ")}`);
 	L.push(`Target: ${card.place?.stackId ?? config.target.stacks.join(" + ")} project at ${card.targetProjectDir}. You may write only: ${card.writeGlobs.join(", ")}`);
 	if (card.areaModule) renderAreaModule(card.areaModule, L);

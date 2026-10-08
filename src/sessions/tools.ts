@@ -123,7 +123,7 @@ export function readFunctionTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "read_function",
 		label: "Read function",
-		description: "Reading view of one legacy function/method: purpose (when known), its comments lifted out with line numbers, then the code without comments or indentation (line positions kept). Use it to follow the call tree on your task card; use source_symbol_body when you must pin exact text.",
+		description: "Reading view of one legacy function/method: its comments lifted out with line numbers, then the code without comments or indentation (line positions kept). Use it to follow the call tree on your task card; use source_symbol_body when you must pin exact text.",
 		promptSnippet: "read_function: one legacy function, comments lifted out, ready to read",
 		parameters: Type.Object({ id: Type.String({ description: "function id from the task card / who_calls, or Class::method" }) }),
 		execute: async (_id, p) => {

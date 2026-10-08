@@ -660,7 +660,7 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 	};
 	if (!dbDetected(config)) {
 		const removed = removeStale(new Set());
-		return { units: [], tables: 0, dropped: 0, wired: wireDbDeps(ledger, config), removed, costUsd: 0 };
+		return { units: [], tables: 0, dropped: 0, wired: wireDbDeps(ledger), removed, costUsd: 0 };
 	}
 	const tables = await readSchema(config);
 	const refactor = config.db.strategy === "new-schema";
@@ -683,7 +683,7 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 	ledger.setMeta(TABLE_PLAN_KEY, JSON.stringify({ groups: Object.fromEntries(plan.groups.map((g) => [g.name, { area: g.area, tables: g.tables.map((t) => t.name) }])), dropped: plan.dropped, at: new Date().toISOString() }));
 	if (plan.dropped.length) o.log?.(`  ${plan.dropped.length} table(s) not migrated, e.g. ${plan.dropped.slice(0, 5).map((d) => `${d.table} (${d.reason})`).join("; ")}`);
 	const place = { stack: dbStack(config), area: "db", shared: false, source: "code" };
-	const route = { difficulty: "medium", needs_db: 1, has_ui: 0, by: "db lane" };
+	const route = { difficulty: "moderate", needs_db: 1, has_ui: 0, by: "db lane" };
 	const base = { lane: "db", strategy: config.db.strategy, from: config.db.from, to: config.db.to, place, route, files: [] as string[], loc: 0 };
 	const want: Array<{ id: string; kind: string; deps: string[]; meta: Record<string, unknown> }> = [];
 	const groups = tables.length ? plan.groups : [{ name: "all", tables: [] as DbTable[] }];
@@ -702,19 +702,27 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 		}
 	}
 	const removed = removeStale(new Set(want.map((w) => w.id)));
-	return { units: want.map((w) => w.id), tables: tables.length, dropped: plan.dropped.length, wired: wireDbDeps(ledger, config), removed, costUsd };
+	return { units: want.map((w) => w.id), tables: tables.length, dropped: plan.dropped.length, wired: wireDbDeps(ledger), removed, costUsd };
 }
 
 /**
- * Planned code units depend on the schema units of the tables their legacy SQL names (FROM/JOIN/INTO/
- * UPDATE/TABLE <name>, or the name as a quoted string next to an ORM call). Re-run after every inventory
- * (which rewrites deps). Returns how many code units got a DB dep.
+ * Planned code units depend on the schema units of the tables their legacy code queries — read from the
+ * index (index_queries: the tables each indexed query names), never from raw text: a quoted word after
+ * "model" in a template (`v-model="countries"`) is no table use. Re-run after every inventory (which rewrites
+ * deps). Returns how many code units got a DB dep.
  */
-export function wireDbDeps(ledger: Ledger, config: Config): number {
+export function wireDbDeps(ledger: Ledger): number {
 	const dbUnits = ledger.listUnits().filter((u) => isDbUnitKind(u.kind) && u.kind !== "db_data");
 	const ofTable = new Map<string, string>();
 	for (const u of dbUnits) for (const t of (JSON.parse(u.meta) as DbUnitMeta).tables ?? []) ofTable.set(t.toLowerCase(), u.id);
 	const allTables = dbUnits.length === 1 && !ofTable.size ? dbUnits[0]!.id : undefined; // schema without parsed tables: one unit holds it all
+	// tables per legacy file, from the indexed queries (a query belongs to a symbol `path::…` or to the file itself)
+	const tablesOf = new Map<string, Set<string>>();
+	for (const q of ledger.db.prepare("SELECT symbol_id, tables FROM index_queries").all() as Array<{ symbol_id: string; tables: string }>) {
+		const path = q.symbol_id.split("::")[0]!;
+		const set = tablesOf.get(path) ?? tablesOf.set(path, new Set()).get(path)!;
+		for (const t of JSON.parse(q.tables) as string[]) set.add(t.toLowerCase());
+	}
 	let wired = 0;
 	for (const u of ledger.listUnits({ state: "planned" })) {
 		if (isDbUnitKind(u.kind)) continue;
@@ -722,24 +730,12 @@ export function wireDbDeps(ledger: Ledger, config: Config): number {
 		const deps = (JSON.parse(u.deps) as string[]).filter((d) => !d.startsWith(DB_UNIT_PREFIX));
 		const add = new Set<string>();
 		if (allTables && ((meta.queries ?? 0) > 0 || (meta.route?.needs_db ?? 0) >= 0.5)) add.add(allTables);
-		else if (ofTable.size) {
-			for (const f of meta.files ?? []) {
-				let text: string;
-				try {
-					text = readFileSync(join(config.source.path, f), "utf8");
-				} catch {
-					continue;
-				}
-				for (const m of text.matchAll(/\b(?:from|join|into|update|table)\s+[`"[]?(\w+)/gi)) {
-					const id = ofTable.get(m[1]!.toLowerCase());
+		else if (ofTable.size)
+			for (const f of meta.files ?? [])
+				for (const t of tablesOf.get(f) ?? []) {
+					const id = ofTable.get(t);
 					if (id) add.add(id);
 				}
-				for (const m of text.matchAll(/['"](\w+)['"]/g)) {
-					const id = ofTable.get(m[1]!.toLowerCase());
-					if (id && /table|query|repository|model|entity|getRepository|DB::/i.test(text.slice(Math.max(0, (m.index ?? 0) - 60), m.index))) add.add(id);
-				}
-			}
-		}
 		const next = [...deps, ...[...add].sort()];
 		if (JSON.stringify(next) !== u.deps) ledger.db.prepare("UPDATE units SET deps = ? WHERE id = ?").run(JSON.stringify(next), u.id);
 		if (add.size) wired++;

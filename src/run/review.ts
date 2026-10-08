@@ -14,6 +14,7 @@ import { spawnLeaf } from "../sessions/spawn.ts";
 import { behaviourPolicy } from "./prompts.ts";
 import { quirksOf } from "./quirks.ts";
 import { docsLookup, readFunctionTool, sourceSymbolBody, targetLookup, whoCalls } from "../sessions/tools.ts";
+import { unitFacts } from "../sessions/taskcard.ts";
 
 /**
  * wired_ok, judged by a model with tools (no fixed pattern lists): is what the unit added real code (no stubs,
@@ -113,7 +114,7 @@ function facts(o: ReviewInput): string {
 	const choices = resolveChoices(o.adapter, o.config.target.choices).map((r) => `- ${r.choice.question}: ${r.option.label}${r.option.platform ? ` (${Object.values(r.option.platform).join("; ")})` : ""}`);
 	const none = noBehaviour(o.ledger, o.unitId);
 	return [
-		`Unit ${o.unitId} (${unit?.kind ?? "?"}), area module ${o.moduleDir}/ in ${o.adapter.id}.`,
+		`Unit ${o.unitId}${unit ? ` (${unitFacts(o.ledger, unit, o.config.source.path).join("; ") || "no facts"})` : ""}, area module ${o.moduleDir}/ in ${o.adapter.id}.`,
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
 		`Ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
 		...(o.writeGlobs?.length ? [`The implementer may write only: ${o.writeGlobs.join(", ")}. A fix anywhere else is an outOfScope item, not a finding.`] : []),

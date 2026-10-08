@@ -194,7 +194,7 @@ export interface SourceAdapter {
 	traits?: SourceTraits;
 	/** Route table extraction when it is not derivable per file (framework route files, CLI dumps). */
 	indexRoutes?(root: string): Promise<IndexedRoute[]>;
-	/** Which tier a symbol belongs to, from its own shape (deps decide the rest). */
+	/** T2 (HTTP/UI-facing) from the symbol's own shape; T0/T1 come from deps alone, so lower answers are ignored. */
 	classifyTier?(sym: IndexedSymbol, file: FileIndex): "T0" | "T1" | "T2" | "T3" | undefined;
 	/** Unit kind from file shape (template, routes, data_access, ...); deps/tier fill the rest. */
 	classifyKind?(file: FileIndex): string | undefined;

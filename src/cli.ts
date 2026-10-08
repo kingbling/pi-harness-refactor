@@ -30,7 +30,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br index-target              (re)index the new codebase: exports, shared helpers, docs → target_lookup/shared_lookup
   br simulate --level 1|2|3    prove the pipeline before touching the real repo
   br dead                      Jev judges files the inventory dropped as unreachable (cron/CLI/dynamic dispatch?); kept ones become entry points
-  br label                     Jev labels units (difficulty → model routing, kind, needs_db, has_ui), auth slices, unreached units → slices, placement
+  br label                     Jev labels units (difficulty → model routing, needs_db, has_ui), auth slices, unreached units → slices, placement
   br place [--force]           target stack + legacy area per unit (code → Jev → question); .bigrefactor/placement.json overrides
   br advise                    models judge what tables used to: library successors, unmapped framework classes (escalate model), open decisions (Jev)
   br decide [--json] [--answer id=value ...]   decision gate: everything the inventory cannot decide; run/L3 wait for it
