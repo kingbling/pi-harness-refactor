@@ -40,8 +40,9 @@ export interface GateInput {
 	/**
 	 * wired_ok: a reviewer model with tools judges whether the new code is real (no stubs), connected (reached by
 	 * the framework, uses the migrated code) and on the chosen stack. Without one the step passes as "not judged".
+	 * `nearDuplicates`: classes whose names only look alike (Repo/Repository …) — facts for the reviewer to judge.
 	 */
-	review?: (changedFiles: string[]) => Promise<{ ok: boolean; output: string; judged: boolean }>;
+	review?: (changedFiles: string[], nearDuplicates?: string[]) => Promise<{ ok: boolean; output: string; judged: boolean }>;
 	/** Gate pool slot for the CPU-bound commands (build, lint, rules, tests); the review never holds one. */
 	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 	timeoutMs?: number;
@@ -113,6 +114,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// 3. structure + reuse: files follow the stack layout (one module per area, no per-legacy-file folders) and
 	//    nothing re-creates a class or function body that already exists in the target
 	//    (deleted files are not checked: a sanctioned tidy move removes a misnamed file; the write scope covers deletes)
+	let nearDuplicates: string[] = [];
 	const structureOk = await step("structure_ok", async () => {
 		const present = changed.filter((f) => existsSync(join(g.targetProjectDir, f)));
 		const ctx = { isNew: (f: string) => !tracked.has(f), sanctioned: g.sanctioned ?? [], legacyWords: g.legacyWords };
@@ -120,8 +122,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const warnings = lines.filter((l) => l.startsWith("warning:"));
 		// drift checks (size cap, one class per responsibility …) on the touched files; drift elsewhere is reported, not failed
 		const tree = checkTree(g.targetProjectDir, g.adapter, present);
-		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed));
-		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings].join("\n") };
+		const reuse = await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed);
+		nearDuplicates = reuse.near;
+		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(reuse.problems);
+		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings, ...reuse.near.map((n) => `note: ${n} (the reviewer judges it)`)].join("\n") };
 	});
 	if (!structureOk) return done();
 
@@ -138,7 +142,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	if (!(await step("rules_ok", () => cpu(() => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout))))) return done();
 
 	// 7. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
-	if (!(await step("wired_ok", () => (g.review ? g.review(changed) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
+	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
 
 	// 8. the ported characterization tests (one per truth case)
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
@@ -170,7 +174,7 @@ function sharedTopicProblems(g: GateInput, present: string[], tracked: Set<strin
 	return out;
 }
 
-/** Canonical class name for the reuse check: aliases of one kind collapse (Repo = Repository, Agency = AgencyEntity). */
+/** Canonical class name to find look-alike classes (Repo = Repository, Agency = AgencyEntity): a hint, never proof. */
 export function classKey(name: string): string {
 	return name
 		.toLowerCase()
@@ -180,32 +184,37 @@ export function classKey(name: string): string {
 }
 
 /**
- * Reuse, decided by code: a new class whose canonical name already exists in this stack's target index (or in another
+ * Reuse, decided by code on facts: a new class whose name already exists in this stack's target index (or in another
  * changed file), and a function/method whose normalized body equals one in another file, fail with a pointer to the
  * original. Same-name DTOs/entities in different areas count too: one record = one class; a different record needs
  * an area-specific name. Files the unit changed are compared against their fresh parse, not the index; fresh bodies
  * include non-exported functions and private methods (tag "internal"), so a copy hidden there fails too.
+ * A name that only looks alike (classKey: AgencyRepo next to AgencyRepository) is a guess, not a fact: it goes to
+ * the reviewer model as `near`, which judges whether it is the same record.
  */
-async function reuseProblems(g: GateInput, prodFiles: string[], allChanged: string[]): Promise<string[]> {
-	if (!g.adapter.indexFile) return [];
+async function reuseProblems(g: GateInput, prodFiles: string[], allChanged: string[]): Promise<{ problems: string[]; near: string[] }> {
+	if (!g.adapter.indexFile) return { problems: [], near: [] };
 	// every changed path, deleted ones too: a tidy move's old path is still indexed but no original any more
 	const changed = new Set(allChanged);
 	const fresh: TargetSymbol[] = [];
 	for (const f of prodFiles) if (g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))) fresh.push(...(await g.adapter.indexFile(g.targetProjectDir, f).catch(() => [])));
 	const problems: string[] = [];
+	const near: string[] = [];
 	const indexed = targetClasses(g.ledger, g.adapter.id).filter((r) => !changed.has(r.path));
 	for (const s of fresh) {
 		if (s.tags.includes("class")) {
-			const key = classKey(s.name);
-			const dup = !key ? undefined : indexed.find((r) => classKey(r.name) === key) ?? fresh.find((o) => o.path !== s.path && o.tags.includes("class") && classKey(o.name) === key);
-			if (dup) problems.push(`reuse ${dup.path}::${dup.name} — ${s.path} declares ${s.name} again; extend/import the existing class (a different record needs an area-specific name)`);
+			const others = [...indexed, ...fresh.filter((o) => o.path !== s.path && o.tags.includes("class"))];
+			const same = others.find((o) => o.name.toLowerCase() === s.name.toLowerCase());
+			const alike = !same && classKey(s.name) ? others.find((o) => classKey(o.name) === classKey(s.name)) : undefined;
+			if (same) problems.push(`reuse ${same.path}::${same.name} — ${s.path} declares ${s.name} again; extend/import the existing class (a different record needs an area-specific name)`);
+			else if (alike) near.push(`${s.path} declares ${s.name}, and ${alike.path} has ${alike.name}: if it is the same record or class, reuse the existing one`);
 		}
 		if (s.bodyHash) {
 			const dup = targetBodies(g.ledger, g.adapter.id, s.bodyHash).find((r) => !changed.has(r.path)) ?? fresh.find((o) => o.path !== s.path && o.bodyHash === s.bodyHash);
 			if (dup) problems.push(`reuse ${dup.path}::${dup.name} — ${s.path}::${s.name} has the same body; call or move it to a shared helper instead of copying`);
 		}
 	}
-	return [...new Set(problems)];
+	return { problems: [...new Set(problems)], near: [...new Set(near)] };
 }
 
 /**
