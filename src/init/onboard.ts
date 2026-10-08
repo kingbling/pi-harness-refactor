@@ -425,9 +425,11 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			const l = ledger();
 			try {
 				// the DB lane (migration for keep-schema, refactor for new-schema): units from the schema, wired to code units
+				// a model judges which tables are the app's and groups them by area; --no-llm groups them by name
 				const { planDbLane } = await import("../inventory/db.ts");
-				const dbl = await planDbLane(l, config);
-				if (dbl.units.length) log(pc.dim(`  db lane (${config.db.strategy === "new-schema" ? "refactor" : "migration"}): ${dbl.units.length} unit(s) for ${dbl.tables} table(s), ${dbl.wired} code unit(s) wait on their tables`));
+				const client = noLlm ? undefined : new (await import("../models/openrouter.ts")).OpenRouterClient();
+				const dbl = await planDbLane(l, config, { client, root, log: (x) => log(pc.dim(x)) });
+				if (dbl.units.length) log(pc.dim(`  db lane (${config.db.strategy === "new-schema" ? "refactor" : "migration"}): ${dbl.units.length} unit(s) for ${dbl.tables - dbl.dropped} table(s), ${dbl.dropped} not migrated, ${dbl.wired} code unit(s) wait on their tables`));
 				const p = join(root, ".bigrefactor", "slices.json");
 				const plan = planSlices(l, existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : {});
 				applySlicePlan(l, plan);
