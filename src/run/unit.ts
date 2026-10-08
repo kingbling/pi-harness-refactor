@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { diagnoseFailure } from "./doctor.ts";
-import { execFile, execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
 import { overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
@@ -17,10 +17,10 @@ import { askViaModel } from "../jev/ask.ts";
 import { sameQuestion } from "../jev/same.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
+import { spawnLeaf } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, testerTools } from "../sessions/tools.ts";
-import { errorSignature, othersTestsChanged, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+import { errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
@@ -28,11 +28,13 @@ import { isDbUnitKind } from "../inventory/db.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
 import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
-import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
+import { askPendingQuirks, quirkList, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { caseOnly, completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
 import { triageGate, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
-import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { caseCoverage, findTests, lintTests } from "./ported.ts";
+export { mentionsCase } from "./ported.ts";
 
 /**
  * The unit's own small orchestrator. Deterministic playbook ("go instructions"):
@@ -147,7 +149,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return r.id;
 	};
 
-	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir };
+	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client };
 	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 
@@ -157,18 +159,31 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastTesterText = "";
 	const envMode: TruthMode = loadLegacyEnv(o.root, o.config).mode ?? "run";
 	let truthMode: TruthMode = envMode;
-	const runTruth = async (extra?: string): Promise<boolean> => {
+	// the tester runs in the workspace (truth dir + the target's test folders); it is told these exact globs, absolute
+	const testerTestGlobs = adapter.layout.testFileGlobs(moduleDir).map((g) => `${targetRel}/${g}`);
+	const testerWriteGlobs = [`${truthDirRel}/**`, ...testerTestGlobs];
+	const absGlob = (g: string) => join(o.root, g);
+	// the truth as code loads it now (the tester's check_ported_tests and the verification after its session)
+	const currentTruth = () => (truthMode === "run" ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : loadReadTruth(truthDirAbs));
+	const truthFiles = [sourceAdapter.truth.scriptName, READ_CASES_FILE, NO_BEHAVIOUR_FILE];
+	const readTruthFiles = () => truthFiles.map((f) => (existsSync(join(truthDirAbs, f)) ? readFileSync(join(truthDirAbs, f), "utf8") : undefined));
+	/**
+	 * `testsOnly`: a retest for coverage, lint or placement. The truth cases stay as they are (no re-run, no
+	 * re-numbering): the tester only adds or fixes tests (and interface.md); a changed truth file is put back.
+	 */
+	const runTruth = async (extra?: string, testsOnly = false): Promise<boolean> => {
 		if (!o.truthOnly && o.ledger.getUnit(o.unitId)!.state === "planned") o.ledger.transitionUnit(o.unitId, "truth", "tester session started");
 		const attempt = o.ledger.startAttempt(o.unitId, "test", o.config.models.test.id);
 		const t0 = Date.now();
+		const before = testsOnly ? readTruthFiles() : undefined;
 		const tester = await spawn({
 			role: "test",
 			cwd: o.root,
 			config: o.config,
-			writeGlobs: [`${truthDirRel}/**`, ...adapter.layout.testFileGlobs(moduleDir).map((g) => `${targetRel}/${g}`)],
-			protectedGlobs: [],
-			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirRel, targetProjectDir: targetRel, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
-			customTools: testerTools({ ...deps, attemptId: attempt }),
+			writeGlobs: testerWriteGlobs,
+			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
+			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
+			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && log(pc.dim(`  tester blocked: ${e.blocked}`)),
 		});
@@ -176,7 +191,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		try {
 			// the orchestrator's note (owner hint, earlier diagnosis) reaches the first tester too, not only the implementer
 			const note = o.retryNote && !extra ? `\n\n## Note from the orchestrator\n${o.retryNote}` : "";
-			res = await tester.run(renderTaskCard(card, o.config) + (extra ? `\n\n## Re-port requested\n${extra}` : "") + note);
+			const quirks = quirkList({ ledger: o.ledger }, o.unitId);
+			const keep = testsOnly ? `\nThe truth cases stay exactly as they are (${truthFiles.filter((_, i) => before![i] !== undefined).join(", ") || "recorded in the ledger"}; truth_lookup lists them): do not change them, only add or fix the tests${extra?.includes("interface.md") ? " and interface.md" : ""}.` : "";
+			res = await tester.run(
+				renderTaskCard({ ...card, writeGlobs: testerWriteGlobs.map(absGlob) }, o.config) +
+					(quirks ? `\n\n## Quirks already recorded for this unit (do not record them again)\n${quirks}` : "") +
+					(extra ? `\n\n## Re-port requested\n${extra}${keep}` : "") +
+					note,
+			);
 		} finally {
 			tester.dispose();
 		}
@@ -192,19 +214,47 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 
+		if (before) {
+			// tests only: the recorded truth stands; a truth file the tester changed anyway is put back
+			const changed = readTruthFiles().flatMap((now, i) => (now === before[i] ? [] : [truthFiles[i]!]));
+			for (const f of changed) {
+				const i = truthFiles.indexOf(f);
+				if (before[i] === undefined) rmSync(join(truthDirAbs, f), { force: true });
+				else writeFileSync(join(truthDirAbs, f), before[i]!);
+			}
+			if (changed.length) log(pc.yellow(`  tester changed ${changed.join(", ")} in a tests-only retest; put back (the recorded truth cases stand)`));
+			o.ledger.endAttempt(attempt, { outcome: "tests_only", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: truthMode, testsOnly: true, restored: changed } });
+			return true;
+		}
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
 		// type the results in) and load the cases; read-not-run cases are only checked for shape.
-		const verified = truthMode === "run" ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : loadReadTruth(truthDirAbs);
+		const verified = currentTruth();
 		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: truthMode, cases: verified.cases.length, error: verified.error } });
 		if (!verified.ok) {
 			log(pc.red(`  truth (${truthMode}) failed: ${verified.error}`));
 			return false;
 		}
-		recordTruth(verified.cases, truthMode);
+		recordTruth(verified.cases, truthMode, verified.none);
 		return true;
 	};
-	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks)
-	const recordTruth = (cases: TruthCase[], mode: TruthMode) => {
+	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks).
+	// The same cases as recorded stay untouched (ids, links to their tests): a retest never makes them drift.
+	const recordTruth = (cases: TruthCase[], mode: TruthMode, none?: string) => {
+		if (none !== undefined && !cases.length) {
+			o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
+			if (noBehaviour(o.ledger, o.unitId) !== none) o.ledger.addEvidence(o.unitId, "truth_none", { reason: none, file: `${truthDirRel}/${NO_BEHAVIOUR_FILE}` });
+			log(pc.yellow(`  truth: no runtime behaviour to pin (${none})`));
+			return;
+		}
+		// real cases replace an earlier "no behaviour" declaration
+		o.ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type = 'truth_none'").run(o.unitId);
+		rmSync(join(truthDirAbs, NO_BEHAVIOUR_FILE), { force: true });
+		const old = o.ledger.db.prepare("SELECT symbol_id, inputs, expected, verified_on_old FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(o.unitId) as Array<{ symbol_id: string; inputs: string; expected: string; verified_on_old: number }>;
+		const same = old.length === cases.length && cases.every((c, i) => old[i]!.symbol_id === c.symbol && old[i]!.inputs === JSON.stringify(c.inputs) && old[i]!.expected === JSON.stringify(c.expected) && old[i]!.verified_on_old === (mode === "run" ? 1 : 0));
+		if (same && o.ledger.hasEvidence(o.unitId, mode === "run" ? "truth_green_on_old" : "truth_read")) {
+			log(pc.dim(`  truth: the same ${cases.length} cases as recorded; kept`));
+			return;
+		}
 		o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
 		const ins = o.ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
 		cases.forEach((c, i) => ins.run(`${o.unitId}#${i + 1}`, o.unitId, c.symbol, JSON.stringify(c.inputs), JSON.stringify(c.expected), mode === "run" ? 1 : 0, new Date().toISOString()));
@@ -219,7 +269,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 	const portedDir = join(truthDirAbs, "ported");
 	const ahead = !o.truthOnly && o.ledger.hasEvidence(o.unitId, "truth_ahead") && existsSync(portedDir);
-	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || o.ledger.hasEvidence(o.unitId, "truth_read")) && existsSync(join(truthDirAbs, "interface.md"));
+	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || o.ledger.hasEvidence(o.unitId, "truth_read") || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
 	if (!hasTruth) {
 		// Playbook: a red truth script gets one more tester pass with the exact error; then a human question (only this unit waits).
 		let truthOk = false;
@@ -237,7 +287,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			const verified = fixed ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 			if (fixed && verified?.ok) {
 				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
-				recordTruth(verified.cases, "run");
+				recordTruth(verified.cases, "run", verified.none);
 				truthOk = true;
 				// units that asked the owner about the same thing run again in the new environment
 				for (const q of o.ledger.openQuestions().filter((x) => x.point === "truth_env")) o.ledger.answerQuestion(q.id, `auto: the old code's environment was set up (${fixed})`, "setup model");
@@ -249,7 +299,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			truthMode = "read";
 			log(pc.yellow(`  truth does not run green on the old code; the tester writes it from reading the code (marked: read, not run)`));
 			for (let t = 1; t <= 2 && !truthOk; t++) {
-				truthOk = await runTruth(`Running ${sourceAdapter.truth.scriptName} on the old code failed${runErr ? `:\n${runErr.slice(-1500)}` : ""}\nWrite ${truthDirRel}/${READ_CASES_FILE} instead (see step 3).${t > 1 && lastErr ? `\nYour previous ${READ_CASES_FILE} was rejected:\n${lastErr}` : ""}`);
+				truthOk = await runTruth(`Running ${sourceAdapter.truth.scriptName} on the old code failed${runErr ? `:\n${runErr.slice(-1500)}` : ""}\nWrite ${join(truthDirAbs, READ_CASES_FILE)} instead (see step 3).${t > 1 && lastErr ? `\nYour previous ${READ_CASES_FILE} was rejected:\n${lastErr}` : ""}`);
 				if (!truthOk) lastErr = (o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string } | undefined)?.gate_report ?? "";
 			}
 		}
@@ -282,22 +332,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			return { unitId: o.unitId, state: "quarantined", attempts: 0, costUsd: cost };
 		}
 		log(pc.yellow(`  interface.md drafts files outside ${moduleDir}/: ${bad.join(", ")} — retest`));
-		await runTruth(`interface.md drafts files outside this unit's placement: ${bad.join(", ")}. Every file this unit creates lives under ${moduleDir}/ (area "${area}"), shaped as below; extend the files already there instead of creating parallel ones. Fix interface.md and the ported tests' imports.\n${adapter.layout.structureDoc}`);
+		await runTruth(`interface.md drafts files outside this unit's placement: ${bad.join(", ")}. Every file this unit creates lives under ${moduleDir}/ (area "${area}"), shaped as below; extend the files already there instead of creating parallel ones. Fix interface.md and the ported tests' imports.\n${adapter.layout.structureDoc}`, true);
 	}
 
 	// Every truth case is a ported test the gate runs: its id (u1#3) is in a test's name. Code checks and links
 	// each case to its test file; the tester adds what is missing (twice), then the unit stops.
 	const uncoveredCases = (): string[] => {
-		const cases = o.ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(o.unitId) as Array<{ id: string }>;
-		const tests = findTests(targetProjectDir, moduleDir, adapter.layout).map((p) => [p, readFileSync(join(targetProjectDir, p), "utf8")] as const);
+		const ids = (o.ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(o.unitId) as Array<{ id: string }>).map((c) => c.id);
+		const cov = caseCoverage(targetProjectDir, moduleDir, adapter.layout, ids);
 		const link = o.ledger.db.prepare("UPDATE truth_cases SET ported_test_path = ? WHERE id = ?");
-		const missing: string[] = [];
-		for (const c of cases) {
-			const hit = tests.find(([, text]) => mentionsCase(text, c.id));
-			link.run(hit?.[0] ?? null, c.id);
-			if (!hit) missing.push(c.id);
-		}
-		return missing;
+		for (const id of ids) link.run(cov.found.get(id) ?? null, id);
+		return cov.missing;
 	};
 	const coverTruth = async (): Promise<boolean> => {
 		for (let i = 0; ; i++) {
@@ -310,7 +355,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			}
 			log(pc.yellow(`  ${missing.length} truth case(s) have no ported test — retest`));
 			const seen = findTests(targetProjectDir, moduleDir, adapter.layout);
-			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. The orchestrator searches the test files for each case id as exact text, "#" included (e.g. "${missing[0]}"); a changed spelling does not count. ${seen.length ? `It searched ${seen.join(", ")} and did not find these ids.` : "It found no test files where this unit's tests belong."} Every case gets its own test asserting the case's expected value, with the exact id in its name, or next to it in a comment or test description where a name cannot hold it.`);
+			const globs = adapter.layout.testFileGlobs(moduleDir).map((g) => join(targetProjectDir, g)).join(", ");
+			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. The orchestrator searches the test files matching ${globs} for each case id as exact text, "#" included (e.g. "${missing[0]}"); a changed spelling does not count. ${seen.length ? `It searched ${seen.join(", ")} and did not find these ids.` : "It found no test files there."} Every case gets its own test asserting the case's expected value, with the exact id in its name, or next to it in a comment or test description where a name cannot hold it. check_ported_tests shows what is still missing.`, true);
 		}
 	};
 
@@ -362,13 +408,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the implementer may not edit tests: tests that fail the stack's lint/format check would fail every attempt,
 	// so the tester fixes them now (once). Only with the real gate (simulations fake it).
 	if (testFiles.length && !o.gate) {
-		const c = adapter.lint(targetProjectDir, testFiles.map((t) => t.path));
-		const lintErr = await new Promise<string | undefined>((res) =>
-			execFile(c.cmd, c.args, { cwd: targetProjectDir, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: 5 * 60_000 }, (e, out, err) => res(e ? `${String(err)}\n${String(out)}`.trim().slice(-2500) : undefined)),
-		);
-		if (lintErr) {
+		const lint = await lintTests(targetProjectDir, adapter, testFiles.map((t) => t.path));
+		if (lint.error) {
 			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
-			if (await runTruth(`The ported tests fail the stack's lint/format check (${[c.cmd, ...c.args].join(" ")}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine), behaviour unchanged.\n${lintErr}`)) testFiles = loadTests();
+			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
 		}
 	}
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");
@@ -421,7 +464,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			onToolCall: (e) => e.blocked && log(pc.dim(`  implementer blocked: ${e.blocked}`)),
 		});
 		const prompt = [
-			renderTaskCard(card, o.config),
+			// the truth as recorded now (the card was built before the tester ran)
+			renderTaskCard({ ...card, ...truthCounts(o.ledger, o.unitId) }, o.config),
 			"",
 			"## Target interface drafted by the tester (satisfy it)",
 			loadIface(),
@@ -729,30 +773,10 @@ export function draftedOutside(md: string, allowedDirs: string[], targetRel: str
 }
 
 
-/** A test text names truth case `id` (u1#3, not u1#30). */
-export function mentionsCase(text: string, id: string): boolean {
-	return new RegExp(`${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\d)`).test(text);
-}
-
-/** The unit's test files: wherever the stack keeps an area's tests (its testFileGlobs), not only inside the module. */
-function findTests(targetProjectDir: string, rel: string, layout: TargetAdapter["layout"]): string[] {
-	const globs = layout.testFileGlobs(rel);
-	const res = globs.map(globToRegExp);
-	const out = new Set<string>();
-	const visit = (d: string) => {
-		for (const n of readdirSync(d)) {
-			const p = join(d, n);
-			const r = relative(targetProjectDir, p);
-			if (statSync(p).isDirectory()) visit(p);
-			else if (layout.isTestFile(n) && res.some((re) => re.test(r))) out.add(r);
-		}
-	};
-	// walk only the fixed part of each glob (src/Billing/tests/**/*Test.php → src/Billing/tests)
-	for (const g of globs) {
-		const base = g.split("/").filter((_, i, a) => !a.slice(0, i + 1).some((s) => /[*?{[]/.test(s))).join("/");
-		if (existsSync(join(targetProjectDir, base))) visit(join(targetProjectDir, base));
-	}
-	return [...out].sort();
+/** The unit's truth as recorded now: cases run on the old code, cases read from it, the tester's "no behaviour" reason. */
+function truthCounts(ledger: Ledger, unitId: string): { truthCases: number; truthRead: number; noBehaviour?: string } {
+	const n = (run: number) => (ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ? AND verified_on_old = ?").get(unitId, run) as { n: number }).n;
+	return { truthCases: n(1), truthRead: n(0), noBehaviour: noBehaviour(ledger, unitId) };
 }
 
 /** The old code's file kinds a new name must not carry, minus the new stack's own file types (php in a PHP → Symfony migration). */

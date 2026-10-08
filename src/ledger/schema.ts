@@ -52,6 +52,8 @@ export const EVIDENCE_TYPES = [
 	"truth_green_on_old",
 	// the old code could not run: the tester wrote the expected values from reading it (truth_cases.verified_on_old = 0)
 	"truth_read",
+	// the tester found no runtime behaviour to pin (only a contract, type declarations or constants): {reason}; no truth cases
+	"truth_none",
 	"ported_tests_green",
 	"build_ok",
 	"lint_ok",

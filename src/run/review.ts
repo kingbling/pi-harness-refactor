@@ -8,6 +8,7 @@ import type { Config } from "../config.ts";
 import { resolveChoices } from "../init/stack.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { goalsText } from "../policy.ts";
+import { noBehaviour } from "./gate.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { docsLookup, readFunctionTool, sourceSymbolBody, targetLookup, whoCalls } from "../sessions/tools.ts";
 
@@ -97,10 +98,12 @@ function facts(o: ReviewInput): string {
 		})
 		.filter(Boolean);
 	const choices = resolveChoices(o.adapter, o.config.target.choices).map((r) => `- ${r.choice.question}: ${r.option.label}${r.option.platform ? ` (${Object.values(r.option.platform).join("; ")})` : ""}`);
+	const none = noBehaviour(o.ledger, o.unitId);
 	return [
 		`Unit ${o.unitId} (${unit?.kind ?? "?"}), area module ${o.moduleDir}/ in ${o.adapter.id}.`,
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
 		`Ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
+		...(none ? [`The tester found no runtime behaviour to pin in this unit, so it has no truth cases and no ported tests. Its reason: ${none}. Check that against the legacy code: if the unit does compute or decide something, name it in weakTests (the tester then writes cases for it).`] : []),
 		`\nStack choices of the owner (${o.adapter.id}):\n${choices.join("\n") || "- none recorded"}`,
 		`\nAlready migrated code this unit's legacy code calls:\n${deps.join("\n") || "- none"}`,
 		...(o.nearDuplicates?.length ? [`\nLook-alike class names the reuse check found (a guess from the names, not proof). For each, read both classes: when they are the same record or class, it is a finding (reuse the existing one); when they hold different things, it is fine:\n${o.nearDuplicates.map((n) => `- ${n}`).join("\n")}`] : []),

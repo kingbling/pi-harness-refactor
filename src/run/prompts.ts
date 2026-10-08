@@ -42,8 +42,33 @@ export interface PlacementPromptOpts {
 	structureDoc: string;
 }
 
-export function testerSystemPrompt(config: Config, opts: PlacementPromptOpts & { unitId: string; truthMode?: "run" | "read"; truthDir: string; truthRun?: string; targetProjectDir: string; rules: string; source: SourceAdapter; target: TargetAdapter; projectNotes: string[] }): string {
+export function testerSystemPrompt(
+	config: Config,
+	opts: PlacementPromptOpts & {
+		unitId: string;
+		truthMode?: "run" | "read";
+		truthDir: string;
+		truthRun?: string;
+		/** The target project (or this unit's worktree of it), absolute: the target's own commands run from here. */
+		targetProjectDir: string;
+		/** Where this session runs (absolute). */
+		workDir: string;
+		/** Exactly the globs the write gate allows this session, absolute; `testWriteGlobs` = the ones for ported tests. */
+		writeGlobs: string[];
+		testWriteGlobs: string[];
+		rules: string;
+		source: SourceAdapter;
+		target: TargetAdapter;
+		projectNotes: string[];
+	},
+): string {
 	return `You are the TESTER for a legacy migration (${config.source.stack} → ${config.target.stacks.join(" + ")}). You are not the implementer and you never write production code.
+
+Where things are (absolute paths; use them, relative paths resolve against your working directory):
+- Your working directory: ${opts.workDir}
+- The legacy code (read-only): ${config.source.path} — the source file paths on the task card are relative to it.
+- The target project: ${opts.targetProjectDir} — run the target project's own commands (its test runner, lint, autoloader …) from there: \`cd ${opts.targetProjectDir} && <command>\`. Find out which commands it has from its files; do not assume.
+- You may write only: ${opts.writeGlobs.join(", ")}. Every other write is blocked.
 
 Your job for one unit:
 1. Read the legacy symbols in the task card (source files are included). Follow "Where this code leads" with read_function to see what callees really do; source_symbol_body / who_calls / symbol_lookup for more.
@@ -53,8 +78,10 @@ Your job for one unit:
 			? `The old code cannot run here, so write the cases from READING it: ${opts.truthDir}/cases.json, a JSON array [{"symbol": "<legacy symbol id from the card>", "inputs": <json>, "expected": <json>}]. Work out every expected value by following the code path (callees too), not by guessing what it probably does; leave out a case you cannot work out. These cases are marked "read, not run" in the ledger. The legacy repo is read-only.`
 			: `Make them run against the OLD code: write ${opts.truthDir}/${opts.source.truth.scriptName} — ${opts.source.truth.instructions} The JSON array has the shape [{"symbol": "<legacy symbol id from the card>", "inputs": <json>, "expected": <json>}]. "expected" is what the legacy code returned when the script ran it: the orchestrator rejects a script that loads none of this unit's legacy files or that has the expected values written into it. The legacy repo is read-only.${opts.truthRun ? ` The orchestrator runs it as: \`${opts.truthRun}\` — run it exactly that way.` : ""}`
 	}
-4. Draft the TARGET interface the implementer must satisfy: write ${opts.truthDir}/interface.md listing target file paths, exported names and signatures (${opts.target.layout.interfaceHint}). This unit belongs to area "${opts.area}" on ${opts.stackId}: every path MUST be under ${opts.moduleDir}/ (binding; the orchestrator rejects other paths) and follow the layout below — extend the area's existing files (target_lookup) instead of new ones per legacy file. Signatures use the target's types, not the legacy language's.
-5. Port the cases to target tests: write them under ${opts.targetProjectDir}/${opts.moduleDir}/ as ${opts.target.layout.testHint}, importing from the paths in interface.md, one test per case with the same expected value. Case N of your array (counting from 1) has the id ${opts.unitId}#N: the orchestrator searches the test files for that id as exact text, "#" included, so put it unchanged in the test's name (e.g. "${opts.unitId}#1 returns the net price"), or next to the test in a comment or test description where a name cannot hold it. They will fail until the implementer is done — that is correct.${opts.projectNotes.length ? `\n   Target project facts: ${opts.projectNotes.join("; ")}.` : ""}
+4. Draft the TARGET interface the implementer must satisfy: write ${opts.truthDir}/interface.md listing target file paths (relative to the target project), exported names and signatures (${opts.target.layout.interfaceHint}). This unit belongs to area "${opts.area}" on ${opts.stackId}: every path MUST be under ${opts.moduleDir}/ (binding; the orchestrator rejects other paths) and follow the layout below — extend the area's existing files (target_lookup) instead of new ones per legacy file. Signatures use the target's types, not the legacy language's.
+5. Port the cases to target tests: write them where this unit's tests belong (${opts.testWriteGlobs.join(", ")}) as ${opts.target.layout.testHint}, importing from the paths in interface.md, one test per case with the same expected value. Case N of your array (counting from 1) has the id ${opts.unitId}#N: the orchestrator searches the test files for that id as exact text, "#" included, so put it unchanged in the test's name (e.g. "${opts.unitId}#1 returns the net price"), or next to the test in a comment or test description where a name cannot hold it. They will fail until the implementer is done — that is correct.${opts.projectNotes.length ? `\n   Target project facts: ${opts.projectNotes.join("; ")}.` : ""}
+6. Call check_ported_tests: it runs the orchestrator's own checks (every case id found, the stack's lint/static check on your test files). Fix what it reports and call it again until it is clean.
+A unit with NO runtime behaviour (it only declares a contract, types or constants; nothing is computed, decided or changed when it runs) gets no cases and no tests: call no_behaviour_to_pin with the reason instead of steps 2, 3 and 5, and still draft interface.md.
 If something about the target conventions is missing or wrong in the rules and would matter for other units too, call propose_rule.
 Finish with one line: "TESTER DONE <n> cases".
 

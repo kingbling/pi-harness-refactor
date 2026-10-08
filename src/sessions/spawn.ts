@@ -191,6 +191,17 @@ export function makeWriteGate(opts: { cwd: string; sourceRoot: string; writeGlob
 	};
 }
 
+/**
+ * What a blocked session is told: why, where it may write instead (this session's own globs, as absolute paths),
+ * and how to report what it cannot do — only with tools this session really has.
+ */
+export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "writeGlobs" | "appendOnlyGlobs" | "customTools">): string {
+	const abs = (g: string) => resolve(opts.cwd, g).split(sep).join("/");
+	const where = opts.writeGlobs.length ? `You may write only: ${opts.writeGlobs.map(abs).join(", ")}${opts.appendOnlyGlobs?.length ? `; new files (never edits) in: ${opts.appendOnlyGlobs.map(abs).join(", ")}` : ""}.` : "This session may not write files.";
+	const report = opts.customTools?.some((t) => t.name === "ledger_prove") ? `record anything you cannot do via ledger_prove(op="dropped", why=...) or in your final message` : "say in your final message what you could not do and why";
+	return `${reason}. ${where} Otherwise ${report}.`;
+}
+
 export interface LeafSession {
 	run(prompt: string): Promise<{ text: string; toolCalls: number; blocked: number; usage: { input: number; output: number; cost: number }; error?: string }>;
 	dispose(): void;
@@ -226,7 +237,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				opts.onToolCall?.({ toolName: event.toolName, blocked: reason });
 				progress.agentTool(agentId, event.toolName, describeArgs(input), reason);
 				if (blocked >= (opts.maxBlocked ?? 5)) return { block: true, terminate: true, reason: `${reason}. Too many blocked tool calls (${blocked}); the session is terminated and the orchestrator will retry with the gate report.` };
-				return { block: true, reason: `${reason}. Stay within the task card; record anything you cannot do via ledger_prove(op="dropped", why=...) or in your final message.` };
+				return { block: true, reason: blockedHint(reason, opts) };
 			}
 			opts.onToolCall?.({ toolName: event.toolName });
 			progress.agentTool(agentId, event.toolName, describeArgs(input));
