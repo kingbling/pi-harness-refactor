@@ -42,6 +42,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
+  br reopen <unit...> [--why text]   accepted units back to planned, code kept (e.g. DB units after br order changed the table plan)
   br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, the reviewer model); failures go back to planned, code kept
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
@@ -219,6 +220,18 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { requeueUnits } = await import("./run/run.ts");
 		const { config, root, ledger } = open();
 		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human")) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
+	},
+	reopen: async (args) => {
+		const { reopenUnit } = await import("./run/recheck.ts");
+		const { ledger } = open();
+		const i = args.indexOf("--why");
+		const why = i >= 0 ? args.slice(i + 1).join(" ") : "re-opened by the owner";
+		const ids = (i >= 0 ? args.slice(0, i) : args).filter((a) => !a.startsWith("--"));
+		if (!ids.length) throw new Error("usage: br reopen <unit-id...> [--why text]");
+		for (const id of ids) {
+			if (ledger.getUnit(id)?.state !== "accepted") console.log(pc.yellow(`${id}: ${ledger.getUnit(id)?.state ?? "unknown"}; only accepted units are re-opened`));
+			else (reopenUnit(ledger, id, `The owner re-opened this accepted unit (its code stays on the branch): ${why}`, `re-opened by the owner: ${why}`), console.log(pc.green(`${id}: back to planned, code kept`)));
+		}
 	},
 	recheck: async (args) => {
 		const { recheckAccepted } = await import("./run/recheck.ts");
