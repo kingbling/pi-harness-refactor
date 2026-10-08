@@ -33,6 +33,8 @@ export interface TaskCard {
 	queries: Array<{ symbol: string; tables: string[]; text: string | null }>;
 	dynamicMarkers: string[];
 	cutDeps: string[];
+	/** Names this unit uses that several legacy files declare: no dependency was recorded; name → candidate files. */
+	ambiguous: Record<string, string[]>;
 	frameworkRefs: Array<{ cls: string; refs: number; verdict: string; platform: string }>;
 	/** Where the unit's code leads outside its files (code map), with migration state per target. */
 	callTree: string[];
@@ -86,7 +88,7 @@ const MAX_SIBLING_FILES = 6;
 export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): TaskCard {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
-	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[] };
+	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]> };
 	const files = meta.files ?? [];
 	const db = ledger.db;
 
@@ -159,7 +161,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -295,6 +297,10 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		L.push("", "## Forward references (cycle cut: these legacy files are scheduled AFTER this unit)");
 		L.push("Code against an interface or type you declare in this unit; do not port them here, do not stub their behaviour.");
 		for (const f of card.cutDeps) L.push(`- ${f}`);
+	}
+	if (Object.keys(card.ambiguous).length) {
+		L.push("", "## Names several legacy files declare (no dependency recorded: read the code and the candidates to see which one is meant, e.g. with source_symbol_body / who_calls)");
+		for (const [n, fs] of Object.entries(card.ambiguous)) L.push(`- ${n}: ${fs.join(", ")}`);
 	}
 	if (card.routes.length) {
 		L.push("", "## Routes");

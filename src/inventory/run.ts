@@ -84,6 +84,16 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		const own = cands.filter((s) => !isFramework(s.path));
 		return new Set(own.map((s) => s.path)).size === 1 ? own[0]!.id : undefined;
 	};
+	/** The files a name could mean when `resolve` gives no edge because several declare it (none when it is unique or unknown). */
+	const ambiguousFiles = (to: string): string[] => {
+		if (to.startsWith("glob:")) {
+			const hit = resolveGlob(to.slice(5));
+			return hit.length > 1 ? hit : [];
+		}
+		if (fileOf.has(to) || resolve(to)) return [];
+		const files = [...new Set((byName.get(to) ?? byName.get(to.split("::")[0]!) ?? []).map((s) => s.path))];
+		return files.length > 1 ? files.sort() : [];
+	};
 	const resolve = (to: string): string | undefined => {
 		if (to.startsWith("glob:")) {
 			const hit = resolveGlob(to.slice(5));
@@ -146,8 +156,14 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		else fileEdges.push([from, toFile]);
 		inbound.set(toFile, (inbound.get(toFile) ?? 0) + 1);
 	};
+	// names several files declare: no edge, but the unit's sessions are told the candidates to look up themselves
+	const ambiguousOf = new Map<string, Map<string, string[]>>();
 	for (const f of indexes)
 		for (const d of f.deps) {
+			if (d.kind !== "load") {
+				const cands = ambiguousFiles(d.to).filter((c) => c !== f.path);
+				if (cands.length > 1) (ambiguousOf.get(f.path) ?? ambiguousOf.set(f.path, new Map()).get(f.path)!).set(d.to.replace(/^glob:/, ""), cands);
+			}
 			if (d.to.startsWith("glob:")) {
 				for (const t of resolveGlob(d.to.slice(5))) addEdge(f.path, t, true);
 				continue;
@@ -200,6 +216,8 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	};
 	for (const [a, b] of fileEdges) refer(a, b);
 	for (const [a, b] of softEdges) refer(a, b);
+	// a name several files declare keeps every candidate alive (the code uses one of them; which one is the model's call)
+	for (const [from, names] of ambiguousOf) for (const fs of names.values()) for (const t of fs) refer(from, t);
 	const literalSoft: Array<[string, string]> = [];
 	// String mentions. Liveness stays generous: any name of the file in a string (method names too) keeps it alive.
 	// Soft edges (slicing) are strict: only a class/function name, an alias or the file name, and only a key that
@@ -310,7 +328,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		const deps = [...(cond.deps.get(ci) ?? [])].map((d) => compUnit.get(d)).filter((x): x is string => !!x);
 		const dyn = comp.flatMap((p) => fileOf.get(p)!.dynamicMarkers);
 		const existing = ledger.getUnit(id);
-		const unitMeta = { files: comp, loc: comp.reduce((a, p) => a + fileOf.get(p)!.loc, 0), dynamic_markers: dyn, queries: comp.reduce((a, p) => a + fileOf.get(p)!.queries.length, 0), cutDeps: [...new Set(comp.flatMap((p) => cutFrom.get(p) ?? []))].filter((t) => !comp.includes(t)).sort() };
+		const unitMeta = { files: comp, loc: comp.reduce((a, p) => a + fileOf.get(p)!.loc, 0), dynamic_markers: dyn, queries: comp.reduce((a, p) => a + fileOf.get(p)!.queries.length, 0), cutDeps: [...new Set(comp.flatMap((p) => cutFrom.get(p) ?? []))].filter((t) => !comp.includes(t)).sort(), ambiguous: Object.fromEntries(comp.flatMap((p) => [...(ambiguousOf.get(p) ?? [])]).slice(0, 20).map(([n, fs]) => [n, fs.slice(0, 8)])) };
 		if (existing?.state === "planned") {
 			// same files, possibly new edges/tier after a profile or decision change
 			ledger.db.prepare("UPDATE units SET tier = ?, deps = ? WHERE id = ?").run(tier, JSON.stringify(deps), id);

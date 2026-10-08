@@ -66,6 +66,21 @@ describe("unit graph without framework noise", () => {
 		for (const u of ledger.listUnits()) expect(JSON.parse(u.deps).some((d: string) => d === unitOf("app/modules/a/enabled.inc.php")?.id)).toBe(false);
 	});
 
+	it("a class two files declare gives no edge, but the unit using it is told both candidates", async () => {
+		const { ledger, unitOf } = await repo({
+			"app/a/Helper.php": "<?php\nclass Helper {\n  public function x() { return 1; }\n}\n",
+			"app/b/Helper.php": "<?php\nclass Helper {\n  public function x() { return 2; }\n}\n",
+			"app/User.php": "<?php\nclass User {\n  public function run() { return (new Helper())->x(); }\n}\n",
+			"index.php": "<?php\nrequire_once __DIR__ . '/app/User.php';\n(new User())->run();\n",
+		});
+		const user = unitOf("app/User.php")!;
+		expect(JSON.parse(user.deps)).toEqual([]);
+		expect(JSON.parse(user.meta).ambiguous).toEqual({ Helper: ["app/a/Helper.php", "app/b/Helper.php"] });
+		// both candidates stay alive: one of them is the code User really runs
+		expect(unitOf("app/a/Helper.php")).toBeDefined();
+		expect(unitOf("app/b/Helper.php")).toBeDefined();
+	});
+
 	it("string mentions: only unique class/function/file names make soft edges, never method names", async () => {
 		const { unitOf } = await repo({
 			"app/Thing.php": "<?php\nclass Thing {\n  public function create() { return 1; }\n}\n",
