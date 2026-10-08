@@ -63,11 +63,11 @@ export function placeUnit(config: Config, metaJson: string, root?: string): Plac
 	return codePlace(config, meta, root).place;
 }
 
-/** Directory of a placement inside its project: the feature dir, or the shared dir + area. */
+/** Directory of a placement inside its project: the feature dir, or the shared dir + the area's folder name as the stack spells it (src/Shared/FileStorage). */
 export function placementDir(layout: TargetLayout, p: Placement): string {
 	if (!p.shared) return layout.moduleDir(p.area);
 	if (!layout.sharedDirs[0]) throw new Error(`shared unit in area ${p.area}, but the target layout has no shared dir`);
-	return `${layout.sharedDirs[0].replace(/\/?$/, "/")}${p.area}`;
+	return `${layout.sharedDirs[0].replace(/\/?$/, "/")}${layout.moduleDir(p.area).split("/").pop()}`;
 }
 
 /** Why a unit may not run yet: no persisted placement and code is unsure (the model/question step has not placed it). */

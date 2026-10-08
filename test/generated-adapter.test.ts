@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { getTargetAdapter, knownTargets, registerGeneratedTargets, TARGET_ROLES, TARGET_SUBDIRS } from "../src/adapters/registry.ts";
 import { fromManifest, generateAdapter, validateManifest, type AdapterManifest } from "../src/adapters/target/generated.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
+import { placementDir } from "../src/run/placement.ts";
 
 const here = resolve(import.meta.dirname, "..");
 
@@ -34,6 +35,14 @@ describe("generated target adapters", () => {
 		const base = manifest();
 		const a = fromManifest(manifest({ layout: { ...base.layout, moduleDir: "src/{Area}", testFileGlobs: ["tests/{Area}/**/*Test.php", "tests/{area_snake}/*.php"] } }));
 		expect(a.layout.testFileGlobs(a.layout.moduleDir("ad-serving"))).toEqual(["tests/AdServing/**/*Test.php", "tests/ad_serving/*.php"]);
+	});
+
+	it("a shared area folder is spelled like the stack's area folders, and its test globs name the area too", () => {
+		const base = manifest();
+		const a = fromManifest(manifest({ layout: { ...base.layout, moduleDir: "src/{Area}", sharedDirs: ["src/Shared/"], testFileGlobs: ["{moduleDir}/tests/**/*Test.php", "tests/{Area}/**/*Test.php"] } }));
+		const dir = placementDir(a.layout, { stackId: "x", area: "file-storage", moduleKey: "x:file-storage", shared: true, source: "model" });
+		expect(dir).toBe("src/Shared/FileStorage");
+		expect(a.layout.testFileGlobs(dir)).toEqual(["src/Shared/FileStorage/tests/**/*Test.php", "tests/FileStorage/**/*Test.php"]);
 	});
 
 	it("a manifest becomes a full adapter: placeholders expand, regexes compile, nothing runs through a shell", () => {

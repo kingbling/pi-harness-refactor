@@ -93,7 +93,8 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 	// test globs may name the area outside the module (tests/{Area}/…): read the area back from the module dir
 	const moduleRe = new RegExp(`^${m.layout.moduleDir.replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\?\{(area|Area|area_snake)\\?\}/g, "([^/]+)")}$`);
 	const testGlobs = (dir: string) => {
-		const seg = moduleRe.exec(dir)?.[1];
+		// a shared folder (src/Shared/FileStorage) is not a module dir: its last folder names the area
+		const seg = moduleRe.exec(dir)?.[1] ?? dir.split("/").pop();
 		const kebab = seg?.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/_/g, "-").toLowerCase();
 		return m.layout.testFileGlobs.map((g) => {
 			const out = g.replace(/\{moduleDir\}/g, dir);
