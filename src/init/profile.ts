@@ -15,6 +15,8 @@ import type { ModelClient } from "../models/types.ts";
  * routes declared in code, scan-discovered entry points, concern table). Code then validates it by
  * re-running the inventory and comparing: load globs that resolve, routes found, dead-code count.
  * The built-in profile (gyro) is shown to the model as the worked example of the format.
+ * Which folders are the framework is the model's call: it gets the top-level listing (a folder with its own .git
+ * marked, a fact) instead of a name guess (CodeIgniter keeps its framework in system/, library/ can be app code).
  */
 export async function generateProfile(config: Config, root: string, ledger: Ledger, opts: { force?: boolean; client?: ModelClient } = {}): Promise<void> {
 	const out = join(root, ".bigrefactor", "framework-profile.json");
@@ -29,13 +31,9 @@ export async function generateProfile(config: Config, root: string, ledger: Ledg
 	const src = config.source.path;
 	const dirs = source.frameworkDirs?.(src) ?? [];
 	const vendor = source.traits?.vendorDirs ?? [];
-	const candidates = dirs.length ? dirs : detectFrameworkDirs(src, vendor);
-	if (!candidates.length) {
-		console.log(pc.yellow("no framework directory found (vendor-only app?) — nothing to profile"));
-		return;
-	}
-	const tree = candidates.map((d) => `${d}\n${listTree(join(src, d), 2, "  ", vendor)}`).join("\n");
+	const tree = topLevel(src, vendor);
 	const stats = indexStats(ledger);
+	const kinds = fileKinds(ledger);
 
 	mkdirSync(join(root, ".bigrefactor", "sessions"), { recursive: true });
 	const attempt = ledger.startAttempt("__init__", "profile", config.models.escalate.id);
@@ -48,13 +46,13 @@ export async function generateProfile(config: Config, root: string, ledger: Ledg
 		tools: ["read", "grep", "find", "ls", "write"],
 		systemPrompt: `You reverse-engineer how a legacy ${config.source.stack} framework loads code by convention, so a migration tool can build an exact dependency graph without running the app.
 You may READ anything under the legacy source at ${src} (it is read-only; never write there). You write exactly one file: .bigrefactor/framework-profile.json in the workspace.
-Work like this: find the class loader / autoloader (string → file path), the router (how routes are declared: a table file, or objects created inside controllers, or attributes), the factories that build objects from strings (commands, views/templates, widgets), the directory-scan discovery at boot (controllers, access delegates, plugins), and the base-class families (ORM, HTTP, rendering, auth, commands, cache, mail, jobs, events, helpers, i18n, logging, install, tests). Quote the real code paths and extensions you saw; do not guess names.
+Work like this: first decide from the top-level listing which folders hold the framework the app is built on (its loader, router, base classes; often a separate checkout) rather than the app's own code; read them to be sure. Then find the class loader / autoloader (string → file path), the router (how routes are declared: a table file, or objects created inside controllers, or attributes), the factories that build objects from strings (commands, views/templates, widgets), the directory-scan discovery at boot (controllers, access delegates, plugins), and the base-class families (ORM, HTTP, rendering, auth, commands, cache, mail, jobs, events, helpers, i18n, logging, install, tests). Quote the real code paths and extensions you saw; do not guess names.
 ${schemaDoc}
 Globs are relative to the legacy root; \`$1\`, \`$2\` are the call's positional string arguments (non-literal args are unknown: a glob using them is skipped unless the rule has "each": true, which applies the glob to every literal argument). Concern "match" is a case-insensitive regex over class/interface/function names; pick verdict platform when the target platform provides the concern, port when the classes contain application logic, drop when obsolete, review when unsure.`,
 		transcriptPath: join(root, ".bigrefactor", "sessions", `__init__.profile.${attempt}.jsonl`),
 		onToolCall: (e) => e.blocked && console.log(pc.dim(`  profile blocked: ${e.blocked}`)),
 	});
-	const prompt = `Framework directories and their layout (depth 2):\n${tree}\n\nCurrent index without a profile: ${stats}\n\nWorked example of the format (another framework, "${example.id}"):\n${JSON.stringify(example, null, 2)}\n\nNow read the framework source and write .bigrefactor/framework-profile.json for THIS framework. Include every loader/factory string→file convention you can prove from the code, the route class pattern if routes are objects, the entry-point regex for files discovered by directory scan, impliedDeps for conventions that resolve at runtime by name (e.g. a model's command directory), and a concerns table covering every base-class family under the framework directories. End the session right after writing the file.`;
+	const prompt = `Top-level layout of the legacy source (depth 1; "[own .git]" marks a folder that is its own git checkout or submodule):\n${tree}${dirs.length ? `\nThe current profile's framework directories: ${dirs.join(", ")}` : ""}\n\nCurrent index: ${stats}${kinds ? `\nDotted file-name parts before the extension, and extensions, in the indexed legacy files (count): ${kinds}` : ""}\n\nWorked example of the format (another framework, "${example.id}"):\n${JSON.stringify(example, null, 2)}\n\nNow read the framework source and write .bigrefactor/framework-profile.json for THIS framework. frameworkDirs are the folders you picked (an empty array when the app has no separate framework). Include every loader/factory string→file convention you can prove from the code, the route class pattern if routes are objects, the entry-point regex for every file that runs without being included (front controllers, CLI/console and cron scripts, what deploy and shell scripts call, files discovered by directory scan — look at bin/, scripts, crontabs, Makefile, docker files), legacyWords picked from the file-name parts above, impliedDeps for conventions that resolve at runtime by name (e.g. a model's command directory), and a concerns table covering every base-class family under the framework directories. End the session right after writing the file.`;
 	let res;
 	try {
 		res = await session.run(prompt);
@@ -98,20 +96,31 @@ function indexStats(ledger: Ledger): string {
 	return `files ${files}, dead ${q("SELECT COUNT(*) n FROM files WHERE dead_code = 1")}, framework ${q("SELECT COUNT(*) n FROM files WHERE disposition = 'framework'")}, load edges ${q("SELECT COUNT(*) n FROM index_deps WHERE kind = 'load'")}, routes ${q("SELECT COUNT(*) n FROM index_routes WHERE side = 'source'")}, units ${q("SELECT COUNT(*) n FROM units")}`;
 }
 
-/** Directories that look like a framework (many files, named like one, or a git submodule) when the adapter has no idea yet. */
-function detectFrameworkDirs(src: string, vendor: string[]): string[] {
-	const out: string[] = [];
-	for (const n of readdirSync(src)) {
-		if (n.startsWith(".") || vendor.includes(n) || ["app", "src", "tests", "docs"].includes(n)) continue;
+/** The legacy root, one level deep, for the model to pick the framework folders from; a folder's own .git is the one fact code adds. */
+function topLevel(src: string, vendor: string[]): string {
+	let out = "";
+	for (const n of readdirSync(src).filter((n) => !n.startsWith(".") && !vendor.includes(n)).sort()) {
 		const p = join(src, n);
+		let isDir = false;
 		try {
-			if (!statSync(p).isDirectory()) continue;
+			isDir = statSync(p).isDirectory();
 		} catch {
 			continue;
 		}
-		if (/framework|core|lib|engine/i.test(n) || existsSync(join(p, ".git"))) out.push(`${n}/`);
+		out += isDir ? `${n}/${existsSync(join(p, ".git")) ? "  [own .git]" : ""}\n${listTree(p, 0, "  ", vendor)}` : `${n}\n`;
 	}
 	return out;
+}
+
+/** Facts for legacyWords: how often each dotted name part before the extension (x.cmd.php → cmd) and each extension occurs. */
+function fileKinds(ledger: Ledger): string {
+	const n = new Map<string, number>();
+	for (const { path } of ledger.db.prepare("SELECT path FROM files").all() as Array<{ path: string }>) {
+		const parts = path.split("/").pop()!.toLowerCase().split(".");
+		if (parts.length < 2 || !parts[0]) continue;
+		for (const w of parts.length >= 3 ? [parts.at(-2)!, `.${parts.at(-1)}`] : [`.${parts.at(-1)}`]) n.set(w, (n.get(w) ?? 0) + 1);
+	}
+	return [...n].filter(([w, c]) => c >= 2 || w.startsWith(".")).sort((a, b) => b[1] - a[1]).slice(0, 60).map(([w, c]) => `${w} ${c}`).join(", ");
 }
 
 function listTree(dir: string, depth: number, prefix: string, vendor: string[]): string {

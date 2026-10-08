@@ -37,7 +37,7 @@ export interface Decision {
 }
 
 export interface DecisionAnswer { answer: string; by: string; at: string }
-export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; dimensions?: import("../init/survey.ts").Dimension[]; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string> };
+export type DecisionFile = { advice?: Record<string, { value: string; reason?: string; confidence?: number }>; dimensions?: import("../init/survey.ts").Dimension[]; phrased?: Record<string, PhrasedQuestion & { hash: string }>; discovered?: Record<string, PhrasedQuestion & { evidence: string }>; survey?: { targets: string[]; dbStrategy: string; dbFrom: string[]; why: string[] }; answers: Record<string, DecisionAnswer>; libraries?: Record<string, { verdict: string; successor?: string }>; frameworkClasses?: Record<string, string>; truth?: Record<string, string>; target?: Record<string, string>; strategy?: Record<string, string>; /** Jev on files the reachability walk dropped (src/init/dead.ts): alive ones are entry points. */ liveness?: Record<string, { alive: boolean; why: string }> };
 
 export function decisionsPath(root: string): string {
 	return join(root, ".bigrefactor", "decisions.json");

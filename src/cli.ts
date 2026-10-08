@@ -29,6 +29,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br inventory                 index source → symbols, units, tiers → ledger (re-run = drift report)
   br index-target              (re)index the new codebase: exports, shared helpers, docs → target_lookup/shared_lookup
   br simulate --level 1|2|3    prove the pipeline before touching the real repo
+  br dead                      Jev judges files the inventory dropped as unreachable (cron/CLI/dynamic dispatch?); kept ones become entry points
   br label                     Jev labels units (difficulty → model routing, kind, needs_db, has_ui), auth slices, unreached units → slices, placement
   br place [--force]           target stack + legacy area per unit (code → Jev → question); .bigrefactor/placement.json overrides
   br advise                    models judge what tables used to: library successors, unmapped framework classes (escalate model), open decisions (Jev)
@@ -244,6 +245,16 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
 		const { loadDecisions } = await import("./inventory/decisions.ts");
 		console.log(renderFrameworkPlan(planFrameworks(ledger, source, targets, config.source.path, loadDecisions(root), config.target.choices)));
+	},
+	dead: async () => {
+		const { confirmDeadCode } = await import("./init/dead.ts");
+		const { config, ledger, root } = open();
+		const r = await confirmDeadCode(config, root, ledger, makeClient(), { log: (l) => console.log(l) });
+		if (r.alive.length) {
+			const { inventory } = await import("./inventory/run.ts");
+			await inventory(config, root, ledger); // the kept files become units again
+		}
+		console.log(`${r.asked} dropped files judged, ${r.alive.length} kept as entry points${r.alive.length ? `: ${r.alive.slice(0, 8).join(", ")}${r.alive.length > 8 ? ", …" : ""}` : ""}, $${r.costUsd.toFixed(4)}`);
 	},
 	label: async () => {
 		const { labelUnits } = await import("./init/label.ts");

@@ -172,7 +172,9 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			}
 		});
 
-		await step("profile", () => (noLlm ? "skipped (--no-llm)" : !source.profileExample ? "adapter has no framework profiles" : has(".bigrefactor", "framework-profile.json") ? "profile present" : !(source.frameworkDirs?.(config.source.path) ?? []).length && !frameworkDirsLikely(config.source.path) ? "no framework directory detected" : undefined), async () => {
+		// always profiled when the adapter supports it: the profile model decides which folders are the framework
+		// (none is a valid answer) and names the entry points, which a plain app needs too
+		await step("profile", () => (noLlm ? "skipped (--no-llm)" : !source.profileExample ? "adapter has no framework profiles" : has(".bigrefactor", "framework-profile.json") ? "profile present" : undefined), async () => {
 			const { generateProfile } = await import("./profile.ts");
 			const { OpenRouterClient } = await import("../models/openrouter.ts");
 			const l = ledger();
@@ -378,6 +380,20 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			return `${entries.length} docs`;
 		});
 
+		// files the reachability walk dropped: Jev judges whether they still run (cron, CLI, dynamic dispatch);
+		// the inventory below keeps the ones it says may run
+		await step("dead code", () => (noLlm ? "skipped (--no-llm): unreached files stay dropped" : undefined), async () => {
+			const { confirmDeadCode } = await import("./dead.ts");
+			const { OpenRouterClient } = await import("../models/openrouter.ts");
+			const l = ledger();
+			try {
+				const r = await confirmDeadCode(config, root, l, new OpenRouterClient(), { log: (x) => log(pc.dim(x)) });
+				return r.asked ? `${r.asked} dropped files judged, ${r.alive.length} kept as entry points, $${r.costUsd.toFixed(4)}` : "no new dropped files";
+			} finally {
+				l.close();
+			}
+		});
+
 		// decisions may change the inventory (merge groups, slices): refresh once, cheap
 		await step("inventory (after decisions)", () => undefined, async () => {
 			const l = ledger();
@@ -517,14 +533,5 @@ function ledgerHasUnits(root: string): boolean {
 		return (l.db.prepare("SELECT COUNT(*) n FROM units").get() as { n: number }).n > 0;
 	} finally {
 		l.close();
-	}
-}
-
-function frameworkDirsLikely(src: string): boolean {
-	try {
-		// same signal as the profile's own detection: a framework-ish name or a vendored checkout (own .git)
-		return readdirSync(src).some((n) => /framework|core|lib|engine/i.test(n) || existsSync(join(src, n, ".git")));
-	} catch {
-		return false;
 	}
 }
