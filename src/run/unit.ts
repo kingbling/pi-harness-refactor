@@ -29,7 +29,7 @@ import { reviewWithModel, type Reviewer } from "./review.ts";
 import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
-import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
+import { caseOnly, completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
 import { triageGate, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
@@ -122,7 +122,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const moduleDir = placementDir(adapter.layout, place);
 	// approved tidy tasks of the area: their files are in scope (existing shared ones too); 1:1 moves are done by code
 	const tidy = tidyTasks(o.ledger, stackId, area).filter((t) => t.status === "approved");
-	const tidyMoved = tidyMoves(targetProjectDir, tidy, adapter.layout.isTestFile);
+	const tidyMoved = tidyMoves(targetProjectDir, tidy, (l) => log(pc.dim(`  tidy: ${l}`)));
 	if (tidyMoved.length) log(pc.dim(`  tidy: moved ${tidyMoved.join(", ")} (imports are the implementer's job)`));
 	const tidyPaths = [...new Set(tidy.flatMap((t) => [...t.from, ...t.to]))];
 	const writeGlobs = [`${moduleDir}/**`, ...tidyPaths];
@@ -641,14 +641,23 @@ export function afterAccept(ledger: Ledger, adapter: TargetAdapter, projectDirAb
 	if (drift.length) log(pc.dim(`  drift ${stackId}: ${drift.length} finding(s) (br layout)`));
 }
 
-/** 1:1 moves/renames of approved tidy tasks, done by code before the sessions (source present, target free). */
-export function tidyMoves(dir: string, tasks: TidyTask[], isTest: (p: string) => boolean): string[] {
+/**
+ * 1:1 moves/renames of approved tidy tasks, done by code before the sessions (source present, target free).
+ * Test files move too: the tests are then listed under their new name before the gate takes their hashes, and
+ * the old name is a tidy-sanctioned path, so no unit has to redo the rename by hand. A plain file move, not a
+ * staged one: git sees the old path deleted and the new one added, which is what the gate reads.
+ * Renames that only change letter case are skipped: on a case-insensitive disk (macOS) the target "exists"
+ * already and git does not see the change.
+ */
+export function tidyMoves(dir: string, tasks: TidyTask[], log: (line: string) => void = () => {}): string[] {
 	const out: string[] = [];
 	for (const t of tasks) {
 		if ((t.op !== "move" && t.op !== "rename") || t.from.length !== t.to.length) continue;
 		t.from.forEach((f, i) => {
 			const to = t.to[i]!;
-			if (f === to || isTest(f) || !existsSync(join(dir, f)) || existsSync(join(dir, to))) return;
+			if (f === to) return;
+			if (caseOnly(f, to)) return log(`skipped ${f} → ${to} (only the letter case changes; unsafe on a case-insensitive disk)`);
+			if (!existsSync(join(dir, f)) || existsSync(join(dir, to))) return;
 			mkdirSync(dirname(join(dir, to)), { recursive: true });
 			renameSync(join(dir, f), join(dir, to));
 			out.push(`${f} → ${to}`);
@@ -657,11 +666,11 @@ export function tidyMoves(dir: string, tasks: TidyTask[], isTest: (p: string) =>
 	return out;
 }
 
-/** Sources of approved merges (and n:m moves) still present although every target exists. */
+/** Sources of approved merges (and n:m moves) still present although every target exists (never a case-only twin of a target: on macOS that is the target). */
 export function tidyLeftovers(dir: string, tasks: TidyTask[], moved: string[]): string[] {
 	return tasks
 		.filter((t) => t.op !== "split" && t.to.every((f) => existsSync(join(dir, f))) && !t.from.every((f) => moved.some((m) => m.startsWith(`${f} → `))))
-		.flatMap((t) => t.from.filter((f) => !t.to.includes(f) && existsSync(join(dir, f))));
+		.flatMap((t) => t.from.filter((f) => !t.to.some((x) => x.toLowerCase() === f.toLowerCase()) && existsSync(join(dir, f))));
 }
 
 /** The workspace files a setup fix changes: the stack's command overrides and its fixes log. */

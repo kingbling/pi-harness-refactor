@@ -100,10 +100,10 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const tasks = loadTasks(d.ledger);
 	let asked = 0;
 	for (const c of j.changes ?? []) {
-		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed) || seen.has(sig(c.op, c.from, c.to))) continue;
+		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed) || seen.has(sig(c.op, c.from, c.to)) || onlyCase(c)) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
-			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, the next unit of this area performs it (the build gate catches broken imports); nothing waits for this answer.`,
+			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, the next unit of this area performs it (the builder's whole-project check after merges, which also runs all tests, catches broken imports); nothing waits for this answer.`,
 			options: [{ value: "apply", facts: "do it with the next unit of the area" }, { value: "skip", facts: "leave the files as they are" }],
 			recommended: "apply",
 			agentOpinion: c.why,
@@ -127,7 +127,7 @@ export function tidyTasks(ledger: Ledger, stack?: string, area?: string): TidyTa
 /** Approved tidy tasks of an area, as task-card text for the next unit (empty = none). */
 export function tidyTaskCard(ledger: Ledger, stack: string, area: string): string {
 	syncTidyAnswers(ledger);
-	const todo = tidyTasks(ledger, stack, area).filter((t) => t.status === "approved");
+	const todo = tidyTasks(ledger, stack, area).filter((t) => t.status === "approved" && !onlyCase(t));
 	return todo.map((t) => `- ${t.op}: ${t.from.join(", ")} → ${t.to.join(", ")} (${t.why}); update every import, keep behaviour identical`).join("\n");
 }
 
@@ -138,7 +138,8 @@ export function completeTidyTasks(ledger: Ledger, projectDirAbs: string, stack: 
 	for (const t of tasks) {
 		if (t.stack !== stack || t.area !== area || t.status !== "approved") continue;
 		// sources that are not also targets must be gone (a split may keep its source file)
-		const gone = t.op === "split" || t.from.filter((f) => !t.to.includes(f)).every((f) => !existsSync(join(projectDirAbs, f)));
+		// (a case-only rename is skipped, see tidyMoves: on macOS its source "exists" as the target)
+		const gone = t.op === "split" || t.from.filter((f) => !t.to.some((x) => x.toLowerCase() === f.toLowerCase())).every((f) => !existsSync(join(projectDirAbs, f)));
 		if (gone && t.to.every((f) => existsSync(join(projectDirAbs, f)))) {
 			t.status = "done";
 			done.push(t.id);
@@ -146,6 +147,15 @@ export function completeTidyTasks(ledger: Ledger, projectDirAbs: string, stack: 
 	}
 	if (done.length) saveTasks(ledger, tasks);
 	return done;
+}
+
+/** A rename that only changes letter case (Arangodb → ArangoDb). */
+export function caseOnly(from: string, to: string): boolean {
+	return from !== to && from.toLowerCase() === to.toLowerCase();
+}
+/** A move/rename whose every file only changes letter case: never asked, never handed to a unit. */
+function onlyCase(t: Pick<TidyTask, "op" | "from" | "to">): boolean {
+	return (t.op === "move" || t.op === "rename") && t.from.length === t.to.length && t.from.every((f, i) => caseOnly(f, t.to[i]!));
 }
 
 export function syncTidyAnswers(ledger: Ledger): void {
