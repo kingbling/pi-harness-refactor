@@ -68,7 +68,7 @@ describe("runUnit wiring", () => {
 			calls++;
 			if (calls > 1) return { ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) };
 			rmSync(join(g.targetProjectDir, "src", "features", "agency", "agency.service.spec.ts"), { force: true });
-			return { ok: false, steps: [{ name: "tests_pass", ok: false, ms: 1, output: "1 failing" }], changedFiles: [], failedStep: "tests_pass", testFiles: g.testFiles.map((t) => t.path) };
+			return { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: "1 failing" }], changedFiles: [], failedStep: "ported_tests_green", testFiles: g.testFiles.map((t) => t.path) };
 		};
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, log: () => {} });
 		expect(calls).toBeGreaterThan(1);
