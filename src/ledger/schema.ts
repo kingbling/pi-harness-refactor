@@ -62,6 +62,8 @@ export const EVIDENCE_TYPES = [
 	"truth_ahead",
 	// written files match the stack layout (area module, no per-legacy-file folders, no duplicate classes)
 	"structure_ok",
+	// the new code is real and connected: no stubs, entry point for HTTP units, uses its migrated deps, chosen stack used
+	"wired_ok",
 ] as const;
 export type EvidenceType = (typeof EVIDENCE_TYPES)[number];
 
@@ -74,6 +76,7 @@ export const REQUIRED_FOR_ACCEPTED: readonly EvidenceType[] = [
 	"rules_ok",
 	"antigaming_ok",
 	"structure_ok",
+	"wired_ok",
 	"ported_tests_green",
 ];
 

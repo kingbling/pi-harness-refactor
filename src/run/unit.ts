@@ -24,6 +24,7 @@ export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
+import { reviewWithModel, type Reviewer } from "./review.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
@@ -74,6 +75,8 @@ export interface UnitRunOptions {
 	setupFixer?: SetupFixer | false;
 	/** Sets up the old code's environment when truth stays red; default: the setup model (none when `spawn` is faked). */
 	legacyFixer?: LegacyFixer | false;
+	/** Judges wired_ok (real, connected, on the chosen stack); default: the reviewer model (none when `spawn` is faked). */
+	reviewer?: Reviewer | false;
 }
 
 export interface UnitRunResult {
@@ -439,7 +442,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// merged tidy sources go once every target exists (a missed move breaks the build, the gate says so)
 		for (const f of tidyLeftovers(targetProjectDir, tidy, tidyMoved)) rmSync(join(targetProjectDir, f));
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
-		gate = await gateSlot(() => gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: tidyPaths, legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) }));
+		const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
+		const review = reviewer
+			? async (changedFiles: string[]) => {
+					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
+					cost += r.costUsd ?? 0;
+					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
+					return r;
+				}
+			: undefined;
+		// the gate takes a CPU slot only for its commands: the review (a model session) never holds one
+		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: tidyPaths, legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot });
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
 		if (gate.ok) break;

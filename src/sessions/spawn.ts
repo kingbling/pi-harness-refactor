@@ -18,7 +18,7 @@ import type { Config, ModelRole } from "../config.ts";
  *    source repo (read-only, always), protected paths, and content that does not parse;
  *  - model per role from config, service tier via samplingParams (`:flex` is not a model id).
  */
-export type Role = "implement" | "test" | "escalate" | "setup";
+export type Role = "implement" | "test" | "escalate" | "setup" | "review";
 
 export interface SpawnOptions {
 	role: Role;
@@ -69,6 +69,7 @@ const ROLE_TOOLS: Record<Role, string[]> = {
 	test: ["read", "write", "edit", "grep", "find", "ls", "bash"], // runs the old test runner
 	escalate: ["read", "edit", "write", "grep", "find", "ls"],
 	setup: ["read", "edit", "write", "grep", "find", "ls", "bash"],
+	review: ["read", "grep", "find", "ls"], // judges, never writes
 };
 
 export { modelRuntime };
@@ -196,7 +197,7 @@ export interface LeafSession {
 }
 
 export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
-	const role = opts.modelOverride ?? opts.config.models[opts.role === "setup" ? "escalate" : opts.role];
+	const role = opts.modelOverride ?? opts.config.models[opts.role === "setup" || opts.role === "review" ? "escalate" : opts.role];
 	const model = await resolveSessionModel(role);
 	const orCost = await openRouterCost(role.id);
 	const gate = makeWriteGate({ cwd: opts.cwd, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], appendOnlyGlobs: opts.appendOnlyGlobs });

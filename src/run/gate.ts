@@ -37,6 +37,13 @@ export interface GateInput {
 	sanctioned?: string[];
 	/** The source adapter's legacy file kinds (SourceAdapter.legacyWords): no target name may carry one. */
 	legacyWords?: string[];
+	/**
+	 * wired_ok: a reviewer model with tools judges whether the new code is real (no stubs), connected (reached by
+	 * the framework, uses the migrated code) and on the chosen stack. Without one the step passes as "not judged".
+	 */
+	review?: (changedFiles: string[]) => Promise<{ ok: boolean; output: string; judged: boolean }>;
+	/** Gate pool slot for the CPU-bound commands (build, lint, rules, tests); the review never holds one. */
+	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 	timeoutMs?: number;
 }
 
@@ -63,11 +70,12 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const tracked = new Set(trackedFiles(g.targetProjectDir));
 	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
 	const timeout = g.timeoutMs ?? 240_000;
-	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number }>) => {
+	const cpu = g.slot ?? (<T>(fn: () => Promise<T>) => fn());
+	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number; judged?: boolean }>) => {
 		const t0 = Date.now();
 		const r = await fn();
 		steps.push({ name, ok: r.ok, ms: Date.now() - t0, output: r.output.slice(-6000), exitCode: r.exitCode });
-		if (r.ok) g.ledger.addEvidence(g.unitId, name, { ms: Date.now() - t0 });
+		if (r.ok) g.ledger.addEvidence(g.unitId, name, { ms: Date.now() - t0, ...(r.judged === false ? { judged: false, note: r.output.slice(0, 300) } : {}) });
 		return r.ok;
 	};
 
@@ -122,16 +130,19 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const unitFiles = changed.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f)));
 	const whole = wholeProjectSteps(g.adapter, g.targetProjectDir);
 	const scopedStep = (name: "build" | "lint", c: { cmd: string; args: string[] }) => () =>
-		whole.some((w) => w.step === name) ? Promise.resolve({ ok: true, output: `whole-project ${name}: the builder runs it after merges` }) : unitFiles.length ? run(c.cmd, c.args, g.targetProjectDir, timeout) : Promise.resolve({ ok: true, output: `no files to ${name}` });
+		whole.some((w) => w.step === name) ? Promise.resolve({ ok: true, output: `whole-project ${name}: the builder runs it after merges` }) : unitFiles.length ? cpu(() => run(c.cmd, c.args, g.targetProjectDir, timeout)) : Promise.resolve({ ok: true, output: `no files to ${name}` });
 	if (!(await step("build_ok", scopedStep("build", g.adapter.build(g.targetProjectDir, unitFiles))))) return done();
 	if (!(await step("lint_ok", scopedStep("lint", g.adapter.lint(g.targetProjectDir, unitFiles))))) return done();
 
 	// 6. the stack's ast-grep rules on the changed production files
-	if (!(await step("rules_ok", () => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout)))) return done();
+	if (!(await step("rules_ok", () => cpu(() => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout))))) return done();
 
-	// 7. the ported characterization tests
+	// 7. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
+	if (!(await step("wired_ok", () => (g.review ? g.review(changed) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
+
+	// 8. the ported characterization tests (one per truth case)
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
-	if (!(await step("ported_tests_green", () => run(t.cmd, t.args, g.targetProjectDir, timeout)))) return done();
+	if (!(await step("ported_tests_green", () => cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout))))) return done();
 
 	return done();
 
