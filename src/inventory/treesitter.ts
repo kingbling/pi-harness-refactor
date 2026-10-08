@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { isAbsolute } from "node:path";
 import { Language, Parser, Query, type Node, type Tree } from "web-tree-sitter";
 
 export type { Node, Tree, Language };
@@ -12,8 +13,12 @@ const require = createRequire(import.meta.url);
  */
 const GRAMMARS: Record<string, string> = {};
 
-/** `lang` → npm module path of the grammar wasm (resolved from this package's dependencies). */
+/**
+ * `lang` → npm module path of the grammar wasm (resolved from this package's dependencies), or an absolute path
+ * (a grammar a model installed into the workspace for a generated source adapter).
+ */
 export function registerGrammar(lang: string, wasmModule: string): void {
+	if (GRAMMARS[lang] !== undefined && GRAMMARS[lang] !== wasmModule) languages.delete(lang);
 	GRAMMARS[lang] = wasmModule;
 }
 
@@ -28,7 +33,7 @@ export async function getLanguage(lang: string): Promise<Language> {
 	if (!p) {
 		const rel = GRAMMARS[lang];
 		if (!rel) throw new Error(`no tree-sitter grammar registered for "${lang}" (have: ${Object.keys(GRAMMARS).join(", ") || "none"}; an adapter registers its grammar)`);
-		p = Language.load(require.resolve(rel));
+		p = Language.load(isAbsolute(rel) ? rel : require.resolve(rel));
 		languages.set(lang, p);
 	}
 	return p;
@@ -54,6 +59,18 @@ export async function captures(lang: string, tree: Tree, pattern: string): Promi
 		queries.set(key, q);
 	}
 	return q.captures(tree.rootNode).map((c) => ({ name: c.name, node: c.node }));
+}
+
+/** Like captures, grouped per match (a call's name and its receiver come together). */
+export async function matches(lang: string, tree: Tree, pattern: string): Promise<Array<Array<{ name: string; node: Node }>>> {
+	const language = await getLanguage(lang);
+	const key = `${lang}\u0000${pattern}`;
+	let q = queries.get(key);
+	if (!q) {
+		q = new Query(language, pattern);
+		queries.set(key, q);
+	}
+	return q.matches(tree.rootNode).map((m) => m.captures.map((c) => ({ name: c.name, node: c.node })));
 }
 
 /** Depth-first walk; return false from the visitor to skip a subtree. */

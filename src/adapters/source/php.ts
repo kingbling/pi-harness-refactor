@@ -5,6 +5,7 @@ import { captures, enclosing, normalizedAst, parse, registerGrammar, walk, type 
 
 registerGrammar("php", "tree-sitter-php/tree-sitter-php.wasm");
 import { placePhpFile } from "./php-place.ts";
+import { SQL_RES } from "./sql.ts";
 import type { CodeCall, CodeComment, CodeContainer, CodeFunction, ExternalDep, FileIndex, FrameworkConcern, IndexedDep, IndexedQuery, IndexedRoute, IndexedSymbol, SourceAdapter } from "../types.ts";
 
 const SYMBOL_QUERY = `
@@ -30,14 +31,6 @@ const DEP_QUERY = `
 const HTTP_MARKERS = ["$_GET", "$_POST", "$_REQUEST", "$_SERVER", "$_SESSION", "$_COOKIE", "header(", "http_response_code(", "ob_start("];
 const TEMPLATE_RE = /(^|\/)(templates?|views?|resources\/views)\/|\.phtml$|\.blade\.php$/i;
 const ROUTES_RE = /(^|\/)routes?(\/(web|api|console|channels|[a-z_]+))?\.php$/;
-const SQL_RES: RegExp[] = [
-	/\bSELECT\b[\s\S]{0,400}?\bFROM\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
-	/\bINSERT\s+INTO\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
-	/\bUPDATE\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)\s+SET\b/gi,
-	/\bDELETE\s+FROM\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
-	/\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
-	/\b(?:JOIN)\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)/gi,
-];
 
 /**
  * Framework profiles: how a given PHP framework loads code by convention (string → file), registers

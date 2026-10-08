@@ -119,7 +119,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 	try {
 		await step("init", () => (has("bigrefactor.config.json") && !args.includes("--force") ? "config exists" : undefined), async () => {
-			await init(args.filter((a) => a !== "--no-llm"), { root, prompter: ui, embedded: true });
+			await init(args.filter((a) => a !== "--no-llm"), { root, prompter: ui, embedded: true, noLlm });
 		});
 		reload();
 
