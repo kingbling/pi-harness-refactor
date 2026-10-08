@@ -59,4 +59,19 @@ describe("runUnit wiring", () => {
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
 		expect(r.attempts).toBe(2);
 	});
+
+	it("a test file the tester removed after the list was made does not crash the next attempt", async () => {
+		const spec = join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts");
+		write(spec, "it('x', () => {});\n");
+		let calls = 0;
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			calls++;
+			if (calls > 1) return { ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) };
+			rmSync(join(g.targetProjectDir, "src", "features", "agency", "agency.service.spec.ts"), { force: true });
+			return { ok: false, steps: [{ name: "tests_pass", ok: false, ms: 1, output: "1 failing" }], changedFiles: [], failedStep: "tests_pass", testFiles: g.testFiles.map((t) => t.path) };
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, log: () => {} });
+		expect(calls).toBeGreaterThan(1);
+		expect(r.state).not.toBe("crashed");
+	});
 });

@@ -296,6 +296,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastGateText = "";
 	while (attemptNo < maxTotal) {
 		attemptNo++;
+		// the tests as they are on disk now: the tester (it has a shell) may have renamed or removed one since they
+		// were listed; the implementer cannot write tests, so the gate still catches any change during this attempt
+		testFiles = loadTests();
 		const role = forceEscalate || attemptNo > maxImpl ? "escalate" : "implement";
 		const modelRole = o.config.models[role];
 		const attempt = o.ledger.startAttempt(o.unitId, role, modelRole.id);
@@ -325,7 +328,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			loadIface(),
 			"",
 			`## Ported tests (read-only): ${testFiles.map((t) => t.path).join(", ") || "none"}`,
-			...testFiles.map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
+			...testFiles.filter((t) => existsSync(join(targetProjectDir, t.path))).map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
 			lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
 			o.retryNote && attemptNo === 1 ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
 			tidyMoved.length ? `\n## Tidy moves already done by the orchestrator\n${tidyMoved.join("\n")}\nUpdate every import of the moved files; keep behaviour identical.` : "",
