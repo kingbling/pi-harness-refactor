@@ -12,7 +12,7 @@ import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
  *
  * Path patterns (relative to the feature folder):
  *   {area} {Area} {area_snake}  the unit's area (kebab, Pascal, snake case)
- *   {name} {Name}               any kebab-case / PascalCase name
+ *   {name} {Name} {name_snake}  any kebab-case / PascalCase / snake_case name (pick the stack's own file-name style)
  *   {sub}                       one folder named after what the code does, spelled like the area folders ({area} → kebab,
  *                               {Area} → Pascal, {area_snake} → snake); the same value where it repeats; never a banned
  *                               name or a folder another pattern names literally (dto, entities …)
@@ -54,8 +54,9 @@ export function subStyle(moduleDir: string): SubStyle {
 	const last = /\{(area|Area|area_snake)\}\/?$/.exec(moduleDir)?.[1] ?? "area";
 	return SUB_STYLES[last]!;
 }
-const GROUP: Record<string, string> = { name: "n", Name: "N", sub: "sub" };
-const PLACEHOLDERS = new Set(["area", "Area", "area_snake", "name", "Name", "sub"]);
+const GROUP: Record<string, string> = { name: "n", Name: "N", name_snake: "ns", sub: "sub" };
+const NAME_RE: Record<string, string> = { name: KEBAB, Name: PASCAL, name_snake: SNAKE };
+const PLACEHOLDERS = new Set(["area", "Area", "area_snake", "name", "Name", "name_snake", "sub"]);
 const pascal = (s: string) => s.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("");
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -70,14 +71,14 @@ type Matcher = { test(rel: string): boolean; pattern: string };
 /** A path pattern for one area → matcher. Throws on an unknown placeholder or a malformed group. */
 export function compilePattern(pattern: string, area: string, reserved: Set<string> = new Set(), sub: SubStyle = SUB_STYLES["area"]!): Matcher {
 	let src = "";
-	const seen = new Set<string>(); // {name} {Name} {sub} repeated in one path = the same value
+	const seen = new Set<string>(); // {name} {Name} {name_snake} {sub} repeated in one path = the same value
 	for (const m of pattern.matchAll(/\{([^}]*)\}|\(([^)]*)\)|([^{(]+)|(.)/g)) {
 		if (m[1] !== undefined) {
 			if (!PLACEHOLDERS.has(m[1])) throw new Error(`unknown placeholder {${m[1]}} in "${pattern}" (use ${[...PLACEHOLDERS].map((p) => `{${p}}`).join(" ")})`);
 			if (m[1] === "area") src += esc(area);
 			else if (m[1] === "Area") src += esc(pascal(area));
 			else if (m[1] === "area_snake") src += esc(area.replace(/-/g, "_"));
-			else src += seen.has(m[1]) ? `\\k<${GROUP[m[1]]}>` : (seen.add(m[1]), `(?<${GROUP[m[1]]}>${m[1] === "Name" ? PASCAL : m[1] === "sub" ? sub.re : KEBAB})`);
+			else src += seen.has(m[1]) ? `\\k<${GROUP[m[1]]}>` : (seen.add(m[1]), `(?<${GROUP[m[1]]}>${m[1] === "sub" ? sub.re : NAME_RE[m[1]]})`);
 		} else if (m[2] !== undefined) {
 			const words = m[2].split("|");
 			if (words.some((w) => !/^[A-Za-z0-9_.-]+$/.test(w))) throw new Error(`"(${m[2]})" in "${pattern}": only plain words separated by |`);
@@ -102,6 +103,7 @@ export function samplePath(pattern: string, area = "invoice", sub = "billing"): 
 		.replace(/\{Area\}/g, pascal(area))
 		.replace(/\{area_snake\}/g, area.replace(/-/g, "_"))
 		.replace(/\{name\}/g, "sample")
+		.replace(/\{name_snake\}/g, "sample")
 		.replace(/\{Name\}/g, "Sample")
 		.replace(/\{sub\}/g, sub)
 		.replace(/\(([^)|]*)(\|[^)]*)?\)/g, "$1");
@@ -168,7 +170,7 @@ export function validateLayoutRules(r: LayoutRules): string[] {
 		if (d) out.push(`"${x}" uses the banned folder "${d}"; rename the folder or drop it from forbidDirs`);
 	}
 	// a folder that may be any name is a catch-all: a sub-feature folder is {sub} (named after what it does, never a banned name)
-	for (const f of r.files) if (f.path.split("/").slice(0, -1).some((d) => /^\{(name|Name)\}$/.test(d) && !f.path.split("/").at(-1)!.startsWith(d))) out.push(`files: "${f.path}" allows a folder with any name; use {sub} for a sub-feature folder, a fixed folder name, or a folder named like its file ({Name}/{Name}.tsx)`);
+	for (const f of r.files) if (f.path.split("/").slice(0, -1).some((d) => /^\{(name|Name|name_snake)\}$/.test(d) && !f.path.split("/").at(-1)!.startsWith(d))) out.push(`files: "${f.path}" allows a folder with any name; use {sub} for a sub-feature folder, a fixed folder name, or a folder named like its file ({Name}/{Name}.tsx)`);
 	return out;
 }
 
@@ -194,6 +196,8 @@ export interface LayoutCheckOptions {
 	dataDirs?: string[];
 	isTestFile(path: string): boolean;
 	sourceExtensions?: string[];
+	/** Folders the stack's tools make that are never code (the adapter's layout.ignoreDirs: __pycache__, build …). */
+	ignoreDirs?: string[];
 	/** Stack-specific per-file findings (size, one class per file) that do not depend on the folder layout. */
 	fileFindings?(projectDir: string, file: string, moduleDir?: string, area?: string): string[];
 }
@@ -241,8 +245,8 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 		out.push(...placeProblems(projectDir, f, mod, area, r));
 	}
 	// the gate asks for the required files when a unit starts a feature folder; for older folders it is drift (tidy)
-	const startsFolder = !ctx.isNew || listFiles(join(projectDir, mod)).every((x) => isNew(mod + x));
-	if (touched && checkRequire && startsFolder) out.push(...missingRequired(projectDir, mod, area, r, files));
+	const startsFolder = !ctx.isNew || listFiles(join(projectDir, mod), o.ignoreDirs).every((x) => isNew(mod + x));
+	if (touched && checkRequire && startsFolder) out.push(...missingRequired(projectDir, mod, area, r, files, o.ignoreDirs));
 	return out;
 }
 
@@ -279,9 +283,9 @@ function placeProblems(projectDir: string, f: string, mod: string, area: string,
 }
 
 /** Every feature folder has the required files (on disk or written by this unit). */
-function missingRequired(projectDir: string, mod: string, area: string, r: LayoutRules, written: string[]): string[] {
+function missingRequired(projectDir: string, mod: string, area: string, r: LayoutRules, written: string[], ignore?: string[]): string[] {
 	if (!r.require?.length) return [];
-	const have = new Set([...listFiles(join(projectDir, mod)), ...written.filter((f) => f.startsWith(mod)).map((f) => f.slice(mod.length))]);
+	const have = new Set([...listFiles(join(projectDir, mod), ignore), ...written.filter((f) => f.startsWith(mod)).map((f) => f.slice(mod.length))]);
 	return r.require.filter((q) => ![...have].some((h) => compileFor(r, q, area).test(h))).map((q) => `${mod}: missing ${show(q, area)} (every feature folder has ${r.require.map((x) => show(x, area)).join(", ")}); create it`);
 }
 
@@ -297,7 +301,7 @@ export function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutChe
 	const placeholder = r.moduleDir.replace(/\/$/, "").split("/").at(-1)!;
 	const skip = new Set([...notAreas, ...[...o.sharedDirs, ...(o.dataDirs ?? [])].map((d) => topUnder(d, root)).filter((x): x is string => !!x)]);
 	const out: string[] = [];
-	const dirs = listDirs(join(projectDir, root)).filter((d) => !skip.has(d));
+	const dirs = listDirs(join(projectDir, root), o.ignoreDirs).filter((d) => !skip.has(d));
 	for (const d of dirs) {
 		const area = placeholder === "{area}" ? d : d.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/_/g, "-").toLowerCase();
 		const mod = expandModuleDir(r, area);
@@ -305,13 +309,13 @@ export function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutChe
 			if (!want || [...want].some((f) => f.startsWith(`${root}/${d}/`))) out.push(`${root}/${d}/: folder "${d}" does not follow ${r.moduleDir}`);
 			continue;
 		}
-		const files = listFiles(join(projectDir, mod)).map((f) => `${mod}/${f}`).filter((f) => !scaffold.has(f));
+		const files = listFiles(join(projectDir, mod), o.ignoreDirs).map((f) => `${mod}/${f}`).filter((f) => !scaffold.has(f));
 		const checked = want ? files.filter((f) => want.has(f)) : files;
 		if (!checked.length) continue;
 		out.push(...checkLayoutRules(checked, mod, area, projectDir, r, o, {}, !want));
 		for (const f of checked.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, mod, area, r, o));
 	}
-	const shared = o.sharedDirs.map(slashed).flatMap((s) => listFiles(join(projectDir, s)).map((f) => s + f)).filter((f) => !scaffold.has(f) && (!want || want.has(f)));
+	const shared = o.sharedDirs.map(slashed).flatMap((s) => listFiles(join(projectDir, s), o.ignoreDirs).map((f) => s + f)).filter((f) => !scaffold.has(f) && (!want || want.has(f)));
 	out.push(...checkLayoutRules(shared, "\0none", "", projectDir, r, o));
 	for (const f of shared.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, undefined, undefined, r, o));
 	return [...new Set(out)];
@@ -405,7 +409,7 @@ export function normalize(r: Partial<LayoutRules>): LayoutRules {
 export function withLayoutRules(adapter: TargetAdapter, root: string | undefined): TargetAdapter {
 	const base = { ...adapter.layout, sharedDirs: adapter.layout.sharedDirs.map(slashed) };
 	const rules = () => (root ? loadLayoutRules(root, adapter.id) : undefined);
-	const opts: LayoutCheckOptions = { sharedDirs: base.sharedDirs, dataDirs: base.dataDirs, isTestFile: (f) => base.isTestFile(f), sourceExtensions: base.sourceExtensions, fileFindings: base.fileFindings };
+	const opts: LayoutCheckOptions = { sharedDirs: base.sharedDirs, dataDirs: base.dataDirs, isTestFile: (f) => base.isTestFile(f), sourceExtensions: base.sourceExtensions, ignoreDirs: base.ignoreDirs, fileFindings: base.fileFindings };
 	const layout = {
 		...base,
 		moduleDir: (area: string) => {
@@ -480,18 +484,21 @@ function read(projectDir: string, f: string): string {
 	}
 }
 
-function listDirs(dir: string): string[] {
+/** Dot folders, node_modules and the stack's ignoreDirs are never code. */
+const skipped = (n: string, ignore: string[] = []) => n.startsWith(".") || n === "node_modules" || ignore.includes(n);
+
+function listDirs(dir: string, ignore?: string[]): string[] {
 	try {
-		return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules").map((e) => e.name).sort();
+		return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !skipped(e.name, ignore)).map((e) => e.name).sort();
 	} catch {
 		return [];
 	}
 }
 
-function listFiles(dir: string, prefix = ""): string[] {
+function listFiles(dir: string, ignore?: string[], prefix = ""): string[] {
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
-		.filter((n) => !n.startsWith(".") && n !== "node_modules")
+		.filter((n) => !skipped(n, ignore))
 		.sort()
-		.flatMap((n) => (statSync(join(dir, n)).isDirectory() ? listFiles(join(dir, n), `${prefix}${n}/`) : [`${prefix}${n}`]));
+		.flatMap((n) => (statSync(join(dir, n)).isDirectory() ? listFiles(join(dir, n), ignore, `${prefix}${n}/`) : [`${prefix}${n}`]));
 }
