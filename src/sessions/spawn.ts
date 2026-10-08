@@ -1,4 +1,4 @@
-import { getSourceAdapter } from "../adapters/registry.ts";
+import { findSourceAdapter } from "../adapters/registry.ts";
 import { CODEX_PROVIDER, modelRuntime, openRouterCost, priceAt, resolveCodexModel } from "../models/codex.ts";
 import { recordSpend } from "../spend.ts";
 import { describeArgs, progress } from "../progress.ts";
@@ -218,7 +218,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				reason = gate(path);
 				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""));
 			} else if (event.toolName === "bash") {
-				reason = ROLE_TOOLS[opts.role].includes("bash") ? bashTouchesReadOnly(String(input["command"] ?? ""), opts.config.source.path, opts.cwd, getSourceAdapter(opts.config.source.stack).traits?.mutatingCommands) : "bash is not available to this role";
+				reason = ROLE_TOOLS[opts.role].includes("bash") ? bashTouchesReadOnly(String(input["command"] ?? ""), opts.config.source.path, opts.cwd, findSourceAdapter(opts.config.source.stack)?.traits?.mutatingCommands) : "bash is not available to this role";
 			}
 			if (progress.aborting) return { block: true, terminate: true, reason: "stopped by the user" };
 			if (reason) {

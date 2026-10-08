@@ -397,7 +397,7 @@ function unitIdFor(files: string[], n: number): string {
 	return files.length > 1 ? `U${String(n).padStart(3, "0")}_${base}+${files.length - 1}` : `U${String(n).padStart(3, "0")}_${base}`;
 }
 
-function listFiles(root: string, adapter: SourceAdapter): string[] {
+export function listFiles(root: string, adapter: Pick<SourceAdapter, "include" | "exclude">): string[] {
 	const out: string[] = [];
 	// the adapter's globs, matched as globs (not just extensions); excluded dirs are pruned while walking
 	const include = adapter.include.map(globToRegExp);

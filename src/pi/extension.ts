@@ -984,7 +984,7 @@ export default function (pi: ExtensionAPI) {
 					const best = guesses.sort((a, b) => b.confidence - a.confidence)[0];
 					stackId = best && best.confidence > 0 ? best.id : undefined;
 				}
-				if (!stackId) return { error: `no source stack detected in ${params.source}` };
+				if (!stackId) return { error: `no source stack detected in ${params.source}: bigrefactor cannot read this language yet (br source-adapter has a model write the reader)` };
 				const targets = await Promise.all(params.to.map((id) => getTargetAdapter(id)));
 				const q = stackQuestions(getSourceAdapter(stackId), sourceRoot, targets, {}, loadDecisions(ctx.cwd).libraries);
 				return { sourceStack: stackId, ask: askUserQuestionBatches(q, targets) };

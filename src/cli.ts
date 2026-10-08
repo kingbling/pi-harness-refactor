@@ -35,6 +35,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br advise                    models judge what tables used to: library successors, unmapped framework classes (escalate model), open decisions (Jev)
   br decide [--json] [--answer id=value ...]   decision gate: everything the inventory cannot decide; run/L3 wait for it
   br profile [--force]         generate the legacy framework profile (loaders, routes-in-code, entry points, concerns) from the framework source; validated against the index
+  br source-adapter [--source <old>] [--id <lang>] [--force]   a model writes how to read a legacy language bigrefactor has no reader for (grammar, queries, truth runner); code checks it on the old code
   br frameworks                what the legacy framework/libraries do, app reliance per concern, platform/port/drop verdicts
   br rule [<stack>:] <words>   change how the new code is organised, in plain words (checked by code, shown before it applies); no words: show the layouts
   br layout                    layout preflight: units per stack, top areas, shared units, target tree, problems (br run refuses on problems)
@@ -243,6 +244,23 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { onboard } = await import("./init/onboard.ts");
 		const r = await onboard({ args });
 		if (!r.ok) process.exitCode = 1;
+	},
+	"source-adapter": async (args) => {
+		const { generateSourceAdapter, sourceAdaptersDir } = await import("./adapters/source/generated.ts");
+		const { findSourceAdapter } = await import("./adapters/registry.ts");
+		const { resolve } = await import("node:path");
+		const cfgPath = findConfigPath();
+		const loaded = cfgPath ? loadConfig(cfgPath) : undefined;
+		const root = loaded?.root ?? process.cwd();
+		const sourceRoot = flag(args, "--source") ? resolve(flag(args, "--source")!) : loaded?.config.source.path;
+		if (!sourceRoot) throw new Error("usage: br source-adapter [--source <old code>] [--id <language>] [--force] (in a workspace, the old code comes from the config)");
+		process.env["BR_WORKSPACE"] = root;
+		const id = flag(args, "--id") ?? loaded?.config.source.stack;
+		const saved = id ? join(sourceAdaptersDir(root), `${id}.json`) : undefined;
+		if (id && findSourceAdapter(id) && !(saved && existsSync(saved))) throw new Error(`${id} has a built-in adapter; a written one would not be used`);
+		if (saved && existsSync(saved) && !args.includes("--force")) return console.log(pc.dim(`${id} adapter already written at ${saved} (use --force to write it again)`));
+		const m = await generateSourceAdapter({ root, sourceRoot, id, config: loaded?.config, log: (l) => console.log(pc.dim(l)) });
+		console.log(pc.green(`source adapter ${m.id} written and checked: ${join(sourceAdaptersDir(root), `${m.id}.json`)}`));
 	},
 	profile: async (args) => {
 		const { generateProfile } = await import("./init/profile.ts");

@@ -5,7 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { CONFIG_FILE, ConfigSchema, saveConfig, type Config } from "../config.ts";
-import { getSourceAdapter, getTargetAdapter, knownSources, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
+import { findSourceAdapter, getSourceAdapter, getTargetAdapter, knownSources, registerGeneratedSources, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
 import { fetchDocs } from "./docs.ts";
@@ -41,6 +41,10 @@ export interface InitOptions {
 	embedded?: boolean;
 	/** Model client for stack advice; default: OpenRouter when a key resolves. `--no-llm` disables. */
 	client?: import("../models/types.ts").ModelClient;
+	/** Offline (`--no-llm`): no model writes a source adapter for a language bigrefactor cannot read yet. */
+	noLlm?: boolean;
+	/** The session that writes a source adapter manifest (tests: a scripted one; default: a model with tools). */
+	sourceWriter?: import("../adapters/source/generated.ts").ManifestWriter;
 }
 
 /** Terminal prompter: @clack/prompts, cancel exits the process like before. */
@@ -95,15 +99,28 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 	let targetPath = flag("--target");
 	let to = flag("--to") ? parseTargets(flag("--to")!).ids : undefined;
 	let db = flag("--db") as Config["db"]["strategy"] | undefined;
+	registerGeneratedSources(root);
+	/** No adapter reads this language yet: a model looks at the code and writes one; code checks it on the real files. */
+	const writeSourceAdapter = async (src: string, abs: string, id?: string): Promise<string> => {
+		if (opts.noLlm) throw new Error(`no source adapter reads ${src}${id ? ` (${id})` : ""} (have: ${knownSources().join(", ")}); without a model (--no-llm) none can be written`);
+		if (!yes) {
+			const go = await ui.select(`bigrefactor cannot read ${id ?? "this code"} yet. Let a model write the reader?\n   It looks at the old code, installs a parser (tree-sitter grammar) into the workspace and writes how to read the language. Code checks it on your files before anything uses it.`, [{ value: "write", label: "write and check it (recommended)" }, { value: "stop", label: "stop" }], "write");
+			if (go !== "write") throw cancelled();
+		}
+		const { generateSourceAdapter } = await import("../adapters/source/generated.ts");
+		const m = await generateSourceAdapter({ root, sourceRoot: abs, id, writer: opts.sourceWriter, log: (l) => ui.log(l) });
+		registerGeneratedSources(root);
+		return m.id;
+	};
 	// Survey before asking: every default below comes from what the legacy repo contains.
 	const runSurvey = async (src: string) => {
 		const { surveySource, recommend, renderSurvey } = await import("./survey.ts");
 		const abs = resolve(root, src);
 		const guesses = await Promise.all(knownSources().map(async (id) => ({ id, c: (await getSourceAdapter(id).detect(abs)).confidence })));
 		const best = guesses.sort((a, b) => b.c - a.c)[0];
-		const adapterId = stack ?? (best && best.c > 0 ? best.id : undefined);
-		// no adapter recognises the repo: say so instead of reading it as the first language we happen to support
-		if (!adapterId) throw new Error(`no source adapter recognises ${src} (have: ${knownSources().join(", ")}); pass the stack explicitly or add an adapter`);
+		let adapterId = stack ?? (best && best.c > 0 ? best.id : undefined);
+		// no adapter reads the repo (or the named stack): one is written for it, instead of reading it as the first language we happen to support
+		if (!adapterId || !findSourceAdapter(adapterId)) stack = adapterId = await writeSourceAdapter(src, abs, adapterId);
 		const survey = await surveySource(abs, getSourceAdapter(adapterId));
 		const rec = recommend(survey, src);
 		ui.log(renderSurvey(survey, rec));
@@ -140,7 +157,8 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 		const guesses = await Promise.all(knownSources().map(async (id) => ({ id, ...(await getSourceAdapter(id).detect(resolve(root, sourcePath ?? "."))) })));
 		const best = guesses.sort((a, b) => b.confidence - a.confidence)[0];
 		const label = (g: typeof best) => (g ? `${g.id}${g.framework ? "/" + g.framework : ""}${g.version ? " " + g.version : ""}` : "");
-		if (best && best.confidence >= 0.7) {
+		// --yes takes the recommendation: the best match, however sure
+		if (best && (best.confidence >= 0.7 || (yes && best.confidence > 0))) {
 			stack = best.id;
 			ui.log(`source stack: ${pc.cyan(label(best))} ${pc.dim(`(detected, confidence ${best.confidence})`)}`);
 		} else if (!yes) {
