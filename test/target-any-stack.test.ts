@@ -102,6 +102,7 @@ describe("--to names any stack", () => {
 	it("splits on commas and plus, not on spaces", () => {
 		expect(parseTargets("spring boot + react")).toEqual({ ids: ["react"], unknown: ["spring boot"] });
 		expect(parseTargets("nest, react")).toEqual({ ids: ["nestjs", "react"], unknown: [] });
+		expect(parseTargets("nest react")).toEqual({ ids: ["nestjs", "react"], unknown: [] });
 	});
 
 	it("an unknown target without a model fails with its name", async () => {

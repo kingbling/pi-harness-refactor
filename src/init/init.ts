@@ -374,7 +374,10 @@ export function parseTargets(text: string): { ids: string[]; unknown: string[] }
 	const unknown: string[] = [];
 	for (const raw of text.split(/\s*[,+&/]\s*|\s+and\s+/i).map((t) => t.trim().toLowerCase().replace(/\s+/g, " ")).filter(Boolean)) {
 		const id = targetIdFor(raw) ?? targetIdFor(raw.replace(/ /g, "-"));
-		if (!id) { if (!unknown.includes(raw)) unknown.push(raw); }
+		// "nest react": every word a known stack → several stacks; "spring boot" stays one name
+		const words = id ? [] : raw.split(" ").map((w) => targetIdFor(w));
+		if (words.length > 1 && words.every(Boolean)) { for (const w of words) if (!ids.includes(w!)) ids.push(w!); }
+		else if (!id) { if (!unknown.includes(raw)) unknown.push(raw); }
 		else if (!ids.includes(id)) ids.push(id);
 	}
 	return { ids, unknown };
