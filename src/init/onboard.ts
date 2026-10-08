@@ -358,6 +358,18 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			await setup(config, root);
 		});
 
+		// where the new code goes: the target repo's remote, and whether the run pushes there (asked once)
+		await step("remote", () => (config.target.git.pushAskedAt ? `push ${config.target.git.push}${config.target.git.remote ? ` (${config.target.git.remote})` : ""}` : undefined), async () => {
+			const { askPush } = await import("../run/push.ts");
+			const got = await askPush(config, ui, yes);
+			const { saveConfig } = await import("../config.ts");
+			const raw = loadConfig(configPath).config;
+			raw.target.git = { ...raw.target.git, ...got, pushAskedAt: yes ? raw.target.git.pushAskedAt : new Date().toISOString() };
+			saveConfig(root, raw);
+			reload();
+			return `push ${got.push}${got.remote ? ` → ${got.remote}` : ""}`;
+		});
+
 		await step("docs", () => (has(".bigrefactor", "docs", "index.json") || args.includes("--no-docs") ? "docs present" : undefined), async () => {
 			const { fetchDocs } = await import("./docs.ts");
 			const entries = await fetchDocs(config, root, { log: (l) => log(pc.dim(l)) });

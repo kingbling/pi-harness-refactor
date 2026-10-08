@@ -104,3 +104,50 @@ export function pushSetting(configPath: string, args: string[]): string {
 	const found = pushRemote(config.target.path, g.remote);
 	return `push ${g.push}: ${g.branch} → ${found ?? (g.remote ? `${g.remote} (no such remote in ${config.target.path})` : `no remote in ${config.target.path}`)}${g.push === "on" ? " (after merges, at most once a minute, and when a run ends)" : ""}\nchange: br push on|off [remote]  ·  in Pi: /br push on|off [remote]`;
 }
+
+function remoteUrl(repo: string, remote: string): string | undefined {
+	try {
+		return execFileSync("git", ["-C", repo, "remote", "get-url", remote], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Can this machine reach the remote without a password prompt? undefined = yes, else git's message. */
+function reachable(repo: string, remote: string): string | undefined {
+	try {
+		execFileSync("git", ["-C", repo, "ls-remote", "--heads", remote], { timeout: 30_000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: process.env["GIT_SSH_COMMAND"] ?? "ssh -o BatchMode=yes" } });
+		return undefined;
+	} catch (e: any) {
+		return String(e?.stderr ?? e?.message ?? e).trim().split("\n").slice(-1)[0];
+	}
+}
+
+/**
+ * Onboarding: where the new code goes. Shows the target repo's remote (if any) and asks whether the run pushes
+ * the migration branch there, to another URL, or not at all. Returns what to store in target.git.
+ */
+export async function askPush(config: Config, ui: { select(m: string, o: Array<{ value: string; label: string; hint?: string }>, i?: string): Promise<string | undefined>; text(m: string, i: string): Promise<string | undefined>; log(l: string): void }, yes: boolean): Promise<{ push: "on" | "off"; remote?: string }> {
+	const repo = config.target.path;
+	const remote = pushRemote(repo, config.target.git.remote);
+	const url = remote ? remoteUrl(repo, remote) : undefined;
+	if (yes) return { push: config.target.git.push, remote: config.target.git.remote };
+	const pick = await ui.select(
+		url ? `The new repo has the remote ${remote} → ${url}. Push the ${config.target.git.branch} branch there after merges?` : `The new repo (${repo}) has no remote. Should the run push the ${config.target.git.branch} branch somewhere after merges?`,
+		[
+			...(url ? [{ value: "on", label: `yes, push to ${remote}`, hint: "on the side, at most once a minute and when a run ends" }] : []),
+			{ value: "url", label: url ? "push to another URL (type it)" : "yes: add a remote (type its URL)" },
+			{ value: "off", label: "no, keep it local", hint: "br push on later" },
+		],
+		url ? "on" : "off",
+	);
+	if (pick === "on") return { push: "on", remote };
+	if (pick !== "url") return { push: "off", remote: config.target.git.remote };
+	const typed = (await ui.text("Remote URL of the new repo (git@… or https://…)", ""))?.trim();
+	if (!typed) return { push: "off", remote: config.target.git.remote };
+	const name = remote && remote !== "origin" ? "bigrefactor" : "origin";
+	execFileSync("git", ["-C", repo, "remote", ...(remoteUrl(repo, name) ? ["set-url", name, typed] : ["add", name, typed])], { stdio: ["ignore", "pipe", "pipe"] });
+	const err = reachable(repo, name);
+	ui.log(err ? `  ${name} → ${typed}: not reachable without a password yet (${err}); pushes retry after merges` : `  ${name} → ${typed}: reachable`);
+	return { push: "on", remote: name };
+}

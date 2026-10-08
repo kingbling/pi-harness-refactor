@@ -43,6 +43,8 @@ export const ConfigSchema = z.object({
 				push: z.enum(["off", "on"]).default("off"),
 				/** Which remote to push to; default: origin, else the repo's only remote. */
 				remote: z.string().optional(),
+				/** When onboarding asked about the remote and pushing (asked once). */
+				pushAskedAt: z.string().optional(),
 			})
 			.prefault({}),
 	}),

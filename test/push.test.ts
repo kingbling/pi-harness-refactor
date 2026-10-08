@@ -61,3 +61,26 @@ describe("pushing to the target's remote", () => {
 		expect(() => pushSetting(cfgPath, ["maybe"])).toThrow(/usage/);
 	});
 });
+
+describe("onboarding asks where the new code goes", () => {
+	const ui = (answers: string[]) => ({ asked: [] as string[], select: async function (m: string) { this.asked.push(m); return answers.shift(); }, text: async () => answers.shift(), log: () => {} });
+
+	it("with a remote: shows it and turns pushing on when the owner says yes", async () => {
+		const { askPush } = await import("../src/run/push.ts");
+		const { config } = setup(true);
+		const u = ui(["on"]);
+		expect(await askPush(config, u, false)).toEqual({ push: "on", remote: "origin" });
+		expect(u.asked[0]).toMatch(/remote origin → .*remote\.git/);
+	});
+
+	it("without one: the typed URL becomes origin and pushing is on; no answer keeps it local", async () => {
+		const { askPush } = await import("../src/run/push.ts");
+		const { root, target, config } = setup(false);
+		const bare = join(root, "other.git");
+		git(root, ["init", "-q", "--bare", bare]);
+		expect(await askPush(config, ui(["off"]), false)).toMatchObject({ push: "off" });
+		expect(await askPush(config, ui(["url", bare]), false)).toEqual({ push: "on", remote: "origin" });
+		expect(git(target, ["remote", "get-url", "origin"])).toBe(bare);
+		expect(await askPush(config, ui([]), true)).toMatchObject({ push: "off" }); // --yes: no question, nothing changes
+	});
+});
