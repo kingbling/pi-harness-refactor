@@ -36,6 +36,14 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 		const tot = Object.values(states).reduce((a, b) => a + b, 0);
 		lines.push(`  ${tier.padEnd(3)} ${bar(states["accepted"] ?? 0, tot)} ${states["accepted"] ?? 0}/${tot}`);
 	}
+	{
+		// how sure the parity of accepted units is: truth run on the old code, read from it (not run), or none
+		const t = ledger.db.prepare(`SELECT
+			SUM(EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_green_on_old')) run,
+			SUM(NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_green_on_old') AND EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_read')) read,
+			COUNT(*) n FROM units u WHERE u.state = 'accepted'`).get() as { run: number | null; read: number | null; n: number };
+		if (t.n) lines.push(`truth of accepted  run on old code ${t.run ?? 0}  ${c.yellow(`read, not run ${t.read ?? 0}`)}  none ${t.n - (t.run ?? 0) - (t.read ?? 0)}`);
+	}
 	const accepted = u["accepted"] ?? 0;
 	lines.push(`first-pass accepted ${s.firstPassAccepted}/${accepted}${accepted ? ` (${Math.round((100 * s.firstPassAccepted) / accepted)}%)` : ""}   cost $${s.costUsd.toFixed(3)}`);
 	for (const r of s.costByModel) lines.push(`  ${r.role.padEnd(11)} ${r.model.padEnd(28)} ${String(r.n).padStart(4)} calls  $${r.c.toFixed(3)}`);

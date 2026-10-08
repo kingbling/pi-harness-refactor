@@ -84,9 +84,10 @@ describe("runUnit wiring", () => {
 			({
 				run: async () => {
 					if (opts.role === "test") {
-						write(join(truthDir, "cases.php"), "<?php require 'vendor/autoload.php';\n");
+						write(join(truthDir, "cases.php"), "<?php require 'vendor/autoload.php'; require 'app/behaviour/commands/agency/create.cmd.php';\n");
 						write(join(truthDir, "cases.php.json"), '[{"symbol":"app/behaviour/commands/agency/create.cmd.php::create","inputs":[],"expected":1}]');
 						write(join(truthDir, "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
+						write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), "it('u1#1 creates', () => {});\n");
 					}
 					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
 				},
@@ -119,5 +120,46 @@ describe("runUnit wiring", () => {
 		expect(calls).toBe(0);
 		expect(ledger.openQuestions().map((x) => x.id)).toEqual([q]);
 		expect(ledger.blockedUnits().get("u1")).toEqual([q]);
+	});
+	it("truth that cannot run on the old code is read from it instead, marked as not run; no question", async () => {
+		rmSync(join(ws, ".bigrefactor", "truth", "u1"), { recursive: true, force: true });
+		ledger.db.prepare("DELETE FROM evidence").run();
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		const prompts: string[] = [];
+		const tester = async (opts: { role: string; systemPrompt: string }): Promise<LeafSession> =>
+			({
+				run: async (task: string) => {
+					if (opts.role === "test") {
+						prompts.push(opts.systemPrompt);
+						write(join(truthDir, "cases.php"), "<?php exit(1);\n"); // never runs green
+						if (task.includes("cases.json")) write(join(truthDir, "cases.json"), '[{"symbol":"app/behaviour/commands/agency/create.cmd.php::create","inputs":["Acme"],"expected":{"id":7}}]');
+						write(join(truthDir, "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
+						write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), "it('u1#1 creates', () => {});\n");
+					}
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: tester as never, gate, legacyFixer: false, log: () => {} });
+		expect(ledger.hasEvidence("u1", "truth_green_on_old")).toBe(false);
+		expect(ledger.hasEvidence("u1", "truth_read")).toBe(true);
+		expect(ledger.db.prepare("SELECT verified_on_old, ported_test_path FROM truth_cases WHERE unit_id = 'u1'").all()).toEqual([{ verified_on_old: 0, ported_test_path: "src/features/agency/agency.service.spec.ts" }]);
+		expect(prompts.at(-1)).toMatch(/cannot run here/);
+		expect(ledger.openQuestions()).toEqual([]);
+	});
+
+	it("every truth case needs a test naming its id: the tester adds what is missing, then the unit stops", async () => {
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t'), ('u1#2','u1','s','[]','2',1,'t')").run();
+		write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), "it('u1#1 a', () => {}); it('u1#12 b', () => {});\n");
+		const tasks: string[] = [];
+		const tester = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (t: string) => (opts.role === "test" && tasks.push(t), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+		let gates = 0;
+		const gate = async (): Promise<GateReport> => (gates++, { ok: true, steps: [], changedFiles: [], testFiles: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: tester as never, gate, log: () => {} });
+		expect(tasks.length).toBe(2);
+		expect(tasks[0]).toMatch(/u1#2/);
+		expect(r.state).toBe("quarantined");
+		expect(gates).toBe(0);
 	});
 });

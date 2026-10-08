@@ -219,7 +219,8 @@ export class Ledger {
 		}
 		if (!skipEvidenceCheck && (to === "tested" || to === "accepted") && s.unit_id) {
 			const required = to === "tested" ? REQUIRED_FOR_TESTED : REQUIRED_FOR_ACCEPTED;
-			const missing = required.filter((t) => !this.hasEvidence(s.unit_id!, t));
+			// read-not-run truth stands in for truth run on the old code (marked as such in truth_cases)
+			const missing = required.filter((t) => !this.hasEvidence(s.unit_id!, t) && !(t === "truth_green_on_old" && this.hasEvidence(s.unit_id!, "truth_read")));
 			if (missing.length) throw new LedgerError(`${id} -> ${to} needs evidence: ${missing.join(", ")}`);
 		}
 		this.db

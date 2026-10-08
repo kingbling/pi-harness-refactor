@@ -33,6 +33,8 @@ export interface TaskCard {
 	/** Where the unit's code leads outside its files (code map), with migration state per target. */
 	callTree: string[];
 	truthCases: number;
+	/** Cases written from reading the old code (it could not run): weaker, marked as such. */
+	truthRead?: number;
 	/** Cross-cutting helpers that already exist in the target (reuse, never reimplement). */
 	sharedHelpers: Array<{ id: string; kind: string; signature: string | null; doc: string | null }>;
 	/** Target symbols whose names resemble this unit's legacy symbols — check before creating. */
@@ -124,6 +126,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const routes = db.prepare(`SELECT method, path, handler_symbol AS handler FROM index_routes WHERE handler_symbol IN (${[...ids].map(() => "?").join(",") || "''"})`).all(...ids) as TaskCard["routes"];
 	const queries = (db.prepare(`SELECT symbol_id AS symbol, tables, text FROM index_queries WHERE symbol_id IN (${[...ids].map(() => "?").join(",") || "''"}) AND tables != '[]'`).all(...ids) as Array<{ symbol: string; tables: string; text: string | null }>).map((q) => ({ ...q, tables: JSON.parse(q.tables) as string[] }));
 	const truthCases = (db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ? AND verified_on_old = 1").get(unitId) as { n: number }).n;
+	const truthRead = (db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ? AND verified_on_old = 0").get(unitId) as { n: number }).n;
 
 	// legacy framework classes this unit leans on → what the platform provides (from the framework plan + decisions)
 	const fwRefs: TaskCard["frameworkRefs"] = [];
@@ -150,7 +153,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -274,7 +277,7 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		L.push("", "## Possibly already migrated elsewhere (target_lookup before creating)");
 		for (const h of card.reuseHints) L.push(`- ${h.legacy} ~ ${h.id} [${h.kind}]`);
 	}
-	L.push("", `## Truth: ${card.truthCases} characterization cases verified on the old code (truth_lookup tool)`);
+	L.push("", `## Truth: ${card.truthCases} characterization cases verified on the old code${card.truthRead ? `, ${card.truthRead} read from the old code but not run (it cannot run here)` : ""} (truth_lookup tool)`);
 	if (opts.includeSource) {
 		for (const f of card.files) {
 			L.push("", `## Source: ${f}`, "```" + config.source.stack);

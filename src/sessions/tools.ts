@@ -203,12 +203,12 @@ export function truthLookup(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "truth_lookup",
 		label: "Truth cases",
-		description: "Characterization cases recorded against the OLD code for a symbol of this unit: inputs → expected output. These are the behaviour you must preserve.",
+		description: "Characterization cases of the OLD code for a symbol of this unit: case id, inputs → expected output. Recorded by running the old code, or — marked — read from it when it cannot run. These are the behaviour you must preserve.",
 		promptSnippet: "truth_lookup: recorded old-code behaviour for a symbol",
 		parameters: Type.Object({ symbolId: Type.Optional(Type.String()) }),
 		execute: async (_id, p) => {
-			const rows = d.ledger.db.prepare(`SELECT symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ? AND verified_on_old = 1 ${p.symbolId ? "AND symbol_id = ?" : ""} ORDER BY symbol_id, id`).all(...(p.symbolId ? [d.unitId, p.symbolId] : [d.unitId])) as Array<{ symbol_id: string; inputs: string; expected: string }>;
-			return text(rows.length ? rows.map((r) => `${r.symbol_id}: ${r.inputs} → ${r.expected}`).join("\n") : "no verified truth cases for this unit yet");
+			const rows = d.ledger.db.prepare(`SELECT id, symbol_id, inputs, expected, verified_on_old FROM truth_cases WHERE unit_id = ? ${p.symbolId ? "AND symbol_id = ?" : ""} ORDER BY symbol_id, id`).all(...(p.symbolId ? [d.unitId, p.symbolId] : [d.unitId])) as Array<{ id: string; symbol_id: string; inputs: string; expected: string; verified_on_old: number }>;
+			return text(rows.length ? rows.map((r) => `${r.id} ${r.symbol_id}: ${r.inputs} → ${r.expected}${r.verified_on_old ? "" : " (read from the old code, not run)"}`).join("\n") : "no truth cases for this unit yet");
 		},
 	});
 }

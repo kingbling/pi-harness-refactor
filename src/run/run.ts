@@ -14,7 +14,8 @@ import { paidSince } from "../spend.ts";
 import { loadConfig, type Config } from "../config.ts";
 import { addWorktree, emptyWorktreeTrash, headOf, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
-import { getTargetAdapter } from "../adapters/registry.ts";
+import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
+import { probeLegacyEnv } from "./legacy-env.ts";
 import { resolveChoices } from "../init/stack.ts";
 import { indexTarget } from "../inventory/target.ts";
 import { applySlicePlan, planSlices, renderSlicePlan, type SliceOverrides } from "../inventory/slices.ts";
@@ -130,6 +131,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 	}
 	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
+	// ---- truth: can the old code run here? decided once per workspace (run → truth from running it, read → from reading it)
+	if (!o.dry && !o.spawn) {
+		await probeLegacyEnv({ config, root: o.root, source: getSourceAdapter(config.source.stack), log }).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
+	}
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
 	if (!o.dry) await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) });
 	// ---- layout preflight: one folder per legacy file must be caught before a run scales it
@@ -318,7 +323,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				 FROM units u
 				 WHERE u.state = 'planned' AND COALESCE(json_extract(u.meta, '$.stale'), 0) = 0
 				   AND substr(COALESCE(u.kind, ''), 1, 3) != 'db_' -- the DB lane has no tester truth to capture ahead
-				   AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type IN ('truth_ahead', 'truth_green_on_old'))`,
+				   AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type IN ('truth_ahead', 'truth_green_on_old', 'truth_read'))`,
 			)
 			.all() as Array<{ id: string; meta: string; open: number }>;
 		return rows

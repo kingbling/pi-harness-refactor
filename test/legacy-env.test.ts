@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { SourceAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
-import { describeTruthRun, fixLegacyEnv, legacyCopyTool, legacyRunTool, loadLegacyEnv, MAX_LEGACY_FIXES_PER_PROBLEM, verifyTruthOnOld, type LegacyFixer } from "../src/run/legacy-env.ts";
+import { describeTruthRun, fixLegacyEnv, legacyCopyTool, legacyRunTool, loadLegacyEnv, MAX_LEGACY_FIXES_PER_PROBLEM, notFromOldCode, probeLegacyEnv, verifyTruthOnOld, type LegacyFixer } from "../src/run/legacy-env.ts";
 
 /**
  * The old code runs for truth in its own environment: when its packages are missing, the setup model makes a
@@ -56,5 +56,26 @@ describe("the old code's environment", () => {
 		expect((await call(legacyRunTool(root, config), { cmd: "true", args: [], why: "cheat" })).content[0]!.text).toMatch(/refused/);
 		await call(legacyRunTool(root, config), { cmd: "sh", args: ["-e", "{script}"], why: "stop on the first error" });
 		expect(describeTruthRun(root, config, source, "/t/cases.sh")).toBe(`cd ${config.source.path} && sh -e /t/cases.sh`);
+	});
+
+	it("truth the old code did not produce is rejected: no legacy file loaded, or the results typed into the script", () => {
+		const files = ["app/model/offer.php"];
+		expect(notFromOldCode("<?php echo json_encode([]);", [], files)).toMatch(/loads none/);
+		const typed = "<?php require 'app/model/offer.php'; class Fake { function get() { return 123.45; } } echo json_encode([['symbol'=>'x','inputs'=>null,'expected'=>123.45]]);";
+		expect(notFromOldCode(typed, [{ symbol: "x", inputs: null, expected: 123.45 }], files)).toMatch(/written into the script/);
+		const real = "<?php require 'app/model/offer.php'; $o = new Offer('Acme Ltd'); echo json_encode([['symbol'=>'x','inputs'=>['Acme Ltd'],'expected'=>[$o->name(), $o->net()]]]);";
+		expect(notFromOldCode(real, [{ symbol: "x", inputs: ["Acme Ltd"], expected: ["Acme Ltd", 84.03] }], files)).toBeUndefined();
+	});
+
+	it("whether the old code runs is decided once per workspace by a probe the setup model writes", async () => {
+		const { root, config, source } = workspace();
+		let calls = 0;
+		const green: LegacyFixer = async (o) => (calls++, writeFileSync(o.script, "echo '[{\"symbol\":\"probe\",\"inputs\":null,\"expected\":\"ok\"}]'\n"), "it runs");
+		expect(await probeLegacyEnv({ config, root, source, fixer: green, log: () => {} })).toBe("run");
+		expect(await probeLegacyEnv({ config, root, source, fixer: green, log: () => {} })).toBe("run");
+		expect(calls).toBe(1);
+		const other = workspace();
+		expect(await probeLegacyEnv({ ...other, fixer: async () => "no php on this machine", log: () => {} })).toBe("read");
+		expect(loadLegacyEnv(other.root, other.config).mode).toBe("read");
 	});
 });
