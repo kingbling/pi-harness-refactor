@@ -378,7 +378,6 @@ export const phpAdapter: SourceAdapter = {
 		globalState: /\$_SESSION|\$_COOKIE|\$GLOBALS|^\s*global\s+\$|\bsession_(start|id|destroy)\(/m,
 		languageArtifacts: ["loose truthiness/emptiness checks (empty(), == between strings and numbers)", "implicit type coercion of numeric strings", "arrays used as untyped records"],
 		mutatingCommands: /\bcomposer\s+(install|update|require|remove)\b/,
-		layerDirs: ["classes", "class", "inc", "includes", "include", "lib", "libs", "model", "models", "controller", "controllers", "view", "views", "templates", "tpl", "modules"],
 		vendorDirs: ["vendor"],
 	},
 	include: ["**/*.php", "**/*.phtml", "**/*.inc"],

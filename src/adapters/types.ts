@@ -83,8 +83,6 @@ export interface SourceTraits {
 	languageArtifacts?: string[];
 	/** Shell commands that would change the legacy checkout or its dependencies (refused in agent sessions). */
 	mutatingCommands?: RegExp;
-	/** Directory names that are technical layers of this ecosystem (lowercase). Not used for placement: the area model reads the folder tree. */
-	layerDirs?: string[];
 	/** Directories holding third-party dependencies or build output (skipped by surveys and scans). */
 	vendorDirs?: string[];
 }
