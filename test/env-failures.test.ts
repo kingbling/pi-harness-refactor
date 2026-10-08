@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tsDiagnose, tsProjectNotes, tsTestRunner, tsVerifyChoices } from "../src/adapters/target/ts-index.ts";
 import { getTargetAdapter } from "../src/adapters/registry.ts";
 import { errorSignature } from "../src/run/run.ts";
+import { findingKey } from "../src/run/gate.ts";
 
 const isTest = (p: string) => /\.spec\.ts$/.test(p);
 function vitestProject(): string {
@@ -67,6 +68,16 @@ describe("environment failures (the @jest/globals incident)", () => {
 		// an area's bundle name is a file name, not the cause
 		const layout = (area: string) => `src/${area}/Repository/XRepositoryInterface.php: not an allowed file in the feature folder; allowed: ${area}Bundle.php | Controller/<Name>Controller.php`;
 		expect(errorSignature("structure_ok", layout("Customers"))).toBe(errorSignature("structure_ok", layout("Media")));
+	});
+
+	it("a reviewer finding in new words at the same place is the same finding; another place is not", () => {
+		const r = (...f: string[]) => `reviewer findings:\n${f.join("\n")}`;
+		const a = r("- src/Shared/file-storage/DocumentOwner.php:5: The namespace is not autoloadable. → Add a PSR-4 mapping.");
+		const b = r("- src/Shared/file-storage/DocumentOwner.php:5: App\\Shared\\FileStorage does not match the file's path. → Move the file.");
+		expect(findingKey("wired_ok", a)).toBe(findingKey("wired_ok", b));
+		expect(findingKey("wired_ok", a)).not.toBe(findingKey("wired_ok", r("- src/Shared/file-storage/DocumentOwner.php:5: same", "- src/Shared/file-storage/tests/DocumentOwnerTest.php: weak test")));
+		expect(findingKey("wired_ok", a)).not.toBe(findingKey("review_ok", a));
+		expect(findingKey("build_ok", "error TS2307: Cannot find module 'x'")).toBe(errorSignature("build_ok", "error TS2307: Cannot find module 'x'"));
 	});
 
 	it("a line that names no cause is not a shared key: summaries are skipped, assertions keep their test file", () => {

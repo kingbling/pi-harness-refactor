@@ -897,15 +897,17 @@ type Quarantined = { id: string; meta: string; at: string; reason: string | null
 const quarantinedUnits = (ledger: Ledger) =>
 	ledger.db.prepare("SELECT u.id, u.meta, t.created_at at, t.reason FROM units u JOIN transitions t ON t.id = (SELECT MAX(id) FROM transitions WHERE entity = 'unit' AND entity_id = u.id AND to_state = 'quarantined') WHERE u.state = 'quarantined'").all() as Quarantined[];
 
-function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string): void {
+/** Requeue a quarantined unit; it remembers the failure it heals from, so the same failure again is not retried blindly. */
+function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string, from: string): void {
 	requeueUnits(ledger, config, root, [id], "self-heal");
-	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion'), '$.autoHeals', ?, '$.retryNote', ?) WHERE id = ?").run(heals, note, id);
+	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion', '$.stuck'), '$.autoHeals', ?, '$.retryNote', ?, '$.healedFrom', ?) WHERE id = ?").run(heals, note, from, id);
 }
 
 /**
- * Quarantined units heal by themselves: back into the queue every run.healEveryMinutes, or sooner when something
- * changed after they failed (see lastFixAt), up to run.maxAutoHeals times. After that the owner is asked
- * (askStuckUnits; one question per kind of failure), and the answer is applied here.
+ * Quarantined units heal by themselves, up to run.maxAutoHeals times: back into the queue when something changed
+ * after they failed (see lastFixAt), or after run.healEveryMinutes when the failure is new. The same failure again
+ * with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model tries first, one
+ * question per kind of failure), and the answer is applied here.
  */
 export function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number } = {}): string[] {
 	const since = o.since ?? lastFixAt(config, root, manifests);
@@ -913,9 +915,17 @@ export function healQuarantined(ledger: Ledger, config: Config, root: string, ru
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean };
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
+		const failure = errorSignature("quarantine", r.reason ?? "");
+		const changed = ledgerTime(r.at) < since;
+		if (changed && meta.stuck && meta.healQuestion !== 0 && heals < config.run.maxAutoHeals) {
+			// something changed since the unit got stuck: that is worth a try, an open question about it or not
+			backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.`, failure);
+			back.push(r.id);
+			continue;
+		}
 		if (meta.healQuestion) {
 			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it
 			const q = ledger.getQuestion(meta.healQuestion);
@@ -925,14 +935,20 @@ export function healQuarantined(ledger: Ledger, config: Config, root: string, ru
 				ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
 				continue;
 			}
-			backInQueue(ledger, config, root, r.id, 0, `This unit was quarantined (${why}); the owner said to try again.${a.hint ? ` The owner's hint: ${a.hint}` : ""}`);
+			backInQueue(ledger, config, root, r.id, 0, `This unit was quarantined (${why}); the owner said to try again.${a.hint ? ` The owner's hint: ${a.hint}` : ""}`, failure);
 			back.push(r.id);
 			continue;
 		}
-		if (meta.healQuestion === 0 || heals >= config.run.maxAutoHeals) continue;
-		const at = ledgerTime(r.at);
-		if (at >= since && now - at < config.run.healEveryMinutes * 60_000) continue;
-		backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.`);
+		if (meta.healQuestion === 0 || meta.stuck || heals >= config.run.maxAutoHeals) continue;
+		if (!changed) {
+			// nothing changed and it failed the same way as before its last try: another try would only cost money
+			if (failure === meta.healedFrom) {
+				ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.stuck', json('true')) WHERE id = ?").run(r.id);
+				continue;
+			}
+			if (now - ledgerTime(r.at) < config.run.healEveryMinutes * 60_000) continue;
+		}
+		backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.`, failure);
 		back.push(r.id);
 	}
 	if (back.length) log(pc.cyan(`⚕ ${back.length} quarantined unit(s) back in the queue: ${back.slice(0, 5).join(", ")}${back.length > 5 ? ", …" : ""}`));
@@ -943,12 +959,12 @@ export function healQuarantined(ledger: Ledger, config: Config, root: string, ru
 export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: string; client?: ModelClient }): Promise<number> {
 	let asked = 0;
 	for (const r of quarantinedUnits(d.ledger)) {
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number };
-		if (meta.healQuestion !== undefined || (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals) continue;
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; stuck?: boolean };
+		if (meta.healQuestion !== undefined || (!meta.stuck && (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals)) continue;
 		const q = await askViaModel(d, {
 			point: "quarantine",
 			unitId: r.id,
-			facts: `${r.id} was quarantined and tried again automatically ${meta.autoHeals} times; it still fails: ${(r.reason ?? "").slice(0, 600)}. Other units with the same failure wait on this answer too.`,
+			facts: `${r.id} was quarantined and tried again automatically ${meta.autoHeals ?? 0} times; ${meta.stuck ? "the last try failed the same way as before and nothing changed in between (plugin, setup, environment), so it is not retried by itself" : "it still fails"}: ${(r.reason ?? "").slice(0, 600)}. Other units with the same failure wait on this answer too.`,
 			options: [
 				{ value: "retry", facts: "try again (after you fixed something; type a hint instead to steer the next attempt)" },
 				{ value: "leave", facts: "leave it quarantined for a human" },
