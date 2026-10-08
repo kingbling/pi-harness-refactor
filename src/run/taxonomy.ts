@@ -19,7 +19,9 @@ import { codePlace, covers, setTaxonomyRules, type PlacementRule } from "./place
  *   exclude  → not application code to migrate (tooling stubs, entry scripts, framework bootstrap) — always asked
  * Confident area/shared rules go into `.bigrefactor/placement.json` (by "taxonomy", replacing its earlier ones);
  * code only applies them (placement.ts). Planned units they now cover are moved there (source "taxonomy"). Files no
- * rule covers are left to Jev, one unit at a time. The result is kept in `.bigrefactor/areas.json` for review.
+ * rule covers are left to Jev, one unit at a time; when the area set changes, Jev's earlier picks are made again
+ * against it. One domain has one home: the model merges overlapping areas/topics itself, and what it cannot merge
+ * becomes one owner question. DB table groups are mapped onto the areas too. Kept in `.bigrefactor/areas.json`.
  */
 export interface AreaRule {
 	prefix: string;
@@ -41,7 +43,34 @@ interface Deps {
 	client?: ModelClient;
 }
 
-type Meta = { files?: string[]; lane?: string; route?: { has_ui?: number }; place?: { stack: string; area: string; shared: boolean; source: string }; exclude?: { question: number; why: string }; taxonomyQuestion?: number; taxonomyKeep?: number };
+type Meta = { files?: string[]; lane?: string; group?: string; businessArea?: string; tables?: string[]; route?: { has_ui?: number }; place?: { stack: string; area: string; shared: boolean; source: string }; exclude?: { question: number; why: string }; taxonomyQuestion?: number; taxonomyKeep?: number };
+
+/** Areas or topics of one stack that hold the same domain (topics as `shared/<topic>`); `into` is the name to keep. */
+export interface Overlap {
+	stack: string;
+	names: string[];
+	into: string;
+	why: string;
+}
+/** `.bigrefactor/areas.json` */
+interface AreasFile {
+	stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose: string }>; topics?: Array<{ name: string; purpose: string }> }>;
+	rules?: AreaRule[];
+	overlaps?: Overlap[];
+	/** The owner question about `overlaps`, and the last one applied. */
+	overlapQuestion?: number;
+	overlapDone?: number;
+	/** Overlaps the owner keeps apart: never raised again. */
+	overlapsKept?: Overlap[];
+	at?: string;
+	by?: string;
+}
+const readAreas = (root: string): AreasFile | undefined => (existsSync(areasPath(root)) ? (JSON.parse(readFileSync(areasPath(root), "utf8")) as AreasFile) : undefined);
+const writeAreas = (root: string, f: AreasFile) => (mkdirSync(dirname(areasPath(root)), { recursive: true }), writeFileSync(areasPath(root), JSON.stringify(f, null, 2) + "\n"));
+/** Every area and topic name of a curated set, `stack:area` / `stack:shared/topic`. */
+const namesOf = (f: AreasFile | undefined) => new Set((f?.stacks ?? []).flatMap((s) => [...s.areas.map((a) => `${s.stack}:${kebab(a.name)}`), ...(s.topics ?? []).map((t) => `${s.stack}:shared/${kebab(t.name)}`)]));
+const overlapKey = (o: Overlap) => `${o.stack}:${[...o.names].sort().join("+")}`;
+const areaName = (n: string) => (n.startsWith("shared/") ? `shared/${kebab(n.slice(7))}` : kebab(n));
 
 const ACT = 0.8;
 
@@ -70,9 +99,9 @@ export function currentAreas(ledger: Ledger): Array<{ key: string; stack: string
 	return [...by.values()].sort((a, b) => b.units - a.units);
 }
 
-export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } = {}): Promise<{ applied: number; moved: number; asked: number; areas: Record<string, string[]>; costUsd: number }> {
+export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } = {}): Promise<{ applied: number; moved: number; asked: number; areas: Record<string, string[]>; cleared: string[]; costUsd: number }> {
 	const log = opts.log ?? (() => {});
-	const none = { applied: 0, moved: 0, asked: 0, areas: {}, costUsd: 0 };
+	const none = { applied: 0, moved: 0, asked: 0, areas: {}, cleared: [] as string[], costUsd: 0 };
 	if (!d.client) return none;
 	const units = (d.ledger.db.prepare("SELECT id, state, deps, meta FROM units").all() as Array<{ id: string; state: string; deps: string; meta: string }>)
 		.map((u) => ({ ...u, m: JSON.parse(u.meta) as Meta }))
@@ -80,13 +109,15 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 	if (!units.length) return none;
 	const areas = currentAreas(d.ledger);
 	// idempotent: when every feature area is already in the curated set (and no area question is pending), nothing to do
-	const prev = existsSync(areasPath(d.root)) ? (JSON.parse(readFileSync(areasPath(d.root), "utf8")) as { stacks?: Array<{ stack: string; areas: Array<{ name: string }> }> }) : undefined;
+	const prev = readAreas(d.root);
 	const curated = new Set((prev?.stacks ?? []).flatMap((s) => s.areas.map((a) => `${s.stack}:${kebab(a.name)}`)));
 	if (prev && areas.every((a) => a.shared || a.fixed || curated.has(`${a.stack}:${a.area}`))) return { ...none, areas: Object.fromEntries((prev.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])) };
 	const source = getSourceAdapter(d.config.source.stack);
 	const surfaceOf = (f: string) => source.placeFile?.(f, d.config.source.path)?.surface;
 	const brief = await repoBrief(d);
 	const role = d.config.models.escalate;
+	const dbUnits = (d.ledger.db.prepare("SELECT id, state, meta FROM units").all() as Array<{ id: string; state: string; meta: string }>).map((u) => ({ ...u, m: JSON.parse(u.meta) as Meta })).filter((u) => u.m.lane === "db" && u.m.group);
+	const kept = prev?.overlapsKept ?? [];
 	const res = await d.client.chat({
 		model: role.id,
 		tier: role.tier as "default" | "flex" | "priority",
@@ -94,8 +125,10 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		schema: {
 			type: "object",
 			additionalProperties: false,
-			required: ["stacks", "rules"],
+			required: ["stacks", "rules", "overlaps", "db"],
 			properties: {
+				overlaps: { type: "array", description: "areas or topics that hold the same domain which you could NOT merge yourself (a FIXED one is involved, or you are unsure); the owner decides", items: { type: "object", additionalProperties: false, required: ["stack", "names", "into", "why"], properties: { stack: { type: "string" }, names: { type: "array", items: { type: "string" }, description: "area names; shared topics as shared/<topic>" }, into: { type: "string", description: "the one of names to keep" }, why: { type: "string" } } } },
+				db: { type: "array", description: "each database table group → the one area of yours its tables belong to", items: { type: "object", additionalProperties: false, required: ["group", "area"], properties: { group: { type: "string" }, area: { type: "string" } } } },
 				stacks: { type: "array", items: { type: "object", additionalProperties: false, required: ["stack", "areas", "topics"], properties: { stack: { type: "string" }, areas: { type: "array", items: { type: "object", additionalProperties: false, required: ["name", "purpose"], properties: { name: { type: "string" }, purpose: { type: "string" } } } }, topics: { type: "array", description: "the shared topics of this stack", items: { type: "object", additionalProperties: false, required: ["name", "purpose"], properties: { name: { type: "string" }, purpose: { type: "string", description: "one line: what code goes there" } } } } } } },
 				rules: {
 					type: "array",
@@ -127,19 +160,20 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 - Folders that hold one kind of file for all features (models, components, helpers, controllers) need file rules: use the names and the "used from" counts (which folders' code uses the file, ×n) to put each file with the feature that uses it; used by many features → shared.
 - Write a rule only where you are sure; another model places the files no rule covers one at a time.
 - "exclude" only for things that are not application behaviour to migrate (static-analysis stubs, entry/bootstrap scripts the new framework replaces); these are confirmed by the owner.
+- One domain, one home: an area and a shared topic, or two areas, for the same concept (documents next to file-storage, dashboards next to dashboard-layout) become one name in your areas, topics and rules. List in overlaps only those you cannot merge yourself; never one the owner keeps apart.
+- Map each database table group onto one of your areas in db (by what its tables hold).
 - Areas placed so far are listed with their units; FIXED areas stay as they are (keep their files there), others may be renamed or merged. confidence = how sure you are (0–1).`,
 			},
-			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nLegacy folder tree (folder, files, ui/server fact; then each file name up to its first dot, ← used from folder ×n):\n${treeFacts(units, surfaceOf)}\n\nAreas placed so far (key, units, sample files):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n") || "none yet"}` },
+			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nLegacy folder tree (folder, files, ui/server fact; then each file name up to its first dot, ← used from folder ×n):\n${treeFacts(units, surfaceOf)}\n\nAreas placed so far (key, units, sample files):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n") || "none yet"}${dbUnits.length ? `\n\nDatabase table groups (group, business area the table model named, tables):\n${dbUnits.map((u) => `${u.m.group}  ${u.m.businessArea ?? "-"}  ${(u.m.tables ?? []).slice(0, 6).join(", ")}`).join("\n")}` : ""}${kept.length ? `\n\nThe owner keeps these apart: ${kept.map((o) => `${o.stack}: ${o.names.join(" + ")}`).join("; ")}` : ""}` },
 		],
 	});
 	let cost = brief.costUsd + res.usage.costUsd;
-	const j = (res.json ?? {}) as { stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose: string }>; topics?: Array<{ name: string; purpose: string }> }>; rules?: AreaRule[] };
+	const j = (res.json ?? {}) as { stacks?: AreasFile["stacks"]; rules?: AreaRule[]; overlaps?: Overlap[]; db?: Array<{ group: string; area: string }> };
 	const files = units.flatMap((u) => u.m.files!);
 	// guards: a rule must cover a real file of the inventory and name a target stack
 	const rules = (j.rules ?? []).map((r) => ({ ...r, prefix: r.prefix.replace(/^\.\//, ""), area: kebab(r.area) })).filter((r) => r.prefix && (r.area || r.to === "exclude") && d.config.target.stacks.includes(r.stack) && files.some((f) => covers(r.prefix, f)));
-	const out = { stacks: j.stacks ?? [], rules, at: new Date().toISOString(), by: res.usage.model };
-	mkdirSync(dirname(areasPath(d.root)), { recursive: true });
-	writeFileSync(areasPath(d.root), JSON.stringify(out, null, 2) + "\n");
+	const out: AreasFile = { stacks: j.stacks ?? [], rules, at: new Date().toISOString(), by: res.usage.model, ...(kept.length ? { overlapsKept: kept } : {}) };
+	const changed = !prev || [...namesOf(prev)].sort().join() !== [...namesOf(out)].sort().join();
 
 	// confident rules: code applies them; the stack only where the adapter knows no surface for the covered files
 	const write: PlacementRule[] = rules
@@ -147,15 +181,29 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		.map((r) => ({ prefix: r.prefix, area: r.area, ...(files.some((f) => covers(r.prefix, f) && surfaceOf(f)) ? {} : { stack: r.stack }), ...(r.to === "shared" ? { shared: true } : {}) }));
 	setTaxonomyRules(d.root, write);
 
-	// planned units the rules now cover move there; answers, owner keeps, open questions and FIXED areas stay
+	// planned units the rules now cover move there; answers, owner keeps, open questions and FIXED areas stay.
+	// A unit Jev placed against another area set is placed again against this one (the caller does that): its pick was a guess.
 	const fixed = new Set(areas.filter((a) => a.fixed).map((a) => a.key));
 	let moved = 0;
+	const cleared: string[] = [];
 	for (const u of units) {
 		const p = u.m.place;
 		if (u.state !== "planned" || !p || p.source === "answer" || u.m.taxonomyKeep || u.m.taxonomyQuestion || fixed.has(`${p.stack}:${p.shared ? "shared/" : ""}${p.area}`)) continue;
 		const c = codePlace(d.config, { files: u.m.files, route: u.m.route }, d.root);
-		if (c.unsure || c.place.source !== "override" || (c.place.stackId === p.stack && c.place.area === p.area && c.place.shared === p.shared)) continue;
+		if (c.unsure || c.place.source !== "override") {
+			if (changed && p.source === "model") (d.ledger.updateUnit(u.id, { meta: { place: undefined } }), cleared.push(u.id));
+			continue;
+		}
+		if (c.place.stackId === p.stack && c.place.area === p.area && c.place.shared === p.shared) continue;
 		d.ledger.updateUnit(u.id, { meta: { place: { stack: c.place.stackId, area: c.place.area, shared: c.place.shared, source: "taxonomy" } } });
+		moved++;
+	}
+	// DB table groups go to the area the model mapped them to (an owner's answer stays)
+	for (const m of j.db ?? []) {
+		const u = dbUnits.find((x) => x.m.group === m.group);
+		const area = kebab(m.area ?? "");
+		if (!u || !area || u.state !== "planned" || u.m.place?.source === "answer" || u.m.place?.area === area) continue;
+		d.ledger.updateUnit(u.id, { meta: { place: { stack: u.m.place?.stack ?? d.config.target.stacks[0]!, area, shared: false, source: "taxonomy" } } });
 		moved++;
 	}
 
@@ -181,8 +229,99 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		// the units wait for the answer: placement treats a unit with an open taxonomy question as unplaced
 		for (const u of hit) d.ledger.updateUnit(u.id, { meta: { taxonomyQuestion: q.id } });
 	}
-	log(`areas: ${rules.length} rules from the folder tree, ${write.length} applied, ${moved} unit(s) moved, ${asked} asked; ${(j.stacks ?? []).map((s) => `${s.stack} ${s.areas.length} areas`).join(", ")}`);
-	return { applied: write.length, moved, asked, areas: Object.fromEntries((j.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])), costUsd: cost };
+	// overlaps the model could not merge: one owner question for all of them (not while an earlier one is open)
+	const overlaps = (j.overlaps ?? [])
+		.map((o) => ({ ...o, names: [...new Set(o.names.map(areaName).filter(Boolean))], into: areaName(o.into) }))
+		.filter((o) => d.config.target.stacks.includes(o.stack) && o.names.length > 1 && o.names.includes(o.into) && !kept.some((k) => overlapKey(k) === overlapKey(o)));
+	const openBefore = prev?.overlapQuestion && d.ledger.getQuestion(prev.overlapQuestion)?.status === "open" ? prev.overlapQuestion : undefined;
+	if (openBefore) Object.assign(out, { overlaps: prev!.overlaps, overlapQuestion: openBefore });
+	else if (overlaps.length) {
+		const q = await askViaModel(d, {
+			point: "area_overlap",
+			facts: `Area review of the new codebase: these areas/topics look like one domain each, but the area model could not merge them on its own:\n${overlaps.map((o) => `- ${o.stack}: ${o.names.join(" + ")} → keep ${o.into} (${o.why})`).join("\n")}\nmerge = their planned units and rules move to the kept name (units already migrated stay where they are); keep = they stay apart and are not raised again.`,
+			options: [{ value: "merge", facts: "one home per domain: merge as listed" }, { value: "keep", facts: "keep them apart" }],
+			recommended: "merge",
+			blocks: "none",
+			askedBy: "taxonomy",
+			context: { overlaps },
+		});
+		cost += q.costUsd;
+		asked++;
+		Object.assign(out, { overlaps, overlapQuestion: q.id });
+	} else if (prev?.overlapQuestion) Object.assign(out, { overlaps: prev.overlaps, overlapQuestion: prev.overlapQuestion });
+	if (prev?.overlapDone) out.overlapDone = prev.overlapDone;
+	writeAreas(d.root, out);
+	syncOverlapAnswer(d);
+	log(`areas: ${rules.length} rules from the folder tree, ${write.length} applied, ${moved} unit(s) moved, ${cleared.length} Jev pick(s) to redo, ${asked} asked; ${(j.stacks ?? []).map((s) => `${s.stack} ${s.areas.length} areas`).join(", ")}`);
+	return { applied: write.length, moved, asked, cleared, areas: Object.fromEntries((j.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])), costUsd: cost };
+}
+
+/**
+ * The owner's answer on overlapping areas: merge moves the planned units and the rules of the other names to the
+ * kept one and drops those names from the curated set; keep remembers them so they are never raised again.
+ */
+export function syncOverlapAnswer(d: Pick<Deps, "ledger" | "root">): boolean {
+	const f = readAreas(d.root);
+	if (!f?.overlapQuestion || f.overlapDone === f.overlapQuestion) return false;
+	const q = d.ledger.getQuestion(f.overlapQuestion);
+	if (!q || (q.status !== "answered" && q.status !== "auto")) return false;
+	const overlaps = f.overlaps ?? [];
+	if (answerValue(q.answer) === "merge") {
+		const split = (n: string) => (n.startsWith("shared/") ? { area: n.slice(7), shared: true } : { area: n, shared: false });
+		const rows = d.ledger.db.prepare("SELECT id, state, meta FROM units").all() as Array<{ id: string; state: string; meta: string }>;
+		const file = join(d.root, ".bigrefactor", "placement.json");
+		const rules = existsSync(file) ? ((JSON.parse(readFileSync(file, "utf8")) as { rules?: PlacementRule[] }).rules ?? []) : [];
+		for (const o of overlaps) {
+			const into = split(o.into);
+			const gone = o.names.filter((n) => n !== o.into).map(split);
+			for (const r of rows) {
+				const p = (JSON.parse(r.meta) as Meta).place;
+				if (r.state === "planned" && p && p.stack === o.stack && gone.some((g) => g.area === p.area && g.shared === p.shared)) d.ledger.updateUnit(r.id, { meta: { place: { stack: o.stack, area: into.area, shared: into.shared, source: "taxonomy" } } });
+			}
+			for (const r of rules) {
+				if ((r.stack && r.stack !== o.stack) || !gone.some((g) => g.area === r.area && g.shared === !!r.shared)) continue;
+				r.area = into.area;
+				if (into.shared) r.shared = true;
+				else delete r.shared;
+			}
+			const s = f.stacks?.find((x) => x.stack === o.stack);
+			if (s) {
+				s.areas = s.areas.filter((a) => !gone.some((g) => !g.shared && g.area === kebab(a.name)));
+				s.topics = (s.topics ?? []).filter((t) => !gone.some((g) => g.shared && g.area === kebab(t.name)));
+			}
+		}
+		if (rules.length) writeFileSync(file, JSON.stringify({ rules }, null, 2) + "\n");
+	} else f.overlapsKept = [...(f.overlapsKept ?? []), ...overlaps];
+	f.overlapDone = f.overlapQuestion;
+	writeAreas(d.root, f);
+	return true;
+}
+
+/** A shared topic named in an answer joins the curated set, so the next units can be placed there too. */
+export function recordTopic(root: string, stack: string, name: string, purpose: string): void {
+	const f = readAreas(root);
+	if (!f?.stacks) return; // nothing curated yet: the first curation sees the topic among the placed areas
+	let s = f.stacks.find((x) => x.stack === stack);
+	if (!s) f.stacks.push((s = { stack, areas: [], topics: [] }));
+	if ((s.topics ?? []).some((t) => kebab(t.name) === name)) return;
+	s.topics = [...(s.topics ?? []), { name, purpose }];
+	writeAreas(root, f);
+}
+
+/**
+ * Not application code (the owner said so): the unit's files are accounted as dropped with the reason, the unit never
+ * runs, and the disposition is kept with the owner's decisions so a re-inventory keeps it.
+ */
+export function excludeUnit(d: Pick<Deps, "ledger" | "root">, unitId: string, files: string[], question: number, why: string): void {
+	const reason = `excluded by the owner (question #${question}): ${why}`;
+	for (const f of files) d.ledger.markRegenerated(f, reason);
+	d.ledger.updateUnit(unitId, { meta: { taxonomyQuestion: undefined, placeQuestion: undefined, exclude: { question, why } } });
+	if (!files.length) return;
+	const p = join(d.root, ".bigrefactor", "decisions.json");
+	const file = loadDecisions(d.root) as ReturnType<typeof loadDecisions> & { excluded?: Record<string, string> };
+	file.excluded = { ...file.excluded, ...Object.fromEntries(files.map((f) => [f, reason])) };
+	mkdirSync(dirname(p), { recursive: true });
+	writeFileSync(p, JSON.stringify(file, null, 2) + "\n");
 }
 
 /**
@@ -239,9 +378,8 @@ function treeFacts(units: Array<{ id: string; deps: string; m: Meta }>, surfaceO
 /** Answered taxonomy questions → placement (apply), unchanged (keep) or excluded units. */
 export function syncTaxonomyAnswers(d: Pick<Deps, "ledger" | "root">): number {
 	const rows = d.ledger.db.prepare("SELECT id, meta FROM units WHERE json_extract(meta,'$.taxonomyQuestion') IS NOT NULL").all() as Array<{ id: string; meta: string }>;
-	let n = 0;
+	let n = syncOverlapAnswer(d) ? 1 : 0;
 	const rules: Array<{ prefix: string; area: string; stack?: string; shared?: boolean }> = [];
-	const excluded: Record<string, string> = {};
 	for (const r of rows) {
 		const meta = JSON.parse(r.meta) as Meta & { taxonomyQuestion: number };
 		const q = d.ledger.getQuestion(meta.taxonomyQuestion);
@@ -257,24 +395,12 @@ export function syncTaxonomyAnswers(d: Pick<Deps, "ledger" | "root">): number {
 			for (const f of meta.files ?? []) rules.push({ prefix: f, area: m.area, stack: m.stack, ...(m.to === "shared" ? { shared: true } : {}) });
 		} else if (m && v === "exclude") {
 			// not application behaviour: a file disposition (symbols accounted as dropped with the owner's reason), never scheduled
-			const why = `excluded by the owner (question #${q.id}): ${m.why}`;
-			for (const f of meta.files ?? []) {
-				d.ledger.markRegenerated(f, why);
-				excluded[f] = why;
-			}
-			d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined, exclude: { question: q.id, why: m.why } } });
+			excludeUnit(d, r.id, meta.files ?? [], q.id, m.why);
 		}
 		else d.ledger.updateUnit(r.id, { meta: { taxonomyQuestion: undefined, taxonomyKeep: q.id } }); // keep is remembered: never re-asked
 		n++;
 	}
 	addPlacementRules(d.root, rules);
-	if (Object.keys(excluded).length) {
-		// persisted with the owner's decisions so a re-inventory keeps the disposition
-		const p = join(d.root, ".bigrefactor", "decisions.json");
-		const file = loadDecisions(d.root) as ReturnType<typeof loadDecisions> & { excluded?: Record<string, string> };
-		file.excluded = { ...file.excluded, ...excluded };
-		writeFileSync(p, JSON.stringify(file, null, 2) + "\n");
-	}
 	return n;
 }
 

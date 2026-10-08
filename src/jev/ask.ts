@@ -289,7 +289,8 @@ export interface AskRequest {
  * "leave", "exclude", "stop" and the like, and every environment question (gate_env, truth_env: a human did something), are always asked.
  */
 const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
-	placement: () => true,
+	// an area or topic: yes; "not app code" drops work (the owner confirms), "new topic" needs a name (the resolver model reads the code and names it)
+	placement: (v) => v !== "not-app-code" && v !== "new-topic",
 	quirk: () => true,
 	// a rule the curator calls breaking: the model weighs it against the goals; the owner can still change it later
 	rule_change: () => true,

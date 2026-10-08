@@ -10,7 +10,7 @@ import { JEV_ACT as ACT, noulConfidence, type Battery } from "../jev/questions.t
 import type { Ledger, UnitRow } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { folderArea, kebab, SHARED_AREA } from "./areas.ts";
-import { areasPath, curateAreas, syncTaxonomyAnswers, taxonomyHold } from "./taxonomy.ts";
+import { areasPath, curateAreas, excludeUnit, recordTopic, syncTaxonomyAnswers, taxonomyHold } from "./taxonomy.ts";
 
 /**
  * Where a unit lands in the target: which stack, which legacy area (one area = one feature module per stack),
@@ -53,14 +53,18 @@ export interface PlacementRule {
 	/** "taxonomy": written by the area model; its next pass replaces them. Answers' and the owner's rules stay. */
 	by?: "taxonomy";
 }
-type UnitMeta = { files?: string[]; route?: { has_ui?: number }; place?: StoredPlace; placeQuestion?: number };
+type UnitMeta = { files?: string[]; route?: { has_ui?: number }; place?: StoredPlace; placeQuestion?: number; lane?: string };
 
 const POINT = "placement";
 
 export function placeUnit(config: Config, metaJson: string, root?: string): Placement {
 	const meta = JSON.parse(metaJson) as UnitMeta;
 	const p = meta.place;
-	if (p?.area && config.target.stacks.includes(p.stack)) return mk(p.stack, p.area, p.shared, p.source);
+	if (p?.area && config.target.stacks.includes(p.stack)) {
+		const placed = mk(p.stack, p.area, p.shared, p.source);
+		// DB units sit in their business area but all write the stack's one data dir: one DB unit at a time
+		return meta.lane === "db" ? { ...placed, moduleKey: `${p.stack}:db` } : placed;
+	}
 	return codePlace(config, meta, root).place;
 }
 
@@ -248,69 +252,106 @@ export async function resolvePlacements(d: PlacementDeps): Promise<{ placed: num
 		const m = JSON.parse(u.meta) as UnitMeta;
 		return u.state === "planned" && !plan.get(u.id)!.stored && !openQuestion(d.ledger, m.placeQuestion) && !taxonomyHold(u.meta);
 	});
-	const res = { placed: 0, byModel: 0, asked: 0, shared: 0, costUsd: 0 };
-	const save = (id: string, p: Placement, extra: Partial<StoredPlace> = {}) => {
-		settleQuestions(d.ledger, id, `superseded: placed at ${p.moduleKey} (${p.source})`);
-		d.ledger.updateUnit(id, { meta: { place: { stack: p.stackId, area: p.area, shared: p.shared, source: p.source, ...extra } satisfies StoredPlace } });
-		res.placed++;
-		if (p.shared) res.shared++;
+	// counted per unit: a guess the curated set dropped is placed twice but counts once
+	const placed = new Map<string, Placement>();
+	const asked = new Set<string>();
+	let costUsd = 0;
+	const pass: PlacePass = {
+		save: (id, p, extra = {}) => {
+			settleQuestions(d.ledger, id, `superseded: placed at ${p.moduleKey} (${p.source})`);
+			d.ledger.updateUnit(id, { meta: { place: { stack: p.stackId, area: p.area, shared: p.shared, source: p.source, ...extra } satisfies StoredPlace } });
+			placed.set(id, p);
+			asked.delete(id);
+		},
+		asked: (id) => void (asked.add(id), placed.delete(id)),
+		cost: (usd) => void (costUsd += usd),
 	};
 	let unsure: UnitRow[] = [];
 	for (const u of todo) {
 		const p = plan.get(u.id)!;
-		if (!p.unsure) save(u.id, p.place);
+		if (!p.unsure) pass.save(u.id, p.place);
 		else {
 			unsure.push(u);
 			if (d.force) d.ledger.updateUnit(u.id, { meta: { place: undefined } }); // a stale guess must not feed the taxonomy
 		}
 	}
+	// after curation: units still without a placement (and guesses the new set dropped) go to code first, then Jev
+	const stillUnsure = (ids: string[]) =>
+		ids.flatMap((id) => {
+			const row = d.ledger.getUnit(id)!;
+			if (row.state !== "planned" || (JSON.parse(row.meta) as UnitMeta).place || taxonomyHold(row.meta)) return [];
+			const c = codePlace(d.config, JSON.parse(row.meta) as UnitMeta, d.root);
+			if (!c.unsure) return (pass.save(id, c.place), []);
+			plan.set(id, { ...c, stored: false });
+			return [row];
+		});
 	if (d.curate && d.client && todo.length) {
 		// only when this pass placed something (re-runs stay free); the whole area set at once: business areas per stack; its rules may now place units code was unsure about
 		const t = await curateAreas({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { log });
-		res.costUsd += t.costUsd;
-		unsure = unsure.filter((u) => {
-			const row = d.ledger.getUnit(u.id)!;
-			if ((JSON.parse(row.meta) as UnitMeta).place || taxonomyHold(row.meta)) return false;
-			const c = codePlace(d.config, JSON.parse(row.meta) as UnitMeta, d.root);
-			if (c.unsure) return true;
-			save(u.id, c.place);
-			return false;
-		});
+		costUsd += t.costUsd;
+		unsure = stillUnsure([...new Set([...unsure.map((u) => u.id), ...t.cleared])]);
 	}
-	if (unsure.length) {
-		// after curation: placements as they are now (curated areas), so candidates come from the curated set
-		const ctx = candidateContext(d.config, d.root, d.ledger.listUnits(), planPlacements(d.config, d.ledger.listUnits(), d.root));
-		let next = 0;
-		// code unsure → Jev; Jev unsure, failing or absent → a question (only that unit waits, never a code guess)
-		const work = async () => {
-			for (let u = unsure[next++]; u; u = unsure[next++]) {
-				const code = plan.get(u.id)!;
-				try {
-					const r = d.client ? await modelPlace(d, u, code, ctx).catch((e) => (log(`  place ${u.id}: Jev failed (${(e as Error).message.split("\n")[0]}); asking`), undefined)) : undefined;
-					res.costUsd += r?.costUsd ?? 0;
-					if (r?.place) (save(u.id, r.place, { confidence: r.confidence, decision: r.decision }), res.byModel++);
-					else if (r) res.asked++;
-					else (res.costUsd += await askPlacement(d, u, code, ctx), res.asked++);
-				} catch (e) {
-					log(`  place ${u.id}: ${(e as Error).message.split("\n")[0]}`);
-				}
-			}
-		};
-		await Promise.all(Array.from({ length: Math.max(1, d.concurrency ?? 16) }, work));
-	}
+	await placeUnsure(d, unsure, plan, pass);
 	// no curated set yet (fresh repo: the model proposed areas) or areas outside it (new area from code or an answer): curate once more
 	const curatedNow = curatedAreas(d.root);
 	if (d.curate && d.client && todo.length && (!curatedNow || outsideCurated(d.ledger, curatedNow).length)) {
 		const t = await curateAreas({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { log });
-		res.costUsd += t.costUsd;
+		costUsd += t.costUsd;
+		// the guesses the new set dropped are placed again right away, against it (no further curation)
+		await placeUnsure(d, stillUnsure(t.cleared), plan, pass);
 	}
 	// placed by another route meanwhile (taxonomy rules, an answer to a similar file): their old questions go
 	for (const u of d.ledger.listUnits()) {
 		const m = JSON.parse(u.meta) as UnitMeta;
 		if (m.place && openQuestion(d.ledger, m.placeQuestion)) settleQuestions(d.ledger, u.id, `superseded: placed at ${m.place.stack}:${m.place.area} (${m.place.source})`, ["placeQuestion"]);
 	}
+	const ps = [...placed.values()];
+	const res = { placed: ps.length, byModel: ps.filter((p) => p.source === "model").length, asked: asked.size, shared: ps.filter((p) => p.shared).length, costUsd };
 	if (todo.length) log(`  placed ${res.placed}/${todo.length} units (${res.byModel} by Jev, ${res.shared} shared), ${res.asked} placement question(s), $${res.costUsd.toFixed(4)}`);
 	return res;
+}
+
+interface PlacePass {
+	save: (id: string, p: Placement, extra?: Partial<StoredPlace>) => void;
+	asked: (id: string) => void;
+	cost: (usd: number) => void;
+}
+
+/**
+ * Code unsure → Jev; Jev unsure, failing or absent → a question (only that unit waits, never a code guess). Units
+ * of one legacy folder go one after another, so each sees where its siblings were just placed; folders run side by side.
+ */
+async function placeUnsure(d: PlacementDeps, unsure: UnitRow[], plan: Map<string, Planned>, pass: PlacePass): Promise<void> {
+	if (!unsure.length) return;
+	const log = d.log ?? (() => {});
+	// placements as they are now (curated areas), so candidates come from the curated set
+	const ctx = candidateContext(d.config, d.root, d.ledger.listUnits(), planPlacements(d.config, d.ledger.listUnits(), d.root));
+	const byFolder = new Map<string, UnitRow[]>();
+	for (const u of unsure) {
+		const dir = dirname((JSON.parse(u.meta) as UnitMeta).files?.[0] ?? "");
+		byFolder.set(dir, [...(byFolder.get(dir) ?? []), u]);
+	}
+	const folders = [...byFolder.values()];
+	let next = 0;
+	const work = async () => {
+		for (let group = folders[next++]; group; group = folders[next++]) {
+			for (const u of group) {
+				const code = plan.get(u.id)!;
+				try {
+					const r = d.client ? await modelPlace(d, u, code, ctx).catch((e) => (log(`  place ${u.id}: Jev failed (${(e as Error).message.split("\n")[0]}); asking`), undefined)) : undefined;
+					pass.cost(r?.costUsd ?? 0);
+					if (r?.place) {
+						pass.save(u.id, r.place, { confidence: r.confidence, decision: r.decision });
+						learn(ctx, u, r.place);
+					} else if (r) pass.asked(u.id);
+					else (pass.cost(await askPlacement(d, u, code, ctx)), pass.asked(u.id));
+				} catch (e) {
+					log(`  place ${u.id}: ${(e as Error).message.split("\n")[0]}`);
+				}
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: Math.max(1, d.concurrency ?? 16) }, work));
 }
 
 /** Withdraws a unit's open placement (and area) questions and forgets them; owner exclusions are never touched. */
@@ -400,6 +441,14 @@ function candidateContext(config: Config, root: string, units: UnitRow[], plan: 
 	return { byDir, count, features, topics, deps: new Map(units.map((u) => [u.id, JSON.parse(u.deps) as string[]])), plan };
 }
 
+/** A unit Jev just placed counts for the units after it: its folder siblings and the code around it see where it went. */
+function learn(ctx: ReturnType<typeof candidateContext>, u: UnitRow, p: Placement): void {
+	const label = placeLabel(p);
+	ctx.plan.set(u.id, { place: p, surfaceKnown: true, stored: true });
+	ctx.count.set(`${p.stackId}:${label}`, (ctx.count.get(`${p.stackId}:${label}`) ?? 0) + 1);
+	for (const f of (JSON.parse(u.meta) as UnitMeta).files ?? []) (ctx.byDir.get(dirname(f)) ?? ctx.byDir.set(dirname(f), []).get(dirname(f))!).push(label);
+}
+
 /** One thing Jev may pick: a feature area or a shared topic, with its one-line purpose. */
 type Cand = { area: string; shared: boolean; purpose: string };
 /** Options Jev chooses from, and the options a placement question shows (most relevant first, the rest cut). */
@@ -413,9 +462,10 @@ const MAX_ASKED = 12;
  */
 function around(u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>, stacks: string[]) {
 	const files = (JSON.parse(u.meta) as UnitMeta).files ?? [];
+	// only placements that hold (rule, answer, curated set, a sure Jev pick): code's unsure guess is a legacy folder name, no area
 	const labelOf = (id: string) => {
-		const p = ctx.plan.get(id)?.place;
-		return p && placeLabel(p);
+		const p = ctx.plan.get(id);
+		return p && !p.unsure ? placeLabel(p.place) : undefined;
 	};
 	const generic = (l: string) => l === SHARED_AREA || l === placeLabel({ area: SHARED_AREA, shared: true });
 	const tally = (xs: Array<string | undefined>) => {
@@ -443,6 +493,12 @@ function around(u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateConte
 	return { files, neighbours, uses, usedBy, cands: cands.slice(0, MAX_CHOICES) };
 }
 
+/** Jev's choice and the question's answer for code that is no app behaviour (test data, tool stub, dead script): dropped only when the owner confirms. */
+const NOT_APP = "not_app_code";
+export const NOT_APP_VALUE = "not-app-code" as const;
+/** The answer for code no area or topic fits: the answerer names a new shared topic (`<stack>:shared/<name>`). */
+export const NEW_TOPIC = "new-topic" as const;
+
 /** Jev's option key for a candidate: `campaigns`, `shared__dates`. */
 const choiceKey = (c: Cand) => `${c.shared ? "shared__" : ""}${c.area.replace(/-/g, "_")}`;
 
@@ -452,15 +508,16 @@ async function modelPlace(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Retu
 	const battery: Battery = {
 		area: {
 			type: "choice",
-			instructions: "Which existing feature area of the app does the code in `summary` belong to, or which shared topic if it is cross-cutting code several features use? `neighbours` are the areas of the files in the same folder, `uses` the areas of the code it depends on, `used_by` the areas of the code that depends on it (`shared/<topic>` = a shared topic). Pick `other` when none fits.",
+			instructions: "Which existing feature area of the app does the code in `summary` belong to, or which shared topic if it is cross-cutting code several features use? `neighbours` are the areas its sibling files in the same folder were placed in, `uses` the areas of the code it depends on, `used_by` the areas of the code that depends on it (`shared/<topic>` = a shared topic). Pick `not_app_code` when it is no app behaviour to carry over, `other` when it is app code but none fits.",
 			criteria: {
 				...Object.fromEntries(cands.map((c) => [choiceKey(c), `${c.shared ? `shared topic "${c.area}" (cross-cutting code)` : `feature "${c.area}"`}${c.purpose ? `: ${c.purpose}` : ""}`])),
 				other: "none of these fits: the code needs a new feature area or shared topic",
+				not_app_code: "not application code to migrate: test data or fixtures, a tool or static-analysis stub, a dead or one-off script",
 			},
 		},
 	};
 	if (!code.surfaceKnown && d.config.target.stacks.length > 1) battery["ui"] = { type: "noul", instructions: "Does the code in `summary` render HTML, templates, or browser-side scripts or styles?" };
-	const r = await decide({ client: d.client!, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id, secondWhen: (a) => a["area"]?.type === "choice" && a["area"].choice !== "other" }, POINT, { summary: excerpt(d.config, files), path: files[0], neighbours: Object.fromEntries(neighbours), uses: Object.fromEntries(uses), used_by: Object.fromEntries(usedBy) }, battery, Object.keys(battery), u.id);
+	const r = await decide({ client: d.client!, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id, secondWhen: (a) => a["area"]?.type === "choice" && a["area"].choice !== "other" && a["area"].choice !== NOT_APP }, POINT, { summary: excerpt(d.config, files), path: files[0], neighbours: Object.fromEntries(neighbours), uses: Object.fromEntries(uses), used_by: Object.fromEntries(usedBy) }, battery, Object.keys(battery), u.id);
 	const a = r.answers["area"];
 	const choice = a?.type === "choice" ? a.choice : "other";
 	const ui = r.answers["ui"];
@@ -476,14 +533,15 @@ async function modelPlace(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Retu
 		...(so ? [`second opinion (${r.second!.model}, read the same code): ${String(so["area"])}${typeof soUi === "number" ? `, renders UI p=${soUi.toFixed(2)}` : ""}`] : []),
 	].join("; ");
 	const second = soPick ? { stackId: typeof soUi === "number" ? stackFor(d.config, soUi >= 0.5 ? "ui" : "server") : stackId, area: soPick.area, shared: soPick.shared, model: r.second!.model } : undefined;
-	return { costUsd: r.costUsd + (await askPlacement(d, u, code, ctx, picked ? { stackId, area: picked.area, shared: picked.shared, facts, decision: r.decisionId, second } : { stackId, facts, decision: r.decisionId, second })) };
+	const where = picked ? { area: picked.area, shared: picked.shared } : { none: choice === NOT_APP ? NOT_APP_VALUE : NEW_TOPIC };
+	return { costUsd: r.costUsd + (await askPlacement(d, u, code, ctx, { stackId, ...where, facts, decision: r.decisionId, second })) };
 }
 
 /**
  * One placement question (phrased by a model) offering the known areas and topics; only this unit waits. `pick` =
  * Jev's unsure pick, if Jev ran; `pick.second` = the stronger model's pick, which the question then recommends.
  */
-async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>, pick?: { stackId: string; area?: string; shared?: boolean; facts: string; decision?: number; second?: { stackId: string; area: string; shared: boolean; model: string } }): Promise<number> {
+async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>, pick?: { stackId: string; area?: string; shared?: boolean; none?: typeof NOT_APP_VALUE | typeof NEW_TOPIC; facts: string; decision?: number; second?: { stackId: string; area: string; shared: boolean; model: string } }): Promise<number> {
 	const stacks = code.surfaceKnown ? [code.place.stackId] : d.config.target.stacks;
 	const { files, neighbours, uses, usedBy, cands } = around(u, code, ctx, stacks);
 	const stackId = pick?.stackId ?? code.place.stackId;
@@ -500,16 +558,24 @@ async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Re
 			if (ctx.features.get(s)?.size && !vocab?.has(c.area)) continue; // a stack without known areas yet (fresh repo): the candidates are proposals
 			add(value(s, c.area, c.shared), `${c.shared ? "shared topic (cross-cutting code)" : "feature area"}${c.purpose ? `: ${c.purpose}` : ""}; ${ctx.count.get(`${s}:${placeLabel(c)}`) ?? 0} units already placed there`);
 		}
+	// what no area holds is an answer too: no app code (the owner confirms the drop), or a new shared topic the answerer names
+	const none: AskOption[] = [
+		{ value: NEW_TOPIC, facts: `app code no listed area or topic fits: a new shared topic; answer ${stackId}:shared/<name> with the name (a concept such as cron or ids, never the file's name)` },
+		{ value: NOT_APP_VALUE, facts: "not app code to carry over (test data, a tool or analysis stub, a dead or one-off script): the unit is dropped from the migration once the owner confirms" },
+	];
+	if (pick?.none) options.unshift(...none.filter((o) => o.value === pick.none));
 	const shown = options.slice(0, MAX_ASKED);
-	// cross-cutting is always an answer, even before any shared topic exists (another topic name can be typed)
-	for (const s of stacks) if (!shown.some((o) => o.value.startsWith(`${s}:shared/`))) shown.push({ value: value(s, SHARED_AREA, true), facts: "the stack's shared dir (cross-cutting code); type <stack>:shared/<topic> for a named topic" });
+	// cross-cutting is always an answer, even before any shared topic exists
+	for (const s of stacks) if (!shown.some((o) => o.value.startsWith(`${s}:shared/`))) shown.push({ value: value(s, SHARED_AREA, true), facts: "the stack's shared dir (cross-cutting code)" });
+	for (const o of none) if (!shown.some((x) => x.value === o.value)) shown.push(o);
 	const recommended = shown[0]!.value;
 	const facts = [
 		`unit ${u.id}, files: ${files.join(", ")}`,
 		`code could not place it (${code.unsure}); it never names an area after a single legacy file`,
 		pick?.facts ?? "Jev did not place it (no model, or the call failed)",
-		`areas of files in the same folder: ${JSON.stringify(Object.fromEntries(neighbours))}; it uses: ${JSON.stringify(Object.fromEntries(uses))}; used by: ${JSON.stringify(Object.fromEntries(usedBy))}`,
-		`options are the curated business areas (<stack>:<area>) and shared topics (<stack>:shared/<topic>), most relevant first; a typed area name is taken as a new area on ${stackId}`,
+		`areas its sibling files in the same folder were placed in: ${JSON.stringify(Object.fromEntries(neighbours))}; areas of the code it uses: ${JSON.stringify(Object.fromEntries(uses))}; areas of the code that uses it: ${JSON.stringify(Object.fromEntries(usedBy))} (placements that hold only)`,
+		`options are the curated business areas (<stack>:<area>) and shared topics (<stack>:shared/<topic>), most relevant first; ${NEW_TOPIC} and ${NOT_APP_VALUE} when none fits`,
+		`start of the code:\n${excerpt(d.config, files).slice(0, 1200)}`,
 	].join("\n");
 	const q = await askViaModel(
 		{ ledger: d.ledger, config: d.config, root: d.root, client: d.client },
@@ -545,15 +611,26 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 	for (const r of rows) {
 		const ctx = (r.context ? JSON.parse(r.context) : {}) as { defaultStack?: string };
 		const v = answerValue(r.answer);
-		const m = /^([\w-]+):(shared\/)?([\w-]+)$/.exec(v);
+		const files = (JSON.parse(r.meta) as UnitMeta).files ?? [];
+		const qid = (JSON.parse(r.meta) as UnitMeta).placeQuestion!;
+		if (v === NOT_APP_VALUE) {
+			// the owner (never the run itself) said it is no app code: dropped from the migration like an area exclusion
+			excludeUnit({ ledger, root }, r.id, files, qid, "not app code to carry over (placement question)");
+			done.push(r.id);
+			continue;
+		}
+		// "new-topic: cron" names the topic; a bare "new-topic" names nothing and is asked again
+		const named = /^new-topic\s*:\s*([\w-]+)/i.exec(r.answer ?? "");
+		const m = named ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", named[1]] as const) : /^([\w-]+):(shared\/)?([\w-]+)$/.exec(v);
 		const stack = m && config.target.stacks.includes(m[1]!) ? m[1]! : (ctx.defaultStack ?? stackFor(config, "server"));
-		const area = kebab(m ? m[3]! : v);
+		const area = v === NEW_TOPIC && !named ? "" : kebab(m ? m[3]! : v);
 		if (!area) {
 			ledger.updateUnit(r.id, { meta: { placeQuestion: undefined } }); // unusable answer: the next placement pass asks again
 			continue;
 		}
 		const shared = !!m?.[2] || area === SHARED_AREA;
 		ledger.updateUnit(r.id, { meta: { place: { stack, area, shared, source: "answer" } satisfies StoredPlace } });
+		if (shared && area !== SHARED_AREA) recordTopic(root, stack, area, `named in answer to placement question #${qid}`); // the curated set knows it from now on
 		// similar files (same dir + stem) follow the answer's area; its stack only where the adapter cannot tell the surface
 		const source = getSourceAdapter(config.source.stack);
 		addRules(root, ((JSON.parse(r.meta) as UnitMeta).files ?? []).map((f) => ({ prefix: similarPrefix(f), area, ...(source.placeFile?.(f, config.source.path)?.surface ? {} : { stack }), ...(shared ? { shared } : {}) })));

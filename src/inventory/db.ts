@@ -688,7 +688,9 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 	const want: Array<{ id: string; kind: string; deps: string[]; meta: Record<string, unknown> }> = [];
 	const groups = tables.length ? plan.groups : [{ name: "all", tables: [] as DbTable[] }];
 	for (const g of groups) {
-		want.push({ id: unitId(g.name), kind, deps: [], meta: { ...base, group: g.name, ...("area" in g && g.area ? { businessArea: g.area } : {}), tables: g.tables.map((t) => t.name), loc: g.tables.reduce((a, t) => a + t.ddl.split("\n").length, 0) } });
+		// the unit sits in its tables' business area (the area's code finds it there); "db" only when no area was named
+		const area = "area" in g && g.area ? g.area : undefined;
+		want.push({ id: unitId(g.name), kind, deps: [], meta: { ...base, place: { ...place, area: kebab(area ?? "") || "db" }, group: g.name, ...(area ? { businessArea: area } : {}), tables: g.tables.map((t) => t.name), loc: g.tables.reduce((a, t) => a + t.ddl.split("\n").length, 0) } });
 	}
 	const engineChange = !!config.db.to && config.db.from.some((f) => f.toLowerCase() !== config.db.to!.toLowerCase());
 	const notMigrated = new Set(plan.dropped.map((d) => d.table.toLowerCase()));
@@ -698,7 +700,9 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 		if (!u) ledger.createUnit({ id: w.id, tier: "T0", kind: w.kind, deps: w.deps, meta: w.meta, symbolIds: [] });
 		else if (u.state === "planned") {
 			ledger.db.prepare("UPDATE units SET kind = ?, deps = ? WHERE id = ?").run(w.kind, JSON.stringify(w.deps), w.id);
-			ledger.updateUnit(w.id, { meta: w.meta });
+			// an area the curated set or the owner gave the unit stays
+			const kept = (JSON.parse(u.meta) as { place?: { source?: string } }).place;
+			ledger.updateUnit(w.id, { meta: kept?.source === "taxonomy" || kept?.source === "answer" ? { ...w.meta, place: kept } : w.meta });
 		}
 	}
 	const removed = removeStale(new Set(want.map((w) => w.id)));

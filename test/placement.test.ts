@@ -370,3 +370,102 @@ describe("placement rules left from an earlier setup", () => {
 		expect(pruneRules(ws, config)).toEqual([]);
 	});
 });
+
+describe("placement: what no area holds, siblings, re-placement, overlaps", () => {
+	const phrase = { json: { id: "placement", question: "Where?", options: [], recommended: "", opinion: "" } };
+
+	it("not app code is an answer: Jev's pick is recommended, never decided by the run, and the owner's yes drops the unit", async () => {
+		const client = new FakeModelClient({
+			decide: (req) => ((req.state as { path?: string }).path?.includes("uuid") ? { area: "not_app_code", ui: false } : { area: "agency", ui: false }),
+			// the phrasing model agrees: still the owner's call
+			chat: () => ({ json: { id: "placement", question: "Is uuid test data?", options: [], recommended: "not-app-code", opinion: "looks like a stub" } }),
+		});
+		await resolvePlacements({ ledger, config, root: ws, client });
+		const q = ledger.openQuestions().find((x) => x.unit_id === "uuid")!;
+		expect(q.status).toBe("open");
+		const opts = (JSON.parse(q.options!) as string[]).map((o) => o.split(" — ")[0]);
+		expect(opts[0]).toBe("not-app-code");
+		expect(opts).toContain("new-topic");
+		ledger.answerQuestion(q.id, "not-app-code — not app code", "human");
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["uuid"]);
+		expect(unplacedReason(config, ledger.getUnit("uuid")!.meta, ws)).toMatch(/excluded/);
+		expect(JSON.parse(readFileSync(join(ws, ".bigrefactor", "decisions.json"), "utf8")).excluded["app/lib/components/uuid.cls.php"]).toMatch(/question #\d+/);
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual([]); // applied once
+	});
+
+	it("no area fits: a new shared topic the answerer names; it joins the curated set; a bare 'new-topic' is asked again", async () => {
+		writeFileSync(join(ws, ".bigrefactor", "areas.json"), JSON.stringify({ stacks: [{ stack: "nestjs", areas: [{ name: "agency", purpose: "" }, { name: "campaign", purpose: "" }], topics: [] }] }));
+		const client = new FakeModelClient({ decide: (req) => ((req.state as { path?: string }).path?.includes("uuid") ? { area: "other", ui: false } : { area: "agency", ui: false }), chat: () => ({ json: { ...phrase.json, recommended: "new-topic" } }) });
+		await resolvePlacements({ ledger, config, root: ws, client });
+		const q = ledger.openQuestions().find((x) => x.unit_id === "uuid")!;
+		expect(q.status).toBe("open"); // a name is needed: the resolver model (it reads the code) or the owner gives it
+		expect(JSON.parse(q.context!).recommended).toBe("new-topic");
+		ledger.answerQuestion(q.id, "new-topic", "human");
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual([]);
+		expect(JSON.parse(ledger.getUnit("uuid")!.meta).placeQuestion).toBeUndefined(); // asked again on the next pass
+		const q2 = ledger.askQuestion({ point: "placement", unitId: "uuid", question: "q", blocks: "unit", askedBy: "placement", context: { defaultStack: "nestjs" } });
+		ledger.updateUnit("uuid", { meta: { placeQuestion: q2 } });
+		ledger.answerQuestion(q2, "new-topic: ids", "resolver model");
+		applyPlacementAnswers(ledger, config, ws);
+		expect(place("uuid")).toMatchObject({ stackId: "nestjs", area: "ids", shared: true, source: "answer" });
+		const areas = JSON.parse(readFileSync(join(ws, ".bigrefactor", "areas.json"), "utf8"));
+		expect(areas.stacks[0].topics.map((t: { name: string }) => t.name)).toEqual(["ids"]);
+	});
+
+	it("facts: folder siblings placed in the same pass count; what uses the unit counts only where its placement holds", async () => {
+		for (const f of ["app/lib/openx/advertisercreate.php", "app/lib/openx/advertiserdelete.php", "app/www/thing.php"]) {
+			mkdirSync(dirname(join(config.source.path, f)), { recursive: true });
+			writeFileSync(join(config.source.path, f), "<?php // openx\n");
+		}
+		unit("adv_create", ["app/lib/openx/advertisercreate.php"]);
+		unit("adv_delete", ["app/lib/openx/advertiserdelete.php"]);
+		unit("www_thing", ["app/www/thing.php"], ["uuid"]); // unsure itself: its folder name is no area
+		const client = new FakeModelClient({ decide: () => ({ area: "campaign", ui: false }), chat: () => phrase });
+		await resolvePlacements({ ledger, config, root: ws, client, concurrency: 4 });
+		const stateOf = (path: string) => (client.calls.find((c) => c.kind === "decide" && (c.req as unknown as { state: { path?: string } }).state.path === path)!.req as unknown as { state: { neighbours: Record<string, number>; used_by: Record<string, number> } }).state;
+		expect(stateOf("app/lib/openx/advertiserdelete.php").neighbours).toEqual({ campaign: 1 });
+		expect(stateOf("app/lib/components/uuid.cls.php").used_by).toEqual({});
+		expect(JSON.stringify(client.calls)).not.toMatch(/"www"/);
+	});
+
+	it("when the curated set changes, Jev's earlier picks are made again against it; answers stay", async () => {
+		ledger.updateUnit("money", { meta: { place: { stack: "nestjs", area: "agency", shared: false, source: "model" } } });
+		ledger.updateUnit("fpdf", { meta: { place: { stack: "nestjs", area: "campaign", shared: false, source: "answer" } } });
+		const client = new FakeModelClient({
+			chat: (req) => (req.messages[0]!.content.includes("feature-module structure") ? { json: { stacks: [{ stack: "nestjs", areas: [{ name: "agency", purpose: "" }, { name: "campaign", purpose: "" }, { name: "billing", purpose: "money and invoices" }] }], rules: [], overlaps: [], db: [] } } : phrase),
+			decide: (req) => ((req.state as { path?: string }).path?.includes("money") ? { area: "billing" } : { area: "agency" }),
+		});
+		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		expect(place("money")).toMatchObject({ area: "billing", source: "model" });
+		expect(place("fpdf")).toMatchObject({ area: "campaign", source: "answer" });
+	});
+
+	it("one domain, one home: overlaps the model cannot merge are one owner question; merge moves units and rules", async () => {
+		ledger.updateUnit("uuid", { meta: { place: { stack: "nestjs", area: "file-storage", shared: true, source: "answer" } } });
+		addRules({ prefix: "app/lib/components/uuid.", area: "file-storage", shared: true });
+		const curation = { stacks: [{ stack: "nestjs", areas: [{ name: "documents", purpose: "" }, { name: "agency", purpose: "" }], topics: [{ name: "file-storage", purpose: "" }] }], rules: [], db: [], overlaps: [{ stack: "nestjs", names: ["documents", "shared/file-storage"], into: "documents", why: "both hold uploaded files" }] };
+		const client = new FakeModelClient({ chat: (req) => (req.messages[0]!.content.includes("feature-module structure") ? { json: curation } : undefined), decide: () => ({ area: "agency" }) });
+		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		const qs = ledger.openQuestions().filter((q) => q.point === "area_overlap");
+		expect(qs).toHaveLength(1);
+		ledger.answerQuestion(qs[0]!.id, "merge", "human");
+		await resolvePlacements({ ledger, config, root: ws, client });
+		expect(place("uuid")).toMatchObject({ area: "documents", shared: false, source: "taxonomy" });
+		expect(JSON.parse(readFileSync(rulesPath(), "utf8")).rules).toContainEqual({ prefix: "app/lib/components/uuid.", area: "documents" });
+		const areas = JSON.parse(readFileSync(join(ws, ".bigrefactor", "areas.json"), "utf8"));
+		expect(areas.stacks[0].topics).toEqual([]);
+		expect(ledger.openQuestions().filter((q) => q.point === "area_overlap")).toHaveLength(0);
+	});
+
+	it("DB table groups are mapped onto the curated areas", async () => {
+		ledger.createUnit({ id: "DB_schema_alerts", tier: "T0", kind: "db_schema", deps: [], meta: { lane: "db", group: "operational_alerts", businessArea: "alerts", tables: ["adminalerts"], files: [], place: { stack: "nestjs", area: "alerts", shared: false, source: "code" } }, symbolIds: [] });
+		const client = new FakeModelClient({
+			chat: (req) => (req.messages[0]!.content.includes("feature-module structure") ? { json: { stacks: [{ stack: "nestjs", areas: [{ name: "agency", purpose: "" }, { name: "campaign", purpose: "" }] }], rules: [], overlaps: [], db: [{ group: "operational_alerts", area: "agency" }] } } : phrase),
+			decide: () => ({ area: "agency" }),
+		});
+		await resolvePlacements({ ledger, config, root: ws, client, curate: true });
+		const prompt = JSON.stringify(client.calls.find((c) => JSON.stringify(c).includes("feature-module structure")));
+		expect(prompt).toContain("operational_alerts  alerts  adminalerts");
+		expect(place("DB_schema_alerts")).toMatchObject({ area: "agency", source: "taxonomy", moduleKey: "nestjs:db" });
+	});
+});
