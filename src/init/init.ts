@@ -5,7 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { CONFIG_FILE, ConfigSchema, saveConfig, type Config } from "../config.ts";
-import { findSourceAdapter, getSourceAdapter, getTargetAdapter, knownSources, registerGeneratedSources, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
+import { findSourceAdapter, getSourceAdapter, getTargetAdapter, knownSources, knownTargets, registerGeneratedSources, registerGeneratedTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
 import { fetchDocs } from "./docs.ts";
@@ -84,6 +84,7 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 		return i >= 0 ? args[i + 1] : undefined;
 	};
 	const yes = args.includes("--yes");
+	const noLlm = opts.noLlm ?? args.includes("--no-llm");
 	const root = resolve(opts.root ?? process.cwd());
 	const ui = opts.prompter ?? terminalPrompter;
 	const terminal = ui === terminalPrompter;
@@ -97,12 +98,45 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 	let sourcePath = flag("--source");
 	let stack = flag("--stack");
 	let targetPath = flag("--target");
-	let to = flag("--to") ? parseTargets(flag("--to")!).ids : undefined;
 	let db = flag("--db") as Config["db"]["strategy"] | undefined;
 	registerGeneratedSources(root);
+	registerGeneratedTargets(root);
+	/** No adapter builds this target stack yet: a model writes one from the stack's official tooling, checked on a scratch project. */
+	const writeTargetAdapter = async (name: string, known: string[]): Promise<string> => {
+		const id = name.replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, "");
+		if (noLlm) throw new Error(`unknown target "${name}" (have: ${knownTargets().join(", ")}); without a model (--no-llm) no adapter can be written for it`);
+		let role: "server" | "ui" = known.some((k) => TARGET_ROLES[k] === "server") ? "ui" : "server";
+		if (!yes) {
+			const pick = await ui.select(`bigrefactor has no ${name} adapter yet. A model writes one from ${name}'s official tooling; it is checked on a scratch project before anything uses it. What part of the app does ${name} build?`, [{ value: "server", label: "the server" }, { value: "ui", label: "the user interface" }, { value: "stop", label: "stop" }], role);
+			if (pick !== "server" && pick !== "ui") throw cancelled();
+			role = pick;
+		}
+		const { generateAdapter } = await import("../adapters/target/generated.ts");
+		const client = opts.client ?? new (await import("../models/openrouter.ts")).OpenRouterClient();
+		await generateAdapter({
+			id,
+			role,
+			why: `named with --to ${name}`,
+			root,
+			client,
+			model: ConfigSchema.shape.models.parse({}).escalate.id,
+			log: (l) => ui.log(pc.dim(l)),
+			// in onboarding the slow trial build runs after the last question, like a stack picked there
+			deferVerify: !!opts.embedded,
+			confirm: async (cmds) => yes || (await ui.select(`To check the ${id} setup, these commands run (the project they build becomes your new ${id} project):\n   ${cmds.join("\n   ")}`, [{ value: "run", label: "OK, run them" }, { value: "stop", label: "stop" }], "run")) === "run",
+		});
+		registerGeneratedTargets(root);
+		return id;
+	};
+	let to: string[] | undefined;
+	if (flag("--to")) {
+		const parsed = parseTargets(flag("--to")!);
+		to = parsed.ids;
+		for (const name of parsed.unknown) to.push(await writeTargetAdapter(name, to));
+	}
 	/** No adapter reads this language yet: a model looks at the code and writes one; code checks it on the real files. */
 	const writeSourceAdapter = async (src: string, abs: string, id?: string): Promise<string> => {
-		if (opts.noLlm) throw new Error(`no source adapter reads ${src}${id ? ` (${id})` : ""} (have: ${knownSources().join(", ")}); without a model (--no-llm) none can be written`);
+		if (noLlm) throw new Error(`no source adapter reads ${src}${id ? ` (${id})` : ""} (have: ${knownSources().join(", ")}); without a model (--no-llm) none can be written`);
 		if (!yes) {
 			const go = await ui.select(`bigrefactor cannot read ${id ?? "this code"} yet. Let a model write the reader?\n   It looks at the old code, installs a parser (tree-sitter grammar) into the workspace and writes how to read the language. Code checks it on your files before anything uses it.`, [{ value: "write", label: "write and check it (recommended)" }, { value: "stop", label: "stop" }], "write");
 			if (go !== "write") throw cancelled();
@@ -331,13 +365,16 @@ export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: 
 	return true;
 }
 
-/** "nest + react", "nestjs,react", "NestJS and React" → known target ids (deduped) plus whatever was not recognised. */
+/**
+ * "nest + react", "nestjs,react", "NestJS and React" → known target ids (deduped) plus whatever was not recognised.
+ * Names are split on commas, plus, &, / and "and", not on spaces: "spring boot" is one name.
+ */
 export function parseTargets(text: string): { ids: string[]; unknown: string[] } {
 	const ids: string[] = [];
 	const unknown: string[] = [];
-	for (const raw of text.split(/[\s,+&/]+|\band\b/i).map((t) => t.trim().toLowerCase()).filter(Boolean)) {
-		const id = targetIdFor(raw);
-		if (!id) unknown.push(raw);
+	for (const raw of text.split(/\s*[,+&/]\s*|\s+and\s+/i).map((t) => t.trim().toLowerCase().replace(/\s+/g, " ")).filter(Boolean)) {
+		const id = targetIdFor(raw) ?? targetIdFor(raw.replace(/ /g, "-"));
+		if (!id) { if (!unknown.includes(raw)) unknown.push(raw); }
 		else if (!ids.includes(id)) ids.push(id);
 	}
 	return { ids, unknown };
@@ -384,13 +421,14 @@ async function toolchainProblem(config: Config, adapter: TargetAdapter): Promise
 			const err = await runChecked(c, dir);
 			if (err !== undefined) return `${adapter.id}: the gate's ${step} command fails on a fresh project (${c.cmd} ${c.args.join(" ")}):\n${err}`;
 		}
-		// a test command that cannot fail proves nothing: the same probe with a wrong expectation must fail
-		const broken = probe.content.replace("toBe(2)", "toBe(3)");
-		if (broken !== probe.content) {
-			writeFileSync(probePath, broken);
-			const c = adapter.test(dir, [probe.path]);
-			if ((await runChecked(c, dir)) === undefined) return `${adapter.id}: the gate's test command passes a failing test (${c.cmd} ${c.args.join(" ")}): it does not run the given test files`;
+		// a test command that cannot fail proves nothing: the same probe with a wrong expected value must fail
+		if (!probe.failing) {
+			console.log(pc.yellow(`  ${adapter.id}: not checked that the gate's test command can fail (the adapter's probe test has no failing variant; regenerate the adapter to get one)`));
+			return undefined;
 		}
+		writeFileSync(probePath, probe.failing);
+		const c = adapter.test(dir, [probe.path]);
+		if ((await runChecked(c, dir)) === undefined) return `${adapter.id}: the gate's test command passes a failing test (${c.cmd} ${c.args.join(" ")}): it does not run the given test files`;
 		return undefined;
 	} finally {
 		rmSync(probePath, { force: true });

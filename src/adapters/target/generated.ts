@@ -66,8 +66,8 @@ export interface AdapterManifest {
 	stackChoices: StackChoice[];
 	protectedGlobs: string[];
 	patternKinds: string[];
-	/** A minimal test proving the toolchain works on a fresh project. */
-	probeTest: { path: string; content: string };
+	/** A minimal test proving the toolchain works on a fresh project; `failing` is the same test with a wrong expected value (older manifests have none). */
+	probeTest: { path: string; content: string; failing?: string };
 	/** File (relative to a project root) that only this stack's projects have, and text it contains. */
 	detect: { file: string; contains: string };
 	/** false = written but not proven yet (verification runs after the owner's questions); absent = verified. */
@@ -200,6 +200,7 @@ export function validateManifest(m: AdapterManifest): string[] {
 	if (!/^[a-z0-9][a-z0-9.-]*$/.test(m.subdir ?? "")) out.push("subdir must be a plain folder name");
 	for (const k of ["readyFile"] as const) if (!m.scaffold?.[k] || m.scaffold[k].includes("..")) out.push(`scaffold.${k} must be a project-relative file`);
 	if (!m.probeTest?.path || m.probeTest.path.startsWith("/") || m.probeTest.path.includes("..")) out.push("probeTest.path must be project-relative");
+	if (m.probeTest?.failing !== undefined && m.probeTest.failing.trim() === (m.probeTest.content ?? "").trim()) out.push("probeTest.failing must differ from probeTest.content (the same test with a wrong expected value)");
 	if (!m.layout?.sourceExtensions?.length) out.push("layout.sourceExtensions is empty");
 	if (!m.patternKinds?.length) out.push("patternKinds is empty");
 	if (m.layout?.rules) {
@@ -275,7 +276,7 @@ export const MANIFEST_SCHEMA = obj({
 	stackChoices: { type: "array", items: obj({ key: S, question: S, default: S, options: { type: "array", items: OPTION } }) },
 	protectedGlobs: SA,
 	patternKinds: SA,
-	probeTest: obj({ path: S, content: S }),
+	probeTest: obj({ path: S, content: S, failing: S }),
 	detect: obj({ file: S, contains: S }),
 });
 
@@ -291,7 +292,7 @@ const SYSTEM = [
 	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name} any kebab/Pascal name; {sub} a sub-feature folder named after what it does, spelled like the feature folders; (a|b) either word), each with a short doc. require: only files the framework itself needs to load a feature folder (none when the framework finds the code on its own, e.g. autoloading or service discovery); never an empty class just to have one. place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
-	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up.",
+	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up. failing: the same file with only the expected value made wrong (e.g. 1 + 1 expected to equal 3), so the test runs and FAILS; the tool checks that the test command fails on it.",
 	"Use only commands and packages that exist. Answer only with the JSON object.",
 ].join("\n");
 
@@ -459,6 +460,16 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 				return `${step} failed on the fresh project (${c.cmd} ${c.args.join(" ")}):\n${String(e?.message ?? e)}`;
 			}
 		}
+		// a test command that cannot fail proves nothing: the probe with a wrong expected value must make it fail
+		if (!probe.failing) return "probeTest.failing is missing: give the same test with a wrong expected value";
+		writeFileSync(join(dir, probe.path), probe.failing);
+		const t = a.test(dir, [probe.path]);
+		const passed = await runCommand(t.cmd, t.args, { cwd: dir }).then(
+			() => true,
+			() => false,
+		);
+		writeFileSync(join(dir, probe.path), probe.content);
+		if (passed) return `the test command (${t.cmd} ${t.args.join(" ")}) passes probeTest.failing, a test with a wrong expected value: the command does not run the given test file, or probeTest.failing does not fail`;
 		// the whole-project test run (no files) must find tests where the layout puts them: a broken copy of the
 		// probe at the first test glob has to make it fail
 		const at = firstGlobFile(a, probe.path);

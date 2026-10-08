@@ -31,7 +31,7 @@ const manifest = (id: string, over: Partial<AdapterManifest> = {}): AdapterManif
 	stackChoices: [{ key: "orm", question: "ORM?", default: "a", options: [{ id: "a", label: "A", packages: [] }, { id: "b", label: "B", packages: [] }] }] as never,
 	protectedGlobs: [],
 	patternKinds: ["service"],
-	probeTest: { path: "probe.test.mjs", content: 'import test from "node:test"\ntest("probe", () => {})\n' },
+	probeTest: { path: "probe.test.mjs", content: 'import test from "node:test"\nimport assert from "node:assert"\ntest("probe", () => assert.equal(1 + 1, 2))\n', failing: 'import test from "node:test"\nimport assert from "node:assert"\ntest("probe", () => assert.equal(1 + 1, 3))\n' },
 	detect: { file: "ready.txt", contains: "" },
 	...over,
 });

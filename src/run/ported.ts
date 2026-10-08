@@ -24,7 +24,7 @@ export function findTests(targetProjectDir: string, moduleDir: string, layout: T
 			const p = join(d, n);
 			const r = relative(targetProjectDir, p);
 			if (statSync(p).isDirectory()) visit(p);
-			else if (layout.isTestFile(n) && res.some((re) => re.test(r))) out.add(r);
+			else if (layout.isTestFile(r) && res.some((re) => re.test(r))) out.add(r);
 		}
 	};
 	// walk only the fixed part of each glob (src/Billing/tests/**/*Test.php → src/Billing/tests)
