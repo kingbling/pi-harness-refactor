@@ -28,6 +28,7 @@ import { askPendingQuirks, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
 import { triageGate, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
+import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, verifyTruthOnOld, type LegacyFixer, type TruthCase } from "./legacy-env.ts";
 
 /**
  * The unit's own small orchestrator. Deterministic playbook ("go instructions"):
@@ -70,6 +71,8 @@ export interface UnitRunOptions {
 	gate?: typeof runGate;
 	/** Fixes setup problems of the new project during the run; default: the setup model (none when `spawn` is faked). */
 	setupFixer?: SetupFixer | false;
+	/** Sets up the old code's environment when truth stays red; default: the setup model (none when `spawn` is faked). */
+	legacyFixer?: LegacyFixer | false;
 }
 
 export interface UnitRunResult {
@@ -151,7 +154,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			config: o.config,
 			writeGlobs: [`${truthDirRel}/**`, ...adapter.layout.testFileGlobs(moduleDir).map((g) => `${targetRel}/${g}`)],
 			protectedGlobs: [],
-			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, truthDir: truthDirRel, targetProjectDir: targetRel, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
+			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirRel, targetProjectDir: targetRel, rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
 			customTools: testerTools({ ...deps, attemptId: attempt }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && log(pc.dim(`  tester blocked: ${e.blocked}`)),
@@ -168,18 +171,22 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 
 		// Code verifies the truth: re-run the cases script ourselves and load the cases.
-		const verified = verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter);
+		const verified = verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root);
 		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { cases: verified.cases.length, error: verified.error } });
 		if (!verified.ok) {
 			log(pc.red(`  truth failed on old code: ${verified.error}`));
 			return false;
 		}
+		recordTruth(verified.cases);
+		return true;
+	};
+	// verified cases go to the ledger: the gate and later units compare against these
+	const recordTruth = (cases: TruthCase[]) => {
 		o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
 		const ins = o.ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)");
-		verified.cases.forEach((c, i) => ins.run(`${o.unitId}#${i + 1}`, o.unitId, c.symbol, JSON.stringify(c.inputs), JSON.stringify(c.expected), new Date().toISOString()));
-		o.ledger.addEvidence(o.unitId, "truth_green_on_old", { cases: verified.cases.length, script: `${truthDirRel}/${sourceAdapter.truth.scriptName}` });
-		log(pc.green(`  truth: ${verified.cases.length} cases green on old code`));
-		return true;
+		cases.forEach((c, i) => ins.run(`${o.unitId}#${i + 1}`, o.unitId, c.symbol, JSON.stringify(c.inputs), JSON.stringify(c.expected), new Date().toISOString()));
+		o.ledger.addEvidence(o.unitId, "truth_green_on_old", { cases: cases.length, script: `${truthDirRel}/${sourceAdapter.truth.scriptName}` });
+		log(pc.green(`  truth: ${cases.length} cases green on old code`));
 	};
 
 	const portedDir = join(truthDirAbs, "ported");
@@ -192,6 +199,20 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		for (let t = 1; t <= 2 && !truthOk; t++) {
 			truthOk = await runTruth(lastErr ? `Your previous ${sourceAdapter.truth.scriptName} failed when run by the orchestrator (from the legacy root). Fix the script so it runs green and prints the JSON array:\n${lastErr}` : undefined);
 			if (!truthOk) lastErr = (o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string } | undefined)?.gate_report ?? "";
+		}
+		// still red: maybe the old code cannot run here (packages never installed, a runtime only in docker). The
+		// setup model prepares its environment once for all units; code re-runs this script to decide it worked.
+		const legacyFixer = o.legacyFixer === false ? undefined : (o.legacyFixer ?? (o.spawn ? undefined : fixLegacyEnvWithModel));
+		if (!truthOk && legacyFixer && lastErr) {
+			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: lastErr, truthDir: truthDirAbs, signature: errorSignature("truth", lastErr), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
+			const verified = fixed ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root) : undefined;
+			if (fixed && verified?.ok) {
+				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
+				recordTruth(verified.cases);
+				truthOk = true;
+				// units that asked the owner about the same thing run again in the new environment
+				for (const q of o.ledger.openQuestions().filter((x) => x.point === "truth_env")) o.ledger.answerQuestion(q.id, `auto: the old code's environment was set up (${fixed})`, "setup model");
+			}
 		}
 		if (!truthOk) {
 			const q = await ask({
@@ -552,23 +573,6 @@ export function draftedOutside(md: string, allowedDirs: string[], targetRel: str
 	return [...out];
 }
 
-function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter): { ok: boolean; cases: Array<{ symbol: string; inputs: unknown; expected: unknown }>; error?: string } {
-	const script = join(truthDirAbs, source.truth.scriptName);
-	if (!existsSync(script)) return { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
-	try {
-		const { cmd, args } = source.truth.run(config.source.path, script);
-		const out = execFileSync(cmd, args, { cwd: config.source.path, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
-		const start = out.indexOf("[");
-		const cases = JSON.parse(out.slice(start)) as Array<{ symbol: string; inputs: unknown; expected: unknown }>;
-		if (!Array.isArray(cases) || !cases.length) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases` };
-		const bad = cases.filter((c) => typeof c.symbol !== "string");
-		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
-		return { ok: true, cases };
-	} catch (e: any) {
-		// stderr carries PHP's own message ("Failed opening required …"); it is captured, never printed into the UI
-		return { ok: false, cases: [], error: [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || String(e?.message ?? e) };
-	}
-}
 
 function findTests(targetProjectDir: string, rel: string, layout: TargetAdapter["layout"]): string[] {
 	const dir = join(targetProjectDir, rel);

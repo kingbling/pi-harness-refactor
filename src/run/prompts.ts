@@ -42,13 +42,13 @@ export interface PlacementPromptOpts {
 	structureDoc: string;
 }
 
-export function testerSystemPrompt(config: Config, opts: PlacementPromptOpts & { truthDir: string; targetProjectDir: string; rules: string; source: SourceAdapter; target: TargetAdapter; projectNotes: string[] }): string {
+export function testerSystemPrompt(config: Config, opts: PlacementPromptOpts & { truthDir: string; truthRun?: string; targetProjectDir: string; rules: string; source: SourceAdapter; target: TargetAdapter; projectNotes: string[] }): string {
 	return `You are the TESTER for a legacy migration (${config.source.stack} → ${config.target.stacks.join(" + ")}). You are not the implementer and you never write production code.
 
 Your job for one unit:
 1. Read the legacy symbols in the task card (source files are included). Follow "Where this code leads" with read_function to see what callees really do; source_symbol_body / who_calls / symbol_lookup for more.
 2. Write CHARACTERIZATION cases that pin the behaviour of the old code for realistic inputs: every public symbol, every branch you can see, boundaries of valid values. Follow the behaviour policy below; record quirks with record_quirk instead of pinning them blindly, and write the cases the way your opinion says (drop → the intended behaviour is expected, the quirk is not pinned; keep → pin it).
-3. Make them run against the OLD code: write ${opts.truthDir}/${opts.source.truth.scriptName} — ${opts.source.truth.instructions} The JSON array has the shape [{"symbol": "<legacy symbol id from the card>", "inputs": <json>, "expected": <json>}]. The legacy repo is read-only.
+3. Make them run against the OLD code: write ${opts.truthDir}/${opts.source.truth.scriptName} — ${opts.source.truth.instructions} The JSON array has the shape [{"symbol": "<legacy symbol id from the card>", "inputs": <json>, "expected": <json>}]. The legacy repo is read-only.${opts.truthRun ? ` The orchestrator runs it as: \`${opts.truthRun}\` — run it exactly that way.` : ""}
 4. Draft the TARGET interface the implementer must satisfy: write ${opts.truthDir}/interface.md listing target file paths, exported names and signatures (${opts.target.layout.interfaceHint}). This unit belongs to area "${opts.area}" on ${opts.stackId}: every path MUST be under ${opts.moduleDir}/ (binding; the orchestrator rejects other paths) and follow the layout below — extend the area's existing files (target_lookup) instead of new ones per legacy file. Signatures use the target's types, not the legacy language's.
 5. Port the cases to target tests: write them under ${opts.targetProjectDir}/${opts.moduleDir}/ as ${opts.target.layout.testHint}, importing from the paths in interface.md, one expectation per case, same expected values. They will fail until the implementer is done — that is correct.${opts.projectNotes.length ? `\n   Target project facts: ${opts.projectNotes.join("; ")}.` : ""}
 If something about the target conventions is missing or wrong in the rules and would matter for other units too, call propose_rule.

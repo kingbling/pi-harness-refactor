@@ -62,7 +62,10 @@ export async function checkRequirements(o: { cwd: string; tools?: string[] }): P
 			const needs = new Map<string, { why: string; dir?: string }>();
 			const { projectDir } = await import("./init/init.ts");
 			const source = getSourceAdapter(config.source.stack);
-			needs.set(source.truth.run(config.source.path, "x").cmd, { why: `${source.id}: runs the legacy code for truth`, dir: config.source.path });
+			// the old code's environment as the workspace set it up (a copy, another runner), else the adapter's default
+			const { loadLegacyEnv, truthCommand } = await import("./run/legacy-env.ts");
+			const legacy = truthCommand(loadLegacyEnv(dirname(configPath), config), source, "x");
+			needs.set(legacy.cmd, { why: `${source.id}: runs the legacy code for truth`, dir: legacy.cwd });
 			for (const id of config.target.stacks) {
 				const t = await getTargetAdapter(id);
 				// project tools (vendor/bin/…, node_modules/.bin/…) live in that stack's own project folder

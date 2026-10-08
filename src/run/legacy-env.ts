@@ -1,0 +1,184 @@
+import { execFileSync } from "node:child_process";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import pc from "picocolors";
+import { Type } from "typebox";
+import type { SourceAdapter } from "../adapters/types.ts";
+import type { Config } from "../config.ts";
+import { loadDecisions } from "../inventory/decisions.ts";
+import { PLAIN_LANGUAGE } from "../policy.ts";
+import { spawnLeaf } from "../sessions/spawn.ts";
+
+/**
+ * Truth runs on the OLD code. Out of the box it runs in the legacy repo with this machine's tools; when that is
+ * not enough (packages never installed, a runtime only in docker), the setup model prepares a runnable copy once:
+ * a copy-on-write clone of the legacy repo in the workspace (the legacy repo itself stays read-only) where it may
+ * install the dependencies, and/or a different run command. Saved per workspace in .bigrefactor/legacy-env.json;
+ * code decides it worked by re-running a truth script that failed.
+ */
+export interface LegacyEnv {
+	/** Where truth scripts run: the legacy repo, or the workspace copy. */
+	root: string;
+	/** How to run a script; "{script}" is replaced by its absolute path, "{root}" by `root`. Default: the source adapter's runner. */
+	run?: { cmd: string; args: string[] };
+	why?: string;
+}
+
+const envPath = (root: string) => join(root, ".bigrefactor", "legacy-env.json");
+const copyDir = (root: string) => join(root, ".bigrefactor", "legacy-env", "app");
+
+export function loadLegacyEnv(root: string | undefined, config: Config): LegacyEnv {
+	const fallback = { root: config.source.path };
+	if (!root || !existsSync(envPath(root))) return fallback;
+	try {
+		const e = JSON.parse(readFileSync(envPath(root), "utf8")) as LegacyEnv;
+		return e.root && existsSync(e.root) ? e : { ...fallback, run: e.run };
+	} catch {
+		return fallback;
+	}
+}
+
+function saveLegacyEnv(root: string, config: Config, change: Partial<LegacyEnv>, why: string): LegacyEnv {
+	const cur = loadLegacyEnv(root, config);
+	const next = { ...cur, ...change, why: [cur.why, why].filter(Boolean).join("; ") };
+	mkdirSync(join(root, ".bigrefactor"), { recursive: true });
+	writeFileSync(envPath(root), JSON.stringify(next, null, 2) + "\n");
+	return next;
+}
+
+/** The command the orchestrator runs a truth script with (and the tester should too). */
+export function truthCommand(env: LegacyEnv, source: SourceAdapter, script: string): { cmd: string; args: string[]; cwd: string } {
+	const fill = (a: string) => a.replaceAll("{script}", script).replaceAll("{root}", env.root);
+	const c = env.run ? { cmd: fill(env.run.cmd), args: env.run.args.map(fill) } : source.truth.run(env.root, script);
+	return { ...c, cwd: env.root };
+}
+
+export function describeTruthRun(root: string | undefined, config: Config, source: SourceAdapter, script: string): string {
+	const c = truthCommand(loadLegacyEnv(root, config), source, script);
+	return `cd ${c.cwd} && ${[c.cmd, ...c.args].join(" ")}`;
+}
+
+export type TruthCase = { symbol: string; inputs: unknown; expected: unknown };
+
+/** Code runs the tester's script on the old code and loads the cases: the tester never decides that truth is green. */
+export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter, root?: string): { ok: boolean; cases: TruthCase[]; error?: string } {
+	const script = join(truthDirAbs, source.truth.scriptName);
+	if (!existsSync(script)) return { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
+	try {
+		const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script);
+		const out = execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+		const start = out.indexOf("[");
+		const cases = JSON.parse(out.slice(start)) as TruthCase[];
+		if (!Array.isArray(cases) || !cases.length) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases` };
+		const bad = cases.filter((c) => typeof c.symbol !== "string");
+		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
+		return { ok: true, cases };
+	} catch (e: any) {
+		// stderr carries the runtime's own message ("Failed opening required …"); it is captured, never printed into the UI
+		return { ok: false, cases: [], error: [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || String(e?.message ?? e) };
+	}
+}
+
+// ---- the setup model's tools ----------------------------------------------------------------------------
+
+const out = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
+
+/** A copy-on-write clone of the legacy repo in the workspace: the one place dependencies may be installed. */
+export function legacyCopyTool(root: string, config: Config): ToolDefinition {
+	return {
+		name: "make_legacy_copy",
+		label: "Copy the legacy repo",
+		description: `Make a copy of the read-only legacy repo (${config.source.path}) in the workspace and run truth scripts there from now on. Install the old code's dependencies in the copy, never in the legacy repo. Instant on disks that clone (copy-on-write).`,
+		promptSnippet: "make_legacy_copy: a writable copy of the legacy repo where truth scripts run",
+		parameters: Type.Object({ why: Type.String() }),
+		execute: async (_id: string, p: { why: string }) => {
+			const dst = copyDir(root);
+			if (!existsSync(dst)) {
+				mkdirSync(join(dst, ".."), { recursive: true });
+				try {
+					execFileSync("cp", process.platform === "darwin" ? ["-cR", config.source.path, dst] : ["-R", "--reflink=auto", config.source.path, dst], { stdio: ["ignore", "pipe", "pipe"] });
+				} catch {
+					cpSync(config.source.path, dst, { recursive: true, verbatimSymlinks: true });
+				}
+			}
+			saveLegacyEnv(root, config, { root: dst }, p.why);
+			return out(`the copy is at ${dst}; truth scripts run there from now on (cwd = the copy). Install the dependencies there.`);
+		},
+	} as unknown as ToolDefinition;
+}
+
+export function legacyRunTool(root: string, config: Config): ToolDefinition {
+	return {
+		name: "set_legacy_run",
+		label: "Set the truth run command",
+		description: `Set how a truth script runs on the old code, when the default does not fit (another binary or version, ini/memory flags, a container). "{script}" is replaced by the script's absolute path, "{root}" by the folder the old code runs in. The command runs with cwd = that folder and must print the script's output unchanged.`,
+		promptSnippet: "set_legacy_run: the command truth scripts run with on the old code",
+		parameters: Type.Object({ cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
+		execute: async (_id: string, p: { cmd: string; args: string[]; why: string }) => {
+			if (![p.cmd, ...p.args].some((a) => a.includes("{script}"))) return out('refused: one arg must contain "{script}"');
+			saveLegacyEnv(root, config, { run: { cmd: p.cmd, args: p.args } }, p.why);
+			return out(`truth scripts run with: ${[p.cmd, ...p.args].join(" ")}`);
+		},
+	} as unknown as ToolDefinition;
+}
+
+/** Returns the model's one-sentence account of what it changed. */
+export type LegacyFixer = (o: { config: Config; root: string; source: SourceAdapter; problem: string; script: string }) => Promise<string | void>;
+
+export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
+	console.log(pc.cyan(`  ${o.source.id}: the old code does not run here; a model with tools sets up its environment`));
+	const work = join(o.root, ".bigrefactor", "legacy-env");
+	mkdirSync(work, { recursive: true });
+	const truth = loadDecisions(o.root).truth;
+	const env = loadLegacyEnv(o.root, o.config);
+	const session = await spawnLeaf({
+		role: "setup",
+		cwd: work,
+		config: o.config,
+		writeGlobs: ["**"],
+		protectedGlobs: [],
+		customTools: [legacyCopyTool(o.root, o.config), legacyRunTool(o.root, o.config)],
+		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.legacy.${Date.now()}.jsonl`),
+		systemPrompt: `You make the OLD ${o.source.id} code runnable on this machine, so a migration tool can run characterization scripts against it. The legacy repo (${o.config.source.path}) is read-only: never write into it. Use make_legacy_copy for a copy you may change (install the dependencies with the project's own package manager, as its manifest and docs say), and set_legacy_run when the run command itself must change. Check which tools this machine really has (versions, docker) before choosing a way. Do not edit the script: it belongs to the tester; when it is the script itself that is wrong (not the environment), say so and stop. Never interactive prompts, never servers left running. End with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
+	});
+	try {
+		const now = truthCommand(env, o.source, o.script);
+		const r = await session.run(`A characterization script fails on the old code:\n${o.problem.slice(-3000)}\n\nThe script: ${o.script}\nIt runs now as: cd ${now.cwd} && ${[now.cmd, ...now.args].join(" ")}${truth ? `\nThe owner said at setup how the old app runs: ${JSON.stringify(truth)} (paths relative to the legacy repo). Use it if this machine has what it needs; otherwise find another way.` : ""}\nMake the environment such that this script runs green, then run it the way the tool will (with the command set) to confirm.`);
+		const said = r.text.trim().split("\n").at(-1) ?? "";
+		console.log(pc.dim(`  legacy setup model: ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${said}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
+		return said;
+	} finally {
+		session.dispose();
+	}
+};
+
+let fixing: Promise<string | undefined> | undefined;
+const tries = new Map<string, number>();
+/** Tries per problem (the same error in different units), and in all: the run goes on, units then ask the owner. */
+export const MAX_LEGACY_FIXES_PER_PROBLEM = 2;
+export const MAX_LEGACY_FIXES = 10;
+
+/**
+ * A truth script that stays red after the tester's tries: the setup model fixes the old code's environment, once
+ * for all units (units failing meanwhile wait for the running fix). It counts only when code then runs the failed
+ * script green. Returns what changed, or undefined.
+ */
+export async function fixLegacyEnv(o: { config: Config; root: string; source: SourceAdapter; problem: string; truthDir: string; signature: string; fixer?: LegacyFixer }): Promise<string | undefined> {
+	if (fixing) {
+		const said = await fixing;
+		return said && verifyTruthOnOld(o.truthDir, o.config, o.source, o.root).ok ? said : undefined;
+	}
+	if ((tries.get(o.signature) ?? 0) >= MAX_LEGACY_FIXES_PER_PROBLEM || (tries.get("") ?? 0) >= MAX_LEGACY_FIXES) return undefined;
+	tries.set(o.signature, (tries.get(o.signature) ?? 0) + 1);
+	tries.set("", (tries.get("") ?? 0) + 1);
+	fixing = (async () => {
+		const said = await (o.fixer ?? fixLegacyEnvWithModel)({ config: o.config, root: o.root, source: o.source, problem: o.problem, script: join(o.truthDir, o.source.truth.scriptName) });
+		if (!verifyTruthOnOld(o.truthDir, o.config, o.source, o.root).ok) return undefined;
+		const what = said || "the old code's environment was set up";
+		const env = loadLegacyEnv(o.root, o.config);
+		appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} ${relative(o.root, resolve(env.root)) || env.root} ${what.replace(/\s+/g, " ")}\n`);
+		return what;
+	})().finally(() => (fixing = undefined));
+	return fixing;
+}

@@ -74,4 +74,36 @@ describe("runUnit wiring", () => {
 		expect(calls).toBeGreaterThan(1);
 		expect(r.state).not.toBe("crashed");
 	});
+
+	it("truth that stays red gets the old code's environment set up once; the unit then goes on and other units' questions are answered", async () => {
+		rmSync(join(ws, ".bigrefactor", "truth", "u1"), { recursive: true, force: true });
+		ledger.db.prepare("DELETE FROM evidence").run();
+		const other = ledger.askQuestion({ point: "truth_env", question: "old code does not run", askedBy: "orchestrator" });
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		const tester = async (opts: { role: string }): Promise<LeafSession> =>
+			({
+				run: async () => {
+					if (opts.role === "test") {
+						write(join(truthDir, "cases.php"), "<?php require 'vendor/autoload.php';\n");
+						write(join(truthDir, "cases.php.json"), '[{"symbol":"app/behaviour/commands/agency/create.cmd.php::create","inputs":[],"expected":1}]');
+						write(join(truthDir, "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
+					}
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const { legacyRunTool } = await import("../src/run/legacy-env.ts");
+		let fixes = 0;
+		const legacyFixer = async (o: { root: string; config: Config }) => {
+			fixes++;
+			await (legacyRunTool(o.root, o.config) as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { cmd: "sh", args: ["-c", 'cat "$0.json"', "{script}"], why: "test runner" });
+			return "set up the old code's runner";
+		};
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: tester as never, gate, legacyFixer, log: () => {} });
+		expect(fixes).toBe(1);
+		expect(ledger.hasEvidence("u1", "truth_green_on_old")).toBe(true);
+		expect(ledger.getQuestion(other)!.answer).toMatch(/^auto: the old code's environment was set up/);
+		expect(ledger.openQuestions().filter((q) => q.point === "truth_env")).toEqual([]);
+	});
 });
