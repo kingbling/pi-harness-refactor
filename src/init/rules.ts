@@ -40,6 +40,10 @@ export async function generateRules(config: Config, root: string, ledger: Ledger
 			const p = join(rulesDir(root, t.id), "RULES.md");
 			if (existsSync(p)) await saveRulesVersion({ ledger, root }, t.id, stripLayout(readFileSync(p, "utf8")));
 		}
+		if (rulesPresent(root, config)) {
+			log("layout section re-rendered from the stack adapters");
+			return { files: config.target.stacks.map((s) => join(rulesDir(root, s), "RULES.md")), costUsd: 0 };
+		}
 	}
 	if (!opts.force && rulesPresent(root, config)) {
 		log(pc.dim("rules already present (use --force to regenerate)"));

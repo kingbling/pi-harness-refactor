@@ -6,6 +6,9 @@ import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
 import { overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
+// static on purpose: Pi loads plugins without a module cache, and units starting together that each import a
+// module the first time get half-loaded copies of what it imports ("Cannot read properties of undefined")
+import { runDbUnit } from "./db-unit.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { commitAll, mainBranch } from "../git.ts";
@@ -109,7 +112,6 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the DB lane: schema / design / data units run their own loop (no legacy symbols, the schema is the truth)
 	if (isDbUnitKind(unit.kind)) {
 		if (o.truthOnly) return { unitId: o.unitId, state: unit.state, attempts: 0, costUsd: 0 };
-		const { runDbUnit } = await import("./db-unit.ts");
 		return runDbUnit(o, placeUnit(o.config, unit.meta, o.root));
 	}
 	// never on code's unsure guess: an unplaced unit waits for Jev or its placement question (br place)

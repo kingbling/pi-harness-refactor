@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getTargetAdapter } from "../adapters/registry.ts";
 import { answerValue, askViaModel, loadBrief, type AskDeps } from "../jev/ask.ts";
-import { composeRules, rulesDir, stripLayout } from "./layout.ts";
+import { composeRules, renderLayoutSection, rulesDir, stripLayout } from "./layout.ts";
 
 /**
  * Living rules. The first version of a stack's rules is written at onboarding from the docs and a first look
@@ -51,6 +51,23 @@ export async function saveRulesVersion(d: Pick<AskDeps, "ledger"> & { root: stri
 	writeFileSync(join(dir, "history", `RULES.v${version}.md`), md);
 	d.ledger.setMeta(`rules_version:${stack}`, String(version));
 	return version;
+}
+
+/**
+ * The layout section is code, not a model's words: when the adapter changed since RULES.md was written, it is
+ * re-rendered (body kept) instead of stopping anyone. Returns the stacks whose section was out of date.
+ */
+export async function refreshRulesLayout(d: Pick<AskDeps, "ledger"> & { root: string }, stacks: string[]): Promise<string[]> {
+	const out: string[] = [];
+	for (const stack of stacks) {
+		const path = join(rulesDir(d.root, stack), "RULES.md");
+		if (!existsSync(path)) continue;
+		const md = readFileSync(path, "utf8");
+		if (md.includes(renderLayoutSection(await getTargetAdapter(stack)))) continue;
+		await saveRulesVersion(d, stack, stripLayout(md));
+		out.push(stack);
+	}
+	return out;
 }
 
 /**

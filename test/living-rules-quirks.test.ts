@@ -9,7 +9,7 @@ import { FakeModelClient } from "../src/models/fake.ts";
 import { askPendingQuirks, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
 import { rulesText } from "../src/run/prompts.ts";
 import { activeRuleFiles, renderLayoutSection, rulesDir, validateRulesLayout } from "../src/rules/layout.ts";
-import { maybeCurateRules, proposeRule, saveRulesVersion } from "../src/rules/living.ts";
+import { maybeCurateRules, proposeRule, refreshRulesLayout, saveRulesVersion } from "../src/rules/living.ts";
 import { getTargetAdapter } from "../src/adapters/registry.ts";
 
 function setup() {
@@ -135,6 +135,16 @@ describe("living rules", () => {
 		expect(r2.versions).toEqual({ nestjs: 3 });
 		expect(st(p2)).toBe("merged");
 		expect(rulesText(root, "nestjs")).toMatch(/Errors return 200/);
+	});
+	it("an out-of-date layout section is re-rendered from the adapter (body kept), so the layout check passes without anyone running br rules", async () => {
+		const { root, config, ledger } = setup();
+		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
+		const p = join(rulesDir(root, "nestjs"), "RULES.md");
+		writeFileSync(p, readFileSync(p, "utf8").replace(/## Module layout/, "## Old module layout"));
+		expect(await refreshRulesLayout({ ledger, root }, ["nestjs", "react"])).toEqual(["nestjs"]);
+		expect(readFileSync(p, "utf8")).toContain("- throw HttpException");
+		expect((await validateRulesLayout(root, { ...config, target: { ...config.target, stacks: ["nestjs"] } })).filter((x) => /differs/.test(x))).toEqual([]);
+		expect(await refreshRulesLayout({ ledger, root }, ["nestjs"])).toEqual([]);
 	});
 	it("same text = no new version; a proposal the curator refuses after the owner's apply is final, recorded once, never curated again", async () => {
 		const { root, config, ledger } = setup();

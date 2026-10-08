@@ -149,7 +149,14 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
 	if (!o.dry) await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) });
 	// ---- layout preflight: one folder per legacy file must be caught before a run scales it
+	if (!o.dry && isRepo(config.target.path)) {
+		const { resetForNewTarget } = await import("./target-reset.ts");
+		const back = resetForNewTarget(ledger, config, o.root);
+		if (back) log(pc.cyan(`↻ the target project was created anew: ${back.length} unit(s) worked on before go back to planned; questions about the old project are dropped`));
+	}
 	if (!o.dry && !o.spawn) {
+		const { refreshRulesLayout } = await import("../rules/living.ts");
+		for (const s of await refreshRulesLayout({ ledger, root: o.root }, config.target.stacks)) log(pc.dim(`${s}: RULES.md layout section re-rendered from the stack adapter`));
 		const lr = await checkLayout(config, o.root, ledger);
 		for (const w of lr.warnings) log(pc.yellow(`layout: ${w}`));
 		if (lr.problems.length && !o.force) throw new Error(`bigrefactor: the target layout has ${lr.problems.length} problem(s), a run would multiply them:\n  ${lr.problems.join("\n  ")}\nfix: br layout shows the details; start anyway with --force`);
