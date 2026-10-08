@@ -217,6 +217,8 @@ describe("a unit with no runtime behaviour", () => {
 	it("the tester declares it; it is recorded as evidence, needs no tests, stands in for truth, and the reviewer sees the reason", async () => {
 		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
 		rmSync(truthDir, { recursive: true, force: true });
+		// an earlier attempt (cut off by a restart) left cases: the declaration of this attempt replaces them
+		write(join(truthDir, "cases.json"), JSON.stringify([{ symbol: "app/agency/create.cmd.php::Repo", inputs: {}, expected: { constants: { A: 1 } } }]));
 		ledger.upsertFile({ path: "app/agency/create.cmd.php", hash: "h", lang: "php", loc: 1 });
 		ledger.upsertSymbol({ id: "app/agency/create.cmd.php::Repo", name: "Repo", kind: "interface", path: "app/agency/create.cmd.php" });
 		ledger.db.prepare("UPDATE symbols SET unit_id = 'u1', state = 'clustered' WHERE id = ?").run("app/agency/create.cmd.php::Repo");
@@ -238,6 +240,7 @@ describe("a unit with no runtime behaviour", () => {
 		expect(ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = 'u1'").get()).toEqual({ n: 0 });
 		expect(gateTests).toEqual([]);
 		expect(existsSync(join(truthDir, NO_BEHAVIOUR_FILE))).toBe(true);
+		expect(existsSync(join(truthDir, "cases.json"))).toBe(false);
 		// truth_none stands in for truth on the old code when a symbol becomes tested
 		ledger.prove({ unitId: "u1", srcSymbol: "app/agency/create.cmd.php::Repo", op: "moved", targetSymbols: ["src/features/agency/agency.repository.ts::AgencyRepository"], why: "contract" });
 		ledger.addEvidence("u1", "ported_tests_green", {});

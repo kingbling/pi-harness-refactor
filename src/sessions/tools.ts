@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
-import { NO_BEHAVIOUR_FILE, type TruthResult } from "../run/legacy-env.ts";
+import { NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
 import { caseCoverage, lintTests } from "../run/ported.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
@@ -419,7 +419,10 @@ export function noBehaviourTool(d: ToolDeps): ToolDefinition {
 			if (!p.reason.trim()) return text("a reason is required", { error: true });
 			mkdirSync(d.truthDir, { recursive: true });
 			writeFileSync(join(d.truthDir, NO_BEHAVIOUR_FILE), JSON.stringify({ reason: p.reason.trim() }, null, 2) + "\n");
-			return text("recorded: no truth cases and no ported tests are expected for this unit; the reviewer checks your reason. If you write cases anyway, they count instead.");
+			// cases an earlier attempt left behind would count instead of this judgement: this declaration replaces them
+			const old = [READ_CASES_FILE, getSourceAdapter(d.config.source.stack).truth.scriptName].filter((f) => existsSync(join(d.truthDir!, f)));
+			for (const f of old) rmSync(join(d.truthDir, f), { force: true });
+			return text(`recorded: no truth cases and no ported tests are expected for this unit; the reviewer checks your reason.${old.length ? ` Removed the cases an earlier attempt left (${old.join(", ")}).` : ""} If you write cases after this, they count instead.`);
 		},
 	});
 }
