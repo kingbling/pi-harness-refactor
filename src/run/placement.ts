@@ -294,87 +294,132 @@ function openQuestion(ledger: Ledger, id: number | undefined): boolean {
 	return !!id && ledger.getQuestion(id)?.status === "open";
 }
 
-/** The curated business areas per stack (`.bigrefactor/areas.json`, written by the taxonomy), name → purpose. */
-function curatedAreas(root: string): Map<string, Map<string, string>> | undefined {
+/** Area or topic name → one-line purpose, per stack. */
+type Vocab = Map<string, Map<string, string>>;
+
+/**
+ * The curated set per stack (`.bigrefactor/areas.json`, written by the taxonomy): feature areas and shared topics,
+ * each with its one-line purpose. An older file lists no topics: its shared rules name them (their reason stands in).
+ */
+function curatedAreas(root: string): { features: Vocab; topics: Vocab } | undefined {
+	type Named = { name: string; purpose?: string };
+	type Rule = { to: string; stack: string; area: string; why?: string };
 	try {
-		const j = JSON.parse(readFileSync(areasPath(root), "utf8")) as { stacks?: Array<{ stack: string; areas: Array<{ name: string; purpose?: string }> }> };
+		const j = JSON.parse(readFileSync(areasPath(root), "utf8")) as { stacks?: Array<{ stack: string; areas: Named[]; topics?: Named[] }>; rules?: Rule[]; mappings?: Rule[] };
 		if (!j.stacks?.length) return undefined;
-		return new Map(j.stacks.map((s) => [s.stack, new Map(s.areas.map((a) => [kebab(a.name), a.purpose ?? ""]))]));
+		const features: Vocab = new Map();
+		const topics: Vocab = new Map();
+		const add = (v: Vocab, stack: string, name: string, purpose = "") => {
+			const k = kebab(name);
+			const m = v.get(stack) ?? v.set(stack, new Map()).get(stack)!;
+			if (k && !m.get(k)) m.set(k, purpose);
+		};
+		for (const s of j.stacks) {
+			// "shared" listed as an area is the shared dir, not a feature
+			for (const a of s.areas ?? []) if (kebab(a.name) !== "shared" && kebab(a.name) !== SHARED_AREA) add(features, s.stack, a.name, a.purpose);
+			for (const t of s.topics ?? []) add(topics, s.stack, t.name, t.purpose);
+		}
+		for (const r of [...(j.rules ?? []), ...(j.mappings ?? [])]) if (r.to === "shared" && r.area) add(topics, r.stack, r.area, r.why);
+		return { features, topics };
 	} catch {
 		return undefined;
 	}
 }
 
 /** Feature-area placements (stack:area) that the curated set does not contain. */
-function outsideCurated(ledger: Ledger, curated: Map<string, Map<string, string>>): string[] {
+function outsideCurated(ledger: Ledger, curated: { features: Vocab }): string[] {
 	const out = new Set<string>();
 	for (const u of ledger.listUnits()) {
 		const m = JSON.parse(u.meta) as UnitMeta & { lane?: string };
 		const p = m.place;
-		if (p && !p.shared && m.lane !== "db" && !curated.get(p.stack)?.has(p.area)) out.add(`${p.stack}:${p.area}`);
+		if (p && !p.shared && m.lane !== "db" && !curated.features.get(p.stack)?.has(p.area)) out.add(`${p.stack}:${p.area}`);
 	}
 	return [...out];
 }
 
+/** How a placement shows among the areas around a unit: the feature area, or `shared/<topic>`. */
+const placeLabel = (p: { area: string; shared: boolean }) => (p.shared ? `shared/${p.area}` : p.area);
+
 /**
- * What Jev may choose from: per stack, the curated feature areas (or, before any curation, the areas code placed
- * units in for sure) and the shared topics in use. Never the unit's own file name: that is how file-named areas
- * (clock, uuid, metadataids) were born.
+ * What Jev may choose from: per stack, the curated feature areas and shared topics (or, before any curation, the
+ * areas and topics code placed units in for sure). Never the unit's own file name: that is how file-named areas
+ * (clock, uuid, metadataids) and topics (cpaa, medium) were born. Topics the owner answered count as curated.
  */
 function candidateContext(config: Config, root: string, units: UnitRow[], plan: Map<string, Planned>) {
 	const curated = curatedAreas(root);
 	const byDir = new Map<string, string[]>();
-	const count = new Map<string, number>();
-	const features = new Map<string, Map<string, string>>(); // stack → area → purpose
-	const topics = new Map<string, Set<string>>(); // stack → shared topics in use
-	for (const s of config.target.stacks) (features.set(s, new Map(curated?.get(s) ?? [])), topics.set(s, new Set()));
+	const count = new Map<string, number>(); // `${stack}:${label}` → units
+	const features: Vocab = new Map();
+	const topics: Vocab = new Map();
+	for (const s of config.target.stacks) (features.set(s, new Map(curated?.features.get(s) ?? [])), topics.set(s, new Map(curated?.topics.get(s) ?? [])));
 	for (const u of units) {
 		const p = plan.get(u.id)!;
 		if (p.unsure) continue;
-		const key = `${p.place.stackId}:${p.place.area}`;
-		count.set(key, (count.get(key) ?? 0) + 1);
-		if (p.place.shared) topics.get(p.place.stackId)?.add(p.place.area);
-		else if (!curated) features.get(p.place.stackId)?.set(p.place.area, "");
-		for (const f of (JSON.parse(u.meta) as UnitMeta).files ?? []) (byDir.get(dirname(f)) ?? byDir.set(dirname(f), []).get(dirname(f))!).push(p.place.area);
+		const label = placeLabel(p.place);
+		count.set(`${p.place.stackId}:${label}`, (count.get(`${p.place.stackId}:${label}`) ?? 0) + 1);
+		const vocab = (p.place.shared ? topics : features).get(p.place.stackId);
+		if (vocab && !vocab.has(p.place.area) && (!curated || (p.place.shared && p.place.source === "answer"))) vocab.set(p.place.area, "");
+		for (const f of (JSON.parse(u.meta) as UnitMeta).files ?? []) (byDir.get(dirname(f)) ?? byDir.set(dirname(f), []).get(dirname(f))!).push(label);
 	}
 	return { byDir, count, features, topics, deps: new Map(units.map((u) => [u.id, JSON.parse(u.deps) as string[]])), plan };
 }
 
-/** Areas around a unit (same folder, what it uses, what uses it) and Jev's candidates: known areas only, nearest first (max 8). */
+/** One thing Jev may pick: a feature area or a shared topic, with its one-line purpose. */
+type Cand = { area: string; shared: boolean; purpose: string };
+/** Options Jev chooses from, and the options a placement question shows (most relevant first, the rest cut). */
+const MAX_CHOICES = 20;
+const MAX_ASKED = 12;
+
+/**
+ * Areas around a unit (same folder, what it uses, what uses it) and Jev's candidates, most relevant first: code's
+ * guess and the areas around it, then the shared topics (few, and the usual answer when no feature fits), then the
+ * other features by size. Only the least relevant are cut.
+ */
 function around(u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>, stacks: string[]) {
 	const files = (JSON.parse(u.meta) as UnitMeta).files ?? [];
-	const areaOf = (id: string) => ctx.plan.get(id)?.place.area;
+	const labelOf = (id: string) => {
+		const p = ctx.plan.get(id)?.place;
+		return p && placeLabel(p);
+	};
+	const generic = (l: string) => l === SHARED_AREA || l === placeLabel({ area: SHARED_AREA, shared: true });
 	const tally = (xs: Array<string | undefined>) => {
 		const t = new Map<string, number>();
-		for (const x of xs) if (x && x !== SHARED_AREA) t.set(x, (t.get(x) ?? 0) + 1);
+		for (const x of xs) if (x && !generic(x)) t.set(x, (t.get(x) ?? 0) + 1);
 		return [...t].sort((a, b) => b[1] - a[1]);
 	};
 	const neighbours = tally(files.flatMap((f) => ctx.byDir.get(dirname(f)) ?? []));
-	const uses = tally((ctx.deps.get(u.id) ?? []).map(areaOf));
-	const usedBy = tally([...ctx.deps].filter(([, ds]) => ds.includes(u.id)).map(([id]) => areaOf(id)));
-	const known = new Map(stacks.flatMap((s) => [...(ctx.features.get(s) ?? [])]));
-	const byCount = [...known.keys()].sort((a, b) => stacks.reduce((n, s) => n + (ctx.count.get(`${s}:${b}`) ?? 0) - (ctx.count.get(`${s}:${a}`) ?? 0), 0));
-	const near = [code.place.area, ...neighbours.map(([a]) => a), ...uses.map(([a]) => a), ...usedBy.map(([a]) => a)];
+	const uses = tally((ctx.deps.get(u.id) ?? []).map(labelOf));
+	const usedBy = tally([...ctx.deps].filter(([, ds]) => ds.includes(u.id)).map(([id]) => labelOf(id)));
+	const known = new Map<string, Cand>();
+	for (const s of stacks) {
+		for (const [a, purpose] of ctx.features.get(s) ?? []) if (!known.get(a)?.purpose) known.set(a, { area: a, shared: false, purpose });
+		for (const [t, purpose] of ctx.topics.get(s) ?? []) if (!known.get(placeLabel({ area: t, shared: true }))?.purpose) known.set(placeLabel({ area: t, shared: true }), { area: t, shared: true, purpose });
+	}
+	const relevance = new Map<string, number>();
+	for (const [l, n] of [[placeLabel(code.place), 1] as [string, number], ...neighbours, ...uses, ...usedBy]) relevance.set(l, (relevance.get(l) ?? 0) + n);
+	const rel = (l: string) => relevance.get(l) ?? 0;
+	const units = (l: string) => stacks.reduce((n, s) => n + (ctx.count.get(`${s}:${l}`) ?? 0), 0);
 	// no vocabulary yet (fresh repo, nothing curated, nothing code-sure on this stack): code's guesses and the
 	// neighbours' areas are proposals, curation consolidates them right after the model pass
-	const cands = known.size ? [...new Set([...near.filter((a) => known.has(a)), ...byCount])].slice(0, 8) : [...new Set(near.filter((a) => a !== SHARED_AREA))].slice(0, 8);
-	const topics = [...new Set(stacks.flatMap((s) => [...(ctx.topics.get(s) ?? [])]))].slice(0, 6);
-	return { files, neighbours, uses, usedBy, cands, topics, purpose: (a: string) => known.get(a) ?? "" };
+	const cands: Cand[] = known.size
+		? [...known].sort(([a, x], [b, y]) => rel(b) - rel(a) || (rel(a) ? 0 : Number(y.shared) - Number(x.shared)) || units(b) - units(a)).map(([, c]) => c)
+		: [...relevance.keys()].filter((l) => !generic(l)).sort((a, b) => rel(b) - rel(a)).map((l) => ({ area: l.replace(/^shared\//, ""), shared: l.startsWith("shared/"), purpose: "" }));
+	return { files, neighbours, uses, usedBy, cands: cands.slice(0, MAX_CHOICES) };
 }
+
+/** Jev's option key for a candidate: `campaigns`, `shared__dates`. */
+const choiceKey = (c: Cand) => `${c.shared ? "shared__" : ""}${c.area.replace(/-/g, "_")}`;
 
 async function modelPlace(d: PlacementDeps, u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>): Promise<{ place?: Placement; confidence?: number; decision?: number; costUsd: number }> {
 	const stacks = code.surfaceKnown ? [code.place.stackId] : d.config.target.stacks;
-	const { files, neighbours, uses, usedBy, cands, topics, purpose } = around(u, code, ctx, stacks);
-	const key = (a: string) => a.replace(/-/g, "_");
-	const topicKey = (t: string) => `shared__${key(t)}`;
+	const { files, neighbours, uses, usedBy, cands } = around(u, code, ctx, stacks);
 	const battery: Battery = {
 		area: {
 			type: "choice",
-			instructions: "Which existing feature area of the app does the code in `summary` belong to, or which shared topic if it is cross-cutting code several features use? `neighbours` are the areas of the files in the same folder, `uses` the areas of the code it depends on, `used_by` the areas of the code that depends on it. Pick `other` when none fits.",
+			instructions: "Which existing feature area of the app does the code in `summary` belong to, or which shared topic if it is cross-cutting code several features use? `neighbours` are the areas of the files in the same folder, `uses` the areas of the code it depends on, `used_by` the areas of the code that depends on it (`shared/<topic>` = a shared topic). Pick `other` when none fits.",
 			criteria: {
-				...Object.fromEntries(cands.map((a) => [key(a), `feature "${a}"${purpose(a) ? `: ${purpose(a)}` : ""}`])),
-				...Object.fromEntries(topics.map((t) => [topicKey(t), `shared topic "${t}" (cross-cutting code)`])),
-				other: null,
+				...Object.fromEntries(cands.map((c) => [choiceKey(c), `${c.shared ? `shared topic "${c.area}" (cross-cutting code)` : `feature "${c.area}"`}${c.purpose ? `: ${c.purpose}` : ""}`])),
+				other: "none of these fits: the code needs a new feature area or shared topic",
 			},
 		},
 	};
@@ -384,41 +429,57 @@ async function modelPlace(d: PlacementDeps, u: UnitRow, code: Planned, ctx: Retu
 	const choice = a?.type === "choice" ? a.choice : "other";
 	const ui = r.answers["ui"];
 	const stackId = ui?.type === "noul" ? stackFor(d.config, ui.noul >= 0.5 ? "ui" : "server") : code.place.stackId;
-	const topic = topics.find((t) => topicKey(t) === choice);
-	const picked = topic ?? cands.find((c) => key(c) === choice);
-	const shared = !!topic;
-	if (picked && r.confidence >= ACT) return { place: mk(stackId, picked, shared, "model"), confidence: r.confidence, decision: r.decisionId, costUsd: r.costUsd };
-	const jev = `Jev: ${choice} at confidence ${r.confidence.toFixed(2)}${ui?.type === "noul" ? `, renders UI p=${ui.noul.toFixed(2)} (confidence ${noulConfidence(ui.noul).toFixed(2)})` : ""}`;
-	return { costUsd: r.costUsd + (await askPlacement(d, u, code, ctx, picked ? { stackId, area: picked, shared, facts: jev, decision: r.decisionId } : { stackId, facts: jev, decision: r.decisionId })) };
+	const picked = cands.find((c) => choiceKey(c) === choice);
+	if (picked && r.confidence >= ACT) return { place: mk(stackId, picked.area, picked.shared, "model"), confidence: r.confidence, decision: r.decisionId, costUsd: r.costUsd };
+	// Jev unsure and a stronger model read the same code: its pick is what the question recommends
+	const so = r.second?.answers;
+	const soUi = so?.["ui"];
+	const soPick = so && cands.find((c) => choiceKey(c) === so["area"]);
+	const facts = [
+		`Jev: ${choice} at confidence ${r.confidence.toFixed(2)}${ui?.type === "noul" ? `, renders UI p=${ui.noul.toFixed(2)} (confidence ${noulConfidence(ui.noul).toFixed(2)})` : ""}`,
+		...(so ? [`second opinion (${r.second!.model}, read the same code): ${String(so["area"])}${typeof soUi === "number" ? `, renders UI p=${soUi.toFixed(2)}` : ""}`] : []),
+	].join("; ");
+	const second = soPick ? { stackId: typeof soUi === "number" ? stackFor(d.config, soUi >= 0.5 ? "ui" : "server") : stackId, area: soPick.area, shared: soPick.shared, model: r.second!.model } : undefined;
+	return { costUsd: r.costUsd + (await askPlacement(d, u, code, ctx, picked ? { stackId, area: picked.area, shared: picked.shared, facts, decision: r.decisionId, second } : { stackId, facts, decision: r.decisionId, second })) };
 }
 
-/** One placement question (phrased by a model) offering the known areas; only this unit waits. `pick` = Jev's unsure pick, if Jev ran. */
-async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>, pick?: { stackId: string; area?: string; shared?: boolean; facts: string; decision?: number }): Promise<number> {
+/**
+ * One placement question (phrased by a model) offering the known areas and topics; only this unit waits. `pick` =
+ * Jev's unsure pick, if Jev ran; `pick.second` = the stronger model's pick, which the question then recommends.
+ */
+async function askPlacement(d: PlacementDeps, u: UnitRow, code: Planned, ctx: ReturnType<typeof candidateContext>, pick?: { stackId: string; area?: string; shared?: boolean; facts: string; decision?: number; second?: { stackId: string; area: string; shared: boolean; model: string } }): Promise<number> {
 	const stacks = code.surfaceKnown ? [code.place.stackId] : d.config.target.stacks;
-	const { files, neighbours, uses, usedBy, cands, topics, purpose } = around(u, code, ctx, stacks);
+	const { files, neighbours, uses, usedBy, cands } = around(u, code, ctx, stacks);
 	const stackId = pick?.stackId ?? code.place.stackId;
 	const value = (stack: string, area: string, sh: boolean) => `${stack}:${sh ? "shared/" : ""}${area}`;
 	const options: AskOption[] = [];
-	if (pick?.area) options.push({ value: value(stackId, pick.area, !!pick.shared), facts: "Jev's pick (below the confidence to act alone)" });
-	for (const s of stacks) {
-		for (const c of cands) {
-			const v = value(s, c, false); // a stack without known areas yet (fresh repo): the candidates are proposals
-			if ((ctx.features.get(s)?.size ? ctx.features.get(s)!.has(c) : true) && !options.some((o) => o.value === v)) options.push({ value: v, facts: `${purpose(c) ? `${purpose(c)}; ` : ""}${ctx.count.get(`${s}:${c}`) ?? 0} units already placed there` });
+	const add = (v: string, facts: string) => void (options.some((o) => o.value === v) || options.push({ value: v, facts }));
+	const second = pick?.second;
+	if (second) add(value(second.stackId, second.area, second.shared), `picked by ${second.model}, a stronger model that read the code`);
+	if (pick?.area) add(value(stackId, pick.area, !!pick.shared), "Jev's pick (below the confidence to act alone)");
+	// most relevant first, each stack in turn: the cut below drops the least relevant
+	for (const c of cands)
+		for (const s of stacks) {
+			const vocab = (c.shared ? ctx.topics : ctx.features).get(s);
+			if (ctx.features.get(s)?.size && !vocab?.has(c.area)) continue; // a stack without known areas yet (fresh repo): the candidates are proposals
+			add(value(s, c.area, c.shared), `${c.shared ? "shared topic (cross-cutting code)" : "feature area"}${c.purpose ? `: ${c.purpose}` : ""}; ${ctx.count.get(`${s}:${placeLabel(c)}`) ?? 0} units already placed there`);
 		}
-		for (const t of ctx.topics.get(s) ?? []) if (topics.includes(t) && !options.some((o) => o.value === value(s, t, true))) options.push({ value: value(s, t, true), facts: "shared topic in use (cross-cutting code)" });
-		// cross-cutting is always an answer, even before any shared topic exists (another topic name can be typed)
-		if (!options.some((o) => o.value.startsWith(`${s}:shared/`))) options.push({ value: value(s, SHARED_AREA, true), facts: "the stack's shared dir (cross-cutting code); type <stack>:shared/<topic> for a named topic" });
-	}
-	const recommended = options[0]?.value ?? value(stackId, SHARED_AREA, true);
-	if (!options.length) options.push({ value: recommended, facts: "no known area yet: the stack's shared dir" });
+	const shown = options.slice(0, MAX_ASKED);
+	// cross-cutting is always an answer, even before any shared topic exists (another topic name can be typed)
+	for (const s of stacks) if (!shown.some((o) => o.value.startsWith(`${s}:shared/`))) shown.push({ value: value(s, SHARED_AREA, true), facts: "the stack's shared dir (cross-cutting code); type <stack>:shared/<topic> for a named topic" });
+	const recommended = shown[0]!.value;
 	const facts = [
 		`unit ${u.id}, files: ${files.join(", ")}`,
 		`code could not place it (${code.unsure}); it never names an area after a single legacy file`,
 		pick?.facts ?? "Jev did not place it (no model, or the call failed)",
 		`areas of files in the same folder: ${JSON.stringify(Object.fromEntries(neighbours))}; it uses: ${JSON.stringify(Object.fromEntries(uses))}; used by: ${JSON.stringify(Object.fromEntries(usedBy))}`,
-		`options are the curated business areas (<stack>:<area>) and the shared topics in use (<stack>:shared/<topic>); a typed area name is taken as a new area on ${stackId}`,
+		`options are the curated business areas (<stack>:<area>) and shared topics (<stack>:shared/<topic>), most relevant first; a typed area name is taken as a new area on ${stackId}`,
 	].join("\n");
-	const q = await askViaModel({ ledger: d.ledger, config: d.config, root: d.root, client: d.client }, { point: POINT, unitId: u.id, facts, options: options.slice(0, 10), recommended, guess: true, blocks: "unit", askedBy: "placement", context: { files, defaultStack: stackId }, decisionId: pick?.decision });
+	const q = await askViaModel(
+		{ ledger: d.ledger, config: d.config, root: d.root, client: d.client },
+		// the stronger model's pick is no guess: the phrasing model (which never saw the code) cannot overrule it without asking
+		{ point: POINT, unitId: u.id, facts, options: shown, recommended, guess: !second, ...(second ? { agentOpinion: `${second.model} read the code and picked ${recommended}` } : {}), blocks: "unit", askedBy: "placement", context: { files, defaultStack: stackId }, decisionId: pick?.decision },
+	);
 	d.ledger.updateUnit(u.id, { meta: { placeQuestion: q.id } });
 	return q.costUsd;
 }
