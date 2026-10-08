@@ -614,6 +614,8 @@ const PRESETS: Record<string, string> = {
 	cost: "SELECT role, model, COUNT(*) calls, round(SUM(cost_usd),4) usd FROM attempts GROUP BY role, model",
 	decisions: "SELECT point, COUNT(*) n, round(AVG(confidence),2) avg_conf FROM decisions GROUP BY point",
 	questions: "SELECT id, unit_id, point, blocks, asked_by, question, options FROM questions WHERE status = 'open' ORDER BY id",
+	// setup fixes on main during the run: what changed, what was put back (tests, migrated code), what the model said
+	setup: "SELECT id, role, outcome, started_at, gate_report FROM attempts WHERE substr(role, 1, 10) = '__setup__:' ORDER BY id",
 };
 
 export default function (pi: ExtensionAPI) {
@@ -900,10 +902,10 @@ export default function (pi: ExtensionAPI) {
 		name: "ledger_query",
 		label: "Ledger query",
 		description:
-			"Read-only access to the bigrefactor migration ledger. `preset` is one of: status, unaccounted, quarantine, units, cost, decisions, questions. Or pass a read-only `sql` SELECT. Use `why` with a symbol id or file path for its full history.",
+			"Read-only access to the bigrefactor migration ledger. `preset` is one of: status, unaccounted, quarantine, units, cost, decisions, questions, setup. Or pass a read-only `sql` SELECT. Use `why` with a symbol id or file path for its full history.",
 		promptSnippet: "Query the migration ledger (status, unaccounted symbols, why a file is in its state).",
 		parameters: Type.Object({
-			preset: Type.Optional(Type.String({ description: "status | unaccounted | quarantine | units | cost | decisions | questions" })),
+			preset: Type.Optional(Type.String({ description: "status | unaccounted | quarantine | units | cost | decisions | questions | setup" })),
 			sql: Type.Optional(Type.String({ description: "A single read-only SELECT statement" })),
 			why: Type.Optional(Type.String({ description: "Symbol id or file path to explain" })),
 		}),

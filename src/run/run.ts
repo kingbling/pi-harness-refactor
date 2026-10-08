@@ -381,6 +381,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						reuseTruth: round > 1,
 						retryNote: conflictNote ?? carried,
 						gateSlot: (fn) => gates.run(fn),
+						mergeLock: (fn) => merge.run(fn),
 						log: (l) => log(`  ${l}`),
 						spawn: o.spawn,
 						gate: o.gate,
@@ -414,7 +415,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							pusher.afterMerge();
 						}
 						// living rules: proposals from units are curated into a new rules version once enough piled up
-						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => Object.entries(r.versions).forEach(([s, v]) => log(pc.cyan(`  rules ${s} → v${v}`))), (e) => log(pc.yellow(`  rules curation failed: ${e?.message ?? e}`)));
+						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => {
+								for (const [s, v] of Object.entries(r.versions)) log(pc.cyan(`  rules ${s} → v${v}`));
+								// shown once: a refused proposal is final and never curated again
+								for (const x of r.refused) log(pc.yellow(`  rules ${x.stack}: proposal ${x.id} ("${x.text.slice(0, 80)}") stays out although the owner said apply — curator: ${x.reason}`));
+							}, (e) => log(pc.yellow(`  rules curation failed: ${e?.message ?? e}`)));
 						// tidy review: every N accepts of an area a model reads its module; approved changes become tidy tasks
 						const { stackId: tStack, area: tArea } = placementOf(ledger.getUnit(unitId)!.meta);
 						await curate.run(() => maybeTidyReview({ ledger, config, root: o.root, client: o.client }, { stackId: tStack, area: tArea })).then((r) => r.reviewed && log(pc.cyan(`  tidy review ${tStack}:${tArea}: ${r.asked} change(s) asked, ${r.proposals} convention(s) proposed`)), (e) => log(pc.yellow(`  tidy review failed: ${e?.message ?? e}`)));
@@ -484,7 +489,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const dx = await diagnoseFailure({ config, adapter, projectDir: dir, failedStep: first.step ?? "", output: first.output ?? "", client: o.client }).catch(() => undefined);
 			if (dx) log(pc.dim(`  diagnosis (${dx.by}): ${dx.action} — ${dx.summary}`));
 			if (!dx || dx.action === "fix" || dx.action === "unknown")
-				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output of ${first.unit}:\n${(first.output ?? first.gate ?? "").slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, ledger, lock: (fn) => merge.run(fn), signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output of ${first.unit}:\n${(first.output ?? first.gate ?? "").slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 		}
 		recent.length = 0;
 		if (fixed) {

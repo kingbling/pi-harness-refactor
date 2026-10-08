@@ -1,11 +1,13 @@
-import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
 import { saveCommandOverride, saveWorktreeCopy } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
+import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 
@@ -78,7 +80,8 @@ async function setupSession(o: { config: Config; root: string; adapter: TargetAd
 		cwd: o.projectDir,
 		config: o.config,
 		writeGlobs: ["**"],
-		// test files may be written to try things: the code's own check writes its probe afresh, so a written test proves nothing
+		// test files may be written to try things: the code's own check writes its probe afresh, so a written test proves
+		// nothing; during the run, test files and migrated code are put back after the session (undoMigratedCode)
 		protectedGlobs: [".git/**"],
 		customTools: [setCommandTool(o.root, o.adapter.id), worktreeCopyTool(o.root, o.adapter)],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.${o.adapter.id}.${label}${o.attempt}.jsonl`),
@@ -124,13 +127,58 @@ export const MAX_FIXES_PER_PROBLEM = 2;
 export const MAX_RUN_FIXES = 20;
 
 /**
+ * Where the migrated code of a project lives: the feature root (the part of moduleDir before the area) and the
+ * shared dirs. A setup fix may touch config, dependencies and tool files, never these: they are the units' work.
+ */
+function migratedCodeDirs(adapter: TargetAdapter): string[] {
+	const dirs = [...adapter.layout.sharedDirs];
+	try {
+		const m = adapter.layout.moduleDir("zzarea");
+		const i = m.toLowerCase().indexOf("zzarea");
+		if (i > 0) dirs.push(m.slice(0, i));
+	} catch {
+		/* no feature root known: only the shared dirs and test files count */
+	}
+	return dirs.filter((d) => d && d !== "/" && d !== "./").map((d) => (d.endsWith("/") ? d : `${d}/`));
+}
+
+/**
+ * After a setup fix on main: put back every test file and every file of migrated code the session changed, as the
+ * builder does for tests. Tests are the truth and accepted code is proven by them; a setup fix runs neither.
+ * Returns the paths put back (relative to the repo).
+ */
+export function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter): string[] {
+	const proj = relative(repo, projectDir);
+	const dirs = migratedCodeDirs(adapter);
+	const entries = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0");
+	const undone: string[] = [];
+	for (let i = 0; i < entries.length; i++) {
+		const e = entries[i]!;
+		if (e.length < 4) continue;
+		const code = e.slice(0, 2);
+		const path = e.slice(3);
+		if (code[0] === "R" || code[0] === "C") i++; // the old name follows
+		const rel = !proj ? path : path.startsWith(`${proj}/`) ? path.slice(proj.length + 1) : undefined;
+		if (rel === undefined || !(adapter.layout.isTestFile(rel) || dirs.some((d) => rel.startsWith(d)))) continue;
+		if (code === "??" || code[0] === "A") {
+			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", path], { stdio: "pipe" });
+			rmSync(join(repo, path), { force: true });
+		} else execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", path], { stdio: "pipe" });
+		undone.push(path);
+	}
+	return undone;
+}
+
+/**
  * A gate failure diagnosed as a setup problem of the new project: the setup model fixes the stack's main project
  * (not the unit's worktree) and the change is committed, so every unit started from now on has it. One fix per
  * stack at a time: units failing meanwhile wait for that fix instead of starting their own. Each different problem
- * (`signature`, the same error in different units) gets its own tries. A fix is logged to the stack's fixes log,
- * which wakes the units parked on a setup problem. Returns what changed, or undefined when nothing did.
+ * (`signature`, the same error in different units) gets its own tries. Changes to test files and migrated code are
+ * put back before the commit, and the commit runs under the run's merge lock (`lock`). A fix is logged to the
+ * stack's fixes log, which wakes the units parked on a setup problem, and kept in the ledger as a `__setup__`
+ * attempt (what changed, what was put back, what the model said). Returns what changed, or undefined when nothing did.
  */
-export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer }): Promise<string | undefined> {
+export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer; ledger?: Ledger; lock?: <T>(fn: () => Promise<T>) => Promise<T> }): Promise<string | undefined> {
 	const key = o.adapter.id;
 	const running = fixing.get(key);
 	if (running) return running;
@@ -142,9 +190,22 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		const { commitAll } = await import("../git.ts");
 		const { loadCommandOverrides, setupLogPath } = await import("../adapters/command-overrides.ts");
 		const before = JSON.stringify(loadCommandOverrides(o.root, key));
-		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! });
-		const sha = commitAll(o.config.target.path, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
+		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
+		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
+			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000) } });
+			throw e;
+		});
+		const repo = o.config.target.path;
+		const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
+		const { sha, undone, changed } = await lock(async () => {
+			const undone = undoMigratedCode(repo, o.projectDir, o.adapter);
+			const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
+			const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
+			return { sha, undone, changed };
+		});
+		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} test or migrated-code file(s) it changed: ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
 		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
+		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });
 		if (!sha && !override) return undefined;
 		const what = said || "the setup was changed";
 		mkdirSync(dirname(setupLogPath(o.root, key)), { recursive: true });

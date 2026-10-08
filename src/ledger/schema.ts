@@ -308,7 +308,7 @@ CREATE TABLE IF NOT EXISTS rule_proposals (
   text TEXT NOT NULL,
   why TEXT NOT NULL,
   evidence TEXT,                      -- file path(s) or symbol ids
-  status TEXT NOT NULL DEFAULT 'pending', -- pending|merged|rejected|asked
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|approved|merged|rejected|asked|refused (refused = the curator said no after the owner's apply: final)
   version INTEGER,                    -- rules version it was merged into
   question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL
