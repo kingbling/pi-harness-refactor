@@ -33,6 +33,7 @@ import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.
 import { maybeTidyReview } from "./tidy.ts";
 import { findTests } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
+import { createTidyJobs } from "./tidy-job.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 
 /**
@@ -244,6 +245,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		repair: o.builderRepair ?? (o.spawn ? false : undefined),
 		mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)),
 	});
+	// approved tidy tasks run once each as their own job on main; units of the area wait for it
+	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
 	const curate = new Semaphore(1);
 	const ran: UnitRunResult[] = [];
 	const running = new Map<string, Promise<void>>();
@@ -310,6 +313,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			// waits for Jev or its placement question, never runs on a guess (a dry run previews before placement ran)
 			if (!o.dry && unplacedReason(config, u.meta, o.root)) return false;
 			if (busyModules.has(placementOf(u.meta).moduleKey)) return false;
+			if (tidyJobs.holds(placementOf(u.meta).stackId, placementOf(u.meta).area)) return false;
 			if (o.units && !o.units.includes(u.id)) return false;
 			if (o.slice && JSON.parse(u.meta).slice !== o.slice) return false;
 			return true;
@@ -658,6 +662,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
 		// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
 		const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
+		if (!stop && !dayCapHit) tidyJobs.next();
 		const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : await samplePause();
 		let readyNow = 0;
 		if (!stop && !dayCapHit && !sampleReason && underLimit()) {
@@ -705,6 +710,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			// a self-heal pass (it may ask the decide model) can still put quarantined units back: wait for it first
 			if (askingStuck) {
 				await askingStuck;
+				continue;
+			}
+			if (tidyJobs.busy) {
+				await tidyJobs.busy;
 				continue;
 			}
 			// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run

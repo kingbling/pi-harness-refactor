@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -7,10 +7,8 @@ import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
 import { reactAdapter } from "../src/adapters/target/react.ts";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { runGate, sha1 } from "../src/run/gate.ts";
+import { runGate } from "../src/run/gate.ts";
 import { checkTree, driftReport, recordDrift } from "../src/run/layout-check.ts";
-import type { TidyTask } from "../src/run/tidy.ts";
-import { tidyLeftovers, tidyMoves } from "../src/run/unit.ts";
 
 /**
  * Whole-tree drift (checkTree): legacy-named folders, stray folders, naming per structureDoc, size cap and one class
@@ -121,52 +119,5 @@ describe("structure_ok and drift", () => {
 		const sanctioned = await gate(["src/features/agency/**", "src/shared/money/format-money.ts", "src/features/agency/agency.constants.ts"]);
 		expect(sanctioned.ok).toBe(true);
 		expect(existsSync(join(project, "src/shared/money/format-money.ts"))).toBe(false);
-	});
-});
-
-describe("approved tidy tasks in a unit's worktree", () => {
-	const task = (op: TidyTask["op"], from: string[], to: string[]): TidyTask => ({ id: "T1", stack: "nestjs", area: "agency", op, from, to, why: "tidy", questionId: 1, status: "approved" });
-
-	it("code does 1:1 renames; merged sources go once every target exists; splits keep theirs", () => {
-		write("src/features/agency/agency-list.service.ts", "export class AgencyListService {}\n");
-		write("src/features/agency/agency-filter.service.ts", "export const x = 1;\n");
-		const tasks = [
-			task("rename", ["src/features/agency/agency-list.service.ts"], ["src/features/agency/agency-overview.service.ts"]),
-			task("merge", ["src/features/agency/agency-filter.service.ts", "src/shared/money/format-money.ts"], ["src/features/agency/agency.service.ts"]),
-			task("split", ["src/features/agency/agency.controller.ts"], ["src/features/agency/agency-admin.controller.ts"]),
-		];
-		const moved = tidyMoves(project, tasks);
-		expect(moved).toEqual(["src/features/agency/agency-list.service.ts → src/features/agency/agency-overview.service.ts"]);
-		expect(existsSync(join(project, "src/features/agency/agency-overview.service.ts"))).toBe(true);
-		// agency.service.ts exists (scaffolded above): the merge's sources are leftovers; the split's target is missing
-		expect(tidyLeftovers(project, tasks, moved).sort()).toEqual(["src/features/agency/agency-filter.service.ts", "src/shared/money/format-money.ts"]);
-		write("src/features/agency/agency-admin.controller.ts", "export class AgencyAdminController {}\n");
-		expect(tidyLeftovers(project, tasks, moved)).not.toContain("src/features/agency/agency.controller.ts");
-	});
-
-	it("moves an earlier unit's test with its file; the gate sees it under the new name, the old name is sanctioned", async () => {
-		const from = ["src/features/agency/agency-list.service.ts", "src/features/agency/agency-list.service.spec.ts"];
-		const to = ["src/features/agency/agency-overview.service.ts", "src/features/agency/agency-overview.service.spec.ts"];
-		write(from[0]!, "export class AgencyListService {}\n");
-		write(from[1]!, "it('u0#1 lists agencies', () => {});\n");
-		git("add", "-A");
-		git("commit", "-qm", "u0");
-		const moved = tidyMoves(project, [task("rename", from, to)]);
-		expect(moved).toEqual([`${from[0]} → ${to[0]}`, `${from[1]} → ${to[1]}`]);
-		const testFiles = [{ path: to[1]!, sha1: sha1(readFileSync(join(project, to[1]!))) }];
-		const g = (sanctioned: string[]) => runGate({ ledger, unitId: "u1", adapter, targetProjectDir: project, writeGlobs: ["src/features/agency/**"], testFiles, moduleDir: "src/features/agency", area: "agency", root: ws, stackId: "nestjs", sanctioned });
-		expect((await g([])).steps.find((s) => s.name === "antigaming_ok")!.output).toMatch(/changed a test of an earlier unit: .*agency-list\.service\.spec\.ts/);
-		write(to[0]!, "export class AgencyOverviewService {}\n"); // the implementer's part: names and imports
-		expect((await g([...from, ...to])).ok).toBe(true);
-	});
-
-	it("skips renames that only change letter case and never deletes their source as a leftover", () => {
-		write("src/features/agency/arangodb.client.ts", "export const db = 1;\n");
-		const tasks = [task("rename", ["src/features/agency/arangodb.client.ts"], ["src/features/agency/arangoDb.client.ts"])];
-		const lines: string[] = [];
-		expect(tidyMoves(project, tasks, (l) => lines.push(l))).toEqual([]);
-		expect(lines.join("\n")).toMatch(/skipped .*arangodb\.client\.ts → .*arangoDb\.client\.ts \(only the letter case/);
-		expect(tidyLeftovers(project, tasks, [])).toEqual([]);
-		expect(existsSync(join(project, "src/features/agency/arangodb.client.ts"))).toBe(true);
 	});
 });

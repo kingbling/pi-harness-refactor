@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { diagnoseFailure } from "./doctor.ts";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
 import { overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
@@ -32,7 +32,7 @@ import { reviewWithModel, type Reviewer } from "./review.ts";
 import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkList, quirkRetestNote, quirkSummary } from "./quirks.ts";
-import { caseOnly, completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
+import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
@@ -126,10 +126,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const sourceAdapter = getSourceAdapter(o.config.source.stack);
 	// one legacy area = one feature module (or, for code ≥ 2 areas use, the shared dir + area)
 	const moduleDir = placementDir(adapter.layout, place);
-	// approved tidy tasks of the area: their files are in scope (existing shared ones too); 1:1 moves are done by code
+	// approved tidy tasks of the area: their files are in scope (existing shared ones too). The tidy job does the
+	// work and the scheduler holds units back meanwhile; a unit sees one only when no tidy job runs (tests, simulation)
 	const tidy = tidyTasks(o.ledger, stackId, area).filter((t) => t.status === "approved");
-	const tidyMoved = tidyMoves(targetProjectDir, tidy, (l) => log(pc.dim(`  tidy: ${l}`)));
-	if (tidyMoved.length) log(pc.dim(`  tidy: moved ${tidyMoved.join(", ")} (imports are the implementer's job)`));
 	const tidyPaths = [...new Set(tidy.flatMap((t) => [...t.from, ...t.to]))];
 	// wiring files the stack names (route table, main module) when no code regenerates them: the unit registers itself
 	const wiring = adapter.generateRegistration ? [] : (adapter.layout.wiringFiles ?? []);
@@ -531,7 +530,6 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			...testFiles.filter((t) => existsSync(join(targetProjectDir, t.path))).map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
 			lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
 			o.retryNote && attemptNo === 1 ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
-			tidyMoved.length ? `\n## Tidy moves already done by the orchestrator\n${tidyMoved.join("\n")}\nUpdate every import of the moved files; keep behaviour identical.` : "",
 		].join("\n");
 		let res;
 		try {
@@ -580,8 +578,6 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			continue;
 		}
 
-		// merged tidy sources go once every target exists (a missed move breaks the build, the gate says so)
-		for (const f of tidyLeftovers(targetProjectDir, tidy, tidyMoved)) rmSync(join(targetProjectDir, f));
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
 		const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
 		const review = reviewer
@@ -757,38 +753,6 @@ export function afterAccept(ledger: Ledger, adapter: TargetAdapter, projectDirAb
 	if (done.length) log(pc.dim(`  tidy done: ${done.join(", ")}`));
 	const drift = recordDrift(ledger, adapter, projectDirAbs);
 	if (drift.length) log(pc.dim(`  drift ${stackId}: ${drift.length} finding(s) (br layout)`));
-}
-
-/**
- * 1:1 moves/renames of approved tidy tasks, done by code before the sessions (source present, target free).
- * Test files move too: the tests are then listed under their new name before the gate takes their hashes, and
- * the old name is a tidy-sanctioned path, so no unit has to redo the rename by hand. A plain file move, not a
- * staged one: git sees the old path deleted and the new one added, which is what the gate reads.
- * Renames that only change letter case are skipped: on a case-insensitive disk (macOS) the target "exists"
- * already and git does not see the change.
- */
-export function tidyMoves(dir: string, tasks: TidyTask[], log: (line: string) => void = () => {}): string[] {
-	const out: string[] = [];
-	for (const t of tasks) {
-		if ((t.op !== "move" && t.op !== "rename") || t.from.length !== t.to.length) continue;
-		t.from.forEach((f, i) => {
-			const to = t.to[i]!;
-			if (f === to) return;
-			if (caseOnly(f, to)) return log(`skipped ${f} → ${to} (only the letter case changes; unsafe on a case-insensitive disk)`);
-			if (!existsSync(join(dir, f)) || existsSync(join(dir, to))) return;
-			mkdirSync(dirname(join(dir, to)), { recursive: true });
-			renameSync(join(dir, f), join(dir, to));
-			out.push(`${f} → ${to}`);
-		});
-	}
-	return out;
-}
-
-/** Sources of approved merges (and n:m moves) still present although every target exists (never a case-only twin of a target: on macOS that is the target). */
-export function tidyLeftovers(dir: string, tasks: TidyTask[], moved: string[]): string[] {
-	return tasks
-		.filter((t) => t.op !== "split" && t.to.every((f) => existsSync(join(dir, f))) && !t.from.every((f) => moved.some((m) => m.startsWith(`${f} → `))))
-		.flatMap((t) => t.from.filter((f) => !t.to.some((x) => x.toLowerCase() === f.toLowerCase()) && existsSync(join(dir, f))));
 }
 
 /** The workspace files a setup fix changes: the stack's command overrides and its fixes log. */
