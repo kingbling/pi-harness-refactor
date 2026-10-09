@@ -429,8 +429,11 @@ export function groupQuestions(rows: QuestionRow[]): QuestionRow[][] {
 	const groups = new Map<string, QuestionRow[]>();
 	for (const q of rows) {
 		const values = q.options ? (JSON.parse(q.options) as string[]).map(answerValue).sort() : [];
-		const rec = (q.context ? (JSON.parse(q.context) as { recommended?: string }).recommended : undefined) ?? "";
-		const key = values.length ? `${q.point}\0${values.join("\0")}\0${rec}` : `${q.question}\0`;
+		const ctx = q.context ? (JSON.parse(q.context) as { recommended?: string; sameAs?: string }) : {};
+		const rec = ctx.recommended ?? "";
+		// a question about one problem (sameAs: its failure, with numbers and paths blanked) shares an answer only
+		// with questions about the same problem: a bundle registration and a missing route are not one decision
+		const key = ctx.sameAs ? `${q.point}\0${ctx.sameAs}` : values.length ? `${q.point}\0${values.join("\0")}\0${rec}` : `${q.question}\0`;
 		groups.set(key, [...(groups.get(key) ?? []), q]);
 	}
 	return [...groups.values()];

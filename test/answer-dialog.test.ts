@@ -76,6 +76,9 @@ describe("/br answer applies every question type", () => {
 		const open = ledger.openQuestions();
 		expect(open.map((q) => q.point).sort()).toEqual(["area_taxonomy", "quirk", "quirk", "quirk", "quirk", "rule_change", "tidy"]);
 		expect(groupQuestions(open).map((g) => g.length).sort()).toEqual([1, 1, 1, 2, 2]);
+		// questions about different problems (their sameAs) never share one answer, even with the same options
+		const row = (id: number, sameAs: string) => ({ id, unit_id: `U${id}`, point: "gate_env", question: `problem ${sameAs}`, options: JSON.stringify(["leave — Leave it", "retry — Retry"]), context: JSON.stringify({ sameAs }) }) as never;
+		expect(groupQuestions([row(1, "wired_ok: bundle"), row(2, "wired_ok: route"), row(3, "wired_ok: bundle")]).map((g) => g.length).sort()).toEqual([1, 2]);
 		ledger.close();
 
 		// the owner answers everything in Pi
