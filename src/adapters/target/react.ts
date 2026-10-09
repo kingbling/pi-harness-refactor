@@ -24,6 +24,8 @@ export const reactAdapter: TargetAdapter = {
 		fileFindings: tsFileFindings,
 		testFileGlobs: (dir) => [`${dir}/**/*.test.tsx`, `${dir}/**/*.test.ts`],
 		testHint: "*.test.tsx files (vitest + @testing-library/react) next to the component",
+		// the app's route table and the component that mounts it: each unit adds its area's routes there
+		wiringFiles: ["src/routes.tsx", "src/App.tsx"],
 	},
 	layoutRules: REACT_LAYOUT,
 	indexFile: (root, rel) => indexTsFile(root, rel, { sharedDirs: tsLayoutBase().sharedDirs, nameKinds: [[/Page$/, "page"], [/^use[A-Z]/, "hook"]] }),
@@ -87,8 +89,8 @@ export const reactAdapter: TargetAdapter = {
 		helpers: "TypeScript stdlib; src/shared/* helpers",
 		tests: "vitest + Testing Library",
 	},
-	protectedGlobs: ["**/*.test.tsx", "**/*.test.ts", "**/__goldens__/**", "vite.config.*", "vitest.config.*", "package.json", "pnpm-lock.yaml", "tsconfig*.json", "src/main.tsx", "src/routes.tsx"],
-	generatedFiles: ["src/routes.tsx"],
+	protectedGlobs: ["**/*.test.tsx", "**/*.test.ts", "**/__goldens__/**", "vite.config.*", "vitest.config.*", "package.json", "pnpm-lock.yaml", "tsconfig*.json", "src/main.tsx"],
+	generatedFiles: [],
 	patternKinds: ["page", "component", "hook", "api-client", "test"],
 
 	async detect(root) {

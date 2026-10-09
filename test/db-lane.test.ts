@@ -259,6 +259,68 @@ describe("DB lane", () => {
 	});
 });
 
+describe("DB lane: migrations are written in order, reviewed, and applied to an empty database", () => {
+	it("the prompt lists the migrations already there and names no unit id; the code units' reviewer judges the work", async () => {
+		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
+		write(join(ws, "migrated", "package.json"), "{}");
+		write(join(ws, "migrated", "src", "db", "migrations", "1700000000000-customers.ts"), "export class Customers {}\n");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await planDbLane(ledger, config);
+		const prompts: string[] = [];
+		const spawn = async (): Promise<LeafSession> =>
+			({
+				run: async (p: string) => {
+					prompts.push(p);
+					write(join(ws, "migrated", "src", "db", "invoice.entity.spec.ts"), "it('x', () => {});\n");
+					return { text: "done", toolCalls: 3, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const reviewed: Array<{ ownerNote?: string; testFiles?: string[]; changedFiles: string[] }> = [];
+		const reviewer = async (r: { ownerNote?: string; testFiles?: string[]; changedFiles: string[] }) => (reviewed.push(r), { ok: true, judged: true, output: "reviewer: fine" });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!(["src/db/invoice.entity.ts"]);
+			return { ok: r.ok, steps: [{ name: "wired_ok", ok: r.ok, ms: 1, output: r.output }], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) };
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "DB_schema_invoice", spawn, gate, reviewer: reviewer as never, log: () => {} });
+		expect(r.state).toBe("review");
+		expect(prompts[0]).toContain("src/db/migrations/1700000000000-customers.ts");
+		expect(prompts[0]).not.toContain("DB_schema_invoice");
+		expect(reviewed[0]).toMatchObject({ changedFiles: ["src/db/invoice.entity.ts"], testFiles: ["src/db/invoice.entity.spec.ts"] });
+		expect(reviewed[0]!.ownerNote).toMatch(/database unit[\s\S]*invoices/);
+	});
+
+	it("a migration that references a table only a later migration creates fails the migrate step; in order it passes", async () => {
+		const { migrateFreshStep } = await import("../src/run/db-unit.ts");
+		const dir = join(ws, "migrated");
+		// stands for the stack's own migrate command: applies the migrations in order and fails on a missing table
+		write(join(dir, "migrate.mjs"), `import { readdirSync, readFileSync } from "node:fs";
+const made = new Set();
+for (const f of readdirSync("migrations").sort()) {
+	const sql = readFileSync("migrations/" + f, "utf8");
+	for (const [, t] of sql.matchAll(/REFERENCES (\\w+)/g)) if (!made.has(t)) { console.error(f + ": table " + t + " does not exist"); process.exit(1); }
+	for (const [, t] of sql.matchAll(/CREATE TABLE (\\w+)/g)) made.add(t);
+}
+`);
+		write(join(dir, "migrations", "001_invoice_lines.sql"), "CREATE TABLE invoice_lines (id INT, invoice_id INT REFERENCES invoices(id));\n");
+		write(join(dir, "migrations", "002_invoices.sql"), "CREATE TABLE invoices (id INT PRIMARY KEY);\n");
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "DB_schema_invoice", tier: "T0", kind: "db_schema", symbolIds: [] });
+		const adapter = { migrateFresh: () => ({ cmd: process.execPath, args: ["migrate.mjs"] }) } as never;
+		const green: GateReport = { ok: true, steps: [], changedFiles: [] };
+		const red = await migrateFreshStep(green, { ledger, unitId: "DB_schema_invoice", adapter, dir });
+		expect(red).toMatchObject({ ok: false, failedStep: "migrate_ok" });
+		expect(red.steps.at(-1)!.output).toContain("001_invoice_lines.sql: table invoices does not exist");
+		rmSync(join(dir, "migrations", "002_invoices.sql"));
+		write(join(dir, "migrations", "000_invoices.sql"), "CREATE TABLE invoices (id INT PRIMARY KEY);\n");
+		expect((await migrateFreshStep(green, { ledger, unitId: "DB_schema_invoice", adapter, dir })).ok).toBe(true);
+		expect(ledger.hasEvidence("DB_schema_invoice", "migrate_ok")).toBe(true);
+		// no command declared, or the gate already red: nothing runs
+		expect(await migrateFreshStep(green, { ledger, unitId: "DB_schema_invoice", adapter: {} as never, dir })).toBe(green);
+	});
+});
+
 describe("DB lane: a failed gate is read by the triage model", () => {
 	it("a setup failure goes to the setup model, not another schema attempt; the unit waits for a fresh worktree", async () => {
 		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });

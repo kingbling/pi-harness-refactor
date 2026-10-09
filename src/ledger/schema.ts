@@ -55,6 +55,8 @@ export const EVIDENCE_TYPES = [
 	// the tester found no runtime behaviour to pin (only a contract, type declarations or constants): {reason}; no truth cases
 	"truth_none",
 	"ported_tests_green",
+	// DB lane: every migration applied in order to a new empty database (the adapter's migrateFresh command)
+	"migrate_ok",
 	"build_ok",
 	"lint_ok",
 	"rules_ok",

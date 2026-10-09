@@ -147,3 +147,81 @@ describe("generated target adapters on non-TypeScript stacks", () => {
 		}
 	});
 });
+
+describe("stack knowledge is checked when the adapter is written", () => {
+	const php = (layout: Partial<AdapterManifest["layout"]> = {}) => {
+		const base = manifest();
+		return manifest({ id: "sym-test", role: "server", layout: { ...base.layout, moduleDir: "src/{Area}", testFileGlobs: ["tests/{Area}/**/*Test.php"], testFileRegex: "Test\\.php$", sourceExtensions: [".php"], rules: { source: "docs", moduleDir: "src/{Area}", files: [{ path: "{Area}Bundle.php", doc: "the area's bundle" }, { path: "{Name}.php", doc: "a class" }], require: ["{Area}Bundle.php"], forbidDirs: [], place: [], maxLines: 400 }, ...layout } });
+	};
+
+	it("a required file nothing registers goes back to the model until it names the wiring file", async () => {
+		const ws = join(here, ".sim", "gen-adapter-wiring");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(ws, { recursive: true });
+		const answers = [php(), php({ wiringFiles: ["config/bundles.php"] })];
+		const client = new FakeModelClient({ chat: () => ({ json: answers.shift() }) });
+		const m = await generateAdapter({ id: "sym-test", role: "server", why: "", client, model: "m", root: ws, verify: async () => undefined });
+		expect(client.calls.length).toBe(2);
+		const repair = client.calls.at(-1)!.req as { messages: Array<{ content: string }> };
+		expect(repair.messages.at(-1)!.content).toMatch(/require makes every feature folder hold \{Area\}Bundle\.php, but layout\.wiringFiles is empty/);
+		expect(m.layout.wiringFiles).toEqual(["config/bundles.php"]);
+		// the model is asked for a skip marker that also catches the runner's own skip and incomplete calls
+		expect(repair.messages[0]!.content).toMatch(/layout\.skipMarker: .*skip, only and incomplete call/);
+		// a saved older manifest still loads: the check runs only when one is written
+		expect(validateManifest(php())).toEqual([]);
+	});
+
+	it("an area with two test homes is rejected; several globs under one home are fine", async () => {
+		const { stackProblems } = await import("../src/adapters/target/generated.ts");
+		expect(stackProblems(php({ testFileGlobs: ["{moduleDir}/tests/**/*Test.php", "tests/{Area}/**/*Test.php"], wiringFiles: ["config/bundles.php"] })).join("\n")).toMatch(/2 test homes \(src\/Probe\/tests, tests\/Probe\): pick ONE/);
+		expect(stackProblems(php({ wiringFiles: ["config/bundles.php"] }))).toEqual([]);
+		expect(stackProblems(manifest({ layout: { ...manifest().layout, testFileGlobs: ["{moduleDir}/**/*.test.ts", "{moduleDir}/*.spec.ts"] } }))).toEqual([]);
+	});
+
+	it("run start: a saved manifest without wiringFiles gets that one question; nothing to register drops the require", async () => {
+		const { healWiringFiles, loadManifests } = await import("../src/adapters/target/generated.ts");
+		const ws = join(here, ".sim", "heal-wiring");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+		const save = (m: AdapterManifest) => writeFileSync(join(ws, ".bigrefactor", "adapters", `${m.id}.json`), JSON.stringify(m));
+		save(php());
+		save(manifest({ layout: { ...manifest().layout, wiringFiles: [] } })); // answered before: not asked again
+		const client = new FakeModelClient({ chat: () => ({ json: { wiringFiles: ["config/bundles.php"] } }) });
+		expect(await healWiringFiles(ws, { client, model: "m" })).toEqual(["sym-test"]);
+		expect(client.calls.length).toBe(1);
+		expect(JSON.stringify((client.calls[0]!.req as { messages: unknown[] }).messages)).toContain("{Area}Bundle.php");
+		const healed = loadManifests(ws).find((m) => m.id === "sym-test")!;
+		expect(healed.layout.wiringFiles).toEqual(["config/bundles.php"]);
+		expect(healed.layout.rules!.require).toEqual(["{Area}Bundle.php"]);
+		expect(healed.scaffold).toEqual(php().scaffold); // the rest stays
+		expect(await healWiringFiles(ws, { client, model: "m" })).toEqual([]); // asked once
+
+		// the model says nothing is registered by hand: the required file is dropped (manifest and the workspace's layout.json)
+		save(php());
+		const { saveLayoutRules, loadLayoutRules } = await import("../src/rules/layout-rules.ts");
+		saveLayoutRules(ws, "sym-test", php().layout.rules!);
+		const none = new FakeModelClient({ chat: () => ({ json: { wiringFiles: [] } }) });
+		await healWiringFiles(ws, { client: none, model: "m" });
+		expect(loadManifests(ws).find((m) => m.id === "sym-test")!.layout.rules!.require).toEqual([]);
+		expect(loadLayoutRules(ws, "sym-test")!.require).toEqual([]);
+	});
+
+	it("the implementer is never told the stack needs no registration when the adapter never said so", async () => {
+		const { implementerSystemPrompt } = await import("../src/run/prompts.ts");
+		const { ConfigSchema } = await import("../src/config.ts");
+		const config = ConfigSchema.parse({ source: { path: "/x", stack: "php" }, target: { path: "/y", stacks: ["sym-test"] }, models: {} });
+		const opts = { area: "billing", stackId: "sym-test", moduleDir: "src/Billing", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, source: { id: "php" } as never };
+		const older = implementerSystemPrompt(config, { ...opts, target: fromManifest(php({ rules: undefined })) });
+		expect(older).not.toMatch(/finds new code without a registration file/);
+		expect(older).toMatch(/No registration file is named for this stack/);
+		expect(implementerSystemPrompt(config, { ...opts, target: fromManifest(php({ rules: undefined, wiringFiles: [] })) })).toMatch(/finds new code without a registration file/);
+	});
+
+	it("the migrate-on-empty-database command is checked like the others and passed on", () => {
+		const m = manifest({ migrateFresh: { cmd: "bin/console", args: ["doctrine:migrations:migrate", "--no-interaction", "--env=test"] } });
+		expect(validateManifest(m)).toEqual([]);
+		expect(fromManifest(m).migrateFresh!("/p")).toEqual({ cmd: "bin/console", args: ["doctrine:migrations:migrate", "--no-interaction", "--env=test"] });
+		expect(fromManifest(manifest()).migrateFresh).toBeUndefined();
+		expect(validateManifest(manifest({ migrateFresh: { cmd: "sh", args: ["-c", "x"] } })).join("\n")).toMatch(/migrateFresh.*shell/);
+	});
+});
