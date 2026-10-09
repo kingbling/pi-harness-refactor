@@ -124,7 +124,7 @@ const fixing = new Map<string, Promise<string | undefined>>();
 const fixes = new Map<string, number>();
 /** Fix sessions per problem: a problem the model does not fix in this many tries goes to the owner. */
 export const MAX_FIXES_PER_PROBLEM = 2;
-/** Fix sessions per stack in one process, all problems together (a cost guard, not a stop: the run goes on). */
+/** Fix sessions per stack in one process that changed nothing (a cost guard, not a stop: the run goes on); fixes that worked do not count. */
 export const MAX_RUN_FIXES = 20;
 
 /**
@@ -195,12 +195,13 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 	const problemKey = `${key}|${o.signature ?? o.problem.slice(0, 200)}`;
 	if ((fixes.get(problemKey) ?? 0) >= MAX_FIXES_PER_PROBLEM || (fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return undefined;
 	fixes.set(problemKey, (fixes.get(problemKey) ?? 0) + 1);
-	fixes.set(key, (fixes.get(key) ?? 0) + 1);
+	const wasted = () => fixes.set(key, (fixes.get(key) ?? 0) + 1);
 	const p = (async () => {
 		const before = JSON.stringify(loadCommandOverrides(o.root, key));
 		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
 		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000) } });
+			wasted();
 			throw e;
 		});
 		const repo = o.config.target.path;
@@ -208,6 +209,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		// the target must be its own repo: inside another checkout, undo and commit would act on the parent's files
 		if (!isRepoRoot(repo)) {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "no_change", gateReport: { said, error: `${repo} is not its own git repo: nothing undone or committed` } });
+			wasted();
 			return undefined;
 		}
 		const { sha, undone, changed } = await lock(async () => {
@@ -220,7 +222,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} test or migrated-code file(s) it changed: ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
 		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
 		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });
-		if (!sha && !override) return undefined;
+		if (!sha && !override) return (wasted(), undefined);
 		const what = said || "the setup was changed";
 		mkdirSync(dirname(setupLogPath(o.root, key)), { recursive: true });
 		appendFileSync(setupLogPath(o.root, key), `${new Date().toISOString()} ${sha ?? "override"} ${what.replace(/\s+/g, " ")}\n`);

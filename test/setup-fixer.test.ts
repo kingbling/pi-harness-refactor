@@ -136,6 +136,18 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 });
 
 describe("setup fixes during the run: tries per problem", () => {
+	it("fixes that worked do not count toward the run's cap; only sessions that changed nothing do", async () => {
+		const { fixRunSetup, MAX_RUN_FIXES } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { root, target, adapter, config } = stack({ id: "manyfixes" } as never);
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		for (let i = 0; i < MAX_RUN_FIXES + 3; i++) {
+			const fix: SetupFixer = async (o) => (writeFileSync(join(o.projectDir, `setting-${i}.yaml`), `n: ${i}\n`), `wired setting ${i}`);
+			expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: `problem ${i}`, signature: `problem ${i}`, fixer: fix })).toBe(`wired setting ${i}`);
+		}
+	}, 60_000);
+
 	it("a problem the model cannot fix stops being tried; a different problem still gets its tries, and a fix is logged", async () => {
 		const { fixRunSetup, MAX_FIXES_PER_PROBLEM } = await import("../src/init/setup-fixer.ts");
 		const { setupLogPath } = await import("../src/adapters/command-overrides.ts");
