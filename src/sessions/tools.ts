@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
-import { caseCoverage, lintTests } from "../run/ported.ts";
+import { caseCoverage, checkTests } from "../run/ported.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { Config } from "../config.ts";
@@ -14,6 +14,8 @@ import { getSourceAdapter } from "../adapters/registry.ts";
 import { sharedSymbols, stackTagLike } from "../inventory/target.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { QUIRK_KINDS, quirkList, recordQuirk, sameQuirk, type QuirkKind } from "../run/quirks.ts";
+import { decide, setDecisionAction } from "../jev/decide.ts";
+import { choiceOf, JEV_ACT } from "../jev/questions.ts";
 import { proposeRule } from "../rules/living.ts";
 import { rulesDir } from "../rules/layout.ts";
 import { slashed } from "../rules/layout-rules.ts";
@@ -103,20 +105,23 @@ export function sourceSymbolBody(d: ToolDeps): ToolDefinition {
 		description: "Exact, unmodified source code of one legacy symbol (function, method, class) by its line span, so you never need to read whole unrelated files. For reading rather than pinning exact behaviour, read_function is shorter.",
 		promptSnippet: "source_symbol_body: exact code of one legacy symbol",
 		parameters: Type.Object({ symbolId: Type.String() }),
-		execute: async (_id, p) => {
-			const row = d.ledger.db.prepare("SELECT s.path, i.line, i.end_line FROM symbols s LEFT JOIN index_symbols i ON i.id = s.id WHERE s.id = ?").get(p.symbolId) as { path: string; line: number | null; end_line: number | null } | undefined;
-			if (!row) return text(`unknown symbol ${p.symbolId}`);
-			const src = safeRead(join(d.config.source.path, row.path));
-			if (src === undefined) return text(`cannot read ${row.path}`);
-			const lines = src.split("\n");
-			const fn = findFunction(d.ledger, p.symbolId);
-			const from = fn?.line ?? row.line ?? 1;
-			const end = fn?.end_line ?? row.end_line;
-			// ledgers indexed before end lines existed: bounded slice instead of the rest of the file
-			const to = end ?? Math.min(lines.length, from + 199);
-			return text(`${row.path}:${from}-${to}\n` + "```" + d.config.source.stack + "\n" + lines.slice(from - 1, to).join("\n") + "\n```" + (end ? "" : `\n(end of the symbol unknown: showing at most 200 lines; re-run br inventory for exact spans)`));
-		},
+		execute: async (_id, p) => text(symbolBody(d, p.symbolId)),
 	});
+}
+
+/** The exact legacy code of one symbol by its line span, headed by its path and lines (source_symbol_body's answer). */
+function symbolBody(d: ToolDeps, symbolId: string): string {
+	const row = d.ledger.db.prepare("SELECT s.path, i.line, i.end_line FROM symbols s LEFT JOIN index_symbols i ON i.id = s.id WHERE s.id = ?").get(symbolId) as { path: string; line: number | null; end_line: number | null } | undefined;
+	if (!row) return `unknown symbol ${symbolId}`;
+	const src = safeRead(join(d.config.source.path, row.path));
+	if (src === undefined) return `cannot read ${row.path}`;
+	const lines = src.split("\n");
+	const fn = findFunction(d.ledger, symbolId);
+	const from = fn?.line ?? row.line ?? 1;
+	const end = fn?.end_line ?? row.end_line;
+	// ledgers indexed before end lines existed: bounded slice instead of the rest of the file
+	const to = end ?? Math.min(lines.length, from + 199);
+	return `${row.path}:${from}-${to}\n` + "```" + d.config.source.stack + "\n" + lines.slice(from - 1, to).join("\n") + "\n```" + (end ? "" : `\n(end of the symbol unknown: showing at most 200 lines; re-run br inventory for exact spans)`);
 }
 
 export function readFunctionTool(d: ToolDeps): ToolDefinition {
@@ -372,15 +377,16 @@ export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 
 /**
  * The tester checks its own ported tests the way the orchestrator will: every truth case id as exact text in a test
- * file where this unit's tests belong, and the stack's lint/static check on those test files (run from the target
- * project dir; the implementer cannot edit tests, so a test that fails the check fails every attempt).
+ * file where this unit's tests belong, and the stack's build and lint on those test files, scoped as the gate scopes
+ * them (run from the target project dir; the implementer cannot edit tests, so a test that fails a check fails every
+ * attempt). A build or lint that checks the whole project runs after merges, so it is reported as not run here.
  */
 export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "check_ported_tests",
 		label: "Check ported tests",
-		description: "Run the orchestrator's own checks on your ported tests: which truth case ids (\"<unit>#N\", searched as exact text) no test file mentions, where it searched, and the output of the target stack's lint/static check on the test files (run in the target project dir). Call it before you finish and fix what it reports.",
-		promptSnippet: "check_ported_tests: the orchestrator's checks on your tests (case ids found, lint) — call before TESTER DONE",
+		description: "Run the orchestrator's own checks on your ported tests: which truth case ids (\"<unit>#N\", searched as exact text) no test file mentions, where it searched, and the output of the target stack's build and lint on the test files (run in the target project dir, the same commands the gate runs). Call it before you finish and fix what it reports.",
+		promptSnippet: "check_ported_tests: the orchestrator's checks on your tests (case ids found, build, lint) — call before TESTER DONE",
 		parameters: Type.Object({}),
 		execute: async () => {
 			const moduleDir = d.moduleDir ?? "";
@@ -398,8 +404,12 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			out.push(`Searched for test files matching ${cov.globs.join(", ")} in ${d.targetProjectDir}: ${cov.files.length ? cov.files.join(", ") : "none found"}.`);
 			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
 			if (cov.files.length) {
-				const lint = await lintTests(d.targetProjectDir, d.adapter, cov.files);
-				out.push(lint.error ? `LINT FAILED (\`${lint.command}\`, run in ${d.targetProjectDir}); fix the test files (formatting/static issues only, behaviour unchanged):\n${lint.error}` : `Lint/static check clean (\`${lint.command}\`, run in ${d.targetProjectDir}).`);
+				// the same build and lint the gate runs on the unit's files; a whole-project one is not the tester's to fix
+				for (const name of ["build", "lint"] as const) {
+					const r = await checkTests(d.targetProjectDir, d.adapter, name, cov.files);
+					const NAME = name.toUpperCase();
+					out.push(r.skipped ? `${NAME} not run per unit (${r.skipped}).` : r.error ? `${NAME} FAILED (\`${r.command}\`, run in ${d.targetProjectDir}); fix the test files (${name === "lint" ? "formatting/static issues only" : "the errors in them"}, behaviour unchanged):\n${r.error}` : `${NAME} clean (\`${r.command}\`, run in ${d.targetProjectDir}).`);
+				}
 			}
 			return text(out.join("\n"), { missing: cov.missing, files: cov.files });
 		},
@@ -417,6 +427,9 @@ export function noBehaviourTool(d: ToolDeps): ToolDefinition {
 		execute: async (_id, p) => {
 			if (!d.truthDir) return text("not available in this session", { error: true });
 			if (!p.reason.trim()) return text("a reason is required", { error: true });
+			// the decision model reads the legacy code against the reason; on a refusal nothing is written or removed
+			const refused = await behaviourFound(d, p.reason.trim());
+			if (refused) return text(refused, { error: true });
 			mkdirSync(d.truthDir, { recursive: true });
 			writeFileSync(join(d.truthDir, NO_BEHAVIOUR_FILE), JSON.stringify({ reason: p.reason.trim() }, null, 2) + "\n");
 			// cases an earlier attempt left behind would count instead of this judgement: this declaration replaces them
@@ -426,6 +439,35 @@ export function noBehaviourTool(d: ToolDeps): ToolDefinition {
 		},
 	});
 }
+
+/**
+ * Does the unit's legacy code run something a test could pin, whatever the tester's reason says? The refusal text,
+ * or undefined when the declaration stands (also when there is no decision model or no code: the reviewer checks it).
+ */
+async function behaviourFound(d: ToolDeps, reason: string): Promise<string | undefined> {
+	const symbols = d.ledger.symbolsOfUnit(d.unitId);
+	if (!d.client || !symbols.length) return undefined;
+	const code = symbols.map((s) => symbolBody(d, s.id)).join("\n\n").slice(0, MAX_BODY_CHARS);
+	try {
+		const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id, second: d.config.models.escalate.id }, "no_behaviour", { reason, code }, {
+			behaviour: {
+				type: "choice",
+				instructions: "The tester says the legacy code in `code` has no runtime behaviour a test could pin, for `reason`. Read the code itself: when it runs, does it compute, decide, send, store or change anything?",
+				criteria: {
+					none: "No: it only declares a contract (interfaces, abstract signatures), types or constant values",
+					runs: "Yes: when it runs it computes, decides, sends (a request, a mail), stores or changes something a test can pin",
+				},
+			},
+		}, ["behaviour"], d.unitId);
+		const refuse = choiceOf(dec.answers["behaviour"]) === "runs" && dec.confidence >= JEV_ACT;
+		setDecisionAction(d.ledger, dec.decisionId, refuse ? "refused no_behaviour_to_pin" : "no behaviour declared");
+		if (!refuse) return undefined;
+		return `refused: the decision model read this unit's legacy code (${symbols.map((s) => s.id).slice(0, 5).join(", ")}${symbols.length > 5 ? ", …" : ""}) and judged that it runs: it computes, decides, sends, stores or changes something a test can pin. Your reason was: "${reason}". Nothing was recorded and no cases were removed: write truth cases and ported tests for that behaviour instead. If you are sure the code only declares a contract, types or constants, call it again with a reason that names what each symbol declares.`;
+	} catch {
+		return undefined; // the decision model is unavailable: the reviewer checks the reason
+	}
+}
+const MAX_BODY_CHARS = 20_000;
 
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
 	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), reportMigratedBugTool(d)];
