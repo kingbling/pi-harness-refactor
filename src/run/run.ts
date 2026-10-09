@@ -125,7 +125,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const chosen = resolveChoices(adapter, config.target.choices).map((c) => ({ key: c.choice.key, id: c.option.id, packages: c.option.packages }));
 			const problems = adapter.verifyChoices?.(projectDir(config, id), chosen) ?? [];
 			const fatal = problems.filter((p) => p.everyUnit);
-			if (fatal.length) throw new Error(`bigrefactor: the ${id} project does not match the stack choices — every unit would fail the same way:\n  ${fatal.map((p) => p.text).join("\n  ")}\nfix: change the choice (br decide) or install what is missing, then run again`);
+			// never a stop: the setup model installs what is missing; units that still fail park on it
+			if (fatal.length) {
+				const text = fatal.map((p) => p.text).join("\n  ");
+				log(pc.red(`${id}: the project does not match the stack choices:\n  ${text}\n  the setup model fixes it; units that need it park until it is fixed (br decide changes a choice)`));
+				if (o.setupFixer !== false && !(!o.setupFixer && o.spawn))
+					await fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, id), fixer: o.setupFixer || fixSetupWithModel, ledger, signature: "stack choices", problem: `The project does not match the owner's stack choices:\n${text}` }).catch((e) => log(pc.yellow(`${id}: setup fix failed: ${e?.message ?? e}`)));
+			}
 			for (const p of problems.filter((x) => !x.everyUnit)) log(pc.yellow(`${id}: ${p.text}${p.fix ? ` — fix: ${p.fix}` : ""} (units that need it will park until it is installed)`));
 		}
 	}
@@ -179,8 +185,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		for (const s of await refreshRulesLayout({ ledger, root: o.root }, config.target.stacks)) log(pc.dim(`${s}: RULES.md layout section re-rendered from the stack adapter`));
 		const lr = await waitOn("checking the target folder layout", () => checkLayout(config, o.root, ledger));
 		for (const w of lr.warnings) log(pc.yellow(`layout: ${w}`));
-		if (lr.problems.length && !o.force) throw new Error(`bigrefactor: the target layout has ${lr.problems.length} problem(s), a run would multiply them:\n  ${lr.problems.join("\n  ")}\nfix: br layout shows the details; start anyway with --force`);
-		for (const p of lr.problems) log(pc.red(`layout (--force): ${p}`));
+		// never a stop: shown, and the tidy jobs and units work against the layout from here on (br layout shows the details)
+		for (const p of lr.problems) log(pc.red(`layout: ${p} (br layout shows the details)`));
 	}
 	// Parked units (state kept, attempt closed, waiting on a question) are resubmitted as soon as the cause is
 	// gone: their question was answered, or — for environment failures — the target project or the stack
@@ -674,101 +680,111 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	resubmitParked();
 	let lastResubmitCheck = Date.now();
 	let lastPlaceCheck = Date.now();
+	// a failing pass never ends the run: the error is shown (once a minute while it repeats) and the next pass tries again
+	let passError = "";
+	let passErrorAt = 0;
 	for (;;) {
-		reloadLanes();
-		if (Date.now() - lastResubmitCheck > 5000) {
-			resubmitParked();
-			lastResubmitCheck = Date.now();
-		}
-		// units Jev could not place (call failed, question could not be filed) get another pass
-		if (Date.now() - lastPlaceCheck > 60_000) {
-			lastPlaceCheck = Date.now();
-			await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) }).catch((e) => log(pc.yellow(`placement failed: ${e?.message ?? e}`)));
-		}
-		if (!dayCapHit && spentToday() >= config.run.budgetUsdPerDay) {
-			dayCapHit = true;
-			await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Paid model spend today (subscription calls are not counted): $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
-			log(pc.red(`daily budget cap reached ($${spentToday().toFixed(2)}); not starting new units`));
-		}
-		if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
-		// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
-		const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
-		if (!stop && !dayCapHit) tidyJobs.next();
-		const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : await samplePause();
-		let readyNow = 0;
-		if (!stop && !dayCapHit && !sampleReason && underLimit()) {
-			const candidates = ready();
-			readyNow = candidates.length;
-			for (const id of candidates) {
-				if (running.size >= laneLimit || !underLimit()) break;
-				startUnit(id);
-				readyNow--;
+		try {
+			reloadLanes();
+			if (Date.now() - lastResubmitCheck > 5000) {
+				resubmitParked();
+				lastResubmitCheck = Date.now();
 			}
-		}
-		// Lanes stay full while anything is todo: idle lanes capture truth for units still waiting on deps.
-		// Not in a pilot (a limit means "spend on N units"), not while stopping or over budget.
-		if ((o.truthAhead ?? o.limit === undefined) && !stop && !dayCapHit && !sampleReason && running.size < laneLimit) {
-			for (const id of aheadCandidates()) {
-				if (running.size >= laneLimit) break;
-				startAhead(id);
+			// units Jev could not place (call failed, question could not be filed) get another pass
+			if (Date.now() - lastPlaceCheck > 60_000) {
+				lastPlaceCheck = Date.now();
+				await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) }).catch((e) => log(pc.yellow(`placement failed: ${e?.message ?? e}`)));
 			}
-		}
-		{
-			const max = laneLimit;
-			const reason = stop
-				? "stopping: running lanes finish, nothing new starts"
-				: dayCapHit
-					? "daily budget cap reached"
-					: sampleReason
-						? sampleReason
-						: o.limit !== undefined && !underLimit()
-						? `pilot limit ${o.limit}: ${acceptedNow} accepted + ${running.size} finishing, nothing new starts`
-						: running.size >= max
-							? undefined
-							: readyNow === 0
-								? aheadRunning.size
-									? undefined
-									: "no unit ready: the rest wait for dependencies on running units, or for answers"
-								: undefined;
-			o.onLanes?.({ running: running.size, max, ready: readyNow, ahead: aheadRunning.size, reason });
-		}
-		if (running.size === 0) {
-			// healing a shared failure: wait for it, then go on (never ends the run)
-			if (healing) {
-				await waitOn("fixing a shared failure (setup model)", () => healing!);
-				continue;
+			if (!dayCapHit && spentToday() >= config.run.budgetUsdPerDay) {
+				dayCapHit = true;
+				await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Paid model spend today (subscription calls are not counted): $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
+				log(pc.red(`daily budget cap reached ($${spentToday().toFixed(2)}); not starting new units`));
 			}
-			// a self-heal pass (it may ask the decide model) can still put quarantined units back: wait for it first
-			if (askingStuck) {
-				await waitOn("checking whether stuck units can run again", () => askingStuck!);
-				continue;
+			if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
+			// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
+			const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
+			if (!stop && !dayCapHit) tidyJobs.next();
+			const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : await samplePause();
+			let readyNow = 0;
+			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
+				const candidates = ready();
+				readyNow = candidates.length;
+				for (const id of candidates) {
+					if (running.size >= laneLimit || !underLimit()) break;
+					startUnit(id);
+					readyNow--;
+				}
 			}
-			if (tidyJobs.busy) {
-				await waitOn("a tidy job is changing the code on main", () => tidyJobs.busy!);
-				continue;
+			// Lanes stay full while anything is todo: idle lanes capture truth for units still waiting on deps.
+			// Not in a pilot (a limit means "spend on N units"), not while stopping or over budget.
+			if ((o.truthAhead ?? o.limit === undefined) && !stop && !dayCapHit && !sampleReason && running.size < laneLimit) {
+				for (const id of aheadCandidates()) {
+					if (running.size >= laneLimit) break;
+					startAhead(id);
+				}
 			}
-			// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
-			if (sampleReason && !stop && !o.shouldStop?.() && underLimit()) {
-				if (o.waitForDecisions) {
-					if (sampleReason !== sampleNote) log(pc.yellow(sampleReason));
-					sampleNote = sampleReason;
+			{
+				const max = laneLimit;
+				const reason = stop
+					? "stopping: running lanes finish, nothing new starts"
+					: dayCapHit
+						? "daily budget cap reached"
+						: sampleReason
+							? sampleReason
+							: o.limit !== undefined && !underLimit()
+							? `pilot limit ${o.limit}: ${acceptedNow} accepted + ${running.size} finishing, nothing new starts`
+							: running.size >= max
+								? undefined
+								: readyNow === 0
+									? aheadRunning.size
+										? undefined
+										: "no unit ready: the rest wait for dependencies on running units, or for answers"
+									: undefined;
+				o.onLanes?.({ running: running.size, max, ready: readyNow, ahead: aheadRunning.size, reason });
+			}
+			if (running.size === 0) {
+				// healing a shared failure: wait for it, then go on (never ends the run)
+				if (healing) {
+					await waitOn("fixing a shared failure (setup model)", () => healing!);
+					continue;
+				}
+				// a self-heal pass (it may ask the decide model) can still put quarantined units back: wait for it first
+				if (askingStuck) {
+					await waitOn("checking whether stuck units can run again", () => askingStuck!);
+					continue;
+				}
+				if (tidyJobs.busy) {
+					await waitOn("a tidy job is changing the code on main", () => tidyJobs.busy!);
+					continue;
+				}
+				// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
+				if (sampleReason && !stop && !o.shouldStop?.() && underLimit()) {
+					if (o.waitForDecisions) {
+						if (sampleReason !== sampleNote) log(pc.yellow(sampleReason));
+						sampleNote = sampleReason;
+						await new Promise((r) => setTimeout(r, 3000));
+						continue;
+					}
+					log(pc.yellow(`${sampleReason}; then br run continues`));
+					break;
+				}
+				// only decision-blocked work left: wait for the answers (asked on the side) instead of ending
+				const pendingBlocked = [...decisionBlocked.keys()].filter((id) => ledger.getUnit(id)?.state === "planned");
+				if (o.waitForDecisions && pendingBlocked.length && !stop && !o.shouldStop?.() && !dayCapHit && underLimit()) {
+					const ids = [...new Set(pendingBlocked.flatMap((u) => decisionBlocked.get(u) ?? []))];
+					const note = `waiting for ${ids.length} decision(s) (${ids.slice(0, 4).join(", ")}${ids.length > 4 ? ", …" : ""}) blocking ${pendingBlocked.length} unit(s)`;
+					if (note !== waitingNote) log(pc.yellow(note));
+					waitingNote = note;
 					await new Promise((r) => setTimeout(r, 3000));
 					continue;
 				}
-				log(pc.yellow(`${sampleReason}; then br run continues`));
 				break;
 			}
-			// only decision-blocked work left: wait for the answers (asked on the side) instead of ending
-			const pendingBlocked = [...decisionBlocked.keys()].filter((id) => ledger.getUnit(id)?.state === "planned");
-			if (o.waitForDecisions && pendingBlocked.length && !stop && !o.shouldStop?.() && !dayCapHit && underLimit()) {
-				const ids = [...new Set(pendingBlocked.flatMap((u) => decisionBlocked.get(u) ?? []))];
-				const note = `waiting for ${ids.length} decision(s) (${ids.slice(0, 4).join(", ")}${ids.length > 4 ? ", …" : ""}) blocking ${pendingBlocked.length} unit(s)`;
-				if (note !== waitingNote) log(pc.yellow(note));
-				waitingNote = note;
-				await new Promise((r) => setTimeout(r, 3000));
-				continue;
-			}
-			break;
+		} catch (e: any) {
+			const msg = String(e?.message ?? e);
+			if (msg !== passError || Date.now() - passErrorAt > 60_000) log(pc.red(`run error (the run goes on): ${msg.slice(0, 600)}`));
+			passError = msg;
+			passErrorAt = Date.now();
 		}
 		// wake at least every 2 s: lane changes, resubmits and stops apply without waiting for a unit to end
 		await Promise.race([...running.values(), new Promise((r) => setTimeout(r, 2000))]);
