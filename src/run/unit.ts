@@ -35,7 +35,7 @@ import { askPendingQuirks, quirkList, quirkRetestNote, quirkSummary } from "./qu
 import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
-import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { caseCoverage, checkTests, findTests, scopeGuard } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
@@ -155,6 +155,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client };
 	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
+	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
+	for (const f of card.waitingStubs) if (!writeGlobs.includes(f)) writeGlobs.push(f);
 
 	// ---- truth ----------------------------------------------------------------------------------
 	// run: expected values come from running the old code; read: it cannot run here (decided once per workspace,
@@ -253,8 +255,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			return false;
 		}
 		recordTruth(verified.cases, verified.madeBy, "none" in verified ? verified.none : undefined);
+		// once the cases were linked to their tests, every later truth run links them again: a new case gets its test now
+		if (linkedOnce) await coverTruth(false);
 		return true;
 	};
+	let linkedOnce = false;
 	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks).
 	// The same cases as recorded stay untouched (ids, links to their tests): a retest never makes them drift.
 	const recordTruth = (cases: TruthCase[], mode: TruthMode, none?: string) => {
@@ -267,15 +272,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// real cases replace an earlier "no behaviour" declaration
 		o.ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type = 'truth_none'").run(o.unitId);
 		rmSync(join(truthDirAbs, NO_BEHAVIOUR_FILE), { force: true });
-		const old = o.ledger.db.prepare("SELECT symbol_id, inputs, expected, verified_on_old FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(o.unitId) as Array<{ symbol_id: string; inputs: string; expected: string; verified_on_old: number }>;
+		const old = o.ledger.db.prepare("SELECT id, symbol_id, inputs, expected, verified_on_old, ported_test_path FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(o.unitId) as Array<{ id: string; symbol_id: string; inputs: string; expected: string; verified_on_old: number; ported_test_path: string | null }>;
 		const same = old.length === cases.length && cases.every((c, i) => old[i]!.symbol_id === c.symbol && old[i]!.inputs === JSON.stringify(c.inputs) && old[i]!.expected === JSON.stringify(c.expected) && old[i]!.verified_on_old === (mode === "run" ? 1 : 0));
 		if (same && o.ledger.hasEvidence(o.unitId, mode === "run" ? "truth_green_on_old" : "truth_read")) {
 			log(pc.dim(`  truth: the same ${cases.length} cases as recorded; kept`));
 			return;
 		}
+		// a case already recorded keeps its id and its link to its test; a new one gets the next free number
+		const ids = caseIds(o.unitId, old, cases);
+		const linked = new Map(old.map((c) => [c.id, c.ported_test_path]));
 		o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
-		const ins = o.ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
-		cases.forEach((c, i) => ins.run(`${o.unitId}#${i + 1}`, o.unitId, c.symbol, JSON.stringify(c.inputs), JSON.stringify(c.expected), mode === "run" ? 1 : 0, new Date().toISOString()));
+		const ins = o.ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, ported_test_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+		cases.forEach((c, i) => ins.run(ids[i]!, o.unitId, c.symbol, JSON.stringify(c.inputs), JSON.stringify(c.expected), mode === "run" ? 1 : 0, linked.get(ids[i]!) ?? null, new Date().toISOString()));
 		if (mode === "run") {
 			o.ledger.addEvidence(o.unitId, "truth_green_on_old", { cases: cases.length, script: `${truthDirRel}/${sourceAdapter.truth.scriptName}` });
 			log(pc.green(`  truth: ${cases.length} cases green on old code`));
@@ -362,13 +370,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		for (const id of ids) link.run(cov.found.get(id) ?? null, id);
 		return cov.missing;
 	};
-	const coverTruth = async (): Promise<boolean> => {
+	// `quarantine` false: a re-run inside the implement loop, which goes on with the tests it has
+	const coverTruth = async (quarantine = true): Promise<boolean> => {
 		for (let i = 0; ; i++) {
 			const missing = uncoveredCases();
-			if (!missing.length) return true;
+			if (!missing.length) return (linkedOnce = true);
 			if (i === 2) {
 				log(pc.red(`  ${missing.length} truth case(s) still without a ported test after 2 retests: ${missing.slice(0, 10).join(", ")}`));
-				if (!o.truthOnly) o.ledger.transitionUnit(o.unitId, "quarantined", `truth cases without a ported test after 2 retests: ${missing.slice(0, 10).join(", ")}`);
+				if (quarantine && !o.truthOnly) o.ledger.transitionUnit(o.unitId, "quarantined", `truth cases without a ported test after 2 retests: ${missing.slice(0, 10).join(", ")}`);
 				return false;
 			}
 			log(pc.yellow(`  ${missing.length} truth case(s) have no ported test — retest`));

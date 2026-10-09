@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Config } from "../config.ts";
@@ -10,6 +11,7 @@ import { tidyTaskCard } from "../run/tidy.ts";
 import { slashed } from "../rules/layout-rules.ts";
 import { noBehaviour } from "../run/gate.ts";
 import { callTree } from "../inventory/codemap.ts";
+import { loadDecisions } from "../inventory/decisions.ts";
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -25,6 +27,10 @@ export interface TaskCard {
 	resolvedDeps: Array<{ source: string; target: string[]; op: string }>;
 	/** Source symbols this unit depends on that are NOT migrated yet (scheduler should not run the unit, but say so). */
 	unresolvedDeps: string[];
+	/** The unit that owns each of unresolvedDeps (when known): a stub is tagged TODO(br:<that unit>), so that unit replaces it. */
+	depOwners: Record<string, string>;
+	/** Target files with a stub earlier units left for this unit's code (TODO(br:<this unit>)): it replaces them. */
+	waitingStubs: string[];
 	/** Who calls this unit (so interfaces stay compatible). */
 	callers: Array<{ from: string; kind: string }>;
 	/** Normalized-AST duplicates within the unit or against accepted target code. */
@@ -133,6 +139,13 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 
 	const routes = db.prepare(`SELECT method, path, handler_symbol AS handler FROM index_routes WHERE handler_symbol IN (${[...ids].map(() => "?").join(",") || "''"})`).all(...ids) as TaskCard["routes"];
 	const queries = (db.prepare(`SELECT symbol_id AS symbol, tables, text FROM index_queries WHERE symbol_id IN (${[...ids].map(() => "?").join(",") || "''"}) AND tables != '[]'`).all(...ids) as Array<{ symbol: string; tables: string; text: string | null }>).map((q) => ({ ...q, tables: JSON.parse(q.tables) as string[] }));
+	// the unit that owns each dependency not migrated yet: its stub carries that unit's id
+	const ownerOf = db.prepare("SELECT unit_id FROM symbols WHERE id = ?");
+	const depOwners: Record<string, string> = {};
+	for (const d of unresolvedDeps) {
+		const owner = (ownerOf.get(d) as { unit_id: string | null } | undefined)?.unit_id;
+		if (owner) depOwners[d] = owner;
+	}
 	const truthCases = (db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ? AND verified_on_old = 1").get(unitId) as { n: number }).n;
 	const truthRead = (db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ? AND verified_on_old = 0").get(unitId) as { n: number }).n;
 
@@ -142,6 +155,8 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	if (fwFiles.size) {
 		const plan = ledger.getMeta("framework_plan");
 		const concerns = plan ? (JSON.parse(plan) as { concerns: Array<{ concern: string; verdict: string; platform: string; top: string[] }> }).concerns : [];
+		// the owner's decision per class wins ("rest": all low-use classes no concern maps)
+		const decided = opts.root ? (loadDecisions(opts.root).frameworkClasses ?? {}) : {};
 		const counts = new Map<string, number>();
 		for (const { to_id } of [...outEdges, ...fwCalls]) {
 			const path = to_id.split("::")[0]!;
@@ -151,7 +166,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 		}
 		for (const [cls, n] of [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)) {
 			const c = concerns.find((k) => k.top.some((t) => t.replace(/\(\d+\)$/, "") === cls));
-			fwRefs.push({ cls, refs: n, verdict: c?.verdict ?? "review", platform: c?.platform ?? "see RULES.md → Legacy framework mapping" });
+			fwRefs.push({ cls, refs: n, verdict: decided[cls] ?? (!c && decided["rest"] === "port" ? "port" : undefined) ?? c?.verdict ?? "review", platform: c?.platform ?? "see RULES.md → Legacy framework mapping" });
 		}
 	}
 	const stackId = opts.place?.stackId ?? opts.adapter.id;
@@ -161,7 +176,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs: stubsWaitingFor(opts.targetProjectDir, unitId), callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -279,15 +294,26 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		L.push("", "## Already migrated dependencies — import these, do not re-port");
 		for (const d of card.resolvedDeps) L.push(`- ${d.source} → ${d.target.join(", ")} (${d.op})`);
 	}
-	if (card.unresolvedDeps.length) L.push("", `## Dependencies not migrated yet (stub minimal interfaces, mark TODO(br:${card.unit.id})): ${card.unresolvedDeps.join(", ")}`);
+	if (card.unresolvedDeps.length) {
+		L.push("", "## Dependencies not migrated yet: stub a minimal interface, marked TODO(br:<the unit that owns it>) as below, so that unit replaces it when it runs. Grep for that mark first and reuse a stub that is already there.");
+		const byOwner = new Map<string, string[]>();
+		for (const d of card.unresolvedDeps) {
+			const owner = card.depOwners[d] ?? card.unit.id;
+			byOwner.set(owner, [...(byOwner.get(owner) ?? []), d]);
+		}
+		for (const [owner, deps] of byOwner) L.push(`- TODO(br:${owner}): ${deps.join(", ")}`);
+	}
+	if (card.waitingStubs.length) L.push("", `## Stubs waiting for you: earlier units stubbed this unit's code, marked TODO(br:${card.unit.id}) (grep for it). Replace each stub that stands in for this unit's code with the real code, or point its callers at the real code, and remove the stub; you may edit these files for that: ${card.waitingStubs.join(", ")}`);
 	if (card.callers.length) L.push("", `## Called from: ${card.callers.map((c) => `${c.from} (${c.kind})`).join(", ")} — keep behaviour compatible`);
 	if (card.dupCandidates.length) {
 		L.push("", "## Duplicate candidates (dedupe: keep one target symbol, prove the other as merged_into)");
 		for (const d of card.dupCandidates) L.push(`- ${d.a} ≡ ${d.b}: ${d.reason}`);
 	}
 	if (card.frameworkRefs.length) {
-		L.push("", "## Legacy framework classes used here → platform replacement (never port the framework itself)");
-		for (const f of card.frameworkRefs) L.push(`- ${f.cls} (${f.refs}×): ${f.verdict} → ${f.platform}`);
+		const port = card.frameworkRefs.some((f) => f.verdict === "port");
+		L.push("", `## Legacy framework classes used here → platform replacement (${port ? "port: the owner decided to carry that class's job over; never port the rest of the framework" : "never port the framework itself"})`);
+		const shared = card.sharedDirs[0] ? slashed(card.sharedDirs[0]) : "the shared dir/";
+		for (const f of card.frameworkRefs) L.push(`- ${f.cls} (${f.refs}×): ${f.verdict} → ${f.verdict === "port" ? `look for an existing port first (target_lookup, or grep for the class's job) and use it; if there is none, write it once in the topic of ${shared} that fits its job (in this unit's module when no topic fits), so later units reuse it` : f.platform}`);
 	}
 	if (card.callTree.length) {
 		L.push("", "## Where this code leads (calls outside this unit, file to file; [state] = migration state; read_function <id> to read one)");
@@ -333,6 +359,15 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		}
 	}
 	return L.join("\n");
+}
+
+/** Files of the project (relative to it) that carry the mark of a stub left for `unitId`; none when it is not a git repo. */
+function stubsWaitingFor(projectDir: string, unitId: string): string[] {
+	try {
+		return execFileSync("git", ["grep", "-l", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: projectDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").filter(Boolean);
+	} catch {
+		return []; // no match, or not a repo
+	}
 }
 
 /** Files under `dir` of the project (relative to `dir`), tests included. Uncapped: the renderer bounds and says so. */

@@ -20,8 +20,8 @@ import { unitFacts } from "../sessions/taskcard.ts";
  * wired_ok, judged by a model with tools (no fixed pattern lists): is what the unit added real code (no stubs,
  * the legacy behaviour is there), connected (the framework reaches it, it uses the code already migrated) and on
  * the stack the owner chose? Code hands it the facts (diff, legacy files, migrated deps, choices); the reviewer
- * reads more with its tools and answers with one verdict. A session that ends without a verdict is "not judged":
- * a provider outage never burns the implementer's attempts.
+ * reads more with its tools and answers with one verdict. A session that ends without a verdict is asked once more;
+ * still none is red ("not judged"): a unit is never accepted with nothing proven.
  */
 export interface ReviewInput {
 	ledger: Ledger;
@@ -76,14 +76,20 @@ export const reviewWithModel: Reviewer = async (o) => {
 		transcriptPath: o.transcriptPath,
 		systemPrompt: `You review ONE unit of an automated migration (${o.config.source.stack} → ${o.config.target.stacks.join(" + ")}) before it is accepted. Build, lint and the layout checks already passed; the tests from the old behaviour run after you. You judge what tests and compilers cannot see:
 1. Real: the unit's legacy behaviour is really ported. No stubs or placeholders (TODO, "not implemented", a fixed empty result where the legacy code computes something, an interface or port nothing implements, an endpoint that only answers "not implemented"). Compare with the legacy code (source_symbol_body, read_function).
-2. Connected: the new code can be reached the way the legacy callers (listed below) reached the old code — an HTTP handler has its route/page registered the way this stack does it; code the legacy callers reached through a factory or another class is reached that way, not turned into an entry point nobody calls — and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet. Code owned by planned units (listed below) is expected as a minimal stub marked TODO(br:…): that is not a finding.
+2. Connected: the new code can be reached the way the legacy callers (listed below) reached the old code — an HTTP handler has its route/page registered the way this stack does it; code the legacy callers reached through a factory or another class is reached that way, not turned into an entry point nobody calls — and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet. Code owned by planned units (listed below) is expected as a minimal stub marked TODO(br:<the owning unit>): that is not a finding. A stub marked TODO(br:${o.unitId}) (grep for it) that stands in for this unit's own legacy code was left by an earlier unit for this one: one still there, not replaced by the real code or pointed at it, is a finding.
 3. On the chosen stack: the owner's stack choices below are used where they apply (data access, rendering, data fetching, routing, forms, styling …), not gone around.
 4. The tests: the ported tests (listed below) really check the legacy behaviour — they assert the expected values, not only that something renders or exists. Weak tests go in weakTests (the tester rewrites them), never in findings.
 Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and few: only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
 	});
 	try {
 		const r = await session.run(facts(o));
-		if (!verdict) return { ok: true, judged: false, costUsd: r.usage.cost, output: `not judged: the reviewer ended without a verdict${r.error ? ` (${r.error})` : ""}` };
+		// no verdict: ask once more in the same session; still none is red, never a pass
+		if (!verdict) {
+			const again = await session.run("You ended without a verdict. Call review_verdict now, once.");
+			r.usage.cost += again.usage.cost;
+			r.error = again.error ?? r.error;
+		}
+		if (!verdict) return { ok: false, judged: false, costUsd: r.usage.cost, output: `not judged: the reviewer ended without a verdict${r.error ? ` (${r.error})` : ""}` };
 		const v = verdict as Verdict;
 		const weakTests = v.weakTests?.length ? v.weakTests.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
 		const outOfScope = v.outOfScope?.length ? v.outOfScope.map((f) => `- ${f.problem} → ${f.fix}`).join("\n") : undefined;
@@ -95,7 +101,7 @@ Judge only what this unit added or changed, against the facts below: the behavio
 		].filter(Boolean).join("\n");
 		return { ok, judged: true, costUsd: r.usage.cost, weakTests, outOfScope, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
 	} catch (e: any) {
-		return { ok: true, judged: false, output: `not judged: ${e?.message ?? e}` };
+		return { ok: false, judged: false, output: `not judged: ${e?.message ?? e}` };
 	} finally {
 		session.dispose();
 	}
@@ -155,7 +161,7 @@ export function legacyFacts(o: Pick<ReviewInput, "ledger" | "config" | "unitId" 
 			UNION SELECT c.to_id FROM code_calls c JOIN symbols s ON s.id = c.from_id WHERE s.unit_id = ? AND c.to_id IS NOT NULL AND c.resolution = 'code'
 		) e JOIN symbols t ON t.id = e.to_id JOIN units u ON u.id = t.unit_id WHERE t.unit_id != ? AND u.state != 'accepted' ORDER BY t.unit_id, t.id`)
 		.all(o.unitId, o.unitId, o.unitId) as Array<{ id: string; unit_id: string; path: string; state: string }>;
-	if (planned.length) out.push(`\nLegacy code this unit calls that other units still own (not migrated yet): a minimal stub marked TODO(br:…) for these is expected, not a finding; porting them here is wrong:\n${capped(planned.map((p) => `- ${p.id} (unit ${p.unit_id}, ${p.state}, ${p.path})`), "callees").join("\n")}`);
+	if (planned.length) out.push(`\nLegacy code this unit calls that other units still own (not migrated yet): a minimal stub marked TODO(br:<the owning unit>) for these is expected, not a finding; porting them here is wrong:\n${capped(planned.map((p) => `- ${p.id} (unit ${p.unit_id}, ${p.state}, ${p.path})`), "callees").join("\n")}`);
 	const own = new Set(o.legacyFiles);
 	const outside = (id: string) => !own.has(id.split("::")[0]!);
 	const callers = (

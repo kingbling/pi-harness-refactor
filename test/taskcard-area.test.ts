@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -120,5 +121,55 @@ describe("task card area module", () => {
 
 		rmSync(join(api, "src/features/offers"), { recursive: true });
 		expect(renderTaskCard(await card("offers_00"), config, { includeSource: false })).toContain("src/features/offers/ is empty");
+	});
+});
+
+describe("stubs carry the owning unit; that unit replaces them", () => {
+	beforeEach(() => {
+		for (const [file, name, id] of [["legacy/agency_pay.php", "Pay", "agency_pay"], ["legacy/billing.php", "Billing", "billing"]] as const) {
+			ledger.upsertFile({ path: file, hash: "h", lang: "php", loc: 5 });
+			ledger.upsertSymbol({ id: `${file}::${name}`, path: file, kind: "class", name });
+			unit(id, "nestjs", id === "billing" ? "billing" : "agency", "planned", [`${file}::${name}`]);
+		}
+		ledger.db.prepare("INSERT INTO index_deps(from_id, to_id, kind) VALUES (?, ?, 'new')").run("legacy/agency_pay.php::Pay", "legacy/billing.php::Billing");
+	});
+
+	it("a unit that depends on billing tags its stub TODO(br:billing) and greps for one first", async () => {
+		const c = await card("agency_pay");
+		expect(c.depOwners).toEqual({ "legacy/billing.php::Billing": "billing" });
+		const text = renderTaskCard(c, config, { includeSource: false });
+		expect(text).toMatch(/## Dependencies not migrated yet: stub a minimal interface, marked TODO\(br:<the unit that owns it>\)[^\n]*Grep for that mark first and reuse/);
+		expect(text).toContain("- TODO(br:billing): legacy/billing.php::Billing");
+	});
+
+	it("billing's own card lists the stubs waiting for it", async () => {
+		execFileSync("git", ["init", "-q"], { cwd: api });
+		write("src/features/agency/billing.stub.ts", "// TODO(br:billing) minimal stand-in\nexport class Billing {}\n");
+		write("src/features/agency/other.stub.ts", "// TODO(br:billing_x)\n");
+		execFileSync("git", ["add", "-A"], { cwd: api });
+		const c = await card("billing");
+		expect(c.waitingStubs).toEqual(["src/features/agency/billing.stub.ts"]);
+		expect(renderTaskCard(c, config, { includeSource: false })).toContain("## Stubs waiting for you: earlier units stubbed this unit's code, marked TODO(br:billing) (grep for it). Replace each stub");
+		expect((await card("agency_pay")).waitingStubs).toEqual([]);
+	});
+});
+
+describe("framework classes the owner decided to port", () => {
+	it("the card names the shared dir and says to look for an existing port first; the heading no longer says never port", async () => {
+		ledger.upsertFile({ path: "legacy/agency_cmd.php", hash: "h", lang: "php", loc: 5 });
+		ledger.upsertSymbol({ id: "legacy/agency_cmd.php::Cmd", path: "legacy/agency_cmd.php", kind: "class", name: "Cmd" });
+		ledger.db.prepare("UPDATE symbols SET unit_id = 'agency_cmd' WHERE id = 'legacy/agency_cmd.php::Cmd'").run();
+		ledger.upsertFile({ path: "fw/Status.php", hash: "h", lang: "php", loc: 5 });
+		ledger.markFramework("fw/Status.php", "framework");
+		ledger.db.prepare("INSERT INTO index_deps(from_id, to_id, kind) VALUES (?, ?, 'new')").run("legacy/agency_cmd.php::Cmd", "fw/Status.php::Status");
+		const before = renderTaskCard(await card("agency_cmd"), config, { includeSource: false });
+		expect(before).toContain("(never port the framework itself)");
+		expect(before).toContain("- Status (1×): review →");
+
+		writeFileSync(join(ws, ".bigrefactor", "decisions.json"), JSON.stringify({ answers: {}, frameworkClasses: { Status: "port" } }));
+		const adapter = await getTargetAdapter("nestjs");
+		const text = renderTaskCard(await card("agency_cmd"), config, { includeSource: false });
+		expect(text).not.toContain("never port the framework itself");
+		expect(text).toContain(`- Status (1×): port → look for an existing port first (target_lookup, or grep for the class's job) and use it; if there is none, write it once in the topic of ${adapter.layout.sharedDirs[0]!.replace(/\/?$/, "/")} that fits its job`);
 	});
 });
