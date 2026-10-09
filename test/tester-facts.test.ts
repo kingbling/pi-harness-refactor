@@ -161,6 +161,76 @@ describe("a full tester pass with the same cases", () => {
 	});
 });
 
+describe("truth case ids stay put", () => {
+	const truthDir = () => join(ws, ".bigrefactor", "truth", "u1");
+	const casesOf = (inputs: number[]) => JSON.stringify(inputs.map((i) => ({ symbol: "s", inputs: [i], expected: i * 10 })));
+	const rows = () => ledger.db.prepare("SELECT id, inputs, ported_test_path FROM truth_cases WHERE unit_id = 'u1' ORDER BY id").all();
+	beforeEach(() => writeFileSync(join(ws, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read" })));
+
+	it("a re-run with a case inserted at position 2 keeps the old ids and links; the new case gets the next number", async () => {
+		write(join(truthDir(), "cases.json"), casesOf([1, 2, 3]));
+		ledger.addEvidence("u1", "truth_read", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, ported_test_path, created_at) VALUES ('u1#1','u1','s','[1]','10',0,?,'t0'), ('u1#2','u1','s','[2]','20',0,?,'t0'), ('u1#3','u1','s','[3]','30',0,?,'t0')").run(SPEC, SPEC, SPEC);
+		write(join(ws, "migrated", SPEC), "it('u1#1', () => {}); it('u1#2', () => {}); it('u1#3', () => {});\n");
+		const tasks: string[] = [];
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (task: string) => {
+					if (opts.role === "test") {
+						tasks.push(task);
+						if (tasks.length === 1) write(join(truthDir(), "cases.json"), casesOf([1, 9, 2, 3]));
+						else write(join(ws, "migrated", SPEC), "it('u1#1', () => {}); it('u1#2', () => {}); it('u1#3', () => {}); it('u1#4', () => {});\n");
+					}
+					return { text: "done", ...ok };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: spawn as never, gate: async (g) => green(g), log: () => {} });
+		expect(rows()).toEqual([
+			{ id: "u1#1", inputs: "[1]", ported_test_path: SPEC },
+			{ id: "u1#2", inputs: "[2]", ported_test_path: SPEC },
+			{ id: "u1#3", inputs: "[3]", ported_test_path: SPEC },
+			{ id: "u1#4", inputs: "[9]", ported_test_path: SPEC },
+		]);
+		expect(tasks[1]).toMatch(/no ported test yet: u1#4/);
+	});
+
+	it("a truth re-run inside the implement loop links the cases again: a new case without a test gets a coverage retest", async () => {
+		const tasks: string[] = [];
+		let gates = 0;
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (task: string) => {
+					if (opts.role === "test") {
+						tasks.push(task);
+						if (tasks.length === 1) {
+							write(join(truthDir(), "cases.json"), casesOf([1, 2]));
+							write(join(ws, "migrated", SPEC), "it('u1#1', () => {}); it('u1#2', () => {});\n");
+						} else if (/too weak/.test(task)) write(join(truthDir(), "cases.json"), casesOf([1, 5, 2]));
+						else write(join(ws, "migrated", SPEC), "it('u1#1', () => {}); it('u1#2', () => {}); it('u1#3', () => {});\n");
+					}
+					return { text: "done", ...ok };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		// the reviewer finds the tests weak once: the tester re-runs the truth inside the loop
+		const reviewer = async () => ({ ok: false, judged: true, output: "weak", weakTests: "- spec: asserts nothing" });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			if (++gates > 1) return green(g);
+			await g.review!([]);
+			return { ok: false, failedStep: "wired_ok", steps: [{ name: "wired_ok", ok: false, output: "weak", ms: 0 } as never], changedFiles: [], testFiles: [] };
+		};
+		await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: spawn as never, reviewer, gate, log: () => {} });
+		expect(rows()).toEqual([
+			{ id: "u1#1", inputs: "[1]", ported_test_path: SPEC },
+			{ id: "u1#2", inputs: "[2]", ported_test_path: SPEC },
+			{ id: "u1#3", inputs: "[5]", ported_test_path: SPEC },
+		]);
+		expect(tasks.length).toBe(3);
+		expect(tasks[2]).toMatch(/no ported test yet: u1#3/);
+	});
+});
+
 describe("quirks are recorded once", () => {
 	const root = () => ws;
 	it("the same behaviour in other spacing/case is the existing quirk; the model judges other wording", async () => {
@@ -247,7 +317,7 @@ describe("a unit with no runtime behaviour", () => {
 		expect(() => ledger.transitionSymbol("app/agency/create.cmd.php::Repo", "tested")).not.toThrow();
 		// the reviewer is told the reason
 		let facts = "";
-		const reviewSpawn = async (): Promise<LeafSession> => ({ run: async (t: string) => ((facts = t), { text: "", ...ok }), dispose() {} }) as unknown as LeafSession;
+		const reviewSpawn = async (): Promise<LeafSession> => ({ run: async (t: string) => ((facts ||= t), { text: "", ...ok }), dispose() {} }) as unknown as LeafSession;
 		await reviewWithModel({ ledger, config, root: ws, unitId: "u1", adapter: nestjsAdapter, targetProjectDir: join(ws, "migrated"), moduleDir: "src/features/agency", legacyFiles: [], changedFiles: [], spawn: reviewSpawn as never });
 		expect(facts).toMatch(/no runtime behaviour to pin[\s\S]*only declares the repository contract/);
 	});

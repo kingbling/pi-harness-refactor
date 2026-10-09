@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
-import { NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
+import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
 import { caseCoverage, lintTests } from "../run/ported.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
@@ -388,7 +388,7 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			const truth = d.currentTruth?.();
 			let ids: string[];
 			if (truth?.ok) {
-				ids = truth.cases.map((_, i) => `${d.unitId}#${i + 1}`);
+				ids = caseIds(d.unitId, d.ledger.db.prepare("SELECT id, symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(d.unitId) as Array<{ id: string; symbol_id: string; inputs: string }>, truth.cases);
 				if (truth.none) out.push(`No runtime behaviour declared (${truth.none}): no case needs a test.`);
 			} else {
 				ids = (d.ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(d.unitId) as Array<{ id: string }>).map((r) => r.id);

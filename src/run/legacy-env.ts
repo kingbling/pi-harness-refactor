@@ -72,6 +72,19 @@ export function describeTruthRun(root: string | undefined, config: Config, sourc
 
 export type TruthCase = { symbol: string; inputs: unknown; expected: unknown };
 
+/**
+ * Case ids that stay put: a case already recorded (same symbol and inputs) keeps its id, a new one gets the next
+ * free number. Never by position, so a case added or left out in a re-run does not shift the others' ids.
+ */
+export function caseIds(unitId: string, recorded: Array<{ id: string; symbol_id: string; inputs: string }>, cases: TruthCase[]): string[] {
+	const left = [...recorded];
+	let next = Math.max(0, ...recorded.map((r) => Number(r.id.slice(r.id.lastIndexOf("#") + 1)) || 0));
+	return cases.map((c) => {
+		const i = left.findIndex((r) => r.symbol_id === c.symbol && r.inputs === JSON.stringify(c.inputs));
+		return i >= 0 ? left.splice(i, 1)[0]!.id : `${unitId}#${++next}`;
+	});
+}
+
 /** Where the tester writes read-not-run cases when the old code cannot run: the same JSON array, no script. */
 export const READ_CASES_FILE = "cases.json";
 

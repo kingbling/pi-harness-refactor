@@ -13,7 +13,8 @@ import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
 
 /**
  * wired_ok is judged by a reviewer model with tools, not by pattern lists: its findings fail the gate and go back
- * to the implementer; a session without a verdict passes as "not judged"; the review never holds a CPU slot.
+ * to the implementer; a session without a verdict is asked once more, then fails as "not judged"; the review never
+ * holds a CPU slot.
  */
 const tick = { cmd: "true", args: [] as string[] };
 const adapter: TargetAdapter = { ...nestjsAdapter, build: () => tick, lint: () => tick, test: () => tick };
@@ -29,13 +30,14 @@ function project() {
 	return { dir, ledger, config };
 }
 
-/** A fake session that calls review_verdict with `verdict` (or never, when undefined). */
-const reviewerSession = (verdict: object | undefined, seen: SpawnOptions[] = []) =>
+/** A fake session that calls review_verdict with `verdict` (or never, when undefined); `prompts` gets every prompt. */
+const reviewerSession = (verdict: object | undefined, seen: SpawnOptions[] = [], prompts: string[] = []) =>
 	(async (opts: SpawnOptions): Promise<LeafSession> => {
 		seen.push(opts);
 		return {
 			run: async (task: string) => {
-				expect(task).toMatch(/new file src\/features\/campaign\/campaign\.service\.ts[\s\S]*TODO/);
+				prompts.push(task);
+				if (prompts.length === 1) expect(task).toMatch(/new file src\/features\/campaign\/campaign\.service\.ts[\s\S]*TODO/);
 				if (verdict) await (opts.customTools!.find((t) => t.name === "review_verdict") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", verdict);
 				return { text: "done", toolCalls: 2, blocked: 0, usage: { input: 0, output: 0, cost: 0.01 } };
 			},
@@ -97,13 +99,47 @@ describe("wired_ok: the reviewer model", () => {
 		expect(r).toMatchObject({ ok: false, judged: true, outOfScope: "- the manifest does not map the Campaign namespace → add the mapping" });
 	});
 
-	it("no verdict (provider down, session cut) passes as not judged, marked in the evidence", async () => {
+	it("no verdict: the reviewer is asked once more in the same session; still none leaves wired_ok red, never passed", async () => {
 		const { dir, ledger, config } = project();
-		const review = (changedFiles: string[]) => reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles, spawn: reviewerSession(undefined) });
+		const prompts: string[] = [];
+		const review = (changedFiles: string[]) => reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles, spawn: reviewerSession(undefined, [], prompts) });
 		const g = await runGate({ ledger, unitId: "u1", adapter, targetProjectDir: dir, writeGlobs: ["src/features/campaign/**"], testFiles: [], review });
-		expect(g.ok).toBe(true);
-		const ev = ledger.db.prepare("SELECT payload FROM evidence WHERE unit_id = 'u1' AND type = 'wired_ok'").get() as { payload: string };
-		expect(JSON.parse(ev.payload)).toMatchObject({ judged: false });
+		expect(prompts).toHaveLength(2);
+		expect(prompts[1]).toMatch(/review_verdict/);
+		expect(g.ok).toBe(false);
+		expect(g.failedStep).toBe("wired_ok");
+		expect(g.steps.find((s) => s.name === "wired_ok")!.output).toMatch(/not judged/);
+		expect(ledger.hasEvidence("u1", "wired_ok")).toBe(false);
+	});
+
+	it("a verdict given after the nudge counts", async () => {
+		const { dir, ledger, config } = project();
+		let calls = 0;
+		const spawn = (async (opts: SpawnOptions) => ({
+			run: async () => {
+				if (++calls === 2) await (opts.customTools!.find((t) => t.name === "review_verdict") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { ok: true, findings: [] });
+				return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0.01 } };
+			},
+			dispose() {},
+		})) as never;
+		const r = await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
+		expect(r).toMatchObject({ ok: true, judged: true, costUsd: 0.02 });
+	});
+
+	it("a reviewer that throws leaves wired_ok red", async () => {
+		const { dir, ledger, config } = project();
+		const spawn = (async () => ({ run: async () => Promise.reject(new Error("provider down")), dispose() {} })) as never;
+		const r = await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
+		expect(r).toMatchObject({ ok: false, judged: false });
+	});
+
+	it("tells the reviewer that a stub left for this unit (TODO(br:<this unit>)) is a finding", async () => {
+		const { dir, ledger, config } = project();
+		let system = "";
+		const spawn = (async (opts: SpawnOptions) => ((system = opts.systemPrompt ?? ""), { run: async () => ({ text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} })) as never;
+		await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
+		expect(system).toContain("TODO(br:<the owning unit>): that is not a finding");
+		expect(system).toMatch(/A stub marked TODO\(br:u1\) \(grep for it\) that stands in for this unit's own legacy code[^:]*: one still there[^.]* is a finding/);
 	});
 
 	it("the review runs outside the CPU slot; the commands inside it", async () => {
