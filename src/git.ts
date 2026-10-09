@@ -58,6 +58,20 @@ export function ensureRepo(path: string, defaultBranch = "main", ignored: string
 	if (!existsSync(join(path, ".gitignore"))) writeFileSync(join(path, ".gitignore"), [...ignored.map((i) => `${i}/`), "/.env"].join("\n") + "\n");
 }
 
+/**
+ * True when a tracked file's change is only whitespace and blank lines (a formatter's fix): it cannot change what
+ * a test checks, so the "tests stay untouched" rules let it through.
+ */
+export function whitespaceOnly(repo: string, path: string): boolean {
+	try {
+		execFileSync("git", ["-C", repo, "ls-files", "--error-unmatch", "--", path], { stdio: "pipe" });
+		execFileSync("git", ["-C", repo, "diff", "--quiet", "-w", "--ignore-blank-lines", "HEAD", "--", path], { stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** True when `path` is the top of its own git repo (not a folder inside some other repo, where git would act on the parent). */
 export function isRepoRoot(path: string): boolean {
 	try {

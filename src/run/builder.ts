@@ -3,7 +3,7 @@ import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, removeWorktree } from "../git.ts";
+import { addWorktree, removeWorktree, whitespaceOnly } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { askViaModel } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -132,7 +132,8 @@ export function createBuilder(o: {
 				// tests are the truth: a repair never changes them
 				const touched = execFileSync("git", ["-C", wt, "status", "--porcelain"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").map((l) => l.slice(3).trim()).filter(Boolean);
 				const proj = relative(o.config.target.path, projectDir(o.config, stackId));
-				const tests = touched.filter((f) => adapter.layout.isTestFile(proj && f.startsWith(`${proj}/`) ? f.slice(proj.length + 1) : f));
+				// a formatter's whitespace fix in a test stays (it cannot change what the test checks)
+				const tests = touched.filter((f) => adapter.layout.isTestFile(proj && f.startsWith(`${proj}/`) ? f.slice(proj.length + 1) : f) && !whitespaceOnly(wt, f));
 				if (tests.length) execFileSync("git", ["-C", wt, "checkout", "--", ...tests], { stdio: "pipe" });
 				problem = await check();
 			}

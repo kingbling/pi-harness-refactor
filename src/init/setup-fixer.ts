@@ -8,7 +8,7 @@ import { loadCommandOverrides, saveCommandOverride, saveWorktreeCopy, setupLogPa
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
-import { commitAll, isRepoRoot } from "../git.ts";
+import { commitAll, isRepoRoot, whitespaceOnly } from "../git.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 
@@ -169,6 +169,7 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		const exts = adapter.layout.sourceExtensions ?? [];
 		const newCode = isNew && inCodeDirs && (!exts.length || exts.some((x) => rel.endsWith(x)));
 		if (!(adapter.layout.isTestFile(rel) || newCode || (migrated ? migrated.has(rel) : inCodeDirs))) continue;
+		if (!isNew && whitespaceOnly(repo, path)) continue; // a formatter's fix changes no behaviour
 		if (code === "??" || code[0] === "A") {
 			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", path], { stdio: "pipe" });
 			rmSync(join(repo, path), { force: true });
