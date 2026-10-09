@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
-import { loadCommandOverrides } from "../adapters/command-overrides.ts";
+import { loadCommandOverrides, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { createBuilder, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
@@ -23,14 +23,16 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
-import { SYSTEMIC_FAILURE, JEV_ACT } from "../jev/questions.ts";
-import { applyPlacementAnswers, placeUnit, renameMisspelledAreaDirs, resolvePlacements, unplacedReason } from "./placement.ts";
+import { SYSTEMIC_FAILURE, JEV_ACT, noulOf } from "../jev/questions.ts";
+import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDirs, resolvePlacements, unplacedReason } from "./placement.ts";
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals } from "../jev/ask.ts";
 import { resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
+import { findTests } from "./ported.ts";
+import type { TargetAdapter } from "../adapters/types.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 
 /**
@@ -165,15 +167,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// Parked units (state kept, attempt closed, waiting on a question) are resubmitted as soon as the cause is
 	// gone: their question was answered, or — for environment failures — the target project or the stack
 	// config changed since they parked. Checked at start and on every scheduling loop.
-	// Quarantined units heal too: something changed since (a setup fix, the old code's environment, the plugin)
+	// Quarantined units heal too: something of their stack changed since (a setup fix, the old code's environment, the plugin)
 	// → back into the queue, every hour or sooner, up to run.maxAutoHeals times; then the owner is asked.
 	let askingStuck: Promise<unknown> | undefined;
 	let resolving: Promise<unknown> | undefined;
 	const resubmitParked = () => {
 		resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
 		if (o.dry) return;
-		healQuarantined(ledger, config, o.root, new Set(running.keys()), log, adapters);
-		askingStuck ??= askStuckUnits({ ledger, config, root: o.root, client: o.client })
+		// healing may ask the decide model, so it runs in line with the stuck questions: one pass at a time
+		askingStuck ??= healQuarantined(ledger, config, o.root, new Set(running.keys()), log, adapters, { client: o.client })
+			.then(() => askStuckUnits({ ledger, config, root: o.root, client: o.client }))
 			.then((n) => n && log(pc.yellow(`${n} question(s): units still failing after ${config.run.maxAutoHeals} automatic tries`)), (e) => log(pc.yellow(`asking about stuck units failed: ${e?.message ?? e}`)))
 			.finally(() => (askingStuck = undefined));
 		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
@@ -412,7 +415,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						client: o.client,
 						accept: false,
 						workDir: wt,
-						reuseTruth: round > 1,
+						// a requeue keeps its truth and saved tests; a bad-truth reopen drops the truth evidence, so the tester redoes it then
+						reuseTruth: true,
 						retryNote: conflictNote ?? carried,
 						gateSlot: (fn) => gates.run(fn),
 						mergeLock: (fn) => merge.run(fn),
@@ -492,6 +496,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			} finally {
 				const st = ledger.getUnit(unitId)!.state;
 				if (st === "accepted" || st === "quarantined") {
+					if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
 					removeWorktree(config.target.path, wt);
 					try {
 						execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
@@ -697,6 +702,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				await healing;
 				continue;
 			}
+			// a self-heal pass (it may ask the decide model) can still put quarantined units back: wait for it first
+			if (askingStuck) {
+				await askingStuck;
+				continue;
+			}
 			// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
 			if (sampleReason && !stop && !o.shouldStop?.() && underLimit()) {
 				if (o.waitForDecisions) {
@@ -866,7 +876,7 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 	const parkedEnv = ledger.db.prepare("SELECT id, meta, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; meta: string; q: number | null; env: string }>;
 	for (const p of parkedEnv) {
 		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
-		if (p.q && open.has(p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest, stack config or a setup fix)", "orchestrator");
+		if (p.q && open.has(p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest or stack config)", "orchestrator");
 	}
 	// waiting units whose blocking questions are all answered (non-blocking ones never hold a unit) get their answer applied
 	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE (q.unit_id = units.id OR q.id IN (SELECT question_id FROM question_waiters w WHERE w.unit_id = units.id)) AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));
@@ -916,22 +926,63 @@ const PLUGIN_TIME = (() => {
 	return t;
 })();
 
-/** The newest change that may fix a quarantined unit: setup fixes, gate commands, the old code's environment, dependency manifests, the plugin. */
-export function lastFixAt(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>): number {
-	const files = [join(root, ".bigrefactor", "legacy-env.json"), join(root, ".bigrefactor", "legacy-env.log")];
-	for (const id of config.target.stacks) {
-		files.push(...setupFiles(root, id));
-		for (const m of manifests.get(id)?.toolchain.manifestFiles ?? []) files.push(join(projectDir(config, id), m));
+/** The files whose change may fix a quarantined unit of one stack: its setup fixes and gate commands, its dependency manifests, the old code's environment. */
+function fixFiles(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string): string[] {
+	return [join(root, ".bigrefactor", "legacy-env.json"), join(root, ".bigrefactor", "legacy-env.log"), ...setupFiles(root, stackId), ...(manifests.get(stackId)?.toolchain.manifestFiles ?? []).map((m) => join(projectDir(config, stackId), m))];
+}
+
+const mtime = (f: string) => {
+	try {
+		return statSync(f).mtimeMs;
+	} catch {
+		return 0; // not there
 	}
-	let t = PLUGIN_TIME;
-	for (const f of files) {
-		try {
-			t = Math.max(t, statSync(f).mtimeMs);
-		} catch {
-			/* not there */
+};
+
+/** The newest change that may fix a quarantined unit of this stack (another stack's fix does not count): see fixFiles, and the plugin. */
+export function lastFixAt(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string): number {
+	return Math.max(PLUGIN_TIME, ...fixFiles(config, root, manifests, stackId).map(mtime));
+}
+
+/** What changed for a stack since `t`, for the decide model: each setup fix logged since (its line and its commit's diff), the other files by name. */
+function changesSince(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string, t: number): string {
+	const out: string[] = [];
+	const logFile = setupLogPath(root, stackId);
+	let lines: string[] = [];
+	try {
+		lines = readFileSync(logFile, "utf8").split("\n").filter(Boolean);
+	} catch {
+		/* no fixes yet */
+	}
+	for (const line of lines) {
+		const [at, sha] = line.split(" ");
+		if (!(Date.parse(at ?? "") > t)) continue;
+		let diff = "";
+		if (sha && sha !== "override") {
+			try {
+				diff = execFileSync("git", ["-C", config.target.path, "show", "--format=", "--stat", "--patch", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+			} catch {
+				/* the commit is gone */
+			}
 		}
+		out.push(`setup fix: ${line}${diff ? `\n${capText(diff, 4000)}` : ""}`);
 	}
-	return t;
+	for (const f of fixFiles(config, root, manifests, stackId)) if (f !== logFile && mtime(f) > t) out.push(`changed: ${relative(root, f)}`);
+	if (PLUGIN_TIME > t) out.push("the plugin itself was updated");
+	return out.join("\n\n");
+}
+
+/** The unit's last red attempt: the failed gate step's output (the reviewer's findings when the review failed), or the tester's error. */
+function lastRedReport(ledger: Ledger, unitId: string): { step: string; output: string } | undefined {
+	const r = ledger.db.prepare("SELECT outcome, gate_report FROM attempts WHERE unit_id = ? AND gate_report IS NOT NULL AND (outcome LIKE 'gate_red%' OR outcome IN ('truth_red', 'review_red')) ORDER BY id DESC LIMIT 1").get(unitId) as { outcome: string; gate_report: string } | undefined;
+	if (!r) return undefined;
+	try {
+		const g = JSON.parse(r.gate_report) as { failedStep?: string; steps?: Array<{ name: string; ok: boolean; output?: string }>; error?: string; output?: string };
+		const bad = g.steps?.find((s) => !s.ok);
+		return { step: bad?.name ?? r.outcome, output: String(bad?.output ?? g.error ?? g.output ?? "") };
+	} catch {
+		return { step: r.outcome, output: r.gate_report };
+	}
 }
 
 /** One finished unit as the circuit breaker sees it: the failure text and its key, whatever kind of failure it was. */
@@ -997,27 +1048,53 @@ function backInQueue(ledger: Ledger, config: Config, root: string, id: string, h
 }
 
 /**
- * Quarantined units heal by themselves, up to run.maxAutoHeals times: back into the queue when something changed
- * after they failed (see lastFixAt), or after run.healEveryMinutes when the failure is new. The same failure again
- * with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model tries first, one
- * question per kind of failure), and the answer is applied here.
+ * Does a change made since a stuck unit's failure plausibly touch that failure? The decide model reads what changed
+ * (each setup fix with its diff) and the unit's last red report. undefined: the model is unavailable (ask next pass).
  */
-export function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number } = {}): string[] {
-	const since = o.since ?? lastFixAt(config, root, manifests);
+async function changeTouches(d: { ledger: Ledger; config: Config; client: ModelClient }, unitId: string, changes: string, failure: string): Promise<boolean | undefined> {
+	try {
+		const dec = await decide({ client: d.client, ledger: d.ledger, model: d.config.models.decide.id }, "heal_stuck", { changes: capText(changes, 6000), failure: capText(failure, 3000) }, {
+			touches: { type: "noul", instructions: "Could a change in `changes` plausibly fix the failure in `failure`? Yes when it touches what the failure is about (the same tool, command, config, dependency, file or error); no when it is about something else." },
+		}, ["touches"], unitId);
+		return noulOf(dec.answers["touches"]) > 0.5;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Quarantined units heal by themselves, up to run.maxAutoHeals times: back into the queue when something of their
+ * own stack changed after they failed (see lastFixAt), or after run.healEveryMinutes when the failure is new. The
+ * same failure again with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model
+ * tries first, one question per kind of failure), and the answer is applied here. A stuck unit runs again on a change
+ * only when the decide model says the change touches its failure (without a client: on any change).
+ */
+export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient } = {}): Promise<string[]> {
+	// one change time per stack per pass
+	const sinces = new Map<string, number>();
+	const sinceOf = (stackId: string) => o.since ?? (sinces.get(stackId) ?? sinces.set(stackId, lastFixAt(config, root, manifests, stackId)).get(stackId)!);
 	const now = o.now ?? Date.now();
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number };
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
 		const failure = errorSignature("quarantine", r.reason ?? "");
+		const stackId = placeUnit(config, r.meta, root).stackId;
+		const since = sinceOf(stackId);
 		const changed = ledgerTime(r.at) < since;
-		if (changed && meta.stuck && meta.healQuestion !== 0 && heals < config.run.maxAutoHeals) {
-			// something changed since the unit got stuck: that is worth a try, an open question about it or not
-			backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.`, failure);
-			back.push(r.id);
-			continue;
+		// a change the decide model already said does not touch this failure is not asked about again
+		if (changed && meta.stuck && meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && since > (meta.healChecked ?? 0)) {
+			const last = lastRedReport(ledger, r.id);
+			const touches = o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			if (touches) {
+				// something changed since the unit got stuck that may fix it: worth a try, an open question about it or not
+				backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.`, failure);
+				back.push(r.id);
+				continue;
+			}
+			if (touches === false) ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healChecked', ?) WHERE id = ?").run(since, r.id);
 		}
 		if (meta.healQuestion) {
 			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it
@@ -1048,28 +1125,51 @@ export function healQuarantined(ledger: Ledger, config: Config, root: string, ru
 	return back;
 }
 
-/** Units that used up their automatic tries: the owner is asked, one question per kind of failure (it blocks only those units). */
+/**
+ * Units that used up their automatic tries: the owner is asked, one question per kind of failure (it blocks only
+ * those units). The facts and the key hold the unit's last red report, so only units that really fail alike share a
+ * question; the owner's earlier answers on such questions go to the phrasing model (askViaModel).
+ */
 export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: string; client?: ModelClient }): Promise<number> {
 	let asked = 0;
 	for (const r of quarantinedUnits(d.ledger)) {
 		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; stuck?: boolean };
 		if (meta.healQuestion !== undefined || (!meta.stuck && (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals)) continue;
+		const last = lastRedReport(d.ledger, r.id);
 		const q = await askViaModel(d, {
 			point: "quarantine",
 			unitId: r.id,
-			facts: `${r.id} was quarantined and tried again automatically ${meta.autoHeals ?? 0} times; ${meta.stuck ? "the last try failed the same way as before and nothing changed in between (plugin, setup, environment), so it is not retried by itself" : "it still fails"}: ${(r.reason ?? "").slice(0, 600)}. Other units with the same failure wait on this answer too.`,
+			facts: `${r.id} was quarantined and tried again automatically ${meta.autoHeals ?? 0} times${meta.stuck ? "; the last try failed the same way as the one before" : ""}: ${(r.reason ?? "").slice(0, 600)}.${last ? `\nIts last failure (${last.step}):\n${capText(last.output, 1500)}` : ""}\nOther units with the same failure wait on this answer too.`,
 			options: [
 				{ value: "retry", facts: "try again (after you fixed something; type a hint instead to steer the next attempt)" },
 				{ value: "leave", facts: "leave it quarantined for a human" },
 			],
 			blocks: "unit",
 			askedBy: "orchestrator",
-			sameAs: errorSignature("quarantine", r.reason ?? ""),
+			// the unit's own id is never part of the key
+			sameAs: [errorSignature("quarantine", r.reason ?? ""), last && errorSignature(last.step, last.output.replaceAll(r.id, "<unit>"))].filter(Boolean).join(" | "),
 		});
 		d.ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', ?) WHERE id = ?").run(q.id, r.id);
 		if (!q.shared) asked++;
 	}
 	return asked;
+}
+
+/** A quarantined unit's ported tests, kept next to its truth before its worktree goes: a requeue puts them back instead of having them written again. */
+export function keepPortedTests(config: Config, root: string, unitId: string, meta: string, wt: string, layout: TargetAdapter["layout"]): string[] {
+	try {
+		const place = placeUnit(config, meta, root);
+		const dir = join(wt, relative(config.target.path, projectDir(config, place.stackId)));
+		const ported = join(root, ".bigrefactor", "truth", unitId, "ported");
+		const files = findTests(dir, placementDir(layout, place), layout);
+		for (const f of files) {
+			mkdirSync(dirname(join(ported, f)), { recursive: true });
+			cpSync(join(dir, f), join(ported, f));
+		}
+		return files;
+	} catch {
+		return []; // no worktree or no tests: the tester writes them again
+	}
 }
 
 /**

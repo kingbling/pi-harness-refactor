@@ -71,14 +71,14 @@ describe("answers are applied per option", () => {
 		}
 		const hour = 60 * 60_000;
 		const heal = (o: { since?: number; now?: number }) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, ...o });
-		expect(heal({})).toEqual([]); // just failed, nothing changed
-		expect(heal({ since: Date.now() + 1000 }).sort()).toEqual(["U1", "U2"]); // a fix landed since
+		expect(await heal({})).toEqual([]); // just failed, nothing changed
+		expect((await heal({ since: Date.now() + 1000 })).sort()).toEqual(["U1", "U2"]); // a fix landed since
 		for (let i = 2; i <= config.run.maxAutoHeals + 1; i++) {
 			for (const id of ["U1", "U2"]) {
 				ledger.transitionUnit(id, "truth", "t");
 				ledger.transitionUnit(id, "quarantined", `gate still red after 5 attempts (${["lint_ok", "build_ok", "test_ok"][i % 3]})`); // a new failure each time
 			}
-			expect(heal({ now: Date.now() + hour + 1000 }).length).toBe(i <= config.run.maxAutoHeals ? 2 : 0); // an hour later
+			expect((await heal({ now: Date.now() + hour + 1000 })).length).toBe(i <= config.run.maxAutoHeals ? 2 : 0); // an hour later
 		}
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 5, retryNote: expect.stringMatching(/try 5 of 5/) });
 		// out of tries: the owner is asked once for both (same failure)
@@ -87,9 +87,9 @@ describe("answers are applied per option", () => {
 		const q = ledger.openQuestions();
 		expect(q).toHaveLength(1);
 		expect(q[0]!.point).toBe("quarantine");
-		expect(heal({ now: Date.now() + 9 * hour })).toEqual([]); // waits for the answer now
+		expect(await heal({ now: Date.now() + 9 * hour })).toEqual([]); // waits for the answer now
 		ledger.answerQuestion(q[0]!.id, "the lint config was wrong, I fixed it");
-		expect(heal({}).sort()).toEqual(["U1", "U2"]);
+		expect((await heal({})).sort()).toEqual(["U1", "U2"]);
 		expect(JSON.parse(ledger.getUnit("U2")!.meta)).toMatchObject({ autoHeals: 0, retryNote: expect.stringMatching(/hint: the lint config was wrong/) });
 	});
 
@@ -100,14 +100,14 @@ describe("answers are applied per option", () => {
 		ledger.transitionUnit("U1", "quarantined", "truth cases without a ported test after 2 retests: U1#1");
 		const hour = 60 * 60_000;
 		const heal = (o: { since?: number; now?: number }) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, ...o });
-		expect(heal({ now: Date.now() + hour + 1000 })).toEqual(["U1"]); // first failure: one try an hour later
+		expect(await heal({ now: Date.now() + hour + 1000 })).toEqual(["U1"]); // first failure: one try an hour later
 		ledger.transitionUnit("U1", "truth", "t");
 		ledger.transitionUnit("U1", "quarantined", "truth cases without a ported test after 2 retests: U1#1");
-		expect(heal({ now: Date.now() + 9 * hour })).toEqual([]); // the same failure, nothing changed: no more tries
+		expect(await heal({ now: Date.now() + 9 * hour })).toEqual([]); // the same failure, nothing changed: no more tries
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 1, stuck: true });
 		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
-		expect(ledger.openQuestions()[0]!.question).toMatch(/failed the same way as before and nothing changed/);
-		expect(heal({ since: Date.now() + 1000 })).toEqual(["U1"]); // the plugin or setup changed since: worth a try, question open or not
+		expect(ledger.openQuestions()[0]!.question).toMatch(/failed the same way as the one before/);
+		expect(await heal({ since: Date.now() + 1000 })).toEqual(["U1"]); // the plugin or setup changed since: worth a try, question open or not
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 2 });
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).stuck).toBeUndefined();
 	});

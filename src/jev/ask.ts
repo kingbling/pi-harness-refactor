@@ -365,6 +365,17 @@ export function ownPick(config: Config, q: AskRequest, phrased: PhrasedQuestion)
 	return DECIDES_ITSELF[q.point]?.(v) ? v : undefined;
 }
 
+/** Points about a unit that keeps failing (retry or leave): the owner's earlier answers on them go to the phrasing model by themselves. */
+const OWNER_ANSWERS_POINTS = new Set(["quarantine", "gate_env"]);
+
+/** The owner's own earlier answers on a point (not the run's, a model's or a bulk "accepted the summary"): what was asked and what they said. */
+export function ownerAnswersOn(ledger: Ledger, point: string, limit = 10): string {
+	const rows = ledger.db
+		.prepare("SELECT question, context, answer FROM questions WHERE point = ? AND status = 'answered' AND answered_by LIKE 'human%' AND answered_by NOT LIKE '%accepted the summary%' ORDER BY id DESC LIMIT ?")
+		.all(point, limit) as Array<{ question: string; context: string | null; answer: string }>;
+	return rows.map((r) => `- ${String((r.context ? (JSON.parse(r.context) as { facts?: string }).facts : undefined) ?? r.question).replace(/\s+/g, " ").slice(0, 300)} → ${r.answer.slice(0, 200)}`).join("\n");
+}
+
 /** Answer given by the run itself (status "auto"); the owner sees these in br questions. */
 export const OWN_ANSWER = "auto (your goals)";
 
@@ -379,7 +390,8 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 		if (q.unitId) d.ledger.addWaiter(same.id, q.unitId);
 		return { id: same.id, phrased: unphrased(q), costUsd: same.costUsd, shared: true };
 	}
-	const phrased = d.client ? await phraseOne(d, q) : unphrased(q);
+	const earlier = !q.ownerAnswers && OWNER_ANSWERS_POINTS.has(q.point) ? ownerAnswersOn(d.ledger, q.point) : "";
+	const phrased = d.client ? await phraseOne(d, earlier ? { ...q, ownerAnswers: earlier } : q) : unphrased(q);
 	const id = d.ledger.askQuestion({
 		unitId: q.unitId,
 		point: q.point,

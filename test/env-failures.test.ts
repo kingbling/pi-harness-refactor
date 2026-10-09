@@ -207,14 +207,14 @@ describe("br lanes", () => {
 		expect(loadConfig(f).config.run.agentConcurrency).toBe(24);
 	});
 
-	it("a setup fix made during the run wakes the units parked on a setup problem", async () => {
+	it("a setup fix for another problem leaves parked units waiting; a changed gate command wakes them", async () => {
 		const { cpSync, mkdirSync, rmSync, appendFileSync } = await import("node:fs");
 		const { ConfigSchema } = await import("../src/config.ts");
 		const { inventory } = await import("../src/inventory/run.ts");
 		const { Ledger } = await import("../src/ledger/db.ts");
 		const { resubmitParkedUnits } = await import("../src/run/run.ts");
 		const { envFingerprint, setupFiles } = await import("../src/run/unit.ts");
-		const { setupLogPath } = await import("../src/adapters/command-overrides.ts");
+		const { overridesPath, setupLogPath } = await import("../src/adapters/command-overrides.ts");
 		const { projectDir } = await import("../src/init/init.ts");
 		const ws = join(import.meta.dirname, "..", ".sim", "env-setupfix");
 		rmSync(ws, { recursive: true, force: true });
@@ -237,6 +237,9 @@ describe("br lanes", () => {
 		const adapters = new Map([["nestjs", nest]]);
 		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
 		appendFileSync(setupLogPath(ws, "nestjs"), "lint gets more memory\n"); // what fixRunSetup writes after a fix
+		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
+		expect(ledger.getQuestion(q)!.status).toBe("open");
+		writeFileSync(overridesPath(ws, "nestjs"), JSON.stringify({ lint: { cmd: "npx", args: ["eslint", "{files}"] } })); // a gate command the setup model changed
 		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([unit]);
 	});
 });

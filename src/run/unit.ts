@@ -774,8 +774,13 @@ export function setupFiles(root: string, stackId: string): string[] {
 	return [overridesPath(root, stackId), setupLogPath(root, stackId)];
 }
 
-/** What a parked environment failure depends on: the target's dependency manifests (adapter-declared), the workspace config and the setup fixes made since. */
+/**
+ * What a parked environment failure depends on: the target's dependency manifests (adapter-declared), the workspace
+ * config and the stack's gate commands. Not the setup fixes log: a fix for another problem must not wake every
+ * parked unit (a fix for the unit's own problem answers its question already).
+ */
 export function envFingerprint(config: Config, projectDir: string, manifestFiles: string[], setup: string[] = []): string {
+	setup = setup.filter((f) => !f.endsWith(".fixes.log")); // see setupLogPath
 	const read = (p: string) => {
 		try {
 			return readFileSync(p, "utf8");
