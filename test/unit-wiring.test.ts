@@ -70,16 +70,41 @@ describe("runUnit wiring", () => {
 		expect(seen[0]!.writeGlobs).toEqual(["internal/agency/**", "cmd/server/routes.go"]);
 	});
 
-	it("after the doctor, the triage question is withdrawn and asked again with the diagnosis, phrased by the model", async () => {
+	it("an identical anti-gaming red twice asks the owner once, after the doctor, with the diagnosis phrased by the model", async () => {
 		const client = new FakeModelClient({ chat: () => ({ json: { action: "unknown", summary: "the protected globs block the module dir", question: "The gate keeps refusing agency writes: fix the protected globs?", options: [], recommended: "retry", opinion: "Looks like config." } }) });
 		const gate = async (): Promise<GateReport> => failing("write outside unit scope: src/features/agency/agency.service.ts");
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, client, log: () => {} });
 		const qs = ledger.db.prepare("SELECT point, question, status, context FROM questions WHERE unit_id = 'u1' ORDER BY id").all() as Array<{ point: string; question: string; status: string; context: string }>;
-		expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "withdrawn"], ["gate_env", "open"]]);
-		expect(qs[1]!.question).toContain("The gate keeps refusing agency writes: fix the protected globs?");
-		expect(JSON.parse(qs[1]!.context).diagnosis.summary).toBe("the protected globs block the module dir");
+		expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "open"]]);
+		expect(qs[0]!.question).toContain("The gate keeps refusing agency writes: fix the protected globs?");
+		expect(JSON.parse(qs[0]!.context).diagnosis.summary).toBe("the protected globs block the module dir");
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
 		expect(r.attempts).toBe(2);
+	});
+
+	it("the same reviewer finding after a retest goes to the stronger model, not the tester again; nobody is asked", async () => {
+		const roles: string[] = [];
+		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => (roles.push(opts.role), spawn());
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "interface_mismatch" } : undefined) });
+		const gate = async (): Promise<GateReport> => ({ ok: false, steps: [{ name: "wired_ok", ok: false, ms: 1, output: "- src/features/agency/agency.service.ts: create() is never called from the controller" }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "wired_ok", testFiles: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate, client, log: () => {} });
+		// one retest after the first red; every later round escalates (the retest changed nothing and the finding stays)
+		expect(roles.filter((x) => x === "test")).toHaveLength(1);
+		expect(roles.filter((x) => x !== "test")).toEqual(["implement", "implement", "escalate", "escalate", "escalate"]);
+		expect(ledger.db.prepare("SELECT count(*) AS n FROM questions").get()).toEqual({ n: 0 });
+		expect(r.state).toBe("quarantined");
+	});
+
+	it("a doctor 'reimplement' past its two actions goes to the stronger model and then the cap: no environment question", async () => {
+		const roles: string[] = [];
+		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => (roles.push(opts.role), spawn());
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "impl_bug" } : undefined), chat: () => ({ json: { action: "reimplement", summary: "create() returns the wrong id", command: "", note: "return the new row's id" } }) });
+		// a tool that printed nothing: triage hands it to the doctor every time
+		const gate = async (): Promise<GateReport> => ({ ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: "", exitCode: 1 }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "ported_tests_green", testFiles: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate, client, log: () => {} });
+		expect(roles).toEqual(["implement", "implement", "implement", "escalate", "escalate"]);
+		expect(ledger.db.prepare("SELECT count(*) AS n FROM questions").get()).toEqual({ n: 0 });
+		expect(r.state).toBe("quarantined");
 	});
 
 	it("triage's ask_human asks nobody first: the doctor looks, and only when it cannot help one retry/leave question is asked", async () => {

@@ -33,7 +33,7 @@ import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, quirkList, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { caseOnly, completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts";
-import { triageGate, type Triage } from "./triage.ts";
+import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { caseCoverage, findTests, lintTests } from "./ported.ts";
@@ -446,6 +446,15 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// what the reviewer says must change outside the unit's files (setup, config, plugin): never the implementer's
 	let reviewOutOfScope: string | undefined;
 	let testRounds = 0;
+	// the tester re-ported: triage never sends a retest that did not help to the tester again
+	let lastRetest: LastRetest | undefined;
+	const retest = async (extra: string) => {
+		const files = () => JSON.stringify([loadTests(), readTruthFiles(), loadIface()]);
+		const before = files();
+		if (await runTruth(extra)) testFiles = loadTests();
+		// no test, truth file or interface.md changed: no progress
+		lastRetest = { progress: files() !== before };
+	};
 	const reports: Array<{ owner: string; target: string; problem: string; evidence: string }> = [];
 	const outOfScopeRoute = async (problem: string): Promise<UnitRunResult | undefined> => {
 		const signature = errorSignature("wired_ok", problem);
@@ -607,7 +616,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			testRounds++;
 			o.ledger.addEvidence(o.unitId, "test_disputed", { note: testsNote.slice(0, 2000) });
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
-			if (await runTruth(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`)) testFiles = loadTests();
+			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`);
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
 			previousGate = gate;
 			continue;
@@ -627,7 +636,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		// Jev picks the next step; code enforces caps and acts.
 		if (o.client) {
-			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo);
+			// a retest counts for the gate right after it, and after that as long as the finding stays the same
+			const afterRetest = lastRetest;
+			if (!sameFinding(gate, previousGate)) lastRetest = undefined;
+			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo, afterRetest);
 			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)}${triage.sure ? "" : ", unsure"})`));
 			if (triage.action === "quarantine") break;
 			// the same step failed again: another blind attempt rarely helps — find out why first (once per step)
@@ -639,17 +651,24 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				const failedOut = gate.steps.find((x) => !x.ok)?.output ?? "";
 				const dx = await diagnoseFailure({ config: o.config, adapter, projectDir: targetProjectDir, failedStep: gate.failedStep ?? "", output: failedOut, client: o.client });
 				log(pc.dim(`  doctor (${dx.by}): ${dx.action} — ${dx.summary}`));
-				// triage's own question (the anti-gaming case); a plain ask_human asks nobody until doctor and setup model tried
-				let qid = triage.questionId;
-				// a question shared with other units is theirs too: only the unit's own question is answered or withdrawn here
-				const ownQ = (id: number | undefined) => id !== undefined && o.ledger.getQuestion(id)?.unit_id === o.unitId;
-				if ((dx.action === "retest" || dx.action === "reimplement") && doctorActions < 2) {
+				// the doctor puts the fault in the unit's own tests or code; a retest that did not help is never followed by another
+				const codeFault = dx.action === "retest" || dx.action === "reimplement";
+				const noRetest = !!afterRetest && (sameFinding(gate, previousGate) || !afterRetest.progress);
+				if (codeFault && doctorActions < 2 && !(dx.action === "retest" && noRetest)) {
 					doctorActions++;
-					if (ownQ(qid)) o.ledger.answerQuestion(qid!, `auto: ${dx.action} (${dx.summary})`, "doctor");
-					if (dx.action === "retest") {
-						const ok = await runTruth(`The gate failed with ${gate.failedStep}: ${dx.summary}. ${dx.note ?? ""} Fix the TESTS, not production code.\n${lastGateText}`);
-						if (ok) testFiles = loadTests();
-					} else lastGateText += `\n\nDiagnosis: ${dx.summary}. ${dx.note ?? ""}`;
+					if (triage.action === "escalate") forceEscalate = true;
+					if (dx.action === "retest") await retest(`The gate failed with ${gate.failedStep}: ${dx.summary}. ${dx.note ?? ""} Fix the TESTS, not production code.\n${lastGateText}`);
+					else lastGateText += `\n\nDiagnosis: ${dx.summary}. ${dx.note ?? ""}`;
+					previousGate = gate;
+					continue;
+				}
+				// the doctor's actions are used up (or its retest would repeat one that did not help): a fault in the unit's own code or tests never becomes an owner question.
+				// The stronger model gets the diagnosis; the attempt cap quarantines the unit after that.
+				// Only an environment cause (triage's) still goes to the setup model and then the owner.
+				if (codeFault && triage.cause !== "env") {
+					lastGateText += `\n\nDiagnosis: ${dx.summary}. ${dx.note ?? ""}`;
+					if (!forceEscalate) log(pc.dim(`  the doctor's actions are used up: the stronger model tries with the diagnosis`));
+					forceEscalate = true;
 					previousGate = gate;
 					continue;
 				}
@@ -659,8 +678,6 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
 					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
-						// the fix serves every unit that waits on this problem
-						if (qid) o.ledger.answerQuestion(qid, `auto: the setup model fixed it (${fixed})`, "setup model");
 						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
 						o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: dx.summary } } } });
 						log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
@@ -675,10 +692,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					previousGate = gate;
 					continue;
 				}
-				// doctor and setup model could not help: now a person is asked, with the diagnosis (phrased by a model);
-				// triage's earlier question, if any, is replaced by this one
-				if (ownQ(qid)) o.ledger.withdrawQuestion(qid!, `diagnosed: ${dx.summary}`);
-				qid = await ask({
+				// doctor and setup model could not help: now a person is asked, once, with the diagnosis (phrased by a model)
+				const qid = await ask({
 					point: "gate_env",
 					sameAs: signature,
 					facts: `Gate step ${gate.failedStep} of ${o.unitId} failed on attempt ${attemptNo}. Diagnosis (${dx.by}): ${dx.summary}.${setupTried}${dx.command ? ` Fix command: \`${dx.command}\` in ${targetRel || "."}.` : ""} The unit resubmits itself when the target project or the config changes.\nGate output tail:\n${failedOut.slice(-1200)}`,
@@ -694,10 +709,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
 			}
 			if (triage.action === "escalate") forceEscalate = true;
-			if (triage.action === "retest") {
-				const ok = await runTruth(`The gate failed with ${gate.failedStep}; Jev judged the cause as ${triage.cause}. Re-check interface.md and the ported tests against the legacy behaviour and the implementation at ${targetRel}/${moduleDir}/; fix the TESTS/INTERFACE, not production code.\n${lastGateText}`);
-				if (ok) testFiles = loadTests();
-			}
+			if (triage.action === "retest") await retest(`The gate failed with ${gate.failedStep}; Jev judged the cause as ${triage.cause}. Re-check interface.md and the ported tests against the legacy behaviour and the implementation at ${targetRel}/${moduleDir}/; fix the TESTS/INTERFACE, not production code.\n${lastGateText}`);
 		}
 		previousGate = gate;
 	}
