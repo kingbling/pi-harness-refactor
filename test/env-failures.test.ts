@@ -128,6 +128,12 @@ describe("parked units resubmit themselves", () => {
 		ledger.transitionUnit(unit, "implementing", "test");
 		const q = ledger.askQuestion({ unitId: unit, point: "triage_gate", question: "env", askedBy: "test" });
 		ledger.updateUnit(unit, { meta: { parked: { question: q, env: envFingerprint(config, api, nest.toolchain.manifestFiles) } } });
+		// a second unit with the same problem waits on the same question: it is answered once, not twice (seen in a run: a crash)
+		const other = ledger.listUnits()[1]!.id;
+		ledger.transitionUnit(other, "truth", "test");
+		ledger.transitionUnit(other, "implementing", "test");
+		ledger.addWaiter(q, other);
+		ledger.updateUnit(other, { meta: { parked: { question: q, env: envFingerprint(config, api, nest.toolchain.manifestFiles) } } });
 		const logs: string[] = [];
 		const adapters = new Map([["nestjs", nest]]);
 
@@ -135,11 +141,11 @@ describe("parked units resubmit themselves", () => {
 		expect(ledger.getUnit(unit)!.state).toBe("implementing");
 
 		writeFileSync(join(api, "package.json"), JSON.stringify({ dependencies: { "drizzle-orm": "^1" }, devDependencies: { vitest: "^3" } })); // e.g. `pnpm add drizzle-orm`
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters)).toEqual([unit]);
+		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters).sort()).toEqual([unit, other].sort());
 		expect(ledger.getUnit(unit)!.state).toBe("planned");
 		expect(ledger.openQuestions().some((x) => x.id === q)).toBe(false);
 		expect(JSON.parse(ledger.getUnit(unit)!.meta).parked).toBeUndefined();
-		expect(logs.join("\n")).toMatch(/resubmitted 1 unit/);
+		expect(logs.join("\n")).toMatch(/resubmitted 2 unit/);
 	});
 });
 

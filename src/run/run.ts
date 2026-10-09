@@ -178,7 +178,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let askingStuck: Promise<unknown> | undefined;
 	let resolving: Promise<unknown> | undefined;
 	const resubmitParked = () => {
-		resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
+		// a slip in this pass is logged like the passes below, never the end of the run (units keep their state)
+		try {
+			resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
+		} catch (e) {
+			log(pc.yellow(`resubmitting parked units failed: ${(e as Error)?.message ?? e}`));
+		}
 		if (o.dry) return;
 		// healing may ask the decide model, so it runs in line with the stuck questions: one pass at a time
 		askingStuck ??= healQuarantined(ledger, config, o.root, new Set(running.keys()), log, adapters, { client: o.client })
@@ -890,7 +895,8 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 	const parkedEnv = ledger.db.prepare("SELECT id, meta, json_extract(meta,'$.parked.question') q, json_extract(meta,'$.parked.env') env FROM units WHERE json_extract(meta,'$.parked.env') IS NOT NULL AND state IN ('truth','implementing','gating')").all() as Array<{ id: string; meta: string; q: number | null; env: string }>;
 	for (const p of parkedEnv) {
 		if (running.has(p.id) || p.env === envNow(p.meta)) continue;
-		if (p.q && open.has(p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest or stack config)", "orchestrator");
+		// several units can wait on one shared question: it is answered once
+		if (p.q && open.delete(p.q)) ledger.answerQuestion(p.q, "auto: the environment changed since the failure (dependency manifest or stack config)", "orchestrator");
 	}
 	// waiting units whose blocking questions are all answered (non-blocking ones never hold a unit) get their answer applied
 	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE (q.unit_id = units.id OR q.id IN (SELECT question_id FROM question_waiters w WHERE w.unit_id = units.id)) AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));
