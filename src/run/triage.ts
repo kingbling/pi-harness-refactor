@@ -114,12 +114,10 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	const cause = choiceOf(dec.answers["cause"]) ?? "other";
 	const sure = dec.confidence >= JEV_ACT;
 	let { action, reason } = playbook(dec.answers);
-	// Unsure on anything but a cheap retry: hand over instead of guessing. Otherwise code acts and nobody is asked:
-	// the outcome of the next attempt is the label, not an owner's guess at a cause code.
-	if (!sure && action !== "retry" && action !== "quarantine") {
-		action = "ask_human";
-		reason = `${reason} (decision model unsure: ${dec.confidence.toFixed(2)})`;
-	}
+	// Unsure between code causes (test or code, interface): act on the best guess, nobody is asked. The owner cannot
+	// tell a test fault from a code fault better than a model; the next attempt's outcome is the label, the attempt
+	// cap bounds the cost. Only an environment cause goes the asking route (doctor and setup model first).
+	if (!sure) reason = `${reason} (decision model unsure: ${dec.confidence.toFixed(2)}; acting on its best guess)`;
 	// ask_human asks nobody yet: unit.ts lets the doctor and the setup model try first (most such failures never needed a person)
 	setDecisionAction(d.ledger, dec.decisionId, action);
 	return { action, cause, confidence: dec.confidence, sure, decisionId: dec.decisionId, reason };

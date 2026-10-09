@@ -194,14 +194,24 @@ interface Durable {
 	accepted: number;
 	quarantined: number;
 	waiting: number;
-	/** Open questions: what the human has to answer to release the waiting units. */
+	/** Open questions for the owner: what the human has to answer to release the waiting units (forOwnerCount). */
 	questions: number;
 	spentUsd: number;
 	forecast: Forecast;
 }
+/** A migration run is going on in this process: its resolver model tries every open question before the owner. */
+let runActive = false;
+/**
+ * Questions for the owner: during a run only those the resolver model handed on (context.forOwner); the others are
+ * still with the models. Without a run nobody else answers, so every open question counts.
+ */
+export function forOwnerCount(ledger: Ledger, running = runActive): number {
+	const open = ledger.openQuestions();
+	return running ? open.filter((q) => q.context && JSON.parse(q.context).forOwner !== undefined).length : open.length;
+}
 export function durable(ledger: Ledger, root: string): Durable {
 	const f = forecast(ledger);
-	return { accepted: f.units.accepted, quarantined: f.units.quarantined, waiting: f.units.waiting, questions: ledger.openQuestions().length, spentUsd: totalSpend(root).usd, forecast: f };
+	return { accepted: f.units.accepted, quarantined: f.units.quarantined, waiting: f.units.waiting, questions: forOwnerCount(ledger), spentUsd: totalSpend(root).usd, forecast: f };
 }
 let durableCache: { at: number; cwd: string; d: Durable } | undefined;
 /** Cached for the panel, which repaints often: at most one ledger read per 5 s. */
@@ -224,7 +234,7 @@ const money = (x: number) => (x < 100 ? `$${x.toFixed(2)}` : `$${Math.round(x).t
 export function statusLine(ledger: Ledger, root: string): string {
 	const d = durable(ledger, root);
 	const f = d.forecast;
-	const open = ledger.openQuestions().length;
+	const open = d.questions;
 	const left = f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}), ${f.remaining.hours[1] < 48 ? `${f.remaining.hours[1].toFixed(1)} h` : `${(f.remaining.hours[1] / 24).toFixed(1)} days`} [${f.confidence}]` : "";
 	return `br ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
 }
@@ -503,6 +513,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 		const { OpenRouterClient } = await import("../models/openrouter.ts");
 		const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
 		let runDone = false;
+		runActive = true;
 		try {
 			// Whole-target decisions refuse; every other open decision only blocks the units it affects and is
 			// asked on the side (dialogs) while the run goes on. Answers release their units at the next loop.
@@ -582,6 +593,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(own ? [`${own} routine question(s) decided from your goals (br questions lists them; /br answer <id> <text> changes one)`] : []), ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };
 		} finally {
 			runDone = true;
+			runActive = false;
 			ledger.close();
 		}
 	});

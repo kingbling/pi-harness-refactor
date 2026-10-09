@@ -61,3 +61,15 @@ describe("resolver model before the owner", () => {
 		expect(JSON.parse(ledger.getQuestion(b)!.context!).forOwner).toMatch(/fix job was tried and changed nothing/);
 	});
 });
+
+describe("the owner's question count", () => {
+	it("during a run counts only questions the resolver handed on; without a run every open question", async () => {
+		const { forOwnerCount } = await import("../src/pi/extension.ts");
+		const ledger = new Ledger(":memory:");
+		ledger.askQuestion({ point: "gate_env", question: "still with the models", askedBy: "orchestrator" });
+		const b = ledger.askQuestion({ point: "budget", question: "money", askedBy: "orchestrator" });
+		ledger.markForOwner(b, "money is the owner's call");
+		expect(forOwnerCount(ledger, true)).toBe(1);
+		expect(forOwnerCount(ledger, false)).toBe(2);
+	});
+});

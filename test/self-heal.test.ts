@@ -212,6 +212,19 @@ describe("triage", () => {
 		ledger.close();
 	});
 
+	it("an unsure test-or-code cause acts on the best guess; nobody is asked", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const unsure = { cause: { type: "choice", choice: "test_bug", probabilities: { test_bug: 0.52, impl_bug: 0.32, env: 0, other: 0.16 }, confidence: 0.44 } };
+		// the second opinion disagrees, so the answer stays unsure
+		const client = new FakeModelClient({ decide: () => unsure as never, chat: () => ({ json: { cause: "impl_bug" } }) });
+		const build = { ok: false, failedStep: "build_ok", steps: [{ name: "build_ok", ok: false, output: "tests/BillingTest.x:12 static call to instance method total()", exitCode: 1 }], changedFiles: [], testFiles: [] } as never;
+		const t = await triageGate({ ledger, config, client }, "U1", build, undefined, 1);
+		expect(t.sure).toBe(false);
+		expect(t.action).toBe("retest");
+		ledger.close();
+	});
+
 	it("the same finding after a retest, or a retest that changed nothing, never goes to the tester again: escalate", async () => {
 		const { config, ledger, mk } = workspace();
 		mk("U1", "billing", "implementing");
