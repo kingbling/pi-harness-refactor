@@ -23,8 +23,10 @@ export type Role = "implement" | "test" | "escalate" | "setup" | "review";
 export interface SpawnOptions {
 	role: Role;
 	cwd: string; // worktree or target project dir
+	/** The folder writeGlobs and protectedGlobs are relative to, when it is not cwd (a tester works in the project, its globs start at the workspace). */
+	globRoot?: string;
 	config: Config;
-	/** Globs (relative to cwd) the session may write to. Empty = read-only session. */
+	/** Globs (relative to globRoot, else cwd) the session may write to. Empty = read-only session. */
 	writeGlobs: string[];
 	/** Globs never writable even when inside writeGlobs (tests, configs, generated files). */
 	protectedGlobs?: string[];
@@ -174,7 +176,7 @@ export function globToRegExp(glob: string): RegExp {
 	return new RegExp(`^${out}$`);
 }
 
-export function makeWriteGate(opts: { cwd: string; sourceRoot: string; writeGlobs: string[]; protectedGlobs: string[]; appendOnlyGlobs?: string[] }) {
+export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot: string; writeGlobs: string[]; protectedGlobs: string[]; appendOnlyGlobs?: string[] }) {
 	const allow = opts.writeGlobs.map(globToRegExp);
 	const deny = opts.protectedGlobs.map(globToRegExp);
 	const appendOnly = (opts.appendOnlyGlobs ?? []).map(globToRegExp);
@@ -182,7 +184,7 @@ export function makeWriteGate(opts: { cwd: string; sourceRoot: string; writeGlob
 	return (absOrRel: string): string | undefined => {
 		const abs = resolve(opts.cwd, absOrRel);
 		if (abs === src || abs.startsWith(src + sep)) return "the legacy source repo is read-only";
-		const rel = relative(opts.cwd, abs).split(sep).join("/");
+		const rel = relative(opts.globRoot ?? opts.cwd, abs).split(sep).join("/");
 		if (rel.startsWith("..")) return "outside the working directory";
 		if (deny.some((r) => r.test(rel))) return `protected path: ${rel}`;
 		if (allow.some((r) => r.test(rel))) return undefined;
@@ -195,8 +197,8 @@ export function makeWriteGate(opts: { cwd: string; sourceRoot: string; writeGlob
  * What a blocked session is told: why, where it may write instead (this session's own globs, as absolute paths),
  * and how to report what it cannot do — only with tools this session really has.
  */
-export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "writeGlobs" | "appendOnlyGlobs" | "customTools">): string {
-	const abs = (g: string) => resolve(opts.cwd, g).split(sep).join("/");
+export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "globRoot" | "writeGlobs" | "appendOnlyGlobs" | "customTools">): string {
+	const abs = (g: string) => resolve(opts.globRoot ?? opts.cwd, g).split(sep).join("/");
 	const where = opts.writeGlobs.length ? `You may write only: ${opts.writeGlobs.map(abs).join(", ")}${opts.appendOnlyGlobs?.length ? `; new files (never edits) in: ${opts.appendOnlyGlobs.map(abs).join(", ")}` : ""}.` : "This session may not write files.";
 	const report = opts.customTools?.some((t) => t.name === "ledger_prove") ? `record anything you cannot do via ledger_prove(op="dropped", why=...) or in your final message` : "say in your final message what you could not do and why";
 	return `${reason}. ${where} Otherwise ${report}.`;
@@ -213,7 +215,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	const role = opts.modelOverride ?? opts.config.models[opts.role === "setup" || opts.role === "review" ? "escalate" : opts.role];
 	const model = await resolveSessionModel(role);
 	const orCost = await openRouterCost(role.id);
-	const gate = makeWriteGate({ cwd: opts.cwd, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], appendOnlyGlobs: opts.appendOnlyGlobs });
+	const gate = makeWriteGate({ cwd: opts.cwd, globRoot: opts.globRoot, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], appendOnlyGlobs: opts.appendOnlyGlobs });
 	let toolCalls = 0;
 	let blocked = 0;
 	// one agent per session in the live panel: label = unit (from the transcript name "<unit>.<role>.<attempt>.jsonl")
@@ -247,6 +249,11 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 		});
 		// Post-write syntax check for edits too (write is validated before it lands; edit cannot be, so check the result on disk).
 		pi.on("tool_result", async (event) => {
+			// a failed edit is a tool slip, not a reason to give up: say how to get it through
+			if (event.toolName === "edit" && event.isError) {
+				const text = (event.content ?? []).map((c) => ("text" in c ? c.text : "")).join("\n");
+				return { content: [{ type: "text", text: `${text}\nTo get the edit through: read the file again and quote the exact text with enough surrounding lines to be unique, or write the whole file with write.` }], isError: true, details: (event as any).result?.details ?? {} };
+			}
 			if (event.toolName !== "edit" || event.isError || !opts.validateWrite) return undefined;
 			const path = String((event.input as Record<string, unknown>)["path"] ?? "");
 			try {

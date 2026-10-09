@@ -63,7 +63,8 @@ describe("the tester knows where things are", () => {
 		// no test yet: the coverage retest runs the tester
 		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate: async (g) => green(g), log: () => {} });
 		const { opts, task } = seen!;
-		expect(opts.cwd).toBe(ws);
+		expect(opts.cwd).toBe(join(ws, "migrated")); // the shell starts in the project
+		expect(opts.globRoot).toBe(ws); // the globs below are relative to the workspace
 		for (const g of opts.writeGlobs) {
 			expect(opts.systemPrompt).toContain(join(ws, g));
 			expect(task).toContain(join(ws, g));

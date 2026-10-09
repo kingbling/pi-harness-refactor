@@ -191,7 +191,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const putBack = scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
 		const tester = await spawn({
 			role: "test",
-			cwd: o.root,
+			// the shell and relative paths start in the project (reviewer findings and test paths are project paths);
+			// the write globs stay relative to the workspace, where the truth folder lives
+			cwd: targetProjectDir,
+			globRoot: o.root,
 			config: o.config,
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],

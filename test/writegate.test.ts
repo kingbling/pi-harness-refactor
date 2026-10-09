@@ -30,3 +30,13 @@ describe("write gate", () => {
 		expect(globToRegExp("src/*.ts").test("src/a/b.ts")).toBe(false);
 	});
 });
+
+describe("a session working in one folder with globs relative to another", () => {
+	it("relative paths start at cwd; the globs (truth folder, tests) at globRoot", () => {
+		const gate = makeWriteGate({ cwd: "/ws/new/api", globRoot: "/ws", sourceRoot: "/legacy", writeGlobs: [".bigrefactor/truth/u1/**", "new/api/tests/**"], protectedGlobs: [] });
+		expect(gate("tests/OrderTest.x")).toBeUndefined(); // relative to the project
+		expect(gate("/ws/.bigrefactor/truth/u1/cases.json")).toBeUndefined();
+		expect(gate("src/Order.x")).toMatch(/outside this unit's scope: new\/api\/src\/Order.x/);
+		expect(gate("/elsewhere/x")).toMatch(/outside the working directory/);
+	});
+});
