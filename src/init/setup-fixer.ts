@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
@@ -148,14 +148,17 @@ function migratedCodeDirs(adapter: TargetAdapter): string[] {
  * builder does for tests. Tests are the truth and accepted code is proven by them; a setup fix runs neither.
  * `migrated` (project-relative files the ledger's moves point to) says which existing files hold migrated code: a
  * folder that also holds the stack's own wiring (Symfony's config/) is no reason to put back a bundle registration.
- * New source files in the code folders are new app code: put back too. Without the ledger, the folders decide.
+ * New source files in the code folders are new app code: put back too, unless a file the fix keeps names them by
+ * their path (a tool config loading a bootstrap file): then they are part of the fix, and putting them back would
+ * leave main pointing at a missing file. Without the ledger, the folders decide.
  * Returns the paths put back (relative to the repo).
  */
 export function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter, migrated?: Set<string>): string[] {
 	const proj = relative(repo, projectDir);
 	const dirs = migratedCodeDirs(adapter);
+	const exts = adapter.layout.sourceExtensions ?? [];
 	const entries = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0");
-	const undone: string[] = [];
+	const changes: Array<{ path: string; rel?: string; isNew: boolean; undo: "always" | "newCode" | "keep" }> = [];
 	for (let i = 0; i < entries.length; i++) {
 		const e = entries[i]!;
 		if (e.length < 4) continue;
@@ -163,18 +166,34 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		const path = e.slice(3);
 		if (code[0] === "R" || code[0] === "C") i++; // the old name follows
 		const rel = !proj ? path : path.startsWith(`${proj}/`) ? path.slice(proj.length + 1) : undefined;
-		if (rel === undefined) continue;
 		const isNew = code === "??" || code[0] === "A";
+		if (rel === undefined) {
+			changes.push({ path, isNew, undo: "keep" });
+			continue;
+		}
 		const inCodeDirs = dirs.some((d) => rel.startsWith(d));
-		const exts = adapter.layout.sourceExtensions ?? [];
 		const newCode = isNew && inCodeDirs && (!exts.length || exts.some((x) => rel.endsWith(x)));
-		if (!(adapter.layout.isTestFile(rel) || newCode || (migrated ? migrated.has(rel) : inCodeDirs))) continue;
-		if (!isNew && whitespaceOnly(repo, path)) continue; // a formatter's fix changes no behaviour
-		if (code === "??" || code[0] === "A") {
-			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", path], { stdio: "pipe" });
-			rmSync(join(repo, path), { force: true });
-		} else execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", path], { stdio: "pipe" });
-		undone.push(path);
+		let undo: "always" | "newCode" | "keep" = adapter.layout.isTestFile(rel) || (migrated ? migrated.has(rel) : inCodeDirs) ? "always" : newCode ? "newCode" : "keep";
+		if (undo === "always" && !isNew && whitespaceOnly(repo, path)) undo = "keep"; // a formatter's fix changes no behaviour
+		changes.push({ path, rel, isNew, undo });
+	}
+	// what the fix keeps: a new code file one of them names by path belongs to the fix
+	const kept = changes.filter((c) => c.undo === "keep").map((c) => {
+		try {
+			return readFileSync(join(repo, c.path), "utf8");
+		} catch {
+			return "";
+		}
+	});
+	const undone: string[] = [];
+	for (const c of changes) {
+		if (c.undo === "keep") continue;
+		if (c.undo === "newCode" && kept.some((t) => t.includes(c.rel!) || t.includes(c.path))) continue;
+		if (c.isNew) {
+			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", c.path], { stdio: "pipe" });
+			rmSync(join(repo, c.path), { force: true });
+		} else execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", c.path], { stdio: "pipe" });
+		undone.push(c.path);
 	}
 	return undone;
 }

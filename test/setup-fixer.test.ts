@@ -115,13 +115,15 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 			writeFileSync(join(o.projectDir, "src", "features", "orders", "orders.spec.ts"), "expect(a).toBe(2)\n"); // a test
 			writeFileSync(join(o.projectDir, "src", "features", "orders", "extra.spec.ts"), "new test\n"); // a new test
 			writeFileSync(join(o.projectDir, "src", "shared", "helper.ts"), "export {};\n"); // new shared code
+			writeFileSync(join(o.projectDir, "lint.config.json"), JSON.stringify({ bootstrap: "src/shared/lint-bootstrap.ts" })); // setup: kept
+			writeFileSync(join(o.projectDir, "src", "shared", "lint-bootstrap.ts"), "export {};\n"); // new code the kept config loads: kept
 			return "added the vitest config";
 		};
 		let locked = 0;
 		const lock = async <T>(fn: () => Promise<T>) => (locked++, fn());
 		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "vitest: no config", fixer, ledger, lock })).toBe("added the vitest config");
 		expect(locked).toBe(1);
-		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim().split("\n").sort()).toEqual(["src/shared/money.ts", "vitest.config.ts"]);
+		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim().split("\n").sort()).toEqual(["lint.config.json", "src/shared/lint-bootstrap.ts", "src/shared/money.ts", "vitest.config.ts"]);
 		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
 		expect(readFileSync(join(target, "src", "features", "orders", "orders.ts"), "utf8")).toBe("export const a = 1;\n");
 		expect(existsSync(join(target, "src", "features", "orders", "extra.spec.ts"))).toBe(false);
@@ -129,7 +131,7 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		expect(row.role).toBe("__setup__:fix:keepcode");
 		expect(row.outcome).toBe("fixed");
 		const report = JSON.parse(row.gate_report) as { changedFiles: string[]; undone: string[]; said: string };
-		expect(report.changedFiles.sort()).toEqual(["src/shared/money.ts", "vitest.config.ts"]);
+		expect(report.changedFiles.sort()).toEqual(["lint.config.json", "src/shared/lint-bootstrap.ts", "src/shared/money.ts", "vitest.config.ts"]);
 		expect(report.undone.sort()).toEqual(["src/features/orders/extra.spec.ts", "src/features/orders/orders.spec.ts", "src/features/orders/orders.ts", "src/shared/helper.ts"]);
 		expect(report.said).toBe("added the vitest config");
 	});
