@@ -18,8 +18,9 @@ import { placementDir } from "./placement.ts";
  * capability cards and drift findings and returns:
  *  - conventions worth stating → rule proposals (living rules curate them),
  *  - moves/renames/merges/splits → one question each (via a model, with opinion; blocks nothing).
- * An approved change becomes a tidy task the NEXT unit of that area performs (task card), so the gate checks
- * the result like any other change; `completeTidyTasks` closes tasks once the tree shows them done.
+ * An approved change becomes a tidy task that runs once as its own job (tidy-job.ts): a model moves the files and
+ * updates every file that uses them, the build and tests decide, and the task ends done or failed. Units of the
+ * area wait for it; `completeTidyTasks` still closes tasks the tree shows done (a case-only rename, no tidy job).
  */
 export interface TidyTask {
 	id: string;
@@ -30,7 +31,9 @@ export interface TidyTask {
 	to: string[];
 	why: string;
 	questionId: number;
-	status: "asked" | "approved" | "rejected" | "done";
+	status: "asked" | "approved" | "rejected" | "done" | "failed";
+	/** Why the tidy job failed (its check output). */
+	failure?: string;
 }
 
 interface Deps {
@@ -105,8 +108,8 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed) || seen.has(sig(c.op, c.from, c.to)) || onlyCase(c)) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
-			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, the next unit of this area performs it (the builder's whole-project check after merges, which also runs all tests, catches broken imports); nothing waits for this answer.`,
-			options: [{ value: "apply", facts: "do it with the next unit of the area" }, { value: "skip", facts: "leave the files as they are" }],
+			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, a separate job does it once on the main branch and updates every file that uses the moved code; it is kept only when the build and the tests of the changed files pass. Nothing waits for this answer.`,
+			options: [{ value: "apply", facts: "do it once now; new work in this area waits for it" }, { value: "skip", facts: "leave the files as they are" }],
 			recommended: "apply",
 			agentOpinion: c.why,
 			blocks: "none",
@@ -139,10 +142,7 @@ export function completeTidyTasks(ledger: Ledger, projectDirAbs: string, stack: 
 	const done: string[] = [];
 	for (const t of tasks) {
 		if (t.stack !== stack || t.area !== area || t.status !== "approved") continue;
-		// sources that are not also targets must be gone (a split may keep its source file)
-		// (a case-only rename is skipped, see tidyMoves: on macOS its source "exists" as the target)
-		const gone = t.op === "split" || t.from.filter((f) => !t.to.some((x) => x.toLowerCase() === f.toLowerCase())).every((f) => !existsSync(join(projectDirAbs, f)));
-		if (gone && t.to.every((f) => existsSync(join(projectDirAbs, f)))) {
+		if (!tidyMissing(projectDirAbs, t).length) {
 			t.status = "done";
 			done.push(t.id);
 		}
@@ -151,12 +151,30 @@ export function completeTidyTasks(ledger: Ledger, projectDirAbs: string, stack: 
 	return done;
 }
 
+/** What still keeps a task from being done in `dir`: sources still there, targets not there yet (empty = done). */
+export function tidyMissing(dir: string, t: Pick<TidyTask, "op" | "from" | "to">): string[] {
+	// sources that are not also targets must be gone (a split may keep its source file)
+	// (a case-only rename counts as done: on macOS its source "exists" as the target)
+	const left = t.op === "split" ? [] : t.from.filter((f) => !t.to.some((x) => x.toLowerCase() === f.toLowerCase()) && existsSync(join(dir, f)));
+	return [...left.map((f) => `${f} still exists`), ...t.to.filter((f) => !existsSync(join(dir, f))).map((f) => `${f} is missing`)];
+}
+
+/** The tidy job ends a task: done (merged) or failed (thrown away, with why). */
+export function endTidyTask(ledger: Ledger, id: string, status: "done" | "failed", failure?: string): void {
+	const tasks = loadTasks(ledger);
+	const t = tasks.find((x) => x.id === id);
+	if (!t) return;
+	t.status = status;
+	if (failure) t.failure = failure.slice(-4000);
+	saveTasks(ledger, tasks);
+}
+
 /** A rename that only changes letter case (Arangodb → ArangoDb). */
 export function caseOnly(from: string, to: string): boolean {
 	return from !== to && from.toLowerCase() === to.toLowerCase();
 }
-/** A move/rename whose every file only changes letter case: never asked, never handed to a unit. */
-function onlyCase(t: Pick<TidyTask, "op" | "from" | "to">): boolean {
+/** A move/rename whose every file only changes letter case: never asked, never given to the tidy job. */
+export function onlyCase(t: Pick<TidyTask, "op" | "from" | "to">): boolean {
 	return (t.op === "move" || t.op === "rename") && t.from.length === t.to.length && t.from.every((f, i) => caseOnly(f, t.to[i]!));
 }
 

@@ -42,7 +42,7 @@ export const repairWithModel: Repairer = async (o) => {
 	}
 };
 
-function runCmd(cmd: string, args: string[], cwd: string): Promise<string | undefined> {
+export function runCmd(cmd: string, args: string[], cwd: string): Promise<string | undefined> {
 	return new Promise((res) => {
 		execFile(cmd, args, { cwd, timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => res(err ? `${stdout}\n${stderr}`.trim().slice(-8000) || String(err.message) : undefined));
 	});
