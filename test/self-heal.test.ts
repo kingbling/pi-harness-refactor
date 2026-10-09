@@ -204,16 +204,39 @@ describe("triage", () => {
 		// the same failure class twice (Jev says so), not the same finding → a stronger model
 		const t2 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/b.spec.ts\nTypeError: name of undefined"), gate("FAIL test/a.spec.ts\nexpected 2, got 3"), 2);
 		expect(t2.action).toBe("escalate");
-		// the very same finding again → nobody retries blindly: ask (the doctor looks first)
+		// the very same finding again is a fact Jev reads, not a code rule: the owner is not asked
 		const t3 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/a.spec.ts\nexpected 2, got 4"), gate("FAIL test/a.spec.ts\nexpected 2, got 3"), 2);
-		expect(t3.action).toBe("ask_human");
+		expect((client.calls.at(-1)!.req as { state: { same_finding_as_previous: boolean } }).state.same_finding_as_previous).toBe(true);
+		expect(t3.action).toBe("escalate");
+		expect(ledger.openQuestions()).toEqual([]);
 		ledger.close();
 	});
 
-	it("errors only in the ported tests go to the tester, whichever side of the path is longer; the command line is not an error", async () => {
+	it("the same finding after a retest, or a retest that changed nothing, never goes to the tester again: escalate", async () => {
 		const { config, ledger, mk } = workspace();
 		mk("U1", "billing", "implementing");
-		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug" }) });
+		const client = new FakeModelClient({ decide: () => ({ cause: "interface_mismatch" }) });
+		const wired = (output: string) => ({ ok: false, failedStep: "wired_ok", steps: [{ name: "wired_ok", ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php"], testFiles: [] }) as never;
+		const finding = "- src/Billing/Invoice.php: total() is never called from the controller";
+		const t1 = await triageGate({ ledger, config, client }, "U1", wired(finding), undefined, 1);
+		expect(t1.action).toBe("retest");
+		// the retest changed tests, but the same finding came back
+		const t2 = await triageGate({ ledger, config, client }, "U1", wired(`${finding} (still)`), wired(finding), 2, { progress: true });
+		expect(t2.action).toBe("escalate");
+		// a new finding, but the retest before it changed nothing
+		const t3 = await triageGate({ ledger, config, client }, "U1", wired("- src/Billing/Other.php: x"), wired(finding), 2, { progress: false });
+		expect(t3.action).toBe("escalate");
+		// a new finding after a retest that did something: the tester may try again
+		const t4 = await triageGate({ ledger, config, client }, "U1", wired("- src/Billing/Other.php: x"), wired(finding), 2, { progress: true });
+		expect(t4.action).toBe("retest");
+		expect(ledger.openQuestions()).toEqual([]);
+		ledger.close();
+	});
+
+	it("errors only in the ported tests are a fact Jev reads, whichever side of the path is longer; the command line is not an error", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const client = new FakeModelClient({ decide: (req) => ({ cause: (req.state as { errors_in_protected_tests_only: boolean }).errors_in_protected_tests_only ? "test_bug" : "impl_bug" }) });
 		const step = (name: string, output: string, testFiles: string[]) => ({ ok: false, failedStep: name, steps: [{ name, ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php", "tests/Billing/InvoiceTest.php"], testFiles }) as never;
 		const cmd = "$ vendor/bin/phpstan analyse src/Billing/Invoice.php tests/Billing/InvoiceTest.php\n";
 		// the tool prints project-relative paths, the test list is repo-relative
@@ -229,18 +252,17 @@ describe("triage", () => {
 		ledger.close();
 	});
 
-	it("an attempt that wrote nothing is retried with that message, twice or not; other identical anti-gaming failures ask", async () => {
+	it("an attempt that wrote nothing is retried with that message, twice or not; other identical anti-gaming failures are an environment cause, asked later", async () => {
 		const { config, ledger, mk } = workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({});
 		const ag = (output: string) => ({ ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output, exitCode: 1 }], changedFiles: [] }) as never;
 		const none = await triageGate({ ledger, config, client }, "U1", ag("no production files were written"), ag("no production files were written"), 2);
 		expect(none).toMatchObject({ action: "retry" });
-		expect(none.questionId).toBeUndefined();
-		expect(ledger.openQuestions()).toEqual([]);
 		const out = await triageGate({ ledger, config, client }, "U1", ag("write outside unit scope: composer.json"), ag("write outside unit scope: composer.json"), 2);
-		expect(out.action).toBe("ask_human");
-		expect(out.questionId).toBeDefined();
+		expect(out).toMatchObject({ action: "ask_human", cause: "env" });
+		// triage asks nobody: unit.ts lets the doctor and the setup model try first
+		expect(ledger.openQuestions()).toEqual([]);
 		ledger.close();
 	});
 
@@ -250,7 +272,6 @@ describe("triage", () => {
 		const client = new FakeModelClient({ decide: () => ({ cause: "env" }) });
 		const t = await triageGate({ ledger, config, client }, "U1", gate("connect ECONNREFUSED 127.0.0.1:5432"), undefined, 1);
 		expect(t).toMatchObject({ action: "ask_human", cause: "env" });
-		expect(t.questionId).toBeUndefined();
 		expect(ledger.openQuestions()).toEqual([]);
 		ledger.close();
 	});
