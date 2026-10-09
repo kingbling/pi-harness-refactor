@@ -179,6 +179,7 @@ export function globToRegExp(glob: string): RegExp {
 export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot: string; writeGlobs: string[]; protectedGlobs: string[]; appendOnlyGlobs?: string[] }) {
 	const allow = opts.writeGlobs.map(globToRegExp);
 	const deny = opts.protectedGlobs.map(globToRegExp);
+	const named = new Set(opts.writeGlobs.filter((g) => !/[*?[{]/.test(g)));
 	const appendOnly = (opts.appendOnlyGlobs ?? []).map(globToRegExp);
 	const src = resolve(opts.sourceRoot);
 	return (absOrRel: string): string | undefined => {
@@ -186,7 +187,8 @@ export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot
 		if (abs === src || abs.startsWith(src + sep)) return "the legacy source repo is read-only";
 		const rel = relative(opts.globRoot ?? opts.cwd, abs).split(sep).join("/");
 		if (rel.startsWith("..")) return "outside the working directory";
-		if (deny.some((r) => r.test(rel))) return `protected path: ${rel}`;
+		// a file the session is given by name (a stack's wiring file) beats a broad protected glob (config/**)
+		if (deny.some((r) => r.test(rel)) && !named.has(rel)) return `protected path: ${rel}`;
 		if (allow.some((r) => r.test(rel))) return undefined;
 		if (appendOnly.some((r) => r.test(rel))) return existsSync(abs) ? `shared file exists and may be used by other units; add a new file instead of editing ${rel}` : undefined;
 		return `outside this unit's scope: ${rel}`;

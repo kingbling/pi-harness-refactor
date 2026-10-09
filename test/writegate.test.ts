@@ -40,3 +40,12 @@ describe("a session working in one folder with globs relative to another", () =>
 		expect(gate("/elsewhere/x")).toMatch(/outside the working directory/);
 	});
 });
+
+describe("a wiring file inside a protected folder", () => {
+	it("is writable when the session is given it by name; the rest of the folder stays protected", () => {
+		const gate = makeWriteGate({ cwd: "/p", sourceRoot: "/legacy", writeGlobs: ["src/Orders/**", "config/registry.yaml"], protectedGlobs: ["config/**"] });
+		expect(gate("config/registry.yaml")).toBeUndefined();
+		expect(gate("config/other.yaml")).toMatch(/protected path/);
+		expect(gate("src/Orders/Order.x")).toBeUndefined();
+	});
+});
