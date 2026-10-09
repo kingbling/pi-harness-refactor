@@ -36,7 +36,7 @@ import { caseOnly, completeTidyTasks, tidyTasks, type TidyTask } from "./tidy.ts
 import { triageGate, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
-import { caseCoverage, findTests, lintTests } from "./ported.ts";
+import { caseCoverage, checkTests, findTests, scopeGuard } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
 /**
@@ -185,6 +185,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const attempt = o.ledger.startAttempt(o.unitId, "test", o.config.models.test.id);
 		const t0 = Date.now();
 		const before = testsOnly ? readTruthFiles() : undefined;
+		// its test paths and the approved tidy paths; the plugin's own folder (ledger, truth) when it sits in the project is not the tester's write
+		const ownDir = relative(targetProjectDir, join(o.root, ".bigrefactor"));
+		const putBack = scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
 		const tester = await spawn({
 			role: "test",
 			cwd: o.root,
@@ -219,6 +222,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			execFileSync("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir, stdio: "pipe" });
 			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
 			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. If one is wrong, say which and why in your final answer.)` };
+			lastTesterText = res.text;
+		}
+		// the tester writes tests only: anything else it changed (a formatter run over the project) is put back
+		const outside = putBack();
+		if (outside.length) {
+			log(pc.yellow(`  tester changed ${outside.length} file(s) outside its test paths; put back: ${outside.slice(0, 5).join(", ")}`));
+			res = { ...res, text: `${res.text}\n(Your changes outside your test paths were put back: ${outside.join(", ")}. Run fix modes on your test files only.)` };
 			lastTesterText = res.text;
 		}
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
@@ -417,10 +427,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the implementer may not edit tests: tests that fail the stack's lint/format check would fail every attempt,
 	// so the tester fixes them now (once). Only with the real gate (simulations fake it).
 	if (testFiles.length && !o.gate) {
-		const lint = await lintTests(targetProjectDir, adapter, testFiles.map((t) => t.path));
+		const lint = await checkTests(targetProjectDir, adapter, "lint", testFiles.map((t) => t.path));
 		if (lint.error) {
 			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
-			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
+			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
 		}
 	}
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");

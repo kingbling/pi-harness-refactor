@@ -133,11 +133,12 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// 4. build and 5. lint on the unit's files only. A command that cannot take files checks the whole project:
 	//    the builder runs it after merges now and then, not every unit (it grew with the project and ran out of memory)
 	const unitFiles = changed.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f)));
-	const whole = wholeProjectSteps(g.adapter, g.targetProjectDir);
-	const scopedStep = (name: "build" | "lint", c: { cmd: string; args: string[] }) => () =>
-		whole.some((w) => w.step === name) ? Promise.resolve({ ok: true, output: `whole-project ${name}: the builder runs it after merges` }) : unitFiles.length ? cpu(() => run(c.cmd, c.args, g.targetProjectDir, timeout)) : Promise.resolve({ ok: true, output: `no files to ${name}` });
-	if (!(await step("build_ok", scopedStep("build", g.adapter.build(g.targetProjectDir, unitFiles))))) return done();
-	if (!(await step("lint_ok", scopedStep("lint", g.adapter.lint(g.targetProjectDir, unitFiles))))) return done();
+	const scopedStep = (name: "build" | "lint") => () => {
+		const c = scopedCheck(g.adapter, g.targetProjectDir, name, unitFiles);
+		return "skip" in c ? Promise.resolve({ ok: true, output: c.skip }) : cpu(() => run(c.cmd, c.args, g.targetProjectDir, timeout));
+	};
+	if (!(await step("build_ok", scopedStep("build")))) return done();
+	if (!(await step("lint_ok", scopedStep("lint")))) return done();
 
 	// 6. the stack's ast-grep rules on the changed production files
 	if (!(await step("rules_ok", () => cpu(() => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout))))) return done();
@@ -413,6 +414,16 @@ export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ 
 	if (!takesFiles(adapter.build(dir, [MARK]))) out.push({ step: "build", ...adapter.build(dir, []) });
 	if (!takesFiles(adapter.lint(dir, [MARK]))) out.push({ step: "lint", ...adapter.lint(dir, []) });
 	return out;
+}
+
+/**
+ * The stack's build or lint on the given files, or why it does not run per unit: a command that ignores the files
+ * checks the whole project, and the builder runs it after merges. Shared by the gate and the tester's checks.
+ */
+export function scopedCheck(adapter: TargetAdapter, dir: string, name: "build" | "lint", files: string[]): { cmd: string; args: string[] } | { skip: string } {
+	if (wholeProjectSteps(adapter, dir).some((w) => w.step === name)) return { skip: `whole-project ${name}: the builder runs it after merges` };
+	if (!files.length) return { skip: `no files to ${name}` };
+	return name === "build" ? adapter.build(dir, files) : adapter.lint(dir, files);
 }
 
 /** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */

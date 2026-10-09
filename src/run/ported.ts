@@ -1,8 +1,9 @@
-import { execFile } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { execFile, execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
+import { changedFiles, scopedCheck, trackedFiles } from "./gate.ts";
 
 /**
  * The ported-test checks code runs on a unit, shared by the orchestrator (coverTruth, the lint pass before the
@@ -49,13 +50,47 @@ export function caseCoverage(targetProjectDir: string, moduleDir: string, layout
 	return { missing, found, files, globs: layout.testFileGlobs(moduleDir) };
 }
 
-/** The stack's lint/static check on the given test files, run from the target project dir; the error output, or undefined when clean. */
-export function lintTests(targetProjectDir: string, adapter: TargetAdapter, files: string[]): Promise<{ command: string; error?: string }> {
-	const c = adapter.lint(targetProjectDir, files);
+/**
+ * The stack's build or lint on the given test files, run from the target project dir and scoped the way the gate
+ * scopes it: the error output, or undefined when clean. `skipped` when the command checks the whole project (the
+ * builder runs it after merges, so it is never the tester's to fix).
+ */
+export function checkTests(targetProjectDir: string, adapter: TargetAdapter, name: "build" | "lint", files: string[]): Promise<{ command: string; error?: string; skipped?: string }> {
+	const c = scopedCheck(adapter, targetProjectDir, name, files.filter((f) => adapter.layout.lang(f)));
+	if ("skip" in c) return Promise.resolve({ command: "", skipped: c.skip });
 	const command = [c.cmd, ...c.args].join(" ");
 	return new Promise((res) =>
 		execFile(c.cmd, c.args, { cwd: targetProjectDir, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: 5 * 60_000 }, (e, out, err) =>
 			res({ command, error: e ? `${String(err)}\n${String(out)}`.trim().slice(-2500) || String(e.message) : undefined }),
 		),
 	);
+}
+
+/**
+ * Keeps a session to its own paths in the project. Call it before the session; the function it returns, called after
+ * the session, puts back every file the session changed outside `allowed` (globs relative to `dir`): to its content
+ * before the session, else to HEAD, and a new file is removed. Work already in the tree (an implementer's) stays.
+ * Returns the paths it put back.
+ */
+export function scopeGuard(dir: string, allowed: string[], ignored: string[] = []): () => string[] {
+	const allow = allowed.map(globToRegExp);
+	const outside = () => changedFiles(dir, ignored).filter((f) => !allow.some((r) => r.test(f)));
+	const read = (f: string) => (existsSync(join(dir, f)) && statSync(join(dir, f)).isFile() ? readFileSync(join(dir, f)) : null);
+	const before = new Map(outside().map((f) => [f, read(f)] as const));
+	return () => {
+		const tracked = new Set(trackedFiles(dir));
+		const put: string[] = [];
+		for (const f of new Set([...before.keys(), ...outside()])) {
+			const now = read(f);
+			const was = before.get(f);
+			if (was !== undefined) {
+				if (now === was || (now && was && now.equals(was))) continue;
+				if (was === null) rmSync(join(dir, f), { force: true });
+				else (mkdirSync(dirname(join(dir, f)), { recursive: true }), writeFileSync(join(dir, f), was));
+			} else if (tracked.has(f)) execFileSync("git", ["checkout", "HEAD", "--", f], { cwd: dir, stdio: "pipe" });
+			else rmSync(join(dir, f), { force: true });
+			put.push(f);
+		}
+		return put;
+	};
 }

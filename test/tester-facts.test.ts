@@ -9,12 +9,12 @@ import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { noBehaviour, runGate, type GateInput, type GateReport } from "../src/run/gate.ts";
 import { loadReadTruth, NO_BEHAVIOUR_FILE, verifyTruthOnOld } from "../src/run/legacy-env.ts";
-import { mentionsCase } from "../src/run/ported.ts";
+import { checkTests, mentionsCase } from "../src/run/ported.ts";
 import { quirksOf, recordQuirk, sameQuirk } from "../src/run/quirks.ts";
 import { reviewWithModel } from "../src/run/review.ts";
 import { runUnit } from "../src/run/unit.ts";
 import { blockedHint, type LeafSession, type SpawnOptions } from "../src/sessions/spawn.ts";
-import { checkPortedTestsTool, recordQuirkTool, testerTools } from "../src/sessions/tools.ts";
+import { checkPortedTestsTool, noBehaviourTool, recordQuirkTool, testerTools } from "../src/sessions/tools.ts";
 import { getSourceAdapter } from "../src/adapters/registry.ts";
 
 /**
@@ -89,7 +89,7 @@ describe("check_ported_tests", () => {
 	it("reports missing case ids (exact text only), where it searched, and the lint output from the target dir", async () => {
 		const target = join(ws, "migrated");
 		write(join(target, SPEC), "it('u1#1 creates', () => {}); it('u1-2 other spelling', () => {});\n");
-		const adapter = { ...nestjsAdapter, lint: () => ({ cmd: "sh", args: ["-c", "pwd; echo 'spec: bad indent' >&2; exit 1"] }) };
+		const adapter = { ...nestjsAdapter, lint: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", "pwd; echo 'spec: bad indent' >&2; exit 1", "sh", ...files] }) };
 		const tool = checkPortedTestsTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: target, adapter, moduleDir: "src/features/agency", currentTruth: () => ({ ok: true, cases: [{ symbol: "s", inputs: [], expected: 1 }, { symbol: "s", inputs: [], expected: 2 }] }) });
 		const r = await exec(tool);
 		const out = r.content[0]!.text;
@@ -250,5 +250,88 @@ describe("a unit with no runtime behaviour", () => {
 		const reviewSpawn = async (): Promise<LeafSession> => ({ run: async (t: string) => ((facts = t), { text: "", ...ok }), dispose() {} }) as unknown as LeafSession;
 		await reviewWithModel({ ledger, config, root: ws, unitId: "u1", adapter: nestjsAdapter, targetProjectDir: join(ws, "migrated"), moduleDir: "src/features/agency", legacyFiles: [], changedFiles: [], spawn: reviewSpawn as never });
 		expect(facts).toMatch(/no runtime behaviour to pin[\s\S]*only declares the repository contract/);
+	});
+});
+
+describe("the tester's checks are the gate's checks", () => {
+	it("a lint that ignores the files is not run per unit (no LINT FAILED, no lint retest); the build on the test files is", async () => {
+		const target = join(ws, "migrated");
+		write(join(target, SPEC), "it('u1#1 creates', () => {});\n");
+		const adapter = {
+			...nestjsAdapter,
+			lint: () => ({ cmd: "sh", args: ["-c", "echo 'src/other.ts: bad indent' >&2; exit 1"] }),
+			build: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", 'echo "$1: TS2304 cannot find name" >&2; exit 2', "sh", ...files] }),
+		};
+		// the pre-implement lint retest fires only on an error: a whole-project lint gives none
+		const lint = await checkTests(target, adapter, "lint", [SPEC]);
+		expect(lint.error).toBeUndefined();
+		expect(lint.skipped).toMatch(/whole-project lint: the builder runs it after merges/);
+		const tool = checkPortedTestsTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: target, adapter, moduleDir: "src/features/agency", currentTruth: () => ({ ok: true, cases: [{ symbol: "s", inputs: [], expected: 1 }] }) });
+		const out = (await exec(tool)).content[0]!.text;
+		expect(out).not.toMatch(/LINT FAILED/);
+		expect(out).toMatch(/LINT not run per unit \(whole-project lint/);
+		expect(out).toContain(`BUILD FAILED`);
+		expect(out).toContain(`${SPEC}: TS2304`);
+	});
+});
+
+describe("the tester writes only its own paths", () => {
+	it("a production file it changes and a file it adds outside its test paths are put back; the implementer's work stays", async () => {
+		const target = join(ws, "migrated");
+		const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: target, stdio: "pipe" });
+		write(join(target, "src", "x.ts"), "export const x = 1;\n");
+		write(join(target, "src", "features", "agency", "agency.service.ts"), "export class AgencyService {}\n");
+		git("init", "-q");
+		git("add", "-A");
+		git("commit", "-qm", "base");
+		// work an implementer left in the worktree before a mid-loop retest
+		write(join(target, "src", "features", "agency", "agency.service.ts"), "export class AgencyService { a = 1; }\n");
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
+		const lines: string[] = [];
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => {
+					if (opts.role === "test") {
+						write(join(target, SPEC), "it('u1#1 creates', () => {});\n");
+						write(join(target, "src", "x.ts"), "export const x = 1\n"); // a formatter over the whole project
+						write(join(target, "src", "new.ts"), "export {};\n");
+					}
+					return { text: "done", ...ok };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate: async (g) => green(g), log: (l) => lines.push(l) });
+		expect(readFileSync(join(target, "src", "x.ts"), "utf8")).toBe("export const x = 1;\n");
+		expect(existsSync(join(target, "src", "new.ts"))).toBe(false);
+		expect(readFileSync(join(target, SPEC), "utf8")).toContain("u1#1");
+		expect(readFileSync(join(target, "src", "features", "agency", "agency.service.ts"), "utf8")).toContain("a = 1");
+		expect(lines.join("\n")).toMatch(/outside its test paths; put back: .*src\/x\.ts/);
+		expect(lines.join("\n")).toContain("src/new.ts");
+	});
+});
+
+describe("a no-behaviour declaration is checked against the legacy code", () => {
+	it("a reason the code contradicts is refused and the existing cases stay", async () => {
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		const cases = JSON.stringify([{ symbol: "app/agency/create.cmd.php::send", inputs: {}, expected: 200 }]);
+		write(join(truthDir, "cases.json"), cases);
+		write(join(ws, "legacy", "app", "agency", "create.cmd.php"), "<?php\nfunction send() { return http_post('https://x', ['a' => 1]); }\n");
+		ledger.upsertFile({ path: "app/agency/create.cmd.php", hash: "h", lang: "php", loc: 2 });
+		ledger.upsertSymbol({ id: "app/agency/create.cmd.php::send", name: "send", kind: "function", path: "app/agency/create.cmd.php" });
+		ledger.db.prepare("UPDATE symbols SET unit_id = 'u1', state = 'clustered' WHERE id = ?").run("app/agency/create.cmd.php::send");
+		let seen = "";
+		const client = new FakeModelClient({ decide: (req) => ("behaviour" in req.questions ? ((seen = JSON.stringify(req.state)), { behaviour: "runs" }) : {}) });
+		const tool = noBehaviourTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: join(ws, "migrated"), adapter: nestjsAdapter, truthDir, client });
+		const r = await exec(tool, { reason: "it only sends an HTTP POST to the partner API" });
+		expect(r.details.error).toBe(true);
+		expect(r.content[0]!.text).toMatch(/^refused: .*app\/agency\/create\.cmd\.php::send/);
+		expect(seen).toContain("http_post");
+		expect(readFileSync(join(truthDir, "cases.json"), "utf8")).toBe(cases);
+		expect(existsSync(join(truthDir, NO_BEHAVIOUR_FILE))).toBe(false);
+		// the model finds nothing that runs: the declaration stands
+		const yes = noBehaviourTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: join(ws, "migrated"), adapter: nestjsAdapter, truthDir, client: new FakeModelClient({ decide: () => ({ behaviour: "none" }) }) });
+		expect((await exec(yes, { reason: "only declares constants" })).content[0]!.text).toMatch(/^recorded/);
+		expect(existsSync(join(truthDir, NO_BEHAVIOUR_FILE))).toBe(true);
 	});
 });
