@@ -147,7 +147,7 @@ function migratedCodeDirs(adapter: TargetAdapter): string[] {
  * After a setup fix on main: put back every test file and every file of migrated code the session changed, as the
  * builder does for tests. Tests are the truth and accepted code is proven by them; a setup fix runs neither.
  * `migrated` (project-relative files the ledger's moves point to) says which existing files hold migrated code: a
- * folder that also holds the stack's own wiring (Symfony's config/) is no reason to put back a bundle registration.
+ * folder that also holds the stack's own wiring (a config folder) is no reason to put back a feature registration.
  * New source files in the code folders are new app code: put back too, unless a file the fix keeps names them by
  * their path (a tool config loading a bootstrap file): then they are part of the fix, and putting them back would
  * leave main pointing at a missing file. Without the ledger, the folders decide.

@@ -256,7 +256,7 @@ export function stackProblems(m: AdapterManifest): string[] {
 	if (require.length && !m.layout.wiringFiles?.length) out.push(`layout.rules.require makes every feature folder hold ${require.join(", ")}, but layout.wiringFiles is empty, so nothing registers them: name the file where the framework registers them (from its docs) in layout.wiringFiles, or make require [] when the framework finds them on its own`);
 	return out;
 }
-/** The folder a test glob starts in, before its first wildcard (tests/Probe/**\/*Test.php → tests/Probe). */
+/** The folder a test glob starts in, before its first wildcard (tests/probe/**\/*.test.x → tests/probe). */
 const globHome = (glob: string) => {
 	const parts = glob.split("/").slice(0, -1);
 	const wild = parts.findIndex((p) => /[*?[{]/.test(p));
@@ -586,7 +586,7 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 }
 
 /**
- * A test file in the FIRST test glob of an example area (tests/{Area}/**\/*Test.php → tests/Probe/ProbeTest.php):
+ * A test file in the FIRST test glob of an example area (tests/{Area}/**\/*.spec.ext → tests/probe/probe.spec.ext):
  * the probe's own file name when the glob allows it, else the glob's name with "Probe" for the wildcard.
  */
 export function firstGlobFile(a: TargetAdapter, probePath: string): string | undefined {

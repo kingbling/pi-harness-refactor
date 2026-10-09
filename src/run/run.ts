@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { loadCommandOverrides, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
+import type { QuestionRow } from "../ledger/schema.ts";
 import { createBuilder, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
@@ -177,6 +178,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// → back into the queue, every hour or sooner, up to run.maxAutoHeals times; then the owner is asked.
 	let askingStuck: Promise<unknown> | undefined;
 	let resolving: Promise<unknown> | undefined;
+	// a question the resolver model traces to the project setup: the big setup model fixes it on main first
+	const fixJob = o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (q: QuestionRow, what: string, stack?: string) => {
+		const unit = q.unit_id ? ledger.getUnit(q.unit_id) : undefined;
+		const stackId = unit ? placeUnit(config, unit.meta, o.root).stackId : stack && config.target.stacks.includes(stack) ? stack : config.target.stacks.length === 1 ? config.target.stacks[0] : undefined;
+		const adapter = stackId ? adapters.get(stackId) : undefined;
+		if (!stackId || !adapter) return undefined;
+		const sameAs = q.context ? (JSON.parse(q.context) as { sameAs?: string }).sameAs : undefined;
+		return fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, stackId), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: sameAs ?? `question ${q.id}`, problem: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once the setup is fixed. Fix the project setup, not a unit's own code.\n${q.question}${q.context ? `\nFacts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 3000)}` : ""}` });
+	};
 	const resubmitParked = () => {
 		// a slip in this pass is logged like the passes below, never the end of the run (units keep their state)
 		try {
@@ -193,7 +203,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
 		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
 		if (resolver)
-			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, log: (l) => log(pc.cyan(l)) })
+			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, log: (l) => log(pc.cyan(l)) })
 				.then((r) => r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`)), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
 				.finally(() => (resolving = undefined));
 	};
