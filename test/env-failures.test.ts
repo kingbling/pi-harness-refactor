@@ -191,6 +191,20 @@ describe("durable totals in the TUI", () => {
 		expect(panel).toMatch(/spent \$1\.00 total/);
 		ledger.close();
 	});
+
+	it("a long wait with no unit running shows what the run waits on and for how long", async () => {
+		const { renderProgress } = await import("../src/pi/extension.ts");
+		const { progress } = await import("../src/progress.ts");
+		progress.begin("migration run");
+		progress.wait("placing units: picking each unit's stack and folder");
+		const snap = progress.snapshot();
+		snap.waiting!.since -= 75_000;
+		const panel = renderProgress(snap, 140).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+		expect(panel).toMatch(/placing units: picking each unit's stack and folder \(1m15s\)/);
+		progress.wait(undefined);
+		expect(renderProgress(progress.snapshot(), 140).join("\n")).not.toMatch(/placing units.*\(/);
+		progress.end();
+	});
 });
 
 describe("br lanes", () => {

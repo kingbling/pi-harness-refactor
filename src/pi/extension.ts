@@ -291,8 +291,9 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 		L.push(`${pc.green(`✓ ${acc} accepted`)}${run("done")}  ${qua ? pc.red(`■ ${qua} quarantined`) : pc.dim("■ 0 quarantined")}${run("failed")}${wai ? `  ${pc.yellow(`⏸ ${wai} waiting on ${totals?.questions ? `${totals.questions} question${totals.questions > 1 ? "s" : ""} for you: ${pc.bold("/br answer")}` : "a question"}`)}` : ""}  ${pc.cyan(`${runningNow.length ? spinner(now) : "▶"} ${runningNow.length} running`)}${runningNow.length ? pc.dim(`: ${runningNow.map((x) => `${x.name} ${ELAPSED(now - x.startedAt)}`).join(", ")}`) : ""}`.slice(0, width + 60));
 		if (s.lanes) {
 			const free = s.lanes.max - s.lanes.running;
-			L.push(`${pc.bold(`lanes ${s.lanes.running}/${s.lanes.max}`)}${s.lanes.ahead ? pc.cyan(` · ${s.lanes.running - s.lanes.ahead} migrating, ${s.lanes.ahead} capturing truth ahead`) : ""}${s.lanes.reason ? pc.yellow(` · ${s.lanes.reason}`) : free === 0 ? pc.dim(" · all busy: a new unit starts as soon as one finishes") : pc.dim(` · ${s.lanes.ready} more ready`)}`.slice(0, width + 40));
+			L.push(`${pc.bold(`lanes ${s.lanes.running}/${s.lanes.max}`)}${s.lanes.ahead ? pc.cyan(` · ${s.lanes.running - s.lanes.ahead} migrating, ${s.lanes.ahead} capturing truth ahead`) : ""}${s.lanes.reason ? pc.yellow(` · ${s.lanes.reason}${s.lanes.reasonSince ? ` (${ELAPSED(now - s.lanes.reasonSince)})` : ""}`) : free === 0 ? pc.dim(" · all busy: a new unit starts as soon as one finishes") : pc.dim(` · ${s.lanes.ready} more ready`)}`.slice(0, width + 40));
 		}
+		if (s.waiting) L.push(`${pc.yellow(`${spinner(now)} ${s.waiting.what}`)} ${pc.dim(`(${ELAPSED(now - s.waiting.since)})`)}`.slice(0, width + 20));
 		if (totals) {
 			const f = totals.forecast;
 			L.push(pc.dim(`${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% done · spent ${money(totals.spentUsd)} total${f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}) [${f.confidence}]` : ""} · /br forecast`.slice(0, width)));
@@ -587,7 +588,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 				else if ((m = /^[■✗] ([^:\s]+): (.*)$/.exec(t))) progress.stepEnd(m[1]!, "failed", m[2]!);
 			};
 			const since = new Date().toISOString();
-			const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), limit, slice: flag("--slice"), units: flag("--units")?.split(","), dry: flags.includes("--dry"), force: flags.includes("--force"), log, onLanes: (l) => progress.setLanes(l), shouldStop: () => progress.stopping, handleSigint: false, blocked, waitForDecisions: ctx.hasUI });
+			const r = await runScheduler({ ledger, config, root, client: new OpenRouterClient(), limit, slice: flag("--slice"), units: flag("--units")?.split(","), dry: flags.includes("--dry"), force: flags.includes("--force"), log, onLanes: (l) => progress.setLanes(l), onWait: (w) => progress.wait(w), shouldStop: () => progress.stopping, handleSigint: false, blocked, waitForDecisions: ctx.hasUI });
 			const questions = ledger.openQuestions().length;
 			const own = ledger.ownDecisions(since).length;
 			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(own ? [`${own} routine question(s) decided from your goals (br questions lists them; /br answer <id> <text> changes one)`] : []), ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };

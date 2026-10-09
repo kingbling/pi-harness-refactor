@@ -30,7 +30,9 @@ export interface ProgressSnapshot {
 	/** Every live model session, one per agent (unit × role in a run). */
 	agents: AgentState[];
 	/** Scheduler lanes (runs only): running/max, ready units, and why nothing new starts. */
-	lanes?: { running: number; max: number; ready: number; ahead: number; reason?: string };
+	lanes?: { running: number; max: number; ready: number; ahead: number; reason?: string; reasonSince?: number };
+	/** What the job is waiting on right now when no agent shows it (a run's start checks, a shared fix), and since when. */
+	waiting?: { what: string; since: number };
 	/** Cost per unit/job label, accumulated over finished and live sessions. */
 	costByLabel: Record<string, number>;
 	costUsd: number;
@@ -95,8 +97,15 @@ class ProgressTracker {
 	setLanes(l: NonNullable<ProgressSnapshot["lanes"]>) {
 		const a = this.s.lanes;
 		if (a && a.running === l.running && a.max === l.max && a.ready === l.ready && a.ahead === l.ahead && a.reason === l.reason) return;
-		this.s.lanes = l;
+		this.s.lanes = { ...l, reasonSince: l.reason && l.reason === a?.reason ? a.reasonSince : l.reason ? Date.now() : undefined };
 		if (l.reason && l.reason !== a?.reason) this.log(`⏳ ${l.reason}`);
+		this.emit();
+	}
+	/** The job waits on something long (undefined: no longer); the UI shows it with a timer. */
+	wait(what: string | undefined) {
+		if (what === this.s.waiting?.what) return;
+		this.s.waiting = what ? { what, since: Date.now() } : undefined;
+		if (what) this.log(`⏳ ${what}`);
 		this.emit();
 	}
 	plan(about: Record<string, string>) {
@@ -110,6 +119,7 @@ class ProgressTracker {
 		this.s.stopping = false;
 		this.s.session = undefined;
 		this.s.agents = [];
+		this.s.waiting = undefined;
 		if (error) this.s.error = error;
 		this.emit();
 	}

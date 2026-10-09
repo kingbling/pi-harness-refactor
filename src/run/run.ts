@@ -61,6 +61,8 @@ export interface SchedulerOptions {
 	log?: (line: string) => void;
 	/** Lane status after every scheduling pass: how many run, how many could, and why nothing new starts (if so). */
 	onLanes?: (l: { running: number; max: number; ready: number; ahead: number; reason?: string }) => void;
+	/** What the run waits on while no unit runs (start checks, a shared fix, the final build); undefined when done. */
+	onWait?: (what: string | undefined) => void;
 	/** Fill idle lanes with truth-ahead work (tester only) for units still waiting on deps. Default: on unless a limit is set. */
 	truthAhead?: boolean;
 	/** Host-driven drain (Pi's /br stop): when true, running units finish and no new ones start. */
@@ -101,6 +103,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	process.env["BR_WORKSPACE"] = o.root; // the stacks' layout.json lives in this workspace
 	const log = o.log ?? ((l: string) => console.log(l));
 	const { ledger, config } = o;
+	// a long step with no unit running: the host shows it with a timer, so the run never looks frozen
+	const waitOn = async <T>(what: string, step: () => Promise<T>): Promise<T> => {
+		o.onWait?.(what);
+		try {
+			return await step();
+		} finally {
+			o.onWait?.(undefined);
+		}
+	};
 
 	{
 		const prev = lastRun(ledger);
@@ -140,7 +151,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
 	// ---- truth: can the old code run here? decided once per workspace (run → truth from running it, read → from reading it)
 	if (!o.dry && !o.spawn) {
-		await probeLegacyEnv({
+		await waitOn("checking whether the old code runs here", () => probeLegacyEnv({
 			config,
 			root: o.root,
 			source: getSourceAdapter(config.source.stack),
@@ -148,15 +159,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			// a red probe asks the owner once, blocking nothing: "retry" makes the next run probe again
 			ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "truth_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
 			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
-		}).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
+		})).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
 	}
 	// ---- stack knowledge written before the plugin asked for it (notApp, wiringFiles): a model adds just that
 	if (!o.dry && !o.spawn) {
 		const { healStackKnowledge } = await import("./stack-heal.ts");
-		await healStackKnowledge({ ledger, config, root: o.root, client: o.client, log }).catch((e) => log(pc.yellow(`stack knowledge not updated: ${e?.message ?? e}`)));
+		await waitOn("updating stack knowledge", () => healStackKnowledge({ ledger, config, root: o.root, client: o.client, log })).catch((e) => log(pc.yellow(`stack knowledge not updated: ${e?.message ?? e}`)));
 	}
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
-	if (!o.dry) await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) });
+	if (!o.dry) await waitOn("placing units: picking each unit's stack and folder", () => resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) }));
 	// ---- layout preflight: one folder per legacy file must be caught before a run scales it
 	if (!o.dry && isRepo(config.target.path)) {
 		const { resetForNewTarget } = await import("./target-reset.ts");
@@ -166,7 +177,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	if (!o.dry && !o.spawn) {
 		const { refreshRulesLayout } = await import("../rules/living.ts");
 		for (const s of await refreshRulesLayout({ ledger, root: o.root }, config.target.stacks)) log(pc.dim(`${s}: RULES.md layout section re-rendered from the stack adapter`));
-		const lr = await checkLayout(config, o.root, ledger);
+		const lr = await waitOn("checking the target folder layout", () => checkLayout(config, o.root, ledger));
 		for (const w of lr.warnings) log(pc.yellow(`layout: ${w}`));
 		if (lr.problems.length && !o.force) throw new Error(`bigrefactor: the target layout has ${lr.problems.length} problem(s), a run would multiply them:\n  ${lr.problems.join("\n  ")}\nfix: br layout shows the details; start anyway with --force`);
 		for (const p of lr.problems) log(pc.red(`layout (--force): ${p}`));
@@ -724,16 +735,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (running.size === 0) {
 			// healing a shared failure: wait for it, then go on (never ends the run)
 			if (healing) {
-				await healing;
+				await waitOn("fixing a shared failure (setup model)", () => healing!);
 				continue;
 			}
 			// a self-heal pass (it may ask the decide model) can still put quarantined units back: wait for it first
 			if (askingStuck) {
-				await askingStuck;
+				await waitOn("checking whether stuck units can run again", () => askingStuck!);
 				continue;
 			}
 			if (tidyJobs.busy) {
-				await tidyJobs.busy;
+				await waitOn("a tidy job is changing the code on main", () => tidyJobs.busy!);
 				continue;
 			}
 			// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
@@ -766,8 +777,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	}
 	process.off("SIGINT", onSigint);
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
-	if (!o.dry && !stopRecord) await builder.finish().catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
-	if (!o.dry) await pusher.finish();
+	if (!o.dry && !stopRecord) await waitOn("whole-project check of what was merged", () => builder.finish()).catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
+	if (!o.dry) await waitOn("pushing to the target repo's remote", () => pusher.finish());
 
 	const quarantined = ran.filter((r) => r.state === "quarantined").length;
 	const waiting = ledger.listUnits({ state: "planned" }).length;
