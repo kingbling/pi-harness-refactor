@@ -103,8 +103,14 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		ensureRepo(target, "migration/main", []);
 		commitAll(target, "init");
 		const ledger = new Ledger(":memory:");
+		// orders.ts holds an accepted unit's code (a move points to it); money.ts sits in the shared folder but no unit wrote it
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		ledger.upsertFile({ path: "legacy.php", hash: "h", lang: "php", loc: 1 });
+		ledger.upsertSymbol({ id: "legacy.php::a", name: "a", kind: "const", path: "legacy.php" });
+		ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES ('u1', 'legacy.php::a', 'moved', ?, 'x', datetime('now'))").run(JSON.stringify(["src/features/orders/orders.ts::a"]));
 		const fixer: SetupFixer = async (o) => {
 			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n"); // setup: kept
+			writeFileSync(join(o.projectDir, "src", "shared", "money.ts"), "export const m = 2;\n"); // wiring in a shared folder: kept
 			writeFileSync(join(o.projectDir, "src", "features", "orders", "orders.ts"), "export const a = 2;\n"); // accepted code
 			writeFileSync(join(o.projectDir, "src", "features", "orders", "orders.spec.ts"), "expect(a).toBe(2)\n"); // a test
 			writeFileSync(join(o.projectDir, "src", "features", "orders", "extra.spec.ts"), "new test\n"); // a new test
@@ -115,7 +121,7 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		const lock = async <T>(fn: () => Promise<T>) => (locked++, fn());
 		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "vitest: no config", fixer, ledger, lock })).toBe("added the vitest config");
 		expect(locked).toBe(1);
-		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim()).toBe("vitest.config.ts");
+		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim().split("\n").sort()).toEqual(["src/shared/money.ts", "vitest.config.ts"]);
 		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
 		expect(readFileSync(join(target, "src", "features", "orders", "orders.ts"), "utf8")).toBe("export const a = 1;\n");
 		expect(existsSync(join(target, "src", "features", "orders", "extra.spec.ts"))).toBe(false);
@@ -123,7 +129,7 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		expect(row.role).toBe("__setup__:fix:keepcode");
 		expect(row.outcome).toBe("fixed");
 		const report = JSON.parse(row.gate_report) as { changedFiles: string[]; undone: string[]; said: string };
-		expect(report.changedFiles).toEqual(["vitest.config.ts"]);
+		expect(report.changedFiles.sort()).toEqual(["src/shared/money.ts", "vitest.config.ts"]);
 		expect(report.undone.sort()).toEqual(["src/features/orders/extra.spec.ts", "src/features/orders/orders.spec.ts", "src/features/orders/orders.ts", "src/shared/helper.ts"]);
 		expect(report.said).toBe("added the vitest config");
 	});

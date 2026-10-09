@@ -146,9 +146,12 @@ function migratedCodeDirs(adapter: TargetAdapter): string[] {
 /**
  * After a setup fix on main: put back every test file and every file of migrated code the session changed, as the
  * builder does for tests. Tests are the truth and accepted code is proven by them; a setup fix runs neither.
+ * `migrated` (project-relative files the ledger's moves point to) says which existing files hold migrated code: a
+ * folder that also holds the stack's own wiring (Symfony's config/) is no reason to put back a bundle registration.
+ * New source files in the code folders are new app code: put back too. Without the ledger, the folders decide.
  * Returns the paths put back (relative to the repo).
  */
-export function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter): string[] {
+export function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter, migrated?: Set<string>): string[] {
 	const proj = relative(repo, projectDir);
 	const dirs = migratedCodeDirs(adapter);
 	const entries = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0");
@@ -160,7 +163,12 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		const path = e.slice(3);
 		if (code[0] === "R" || code[0] === "C") i++; // the old name follows
 		const rel = !proj ? path : path.startsWith(`${proj}/`) ? path.slice(proj.length + 1) : undefined;
-		if (rel === undefined || !(adapter.layout.isTestFile(rel) || dirs.some((d) => rel.startsWith(d)))) continue;
+		if (rel === undefined) continue;
+		const isNew = code === "??" || code[0] === "A";
+		const inCodeDirs = dirs.some((d) => rel.startsWith(d));
+		const exts = adapter.layout.sourceExtensions ?? [];
+		const newCode = isNew && inCodeDirs && (!exts.length || exts.some((x) => rel.endsWith(x)));
+		if (!(adapter.layout.isTestFile(rel) || newCode || (migrated ? migrated.has(rel) : inCodeDirs))) continue;
 		if (code === "??" || code[0] === "A") {
 			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", path], { stdio: "pipe" });
 			rmSync(join(repo, path), { force: true });
@@ -202,7 +210,8 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 			return undefined;
 		}
 		const { sha, undone, changed } = await lock(async () => {
-			const undone = undoMigratedCode(repo, o.projectDir, o.adapter);
+			const migrated = o.ledger ? new Set((o.ledger.db.prepare("SELECT target_symbols FROM moves WHERE op != 'dropped'").all() as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!))) : undefined;
+			const undone = undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
 			const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
 			const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
 			return { sha, undone, changed };
