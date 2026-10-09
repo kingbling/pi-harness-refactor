@@ -6,7 +6,9 @@ import { projectDir } from "../init/init.ts";
 import { schemaTextFor, type DbUnitMeta } from "../inventory/db.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { fixRunSetup, fixSetupWithModel } from "../init/setup-fixer.ts";
-import { errorSignature, runGate, renderGate, sha1, type GateReport } from "./gate.ts";
+import { errorSignature, run, runGate, renderGate, sha1, type GateReport } from "./gate.ts";
+import { reviewWithModel } from "./review.ts";
+import type { TargetAdapter } from "../adapters/types.ts";
 import { triageGate } from "./triage.ts";
 import { rulesText } from "./prompts.ts";
 import type { UnitRunOptions, UnitRunResult } from "./unit.ts";
@@ -42,6 +44,8 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	const snapshot = o.config.db.snapshot ? (o.config.db.snapshot.startsWith("/") ? o.config.db.snapshot : join(o.config.source.path, o.config.db.snapshot)) : undefined;
 	const schema = await schemaTextFor(o.config, meta.tables ?? []);
 	const task = (TASK[unit.kind ?? ""] ?? TASK["db_schema"]!)(meta, dataDirs[0]!);
+	// what earlier DB units wrote: the model reads them and orders its migration after every table it references
+	const existing = dataFiles(targetProjectDir, dataDirs, (p) => !adapter.layout.isTestFile(p));
 	const system = [
 		`You are the database engineer of a legacy rewrite (${o.config.source.stack} → ${place.stackId}). You work in the target project; write ONLY under ${dataDirs.join(", ")}.`,
 		`Engines: ${meta.from.join(" + ")} → ${meta.to ?? "unchanged"}. Strategy: ${meta.strategy}. Stack choices: ${JSON.stringify(choices)}.`,
@@ -50,12 +54,14 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		CODE_QUALITY,
 		goalsText(o.config.goals),
 		"Never write credentials. Never edit files outside your directories; other units build features on what you write, so names must match the legacy tables exactly unless your task says otherwise.",
+		`Name files and migrations after the tables, never after the unit. A migration runs after every migration that creates a table it references (foreign keys, data copied from it): read the existing ones (ls, grep) and give yours a later version.${adapter.migrateFresh ? " The gate applies all migrations in order to an empty database." : ""}`,
 		rulesText(o.root, place.stackId),
 	].filter(Boolean).join("\n\n");
 	const prompt = [
-		`# ${o.unitId} (${unit.kind}${meta.group ? `, table group ${meta.group}` : ""})`,
+		`# Database work (${unit.kind}${meta.group ? `, table group ${meta.group}` : ""})`,
 		task,
 		meta.tables?.length ? `\nTables (${meta.tables.length}): ${meta.tables.join(", ")}` : "",
+		`\nFiles already in ${dataDirs.join(", ")} (earlier units' schema and migrations): ${existing.length ? existing.slice(0, 200).join(", ") : "none yet"}`,
 		snapshot ? `\nData dump: ${snapshot}${existsSync(snapshot) ? "" : " (not found on this machine)"} — read it for realistic fixtures; never commit it.` : "",
 		o.config.db.url ? `\nLegacy connection: ${o.config.db.url} (an env var; introspection allowed, read-only).` : "",
 		`\n## Legacy schema\n\`\`\`sql\n${schema || "(no schema inputs: br onboard --force-db to point at them)"}\n\`\`\``,
@@ -65,6 +71,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	const spawn = o.spawn ?? spawnLeaf;
 	const gateFn = o.gate ?? runGate;
 	const gateSlot = o.gateSlot ?? (<T>(fn: () => Promise<T>) => fn());
+	const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
 	const maxImpl = o.config.run.maxImplementAttempts;
 	const maxTotal = maxImpl + o.config.run.maxEscalateAttempts;
 	let cost = 0;
@@ -89,7 +96,18 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${n}`);
 		// the tests the session wrote are this unit's proof: hashed now, so the gate sees them untouched
 		const testFiles = dataTests(targetProjectDir, dataDirs, adapter.layout.isTestFile);
-		gate = await gateSlot(() => gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId }));
+		// the same reviewer as code units judges the schema and its tests (the review never holds a CPU slot)
+		const review = reviewer
+			? async (changedFiles: string[]) => {
+					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir: dataDirs[0]!.replace(/\/$/, ""), legacyFiles: [], changedFiles, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: `This is a database unit. Its task: ${task}${meta.tables?.length ? ` Tables: ${meta.tables.join(", ")}.` : ""}`, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `review-${ra}.jsonl`) });
+					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
+					cost += r.costUsd ?? 0;
+					return r;
+				}
+			: undefined;
+		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot });
+		gate = await migrateFreshStep(gate, { ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, slot: gateSlot });
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
 		if (gate.ok) break;
@@ -123,8 +141,28 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: n, gate, costUsd: cost };
 }
 
+/**
+ * The DB lane's last gate step: every migration, in order, on a new empty database, with the command the adapter
+ * declares (it points at a throwaway database). Skipped when the gate is already red or the adapter declares none.
+ */
+export async function migrateFreshStep(gate: GateReport, o: { ledger: UnitRunOptions["ledger"]; unitId: string; adapter: TargetAdapter; dir: string; slot?: <T>(fn: () => Promise<T>) => Promise<T> }): Promise<GateReport> {
+	const c = o.adapter.migrateFresh?.(o.dir);
+	if (!gate.ok || !c) return gate;
+	const t0 = Date.now();
+	const r = await (o.slot ?? ((fn) => fn()))(() => run(c.cmd, c.args, o.dir, 240_000));
+	const ms = Date.now() - t0;
+	if (r.ok) o.ledger.addEvidence(o.unitId, "migrate_ok", { ms });
+	const step = { name: "migrate_ok" as const, ok: r.ok, ms, output: r.output.slice(-6000), exitCode: r.exitCode };
+	return { ...gate, ok: r.ok, steps: [...gate.steps, step], failedStep: r.ok ? undefined : "migrate_ok" };
+}
+
 function dataTests(projectDir: string, dataDirs: string[], isTest: (p: string) => boolean): Array<{ path: string; sha1: string }> {
-	const out: Array<{ path: string; sha1: string }> = [];
+	return dataFiles(projectDir, dataDirs, isTest).map((p) => ({ path: p, sha1: sha1(readFileSync(join(projectDir, p))) }));
+}
+
+/** Files under the data dirs that `keep` accepts, relative to the project. */
+function dataFiles(projectDir: string, dataDirs: string[], keep: (p: string) => boolean): string[] {
+	const out: string[] = [];
 	const walk = (rel: string) => {
 		const abs = join(projectDir, rel);
 		if (!existsSync(abs)) return;
@@ -132,7 +170,7 @@ function dataTests(projectDir: string, dataDirs: string[], isTest: (p: string) =
 			if (n === "node_modules") continue;
 			const r = rel ? `${rel}/${n}` : n;
 			if (statSync(join(projectDir, r)).isDirectory()) walk(r);
-			else if (isTest(r)) out.push({ path: r, sha1: sha1(readFileSync(join(projectDir, r))) });
+			else if (keep(r)) out.push(r);
 		}
 	};
 	for (const d of dataDirs) walk(d.replace(/\/$/, ""));

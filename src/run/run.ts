@@ -149,6 +149,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
 		}).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
 	}
+	// ---- stack knowledge written before the plugin asked for it (notApp, wiringFiles): a model adds just that
+	if (!o.dry && !o.spawn) {
+		const { healStackKnowledge } = await import("./stack-heal.ts");
+		await healStackKnowledge({ ledger, config, root: o.root, client: o.client, log }).catch((e) => log(pc.yellow(`stack knowledge not updated: ${e?.message ?? e}`)));
+	}
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
 	if (!o.dry) await resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) });
 	// ---- layout preflight: one folder per legacy file must be caught before a run scales it

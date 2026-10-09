@@ -10,7 +10,7 @@ import { buildGraph, condense, cutLargeCycles, tarjanScc } from "./scc.ts";
 import { headOf, isRepo } from "../git.ts";
 import { loadDecisions } from "./decisions.ts";
 import { answerValue } from "../jev/ask.ts";
-import { loadNotApp, notAppOf } from "./not-app.ts";
+import { leftOut, loadNotApp } from "./not-app.ts";
 import { isDbUnitKind, wireDbDeps } from "./db.ts";
 import { resolveCodeMap, writeCodeMap } from "./codemap.ts";
 
@@ -37,11 +37,8 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// tests) are left out on top of the adapter's minimal defaults; a file the adapter calls an entry point stays
 	const notApp = loadNotApp(_root);
 	const profilePath = join(_root, ".bigrefactor", "framework-profile.json");
-	if (existsSync(profilePath) && !/"notApp"\s*:/.test(readFileSync(profilePath, "utf8"))) console.log(pc.yellow("the framework profile names no folders that are not app code (it predates that field): docs, tooling and vendored copies are indexed as app code; br profile --force writes it again"));
-	const files = listFiles(srcRoot, adapter).filter((f) => {
-		const n = notAppOf(f, notApp);
-		return !n || (n.kind !== "vendored" && !!adapter.isEntryPoint?.(f));
-	});
+	if (existsSync(profilePath) && !/"notApp"\s*:/.test(readFileSync(profilePath, "utf8"))) console.log(pc.yellow("the framework profile names no folders that are not app code (it predates that field): docs, tooling and vendored copies are indexed as app code; br run adds them at start"));
+	const files = listFiles(srcRoot, adapter).filter((f) => !leftOut(f, notApp, (p) => !!adapter.isEntryPoint?.(p)));
 	const indexes: FileIndex[] = [];
 	for (const rel of files) {
 		const source = readFileSync(join(srcRoot, rel), "utf8");

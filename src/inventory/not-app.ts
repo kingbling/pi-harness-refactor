@@ -1,6 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join, relative } from "node:path";
 import type { ExternalDep, SourceAdapter } from "../adapters/types.ts";
+import type { Config } from "../config.ts";
+import type { Ledger } from "../ledger/db.ts";
+import type { spawnLeaf } from "../sessions/spawn.ts";
 
 /**
  * Folders of the legacy repo that are not the app's own code (tooling, static-analysis stubs, vendored libraries,
@@ -35,6 +38,63 @@ export function loadNotApp(workspace: string | undefined): NotAppFolder[] {
 
 export function notAppOf(path: string, folders: NotAppFolder[]): NotAppFolder | undefined {
 	return folders.find((f) => path.startsWith(f.path));
+}
+
+/** The inventory leaves the file out: it is in a notApp folder, and not an entry point outside vendored code. */
+export function leftOut(path: string, folders: NotAppFolder[], isEntryPoint?: (p: string) => boolean): boolean {
+	const n = notAppOf(path, folders);
+	return !!n && (n.kind === "vendored" || !isEntryPoint?.(path));
+}
+
+/**
+ * A framework profile written before notApp existed: a small session reads the legacy repo and writes only the notApp
+ * list (the rest of the profile stays as it is). Returns the folders added to the profile, or undefined when the
+ * profile already has the list (or there is no profile, or the session wrote nothing usable: the next run asks again).
+ */
+export async function healNotApp(o: { config: Config; root: string; ledger: Ledger; spawn?: typeof spawnLeaf; log?: (l: string) => void }): Promise<NotAppFolder[] | undefined> {
+	const profile = join(o.root, ".bigrefactor", "framework-profile.json");
+	if (!existsSync(profile)) return undefined;
+	const json = JSON.parse(readFileSync(profile, "utf8")) as Record<string, unknown>;
+	if ("notApp" in json) return undefined;
+	const src = o.config.source.path;
+	const out = join(o.root, ".bigrefactor", "not-app.json");
+	rmSync(out, { force: true });
+	const attempt = o.ledger.startAttempt("__init__", "not-app", o.config.models.escalate.id);
+	const session = await (o.spawn ?? (await import("../sessions/spawn.ts")).spawnLeaf)({
+		role: "setup",
+		cwd: o.root,
+		config: o.config,
+		writeGlobs: [".bigrefactor/not-app.json"],
+		protectedGlobs: [`${relative(o.root, o.config.target.path)}/**`],
+		tools: ["read", "grep", "find", "ls", "write"],
+		systemPrompt: `You look through a legacy ${o.config.source.stack} repo at ${src} (read-only; never write there) and write exactly one file: .bigrefactor/not-app.json in the workspace, as {"notApp": [...]}.\n${NOT_APP_DOC}\nList the top-level folders yourself and look into every candidate before you list it. End the session right after writing the file.`,
+		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__init__.not-app.${attempt}.jsonl`),
+	});
+	let cost = 0;
+	let list: Array<Partial<NotAppFolder>> | undefined;
+	try {
+		let task = `Write .bigrefactor/not-app.json for the legacy repo at ${src}.`;
+		for (let i = 0; i < 2; i++) {
+			const r = await session.run(task);
+			cost += r.usage.cost;
+			if (!existsSync(out)) break;
+			const got = JSON.parse(readFileSync(out, "utf8")) as { notApp?: unknown };
+			const problems = validateNotApp({ notApp: got.notApp ?? [] }, src);
+			list = Array.isArray(got.notApp) ? got.notApp : [];
+			if (!problems.length) break;
+			task = `.bigrefactor/not-app.json has problems: ${problems.join("; ")}. Fix the file.`;
+		}
+	} catch (e: any) {
+		o.log?.(`not-app folders: ${e?.message ?? e}`);
+	} finally {
+		session.dispose();
+		o.ledger.endAttempt(attempt, { outcome: list ? "done" : "error", costUsd: cost });
+	}
+	if (!list) return undefined;
+	// entries still wrong after the fix are left out; the rest is the model's list
+	const folders = list.filter((f) => !validateNotApp({ notApp: [f] }, src).length) as NotAppFolder[];
+	writeFileSync(profile, JSON.stringify({ ...json, notApp: folders }, null, 2) + "\n");
+	return loadNotApp(o.root);
 }
 
 /** Problems with the profile's notApp list (shape; every folder must exist in the legacy repo). */

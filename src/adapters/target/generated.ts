@@ -6,7 +6,7 @@ import { runCommand } from "../../proc.ts";
 import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
 import type { StackChoice, TargetAdapter } from "../types.ts";
-import { DEFAULT_FORBID_DIRS, normalize, slashed, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
+import { DEFAULT_FORBID_DIRS, loadLayoutRules, normalize, saveLayoutRules, slashed, validateLayoutRules, type LayoutRules } from "../../rules/layout-rules.ts";
 
 /**
  * A target adapter for a stack bigrefactor has no hand-written adapter for, written as DATA by a model that
@@ -32,6 +32,8 @@ export interface AdapterManifest {
 	build: Cmd;
 	lint: Cmd;
 	test: Cmd;
+	/** Applies every migration, in order, to a new empty throwaway database (a DB lane gate step). Older manifests and stacks without migrations have none. */
+	migrateFresh?: Cmd;
 	toolchain: {
 		ecosystem: string;
 		packageName: string;
@@ -143,7 +145,8 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 			legacyMarker: (why) => m.layout.legacyMarker.replace(/\{why\}/g, why),
 			dataAccessHint: m.layout.dataAccessHint || undefined,
 			...(m.layout.dataDirs?.length ? { dataDirs: m.layout.dataDirs.map(slashed) } : {}),
-			...(m.layout.wiringFiles?.length ? { wiringFiles: m.layout.wiringFiles } : {}),
+			// [] = the stack registers nothing by hand; absent = an older manifest that was never asked
+			...(m.layout.wiringFiles ? { wiringFiles: m.layout.wiringFiles } : {}),
 			ignoreDirs: m.layout.ignoreDirs,
 		},
 		probeTest: () => m.probeTest,
@@ -166,6 +169,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 		build: (root, files = []) => expand(m.build, { dir: root, files }),
 		lint: (root, files) => expand(m.lint, { dir: root, files }),
 		test: (root, related) => expand(m.test, { dir: root, files: related }),
+		...(m.migrateFresh?.cmd ? { migrateFresh: (root: string) => expand(m.migrateFresh!, { dir: root }) } : {}),
 		protectedGlobs: m.protectedGlobs,
 		generatedFiles: [],
 		patternKinds: m.patternKinds,
@@ -201,12 +205,12 @@ function installedPackages(m: AdapterManifest, dir: string): string[] {
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "cmd", "cmd.exe", "powershell", "pwsh", "eval", "exec", "env", "xargs", "sudo", "su", "doas"]);
 /** Every command a manifest would run, for the owner to see before anything runs. */
 export function manifestCommands(m: AdapterManifest): string[] {
-	return [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`after scaffold ${i + 1}`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ["add packages", m.toolchain.add], ...(m.toolchain.installed?.list?.cmd ? [["list packages", m.toolchain.installed.list] as const] : [])].map(([k, c]) => `${k}: ${(c as Cmd).cmd} ${(c as Cmd).args.join(" ")}`);
+	return [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`after scaffold ${i + 1}`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ...(m.migrateFresh?.cmd ? [["migrate fresh", m.migrateFresh] as const] : []), ["add packages", m.toolchain.add], ...(m.toolchain.installed?.list?.cmd ? [["list packages", m.toolchain.installed.list] as const] : [])].map(([k, c]) => `${k}: ${(c as Cmd).cmd} ${(c as Cmd).args.join(" ")}`);
 }
 /** Problems that make a manifest unusable; empty = structurally sound (it still has to pass verification). */
 export function validateManifest(m: AdapterManifest): string[] {
 	const out: string[] = [];
-	for (const [k, c] of [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`postScaffold[${i}]`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ["toolchain.add", m.toolchain?.add], ...(m.toolchain?.installed?.list?.cmd ? [["toolchain.installed.list", m.toolchain.installed.list] as const] : [])] as const) {
+	for (const [k, c] of [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`postScaffold[${i}]`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ...(m.migrateFresh?.cmd ? [["migrateFresh", m.migrateFresh] as const] : []), ["toolchain.add", m.toolchain?.add], ...(m.toolchain?.installed?.list?.cmd ? [["toolchain.installed.list", m.toolchain.installed.list] as const] : [])] as const) {
 		if (!c || typeof c.cmd !== "string" || !Array.isArray(c.args)) {
 			out.push(`${k}: needs cmd + args`);
 			continue;
@@ -237,6 +241,27 @@ export function validateManifest(m: AdapterManifest): string[] {
 	}
 	return out;
 }
+
+/**
+ * What a newly written manifest must get right about its stack, checked when it is written (an older saved manifest
+ * keeps working): one test home per area, and a wiring file that registers the files the layout requires in every
+ * feature folder. A problem goes back to the model, which picks.
+ */
+export function stackProblems(m: AdapterManifest): string[] {
+	const out: string[] = [];
+	const a = fromManifest(m);
+	const homes = [...new Set(a.layout.testFileGlobs(a.layout.moduleDir("probe")).map(globHome))];
+	if (homes.length > 1) out.push(`layout.testFileGlobs gives one area ${homes.length} test homes (${homes.join(", ")}): pick ONE, where the stack's official convention keeps tests (see the layout.testFileGlobs rule), and give only globs under it`);
+	const require = m.layout.rules?.require ?? [];
+	if (require.length && !m.layout.wiringFiles?.length) out.push(`layout.rules.require makes every feature folder hold ${require.join(", ")}, but layout.wiringFiles is empty, so nothing registers them: name the file where the framework registers them (from its docs) in layout.wiringFiles, or make require [] when the framework finds them on its own`);
+	return out;
+}
+/** The folder a test glob starts in, before its first wildcard (tests/Probe/**\/*Test.php → tests/Probe). */
+const globHome = (glob: string) => {
+	const parts = glob.split("/").slice(0, -1);
+	const wild = parts.findIndex((p) => /[*?[{]/.test(p));
+	return (wild < 0 ? parts : parts.slice(0, wild)).join("/");
+};
 
 // ---- generation + verification ------------------------------------------------------------------------
 
@@ -297,6 +322,7 @@ export const MANIFEST_SCHEMA = obj({
 	build: CMD,
 	lint: CMD,
 	test: CMD,
+	migrateFresh: CMD,
 	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA, list: CMD, listPattern: S }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
 	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
 	platform: MAP,
@@ -318,7 +344,9 @@ const SYSTEM = [
 	"- layout.testFileGlobs: where the stack's official convention keeps an area's tests ({moduleDir}, {area}, {Area}, {area_snake} expand). Next to the code ({moduleDir}/…) only where the framework expects that; where the app loads everything under its source dir as app code (service containers, autoloaded apps), tests go in the official tests dir mirrored per area (e.g. tests/{Area}/…), or the app will not start. The FIRST glob must be a place the test command without {files} runs (the tool checks this with the probe test).",
 	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name}/{name_snake} any kebab-case/PascalCase/snake_case name, use the one this stack names its files with; {sub} a sub-feature folder named after what it does, spelled like the feature folders; (a|b) either word), each with a short doc. require: only files the framework itself needs to load a feature folder (none when the framework finds the code on its own, e.g. autoloading or service discovery); never an empty class just to have one. place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
 	"- layout.dataDirs: the folders (project-relative, trailing slash) where this stack's official docs keep database code: schema/models/entities, migrations, seed scripts (e.g. a Spring project with Flyway: src/main/resources/db/migration/ plus the entity package folder). Database work may write only there. layout.dataAccessHint: one line on how data access is written in this stack (ORM entities, query builder, SQL with generated code, …).",
-	"- layout.wiringFiles: the files (project-relative paths or globs) where this stack registers a new feature by hand (router/route table, main module, URL config), from the official docs; [] when the framework finds handlers on its own (annotations, file-system routing). Units edit these files to wire what they add.",
+	"- layout.wiringFiles: the files (project-relative paths or globs) where this stack registers a new feature by hand (router/route table, main module, URL config), from the official docs; [] when the framework finds handlers on its own (annotations, file-system routing). A file layout.rules.require names is registered somewhere: that file belongs here. Units edit these files to wire what they add.",
+	"- layout.skipMarker: a regex matching a test that is skipped, focused or left incomplete in this stack: every skip, only and incomplete call or annotation its test runner has (from its docs), so a placeholder test is caught.",
+	"- migrateFresh: one command that applies every migration of the project, in order, to a NEW EMPTY throwaway database (in-memory, or a temporary one the command itself points at; never the dev, legacy or production database), and fails when a migration cannot be applied. {cmd: \"\", args: []} when the stack has no migrations.",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up. failing: the same file with only the expected value made wrong (e.g. 1 + 1 expected to equal 3), so the test runs and FAILS; the tool checks that the test command fails on it.",
@@ -367,6 +395,7 @@ export async function generateAdapter(
 		const res = await opts.client.chat({ model: opts.model, messages, schema: MANIFEST_SCHEMA, effort: "medium" });
 		const m = fromModel(res.json, opts.id, opts.role);
 		const invalid = validateManifest(m);
+		if (!invalid.length) invalid.push(...stackProblems(m));
 		let problem: string | undefined = invalid.length ? `invalid manifest:\n${invalid.join("\n")}` : undefined;
 		// a tool missing on this machine is not the model's to fix (nor a manifest problem): the owner installs it
 		// (offered by ensureTools), then the same manifest goes on to verification
@@ -408,6 +437,40 @@ function saveManifest(root: string, m: AdapterManifest): void {
 }
 
 /**
+ * A saved manifest written before wiringFiles was asked for, or whose layout requires files in every feature folder
+ * that no wiring file registers, gets that one question. Only wiringFiles changes (and the require, dropped when the
+ * model says the framework registers nothing by hand); the rest of the manifest stays as it is. Returns the ids changed.
+ */
+export async function healWiringFiles(root: string, opts: { client: ModelClient; model: string; log?: (l: string) => void }): Promise<string[]> {
+	const done: string[] = [];
+	for (const m of loadManifests(root)) {
+		const own = loadLayoutRules(root, m.id);
+		const require = (own ?? m.layout.rules)?.require ?? [];
+		if (m.layout.wiringFiles && (m.layout.wiringFiles.length || !require.length)) continue;
+		const res = await opts.client.chat({
+			model: opts.model,
+			effort: "medium",
+			schema: obj({ wiringFiles: SA }),
+			messages: [
+				{ role: "system", content: SYSTEM },
+				{ role: "user", content: `The ${m.id} manifest has no layout.wiringFiles yet. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}; structure doc:\n${m.layout.structureDoc}\n\nAnswer only layout.wiringFiles, as the rule above says.` },
+			],
+		});
+		const wiring = (((res.json ?? {}) as { wiringFiles?: string[] }).wiringFiles ?? []).filter((p) => p && !p.startsWith("/") && !p.includes(".."));
+		m.layout.wiringFiles = wiring;
+		// nothing registers the required files: the framework finds them itself, so no folder must hold them
+		if (!wiring.length && require.length) {
+			if (own) saveLayoutRules(root, m.id, { ...own, require: [] });
+			if (m.layout.rules) m.layout.rules = { ...m.layout.rules, require: [] };
+		}
+		saveManifest(root, m);
+		opts.log?.(`  adapter ${m.id}: wiring files ${wiring.join(", ") || "none"}${!wiring.length && require.length ? ` (required ${require.join(", ")} dropped: nothing registers them)` : ""}`);
+		done.push(m.id);
+	}
+	return done;
+}
+
+/**
  * Prove every adapter written during the questions (verified: false): build and test a fresh project, kept as
  * the seed setup moves into place. A failure goes back to the model (when there is one) for a fixed manifest,
  * proven the same way. Throws in plain words when an adapter cannot be made to work. Returns the ids proven.
@@ -442,7 +505,7 @@ export async function verifyPendingAdapters(
 /** Executables a manifest runs that are not on PATH (project-relative ones appear after scaffolding). */
 export function missingTools(m: AdapterManifest): string[] {
 	const dirs = (process.env["PATH"] ?? "").split(delimiter).filter(Boolean);
-	const cmds = [m.scaffold, ...(m.postScaffold ?? []), m.build, m.lint, m.test, m.toolchain.add, ...(m.toolchain.installed?.list?.cmd ? [m.toolchain.installed.list] : [])].map((c) => c.cmd).filter((c) => !c.includes("/"));
+	const cmds = [m.scaffold, ...(m.postScaffold ?? []), m.build, m.lint, m.test, ...(m.migrateFresh?.cmd ? [m.migrateFresh] : []), m.toolchain.add, ...(m.toolchain.installed?.list?.cmd ? [m.toolchain.installed.list] : [])].map((c) => c.cmd).filter((c) => !c.includes("/"));
 	return [...new Set(cmds)].filter((c) => !dirs.some((d) => existsSync(join(d, c))));
 }
 
@@ -458,6 +521,7 @@ function fromModel(json: unknown, id: string, role: "server" | "ui"): AdapterMan
 		postScaffold: j.postScaffold ?? [],
 		platform: asMap(j.platform),
 		layout: { ...j.layout, langByExtension: asMap(j.layout?.langByExtension) },
+		migrateFresh: j.migrateFresh?.cmd ? j.migrateFresh : undefined,
 		stackChoices: (j.stackChoices ?? []).map((c) => ({ ...c, options: c.options.map((o) => ({ ...o, platform: asMap(o.platform) })) })),
 	};
 }
@@ -482,7 +546,7 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 		mkdirSync(dirname(join(dir, probe.path)), { recursive: true });
 		writeFileSync(join(dir, probe.path), probe.content);
 		if (!a.layout.isTestFile(probe.path)) return `probeTest.path ${probe.path} does not match layout.testFileRegex ${m.layout.testFileRegex}`;
-		for (const [step, c] of [["build", a.build(dir)], ["test", a.test(dir, [probe.path])]] as const) {
+		for (const [step, c] of [["build", a.build(dir)], ["test", a.test(dir, [probe.path])], ...(a.migrateFresh ? [["migrateFresh", a.migrateFresh(dir)] as const] : [])] as const) {
 			try {
 				await runCommand(c.cmd, c.args, { cwd: dir });
 			} catch (e: any) {
