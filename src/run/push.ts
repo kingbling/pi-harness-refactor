@@ -10,7 +10,10 @@ import { mainBranch } from "../git.ts";
  * a remote that needs one fails and says so in the log.
  */
 
-/** The remote to push to: the configured one, else origin, else the repo's only remote. */
+/** A remote given as a URL or path (git@host:x, https://…, /path) rather than a remote name: git pushes to it as it is. */
+const isUrl = (r: string) => /:|^\.{0,2}\//.test(r);
+
+/** The remote to push to: the configured one (a remote name, or a URL), else origin, else the repo's only remote. */
 export function pushRemote(repo: string, preferred?: string): string | undefined {
 	let remotes: string[] = [];
 	try {
@@ -18,7 +21,7 @@ export function pushRemote(repo: string, preferred?: string): string | undefined
 	} catch {
 		return undefined;
 	}
-	if (preferred) return remotes.includes(preferred) ? preferred : undefined;
+	if (preferred) return remotes.includes(preferred) ? preferred : isUrl(preferred) ? preferred : undefined;
 	return remotes.includes("origin") ? "origin" : remotes.length === 1 ? remotes[0] : undefined;
 }
 
@@ -108,13 +111,22 @@ export function pushSetting(configPath: string, args: string[]): string {
 	const [mode, remote] = args;
 	if (mode === "on" || mode === "off") {
 		config.target.git.push = mode;
-		if (remote) config.target.git.remote = remote;
+		// a URL becomes a remote of the target repo (as onboarding does), so git and the owner see it
+		if (remote) config.target.git.remote = isUrl(remote) ? addRemote(config.target.path, remote) : remote;
 		config.target.git.pushAskedAt = new Date().toISOString(); // the owner decided: onboarding never asks (or overwrites) again
 		saveConfig(root, config);
 	} else if (mode) throw new Error("usage: br push [on|off] [remote]");
 	const g = config.target.git;
 	const found = pushRemote(config.target.path, g.remote);
 	return `push ${g.push}: ${mainBranch(config.target.path, g.branch)} → ${found ?? (g.remote ? `${g.remote} (no such remote in ${config.target.path})` : `no remote in ${config.target.path}`)}${g.push === "on" ? " (after merges, at most once a minute, and when a run ends)" : ""}\nchange: br push on|off [remote]  ·  in Pi: /br push on|off [remote]`;
+}
+
+/** Adds (or points) a remote at `url`: origin, unless origin goes elsewhere; returns its name. */
+function addRemote(repo: string, url: string): string {
+	const origin = remoteUrl(repo, "origin");
+	const name = origin && origin !== url ? "bigrefactor" : "origin";
+	execFileSync("git", ["-C", repo, "remote", ...(remoteUrl(repo, name) ? ["set-url", name, url] : ["add", name, url])], { stdio: ["ignore", "pipe", "pipe"] });
+	return name;
 }
 
 function remoteUrl(repo: string, remote: string): string | undefined {
@@ -157,8 +169,7 @@ export async function askPush(config: Config, ui: { select(m: string, o: Array<{
 	if (pick !== "url") return { push: "off", remote: config.target.git.remote };
 	const typed = (await ui.text("Remote URL of the new repo (git@… or https://…)", ""))?.trim();
 	if (!typed) return { push: "off", remote: config.target.git.remote };
-	const name = remote && remote !== "origin" ? "bigrefactor" : "origin";
-	execFileSync("git", ["-C", repo, "remote", ...(remoteUrl(repo, name) ? ["set-url", name, typed] : ["add", name, typed])], { stdio: ["ignore", "pipe", "pipe"] });
+	const name = addRemote(repo, typed);
 	const err = reachable(repo, name);
 	ui.log(err ? `  ${name} → ${typed}: not reachable without a password yet (${err}); pushes retry after merges` : `  ${name} → ${typed}: reachable`);
 	return { push: "on", remote: name };

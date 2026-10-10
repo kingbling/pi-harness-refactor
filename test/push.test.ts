@@ -75,6 +75,20 @@ describe("pushing to the target's remote", () => {
 		expect(logs.filter((l) => /no remote/.test(l))).toHaveLength(1);
 		expect(() => pushSetting(cfgPath, ["maybe"])).toThrow(/usage/);
 	});
+
+	it("a URL as the remote: an existing config pushes to it as it is; br push on <url> adds it as origin", async () => {
+		const { root, target, bare, config, cfgPath } = setup(false);
+		git(root, ["init", "-q", "--bare", bare]);
+		// a config written with the URL as the remote (no remote in the repo)
+		const p = createPusher({ config: { ...config, target: { ...config.target, git: { ...config.target.git, push: "on", remote: bare } } }, root, log: () => {}, everyMs: 0 });
+		saveConfig(root, { ...config, target: { ...config.target, git: { ...config.target.git, push: "on", remote: bare } } });
+		p.afterMerge();
+		await p.finish();
+		expect(git(bare, ["rev-parse", "migration/main"])).toBe(git(target, ["rev-parse", "HEAD"]));
+		expect(pushSetting(cfgPath, ["on", bare])).toMatch(/→ origin/);
+		expect(git(target, ["remote", "get-url", "origin"])).toBe(bare);
+		expect(JSON.parse(readFileSync(cfgPath, "utf8")).target.git.remote).toBe("origin");
+	});
 });
 
 describe("onboarding asks where the new code goes", () => {
