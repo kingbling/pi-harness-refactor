@@ -378,6 +378,27 @@ export class Ledger {
 		return blocked;
 	}
 
+	/**
+	 * Undo a re-open that was wrong (br recheck sent the unit back on a false finding and nothing ran since): the
+	 * symbols the re-open moved from accepted to clustered are accepted again, then the unit.
+	 */
+	undoReopen(unitId: string, reason: string): void {
+		this.db.exec("BEGIN");
+		try {
+			for (const s of this.symbolsOfUnit(unitId)) {
+				const last = this.transitionsOf("symbol", s.id).at(-1);
+				if (s.state !== "clustered" || last?.from_state !== "accepted") continue;
+				this.db.prepare("UPDATE symbols SET state = 'accepted', updated_at = ? WHERE id = ?").run(now(), s.id);
+				this.recordTransition("symbol", s.id, "clustered", "accepted", reason);
+			}
+			this.transitionUnit(unitId, "accepted", reason);
+			this.db.exec("COMMIT");
+		} catch (e) {
+			this.db.exec("ROLLBACK");
+			throw e;
+		}
+	}
+
 	private recordTransition(entity: "symbol" | "unit", entityId: string, from: string | null, to: string, reason?: string, evidenceId?: number): void {
 		this.db
 			.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, evidence_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")

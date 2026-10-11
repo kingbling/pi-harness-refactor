@@ -13,12 +13,14 @@ import type { Reviewer, ReviewInput } from "../src/run/review.ts";
  * reviewer findings send a unit back to planned with its code kept and the findings as its next note; a clean
  * one stays accepted. The reviewer sees the unit's files as they are now on main, not its old commit.
  */
-function workspace() {
+function workspace(stacks = ["nestjs"]) {
 	const root = mkdtempSync(join(tmpdir(), "br-recheck-"));
-	const config = ConfigSchema.parse({ source: { path: join(root, "legacy"), stack: "php" }, target: { path: join(root, "new"), stacks: ["nestjs"] }, models: {} });
+	const config = ConfigSchema.parse({ source: { path: join(root, "legacy"), stack: "php" }, target: { path: join(root, "new"), stacks }, models: {} });
+	// several stacks: each project in its own folder of the repo, the unit's paths relative to it
+	const proj = stacks.length > 1 ? join(root, "new", "api") : join(root, "new");
 	const ledger = new Ledger(":memory:");
 	ledger.db.prepare("INSERT INTO files(path, hash, lang, updated_at) VALUES ('app/offer.php', 'h', 'php', 't')").run();
-	mkdirSync(join(root, "new", "src", "offer"), { recursive: true });
+	mkdirSync(join(proj, "src", "offer"), { recursive: true });
 	for (const id of ["typed", "fine", "stub"]) {
 		ledger.db.prepare("INSERT INTO symbols(id, path, kind, name, state, updated_at) VALUES (?, 'app/offer.php', 'function', ?, 'accepted', 't')").run(`app/offer.php::${id}`, id);
 		ledger.createUnit({ id, tier: "T1", deps: [], meta: { files: ["app/offer.php"], commit: "abc", place: { stack: "nestjs", area: "offer", shared: false, source: "code" } }, symbolIds: [`app/offer.php::${id}`] });
@@ -26,8 +28,8 @@ function workspace() {
 		ledger.db.prepare("UPDATE symbols SET state = 'accepted' WHERE id = ?").run(`app/offer.php::${id}`);
 		ledger.addEvidence(id, "truth_green_on_old", {});
 		// the unit's code on main now (moved there by a later tidy) and its ported test
-		writeFileSync(join(root, "new", "src", "offer", `${id}.service.ts`), `export const ${id} = 1; // as it is now`);
-		writeFileSync(join(root, "new", "src", "offer", `${id}.spec.ts`), `it("${id}#1 net", () => {});`);
+		writeFileSync(join(proj, "src", "offer", `${id}.service.ts`), `export const ${id} = 1; // as it is now`);
+		writeFileSync(join(proj, "src", "offer", `${id}.spec.ts`), `it("${id}#1 net", () => {});`);
 		ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES (?, ?, 'ported', ?, 'w', 't')").run(id, `app/offer.php::${id}`, JSON.stringify([`src/offer/${id}.service.ts::${id}`]));
 		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, ported_test_path, created_at) VALUES (?, ?, 's', 'null', '123.45', 1, ?, 't')").run(`${id}#1`, id, `src/offer/${id}.spec.ts`);
 		mkdirSync(join(root, ".bigrefactor", "truth", id), { recursive: true });
@@ -65,6 +67,41 @@ describe("br recheck", () => {
 		expect(fine.targetProjectDir).toBe(config.target.path);
 		expect(fine.recheck).toBe(true);
 		expect(fine.testFiles).toEqual(["src/offer/fine.spec.ts"]);
+	});
+
+	it("several stacks: tests and files are found in the unit's own project folder, not the repo root", async () => {
+		const { root, config, ledger } = workspace(["nestjs", "react"]);
+		const seen: ReviewInput[] = [];
+		const ran: string[] = [];
+		const reviewer: Reviewer = async (o) => (seen.push(o), { ok: true, judged: true, output: "fine" });
+		const r = await recheckAccepted({ ledger, config, root, reviewer, runTests: async (_c, _a, cwd) => (ran.push(cwd), { ok: true, output: "ok" }), log: () => {} });
+		expect(r.reopened).toEqual(["typed"]); // only the typed-in truth; no "ported tests are gone"
+		expect(ledger.getUnit("fine")!.state).toBe("accepted");
+		expect(ran.every((d) => d === join(config.target.path, "api"))).toBe(true);
+		const fine = seen.find((s) => s.unitId === "fine")!;
+		expect(fine.targetProjectDir).toBe(join(config.target.path, "api"));
+		expect(fine.changedFiles).toEqual(["src/offer/fine.service.ts"]);
+	});
+
+	it("a unit an earlier recheck sent back, with nothing run since, is judged again: clean → accepted again, symbols too; still red → the new findings are its note", async () => {
+		const { root, config, ledger } = workspace();
+		const { reopenUnit } = await import("../src/run/recheck.ts");
+		const { REQUIRED_FOR_ACCEPTED } = await import("../src/ledger/schema.ts");
+		for (const id of ["fine", "stub"]) for (const t of REQUIRED_FOR_ACCEPTED) ledger.addEvidence(id, t, {});
+		for (const id of ["fine", "stub"]) reopenUnit(ledger, id, "old note: ported tests are gone from the main branch", "recheck: ported tests are gone from the main branch: x");
+		ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.rechecked', 't') WHERE id IN ('fine', 'stub')").run();
+		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("clustered");
+		const reviewer: Reviewer = async (o) => (o.unitId === "stub" ? { ok: false, judged: true, output: "reviewer findings:\n- net() returns 0" } : { ok: true, judged: true, output: "fine" });
+		const r = await recheckAccepted({ ledger, config, root, reviewer, runTests: green, log: () => {} });
+		expect(r.restored).toEqual(["fine"]);
+		expect(ledger.getUnit("fine")!.state).toBe("accepted");
+		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("accepted");
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).retryNote).toBeUndefined();
+		expect(ledger.getUnit("stub")!.state).toBe("planned");
+		expect(JSON.parse(ledger.getUnit("stub")!.meta).retryNote).toMatch(/net\(\) returns 0/);
+		expect(JSON.parse(ledger.getUnit("stub")!.meta).retryNote).not.toMatch(/gone/);
+		// stub's last transition is still the old re-open: judged again next time, but never re-opened twice
+		expect(ledger.transitionsOf("unit", "stub").filter((t) => t.to_state === "planned")).toHaveLength(1);
 	});
 
 	it("re-runs the ported tests on main: red ones send the unit back, code kept", async () => {

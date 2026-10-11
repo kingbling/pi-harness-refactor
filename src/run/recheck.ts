@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import pc from "picocolors";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
@@ -9,6 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { notFromOldCode, type TruthCase } from "./legacy-env.ts";
 import { run } from "./gate.ts";
 import { placementDir, placeUnit } from "./placement.ts";
+import { projectDir } from "../init/init.ts";
 import { Semaphore } from "./pool.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
 
@@ -18,7 +19,9 @@ import { reviewWithModel, type Reviewer } from "./review.ts";
  * tests run again on the main project, and the reviewer model judges the unit's files as they are now (later
  * units, tidy and repairs change accepted code; the original commit is only context). A unit that fails goes back to planned
  * with its code kept on the branch: the next run starts from it with the findings as its note. Each unit is
- * rechecked once (meta.rechecked); --again repeats.
+ * rechecked once (meta.rechecked); --again repeats. A unit recheck sent back that has not run since is judged again
+ * (an earlier recheck may have been wrong): clean now → accepted again, code and history as before; otherwise its
+ * note holds the new findings.
  */
 export interface RecheckOptions {
 	ledger: Ledger;
@@ -32,12 +35,22 @@ export interface RecheckOptions {
 	log?: (l: string) => void;
 }
 
-export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: number; reopened: string[]; notJudged: number }> {
+/** Bump when recheck's checks change: units an older recheck sent back (and nothing ran since) are judged once more. */
+export const RECHECK_VERSION = 2;
+
+export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: number; reopened: string[]; notJudged: number; restored: string[] }> {
 	const log = o.log ?? ((l: string) => console.log(l));
+	// sent back by an older recheck and nothing ran since (its last transition is that re-open); truth it threw away cannot come back
+	const sentBack = (u: { id: string; state: string; meta: string }) =>
+		u.state === "planned" &&
+		JSON.parse(u.meta).recheckVersion !== RECHECK_VERSION &&
+		/^recheck: /.test(o.ledger.transitionsOf("unit", u.id).at(-1)?.reason ?? "") &&
+		(["truth_green_on_old", "truth_read", "truth_none"] as const).some((t) => o.ledger.hasEvidence(u.id, t));
 	const units = o.ledger
 		.listUnits()
-		.filter((u) => u.state === "accepted" && !isDbUnitKind(u.kind) && (o.again || !JSON.parse(u.meta).rechecked))
+		.filter((u) => !isDbUnitKind(u.kind) && ((u.state === "accepted" && (o.again || !JSON.parse(u.meta).rechecked)) || sentBack(u)))
 		.slice(0, o.limit ?? Infinity);
+	const restored: string[] = [];
 	const source = getSourceAdapter(o.config.source.stack);
 	const lanes = new Semaphore(o.config.run.agentConcurrency);
 	// test runs are CPU-bound: few at once, like the gate
@@ -51,6 +64,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 		units.map((u) =>
 			lanes.run(async () => {
 				const meta = JSON.parse(u.meta) as { files?: string[]; commit?: string };
+				const again = u.state === "planned";
 				const findings: string[] = [];
 				// 1. truth said "run on the old code": did the old code produce it?
 				const truthDir = join(o.root, ".bigrefactor", "truth", u.id);
@@ -66,21 +80,23 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 				}
 				const place = placeUnit(o.config, u.meta, o.root);
 				const adapter = await getTargetAdapter(place.stackId);
+				// the unit's paths (ported tests, moves) are relative to its stack's project, not the repo root
+				const dir = projectDir(o.config, place.stackId);
 				// 2. the ported tests (one per truth case) still green on main
 				const ported = [...new Set((o.ledger.db.prepare("SELECT ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(u.id) as Array<{ p: string }>).map((r) => r.p))];
-				const gone = ported.filter((f) => !existsSync(join(main, f)));
-				const tests = ported.filter((f) => existsSync(join(main, f)));
+				const gone = ported.filter((f) => !existsSync(join(dir, f)));
+				const tests = ported.filter((f) => existsSync(join(dir, f)));
 				if (gone.length) findings.push(`ported tests are gone from the main branch: ${gone.join(", ")}`);
 				if (tests.length) {
-					const t = adapter.test(main, tests);
-					const res = await gates.run(() => runTests(t.cmd, t.args, main));
+					const t = adapter.test(dir, tests);
+					const res = await gates.run(() => runTests(t.cmd, t.args, dir));
 					if (!res.ok) findings.push(`the ported tests fail on the main branch now:\n${res.output.slice(-2500)}`);
 				}
 				// 3. the reviewer on the unit's files as they are now: where its moves point, plus its commit's files still there
-				const files = currentFiles(o.ledger, u.id, main, meta.commit);
+				const files = currentFiles(o.ledger, u.id, main, dir, meta.commit);
 				if (files.length) {
 					const ra = o.ledger.startAttempt(u.id, "review", o.config.models.escalate.id);
-					const r = await (o.reviewer ?? reviewWithModel)({ ledger: o.ledger, config: o.config, root: o.root, unitId: u.id, adapter, targetProjectDir: main, moduleDir: placementDir(adapter.layout, place), legacyFiles: meta.files ?? [], changedFiles: files, testFiles: tests, commit: meta.commit, recheck: true, transcriptPath: join(o.root, ".bigrefactor", "sessions", `${u.id}.recheck.${ra}.jsonl`) }).catch((e) => ({ ok: true, judged: false, output: `not judged: ${e?.message ?? e}`, costUsd: 0 }));
+					const r = await (o.reviewer ?? reviewWithModel)({ ledger: o.ledger, config: o.config, root: o.root, unitId: u.id, adapter, targetProjectDir: dir, moduleDir: placementDir(adapter.layout, place), legacyFiles: meta.files ?? [], changedFiles: files, testFiles: tests, commit: meta.commit, recheck: true, transcriptPath: join(o.root, ".bigrefactor", "sessions", `${u.id}.recheck.${ra}.jsonl`) }).catch((e) => ({ ok: true, judged: false, output: `not judged: ${e?.message ?? e}`, costUsd: 0 }));
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output, recheck: true } });
 					const rr = r as { outOfScope?: string; weakTests?: string };
 					if (!r.judged) notJudged++;
@@ -90,7 +106,23 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 						log(pc.yellow(`? ${u.id}: problems outside its files — asked, unit stays accepted`));
 					} else if (!r.ok) findings.push(r.output);
 				}
-				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString() } });
+				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString(), recheckVersion: RECHECK_VERSION } });
+				const note = `This unit was accepted before, and its code stays on the branch. A later check found problems; start from the existing code and fix them:\n${findings.join("\n")}`;
+				if (again) {
+					if (findings.length) {
+						o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), retryNote: note } });
+						return;
+					}
+					try {
+						o.ledger.undoReopen(u.id, "recheck: clean when judged again; the earlier re-open was wrong");
+						o.ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.retryNote') WHERE id = ?").run(u.id);
+						restored.push(u.id);
+						log(pc.green(`↻ ${u.id}: accepted again (the earlier recheck was wrong)`));
+					} catch (e) {
+						log(pc.yellow(`${u.id}: clean now but cannot be accepted again (${(e as Error).message}); it stays planned`));
+					}
+					return;
+				}
 				if (!findings.length) return;
 				reopenUnit(o.ledger, u.id, `This unit was accepted before, and its code stays on the branch. A later check found problems; start from the existing code and fix them:\n${findings.join("\n")}`, `recheck: ${findings.join(" ").slice(0, 200)}`, badTruth);
 				reopened.push(u.id);
@@ -98,8 +130,8 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 			}),
 		),
 	);
-	log(pc.cyan(`recheck: ${units.length} checked, ${reopened.length} back to planned${notJudged ? `, ${notJudged} not judged (reviewer failed; br recheck --again)` : ""}`));
-	return { checked: units.length, reopened, notJudged };
+	log(pc.cyan(`recheck: ${units.length} checked, ${reopened.length} back to planned${restored.length ? `, ${restored.length} accepted again` : ""}${notJudged ? `, ${notJudged} not judged (reviewer failed; br recheck --again)` : ""}`));
+	return { checked: units.length, reopened, notJudged, restored };
 }
 
 /** An accepted unit back to planned with its code kept: symbols re-open, `note` is its next run's note; bad truth is redone. */
@@ -113,10 +145,14 @@ export function reopenUnit(ledger: Ledger, unitId: string, note: string, reason:
 	ledger.transitionUnit(unitId, "planned", reason.split("\n")[0]!.slice(0, 200));
 }
 
-/** The unit's files on main now: the files its moves point to, plus the files of its commit that still exist. */
-export function currentFiles(ledger: Ledger, unitId: string, main: string, commit?: string): string[] {
+/**
+ * The unit's files on main now, relative to its stack's project `dir`: the files its moves point to, plus the files
+ * of its commit (repo-relative in git, so only those inside `dir`) that still exist.
+ */
+export function currentFiles(ledger: Ledger, unitId: string, main: string, dir: string, commit?: string): string[] {
 	const targets = (ledger.db.prepare("SELECT target_symbols FROM moves WHERE unit_id = ? AND op != 'dropped'").all(unitId) as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!));
-	return [...new Set([...targets, ...(commit ? committedFiles(main, commit) : [])])].filter((f) => f && existsSync(join(main, f)));
+	const committed = (commit ? committedFiles(main, commit) : []).map((f) => relative(dir, join(main, f))).filter((f) => !f.startsWith(".."));
+	return [...new Set([...targets, ...committed])].filter((f) => f && existsSync(join(dir, f)));
 }
 
 function committedFiles(repo: string, sha: string): string[] {
