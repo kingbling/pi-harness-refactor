@@ -49,8 +49,8 @@ const SUBCOMMANDS: Record<string, string> = {
 	why: "why <id|path>: full history of a symbol or file",
 	unaccounted: "symbols not yet in a terminal state",
 	questions: "open questions waiting for you (list)",
-	requeue: "requeue <unit...> | --all: put quarantined or waiting units back into the queue (after a fix)",
-	recheck: "recheck [--limit N] [--again]: accepted units under the newer checks; failures go back to planned with their code kept (background)",
+	requeue: "requeue <unit...> | --all [--fresh]: put quarantined or waiting units back into the queue (after a fix); --fresh: the tester drafts the interface and tests again",
+	recheck: "recheck [--limit N] [--again] [--then-run]: accepted units under the newer checks; failures go back to planned with their code kept (background); --then-run starts the migration run when it is done",
 	answer: "answer: walk through the open questions one dialog at a time (identical ones together) · answer <id> <text>",
 	init: "init: give the old and the new folder; gathers data, asks the decisions, builds the workspace",
 	start: "start: same as init",
@@ -723,7 +723,10 @@ export default function (pi: ExtensionAPI) {
 					const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
 					try {
 						const r = await recheckAccepted({ ledger, config, root, limit: i >= 0 ? Number(rest[i + 1]) : undefined, again: rest.includes("--again"), log: (l) => progress.log(l) });
-						return { lines: [`${r.checked} checked · ${r.reopened.length} back to planned (code kept)${r.notJudged ? ` · ${r.notJudged} not judged` : ""}`, "continue with /br run"] };
+						const lines = [`${r.checked} checked · ${r.reopened.length} back to planned (code kept)${r.restored.length ? ` · ${r.restored.length} accepted again` : ""}${r.notJudged ? ` · ${r.notJudged} not judged` : ""}`];
+						// --then-run: the migration run starts right after (recheck and run never touch main at the same time)
+						if (rest.includes("--then-run")) return { lines: [...lines, "starting the migration run"], next: async () => startRun(pi, ctx, []) };
+						return { lines: [...lines, "continue with /br run"] };
 					} finally {
 						ledger.close();
 					}
@@ -904,11 +907,11 @@ export default function (pi: ExtensionAPI) {
 						text = `answered #${id}`;
 					}
 				} else if (sub === "requeue") {
-					if (!rest.length) text = "usage: /br requeue <unit-id...> | --all";
+					if (!rest.filter((a) => a !== "--fresh").length) text = "usage: /br requeue <unit-id...> | --all [--fresh]";
 					else {
 						const { requeueUnits } = await import("../run/run.ts");
 						const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
-						text = requeueUnits(ledger, config, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")), "human (pi)").join("\n");
+						text = requeueUnits(ledger, config, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")), "human (pi)", { fresh: rest.includes("--fresh") }).join("\n");
 					}
 				} else if (sub === "unaccounted") {
 					const rows = ledger.unaccounted();
