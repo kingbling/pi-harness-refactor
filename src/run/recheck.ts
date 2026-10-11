@@ -10,6 +10,7 @@ import { notFromOldCode, type TruthCase } from "./legacy-env.ts";
 import { run } from "./gate.ts";
 import { placementDir, placeUnit } from "./placement.ts";
 import { projectDir } from "../init/init.ts";
+import { mentionsCase } from "./ported.ts";
 import { Semaphore } from "./pool.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
 
@@ -36,7 +37,7 @@ export interface RecheckOptions {
 }
 
 /** Bump when recheck's checks change: units an older recheck sent back (and nothing ran since) are judged once more. */
-export const RECHECK_VERSION = 2;
+export const RECHECK_VERSION = 3;
 
 export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: number; reopened: string[]; notJudged: number; restored: string[] }> {
 	const log = o.log ?? ((l: string) => console.log(l));
@@ -51,6 +52,20 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 		.filter((u) => !isDbUnitKind(u.kind) && ((u.state === "accepted" && (o.again || !JSON.parse(u.meta).rechecked)) || sentBack(u)))
 		.slice(0, o.limit ?? Infinity);
 	const restored: string[] = [];
+	// every test file of a project with its text, read once per recheck (only when a recorded test path is gone)
+	const texts = new Map<string, Array<readonly [string, string]>>();
+	const testTexts = (dir: string, layout: { isTestFile: (f: string) => boolean }) => {
+		if (!texts.has(dir)) {
+			let files: string[] = [];
+			try {
+				files = execFileSync("git", ["ls-files"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).split("\n").filter((f) => f && layout.isTestFile(f));
+			} catch {
+				/* not a git checkout: nothing to find */
+			}
+			texts.set(dir, files.filter((f) => existsSync(join(dir, f))).map((f) => [f, readFileSync(join(dir, f), "utf8")] as const));
+		}
+		return texts.get(dir)!;
+	};
 	const source = getSourceAdapter(o.config.source.stack);
 	const lanes = new Semaphore(o.config.run.agentConcurrency);
 	// test runs are CPU-bound: few at once, like the gate
@@ -82,8 +97,14 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 				const adapter = await getTargetAdapter(place.stackId);
 				// the unit's paths (ported tests, moves) are relative to its stack's project, not the repo root
 				const dir = projectDir(o.config, place.stackId);
-				// 2. the ported tests (one per truth case) still green on main
-				const ported = [...new Set((o.ledger.db.prepare("SELECT ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(u.id) as Array<{ p: string }>).map((r) => r.p))];
+				// 2. the ported tests (one per truth case) still green on main. A test a later tidy moved or renamed is
+				//    found again by its case id (it is in the test's text) and the case is linked to its new file
+				const linked = o.ledger.db.prepare("SELECT id, ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(u.id) as Array<{ id: string; p: string }>;
+				for (const c of linked.filter((c) => !existsSync(join(dir, c.p)))) {
+					const now = testTexts(dir, adapter.layout).find(([, t]) => mentionsCase(t, c.id))?.[0];
+					if (now) (o.ledger.db.prepare("UPDATE truth_cases SET ported_test_path = ? WHERE id = ?").run(now, c.id), (c.p = now));
+				}
+				const ported = [...new Set(linked.map((c) => c.p))];
 				const gone = ported.filter((f) => !existsSync(join(dir, f)));
 				const tests = ported.filter((f) => existsSync(join(dir, f)));
 				if (gone.length) findings.push(`ported tests are gone from the main branch: ${gone.join(", ")}`);

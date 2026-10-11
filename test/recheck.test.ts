@@ -104,6 +104,23 @@ describe("br recheck", () => {
 		expect(ledger.transitionsOf("unit", "stub").filter((t) => t.to_state === "planned")).toHaveLength(1);
 	});
 
+	it("a ported test a tidy moved is found again by its case id and linked to its new file, not reported gone", async () => {
+		const { root, config, ledger } = workspace();
+		const { execFileSync } = await import("node:child_process");
+		const { renameSync } = await import("node:fs");
+		mkdirSync(join(root, "new", "test", "offer"), { recursive: true });
+		renameSync(join(root, "new", "src", "offer", "fine.spec.ts"), join(root, "new", "test", "offer", "net-price.spec.ts"));
+		execFileSync("git", ["init", "-q"], { cwd: join(root, "new") });
+		execFileSync("git", ["add", "-A"], { cwd: join(root, "new") });
+		const ran: string[][] = [];
+		const reviewer: Reviewer = async () => ({ ok: true, judged: true, output: "fine" });
+		const r = await recheckAccepted({ ledger, config, root, reviewer, runTests: async (_c, args) => (ran.push(args), { ok: true, output: "ok" }), log: () => {} });
+		expect(r.reopened).toEqual(["typed"]);
+		expect(ledger.getUnit("fine")!.state).toBe("accepted");
+		expect((ledger.db.prepare("SELECT ported_test_path p FROM truth_cases WHERE id = 'fine#1'").get() as { p: string }).p).toBe("test/offer/net-price.spec.ts");
+		expect(ran.some((a) => a.some((x) => x.includes("net-price.spec")))).toBe(true);
+	});
+
 	it("re-runs the ported tests on main: red ones send the unit back, code kept", async () => {
 		const { root, config, ledger } = workspace();
 		const ran: Array<{ args: string[]; cwd: string }> = [];
