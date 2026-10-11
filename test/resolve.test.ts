@@ -60,6 +60,37 @@ describe("resolver model before the owner", () => {
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => undefined });
 		expect(JSON.parse(ledger.getQuestion(b)!.context!).forOwner).toMatch(/fix job was tried and changed nothing/);
 	});
+
+	it("missing app code outside the unit runs a code job in the stack the resolver names; merged → answered", async () => {
+		const { CODE_JOB } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const a = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "the screen calls an endpoint that does not exist", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
+		const resolver: Resolver = async () => ({ code: "add GET /api/x returning the formatted totals", then: "retry", stack: "backend" });
+		const jobs: Array<[string, string | undefined]> = [];
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => "wrong job", codeJob: async (_q, what, stack) => (jobs.push([what, stack]), "added the endpoint with tests") });
+		expect(jobs).toEqual([["add GET /api/x returning the formatted totals", "backend"]]);
+		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again", answered_by: CODE_JOB });
+	});
+
+	it("a question handed to the owner gets one more try after the plugin changed, once per change", async () => {
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const q = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "u1 keeps failing", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
+		ledger.markForOwner(q, "the resolver model answered this 3 times and it came back");
+		let calls = 0;
+		const resolver: Resolver = async () => (calls++, { owner: "still nothing a model can do" });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, pluginChangedAt: 1 });
+		expect(calls).toBe(0); // handed on after that change
+		await new Promise((r) => setTimeout(r, 5));
+		const later = Date.now(); // the plugin changed after the question was handed on
+		await new Promise((r) => setTimeout(r, 5));
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, pluginChangedAt: later });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, pluginChangedAt: later });
+		expect(calls).toBe(1);
+	});
 });
 
 describe("the owner's question count", () => {

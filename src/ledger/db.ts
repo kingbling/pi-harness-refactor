@@ -316,7 +316,7 @@ export class Ledger {
 	}
 	/** The resolver model tried an open question and could not settle it: it waits for the owner, with the model's reason. */
 	markForOwner(id: number, why: string): void {
-		this.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.forOwner', ?) WHERE id = ? AND status = 'open'").run(why, id);
+		this.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.forOwner', ?, '$.forOwnerAt', ?) WHERE id = ? AND status = 'open'").run(why, Date.now(), id);
 	}
 	withdrawQuestion(id: number, reason: string): void {
 		this.db.prepare("UPDATE questions SET status = 'withdrawn', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'").run(`withdrawn: ${reason}`, now(), id);

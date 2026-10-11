@@ -35,6 +35,7 @@ import { maybeTidyReview } from "./tidy.ts";
 import { findTests } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
+import { runCodeJob } from "./code-job.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 
 /**
@@ -194,6 +195,14 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// Quarantined units heal too: something of their stack changed since (a setup fix, the old code's environment, the plugin)
 	// → back into the queue, every hour or sooner, up to run.maxAutoHeals times; then the owner is asked.
 	let askingStuck: Promise<unknown> | undefined;
+	// app code a unit needs outside its files: a code model writes it on main with tests (the stack the resolver names, else the unit's)
+	const codeJob = o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (q: QuestionRow, what: string, stack?: string) => {
+		const unit = q.unit_id ? ledger.getUnit(q.unit_id) : undefined;
+		const stackId = stack && config.target.stacks.includes(stack) ? stack : unit ? placeUnit(config, unit.meta, o.root).stackId : config.target.stacks.length === 1 ? config.target.stacks[0] : undefined;
+		const adapter = stackId ? adapters.get(stackId) : undefined;
+		if (!adapter) return undefined;
+		return runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), sha)) });
+	};
 	let resolving: Promise<unknown> | undefined;
 	// a question the resolver model traces to the project setup: the big setup model fixes it on main first
 	const fixJob = o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (q: QuestionRow, what: string, stack?: string) => {
@@ -220,7 +229,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
 		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
 		if (resolver)
-			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, log: (l) => log(pc.cyan(l)) })
+			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, codeJob, pluginChangedAt: PLUGIN_TIME, log: (l) => log(pc.cyan(l)) })
 				.then((r) => r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`)), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
 				.finally(() => (resolving = undefined));
 	};
@@ -967,7 +976,7 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 }
 
 /** When the plugin's own code last changed (an update may fix what quarantined a unit); read once per process. */
-const PLUGIN_TIME = (() => {
+export const PLUGIN_TIME = (() => {
 	let t = 0;
 	const walk = (d: string) => {
 		for (const n of readdirSync(d, { withFileTypes: true })) {

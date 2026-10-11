@@ -18,10 +18,13 @@ export const RESOLVER = "resolver model";
 /** Resolver answers on one point of one unit before the owner decides: a backstop, the model hands on earlier. */
 export const MAX_RESOLVER_TRIES = 3;
 
-export type Resolution = { answer: string; why: string } | { owner: string } | { fix: string; then: string; stack?: string };
+export type Resolution = { answer: string; why: string } | { owner: string } | { fix: string; then: string; stack?: string } | { code: string; then: string; stack?: string };
 /** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or undefined. */
 export type FixJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | undefined>;
 export const FIX_JOB = "setup model (fix job)";
+/** A code job: a model writes app code a unit needs but may not write (an endpoint, wiring, a shared fixture) on main, with tests. */
+export type CodeJob = FixJob;
+export const CODE_JOB = "code model (code job)";
 export type Resolver = (o: {
   config: Config;
   root: string;
@@ -37,17 +40,22 @@ export async function resolveOpenQuestions(d: {
   resolver?: Resolver;
   /** runs the fix a resolver asks for (fix_job); without it such questions go to the owner */
   fixJob?: FixJob;
+  /** runs the missing app code a resolver asks for (code_job); without it such questions go to the owner */
+  codeJob?: CodeJob;
+  /** when the plugin's code last changed: a question handed to the owner before that gets one more try (new tools may settle it) */
+  pluginChangedAt?: number;
   log?: (l: string) => void;
 }): Promise<{ answered: number; forOwner: number }> {
   let answered = 0;
   let forOwner = 0;
   for (const q of d.ledger.openQuestions()) {
     const ctx = q.context
-      ? (JSON.parse(q.context) as { forOwner?: string })
+      ? (JSON.parse(q.context) as { forOwner?: string; forOwnerAt?: number })
       : {};
-    if (ctx.forOwner !== undefined) continue;
+    const again = ctx.forOwner !== undefined && !!d.pluginChangedAt && (ctx.forOwnerAt ?? 0) < d.pluginChangedAt;
+    if (ctx.forOwner !== undefined && !again) continue;
     const earlier = triedBefore(d.ledger, q);
-    if (earlier.length >= MAX_RESOLVER_TRIES) {
+    if (earlier.length >= MAX_RESOLVER_TRIES && !again) {
       d.ledger.markForOwner(
         q.id,
         `the resolver model answered this ${earlier.length} times and it came back`,
@@ -64,19 +72,20 @@ export async function resolveOpenQuestions(d: {
       owner: `the resolver model failed: ${e?.message ?? e}`,
     }));
     if (d.ledger.getQuestion(q.id)?.status !== "open") continue; // answered meanwhile (owner, setup model …)
-    if (r && "fix" in r) {
-      // the question waits while the fix job runs; a fix answers it with the option the resolver chose (retry …)
-      const fixed = d.fixJob
-        ? await d.fixJob(q, r.fix, r.stack).catch((e) => (d.log?.(`fix job for question #${q.id} failed: ${e?.message ?? e}`), undefined))
+    if (r && ("fix" in r || "code" in r)) {
+      // the question waits while the job runs; a job that changed main answers it with the option the resolver chose (retry …)
+      const [kind, job, what, by] = "fix" in r ? (["fix job", d.fixJob, r.fix, FIX_JOB] as const) : (["code job", d.codeJob, r.code, CODE_JOB] as const);
+      const fixed = job
+        ? await job(q, what, r.stack).catch((e) => (d.log?.(`${kind} for question #${q.id} failed: ${e?.message ?? e}`), undefined))
         : undefined;
       if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
       if (!fixed) {
-        d.ledger.markForOwner(q.id, `a fix job was tried and changed nothing: ${r.fix}`);
+        d.ledger.markForOwner(q.id, `a ${kind} was tried and changed nothing: ${what}`);
         forOwner++;
         continue;
       }
-      d.ledger.answerQuestion(q.id, optionFor(q, r.then), FIX_JOB);
-      d.log?.(`question #${q.id} (${q.point}${q.unit_id ? ` ${q.unit_id}` : ""}) fixed by a fix job: ${fixed.slice(0, 160)} → ${answerValue(r.then)}`);
+      d.ledger.answerQuestion(q.id, optionFor(q, r.then), by);
+      d.log?.(`question #${q.id} (${q.point}${q.unit_id ? ` ${q.unit_id}` : ""}) fixed by a ${kind}: ${fixed.slice(0, 160)} → ${answerValue(r.then)}`);
       answered++;
       continue;
     }
@@ -101,10 +110,10 @@ function triedBefore(ledger: Ledger, q: QuestionRow): string[] {
   return (
     ledger.db
       .prepare(
-        "SELECT answered_at, answer FROM questions WHERE id != ? AND point = ? AND unit_id IS ? AND answered_by = ? ORDER BY id",
+        "SELECT answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND unit_id IS ? AND answered_by IN (?, ?, ?) ORDER BY id",
       )
-      .all(q.id, q.point, q.unit_id, RESOLVER) as Array<{ answered_at: string; answer: string }>
-  ).map((r) => `${r.answered_at}: ${r.answer}`);
+      .all(q.id, q.point, q.unit_id, RESOLVER, FIX_JOB, CODE_JOB) as Array<{ answered_at: string; answer: string; answered_by: string }>
+  ).map((r) => `${r.answered_at}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`);
 }
 
 export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) => {
@@ -143,9 +152,15 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) =
       ),
       tool(
         "fix_job",
-        "The cause is in the project setup (config, dependencies, tool files, wiring, assets, environment files), not in a unit's own code: a model with write access to the new project fixes it on main while this question waits. what: the problem and the change, concretely. then: the option value to answer once fixed (e.g. retry). stack: the target stack it is in, when the question names no unit.",
+        "The cause is in the project setup (config, dependencies, tool and build files, environment files), not in app code: a model with write access to the new project fixes it on main while this question waits. It writes no app code. what: the problem and the change, concretely. then: the option value to answer once fixed (e.g. retry). stack: the target stack it is in, when the question names no unit.",
         Type.Object({ what: Type.String(), then: Type.String(), stack: Type.Optional(Type.String()) }),
         (p) => ({ fix: p.what, then: p.then, stack: p.stack }),
+      ),
+      tool(
+        "code_job",
+        "App code the unit needs is missing outside the unit's own files (an endpoint or API its screen calls, a service another module must expose, wiring into an entry file or router, a shared test fixture): a model writes it with tests on main while this question waits, then the unit runs again. what: exactly what to write and where, the legacy behaviour it must keep, and who uses it. then: the option value to answer once merged (e.g. retry). stack: the target stack the code goes in (it can differ from the unit's stack: a frontend unit's missing endpoint goes in the backend stack).",
+        Type.Object({ what: Type.String(), then: Type.String(), stack: Type.Optional(Type.String()) }),
+        (p) => ({ code: p.what, then: p.then, stack: p.stack }),
       ),
       tool(
         "needs_owner",
@@ -157,8 +172,9 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) =
     systemPrompt: `An automated migration (${config.source.stack} → ${config.target.stacks.join(" + ")}) raised a question for its owner. Before the owner is bothered, you try to settle it. Legacy code: ${config.source.path}. New project: ${config.target.path}.
 Read the files the question is about with your tools, then call exactly one tool:
 - answer_question when the code, the facts and the owner's goals settle it. Never pick an option that says the owner did something (fixed the environment, raised a budget, edited a file by hand) — you cannot do that for them. A hint for the next attempt is fine when you found the cause and can say what to change.
-- fix_job when the cause is in the project setup and a model can change it (a missing file a config loads, a package, a service binding, a route, an env file): the fix runs first, the question waits; never send the owner a setup fix a model can make.
-- needs_owner when it needs something only a person can do or decide (credentials, money, a business choice, a fix outside the code).${goalsText(config.goals) ? `\n\n${goalsText(config.goals)}` : ""}`,
+- fix_job when the cause is in the project setup and a model can change it (a missing file a config loads, a package, a service binding, a tool config, an env file): the fix runs first, the question waits; never send the owner a setup fix a model can make.
+- code_job when app code is missing outside the unit's files (an endpoint, a service, wiring, a fixture the unit's tests need): a model writes it, the question waits. Missing code is never the owner's job, and "leave parked" or "retry" do not make it appear.
+- needs_owner only when it needs something only a person can do or decide (credentials, money, a business choice, something outside the code). Missing code, a missing wiring or a red check is never that.${goalsText(config.goals) ? `\n\n${goalsText(config.goals)}` : ""}`,
   });
   try {
     const brief = loadBrief(root);
@@ -172,7 +188,7 @@ Read the files the question is about with your tools, then call exactly one tool
           ? `Facts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 6000)}`
           : "",
         earlier?.length
-          ? `You answered this point for this unit before, and it came back:\n${earlier.map((e) => `- ${e}`).join("\n")}\nThe same answer again only helps when something changed since (check: git log of the new project, a setup fix, a different error in the facts) or with a hint that changes what the next attempt does. If the cause is in the setup, call fix_job. If nothing a model can do is left, call needs_owner and say what the owner must do.`
+          ? `You answered this point for this unit before, and it came back:\n${earlier.map((e) => `- ${e}`).join("\n")}\nThe same answer again only helps when something changed since (check: git log of the new project, a setup fix, a different error in the facts) or with a hint that changes what the next attempt does. If the cause is in the setup, call fix_job; if code outside the unit is missing, call code_job. If nothing a model can do is left, call needs_owner and say what the owner must do.`
           : "",
         brief ? `What the legacy repo is:\n${brief.slice(0, 4000)}` : "",
       ]
