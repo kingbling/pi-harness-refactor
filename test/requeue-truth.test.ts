@@ -59,4 +59,29 @@ describe("a requeue keeps the truth", () => {
 		expect(existsSync(join(ws, ".bigrefactor", "truth", "u1", "ported", SPEC))).toBe(true);
 		ledger.close();
 	});
+
+	it("--fresh: the interface and the kept tests go, so the tester drafts them again; the truth cases stay", () => {
+		const ws = join(here, ".sim", "requeue-fresh");
+		rmSync(ws, { recursive: true, force: true });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		for (const id of ["u1", "u2"]) {
+			ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+			write(join(ws, ".bigrefactor", "truth", id, "interface.md"), "# Deferred target interface\n");
+			write(join(ws, ".bigrefactor", "truth", id, "cases.json"), "[]");
+			write(join(ws, ".bigrefactor", "truth", id, "ported", SPEC));
+		}
+		ledger.transitionUnit("u1", "truth", "t");
+		ledger.transitionUnit("u1", "quarantined", "gate still red after 5 attempts (antigaming_ok)");
+		// u1 is quarantined, u2 still waits in the queue: both lose their draft
+		expect(requeueUnits(ledger, config, ws, ["u1", "u2"], "owner", { fresh: true })).toEqual(["u1: requeued", "u2: requeued"]);
+		for (const id of ["u1", "u2"]) {
+			expect(ledger.getUnit(id)!.state).toBe("planned");
+			expect(existsSync(join(ws, ".bigrefactor", "truth", id, "interface.md"))).toBe(false);
+			expect(existsSync(join(ws, ".bigrefactor", "truth", id, "ported"))).toBe(false);
+			expect(existsSync(join(ws, ".bigrefactor", "truth", id, "cases.json"))).toBe(true);
+		}
+		ledger.close();
+	});
 });

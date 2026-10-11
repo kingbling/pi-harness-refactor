@@ -316,7 +316,7 @@ export function proposeRuleTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "propose_rule",
 		label: "Propose rule",
-		description: `Propose an addition or change to the ${d.adapter.id} rules when you learn something other units will need (a convention, a reusable pattern, a pitfall in this codebase, a missing mapping). A curator merges proposals into the next rules version; changes that break already-migrated code are asked to the owner. Not for one-off details of this unit.`,
+		description: `Propose an addition or change to the ${d.adapter.id} rules when you learn something other units will need (a convention, a reusable pattern, a pitfall in this codebase, a missing mapping). A curator merges proposals into the next rules version; changes that break already-migrated code are asked to the owner. Not for one-off details of this unit. Rules say how code is written; the checks (gates, reviewer, ledger tools) are code and do not read them, so a rule about what a check must accept changes nothing: do not propose one (a wrong test goes to dispute_test, a blocker outside your files is reported in your final message).`,
 		promptSnippet: "propose_rule: suggest a rule the other units of this stack should follow",
 		parameters: Type.Object({
 			kind: Type.Union([Type.Literal("add"), Type.Literal("change")]),

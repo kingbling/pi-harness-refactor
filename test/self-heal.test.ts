@@ -93,6 +93,24 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.getUnit("U2")!.meta)).toMatchObject({ autoHeals: 0, retryNote: expect.stringMatching(/hint: the lint config was wrong/) });
 	});
 
+	it("the resolver model's retry is one more try, not a fresh set: a unit it keeps sending back runs out of tries", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
+		const { RESOLVER } = await import("../src/jev/resolve.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (antigaming_ok)");
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals } });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		ledger.answerQuestion(ledger.openQuestions()[0]!.id, "retry", RESOLVER);
+		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {})).toEqual(["U1"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals + 1, retryNote: expect.stringMatching(/the resolver model said to try again/) });
+		// it fails again: no automatic try is left, it is asked about again (the resolver hands it to the owner after its tries)
+		ledger.transitionUnit("U1", "truth", "t");
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (wired_ok)");
+		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { now: Date.now() + 9 * 60 * 60_000 })).toEqual([]);
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+	});
+
 	it("the same failure again with nothing changed is not retried: the unit is asked about, and a later fix still brings it back", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");

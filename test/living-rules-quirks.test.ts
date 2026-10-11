@@ -136,6 +136,24 @@ describe("living rules", () => {
 		expect(st(p2)).toBe("merged");
 		expect(rulesText(root, "nestjs")).toMatch(/Errors return 200/);
 	});
+	it("new curator guidance curates each stack's rules once, without new proposals: rules about what the checks accept go", async () => {
+		const { root, config, ledger } = setup();
+		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException\n- Gates must accept a unit that writes no code", { version: 1 });
+		let seen = "";
+		const client = new FakeModelClient({
+			chat: (req) => {
+				seen = req.messages[0]!.content;
+				return { json: { body: "## Errors\n- throw HttpException", merged: [], rejected: [], breaking: [] } };
+			},
+		});
+		expect((await maybeCurateRules({ ledger, config, root, client })).versions).toEqual({ nestjs: 2 });
+		expect(seen).toMatch(/Reject a proposal that tells a check, gate, reviewer or tool what it must accept/);
+		expect(rulesText(root, "nestjs")).not.toMatch(/Gates must accept/);
+		// done once: no new proposals, no new curation
+		seen = "";
+		expect((await maybeCurateRules({ ledger, config, root, client })).versions).toEqual({});
+		expect(seen).toBe("");
+	});
 	it("an out-of-date layout section is re-rendered from the adapter (body kept), so the layout check passes without anyone running br rules", async () => {
 		const { root, config, ledger } = setup();
 		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });

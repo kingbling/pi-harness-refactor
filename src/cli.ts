@@ -42,7 +42,8 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br order [--no-llm]          database units from the schema, then vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
   br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
-  br requeue <unit...>|--all   put quarantined or parked (waiting on an answered question) units back into the queue
+  br requeue <unit...>|--all [--fresh]   put quarantined or parked (waiting on an answered question) units back into the queue;
+                               --fresh: the tester drafts the interface and tests again (truth cases stay)
   br reopen <unit...> [--why text]   accepted units back to planned, code kept (e.g. DB units after br order changed the table plan)
   br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, ported tests on main, the reviewer model on the code as it is now); failures go back to planned, code kept
   br status                    ledger dashboard
@@ -217,10 +218,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	},
 	requeue: async (args) => {
 		// Put quarantined or waiting units back into the queue (after a fix). Worktree and branch are dropped; truth is kept.
-		if (!args.length) throw new Error("usage: br requeue <unit-id...> | --all");
+		if (!args.filter((a) => a !== "--fresh").length) throw new Error("usage: br requeue <unit-id...> | --all [--fresh]");
 		const { requeueUnits } = await import("./run/run.ts");
 		const { config, root, ledger } = open();
-		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human")) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
+		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human", { fresh: args.includes("--fresh") })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
 	},
 	reopen: async (args) => {
 		const { reopenUnit } = await import("./run/recheck.ts");

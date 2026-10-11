@@ -1,6 +1,6 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { loadCommandOverrides, setupLogPath } from "../adapters/command-overrides.ts";
@@ -29,7 +29,7 @@ import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDir
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals } from "../jev/ask.ts";
-import { resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
+import { RESOLVER, resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
 import { findTests } from "./ported.ts";
@@ -1163,7 +1163,9 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 			if (touches === false) ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healChecked', ?) WHERE id = ?").run(since, r.id);
 		}
 		if (meta.healQuestion) {
-			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it
+			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it.
+			// The resolver model's retry is one more try, not a fresh set: its answers on the same failure would
+			// otherwise put a unit back forever
 			const q = ledger.getQuestion(meta.healQuestion);
 			if (!q || (q.status !== "answered" && q.status !== "auto")) continue;
 			const a = applyParkedAnswer(q.answer ?? "", q.options ? (JSON.parse(q.options) as string[]) : []);
@@ -1171,7 +1173,8 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
 				continue;
 			}
-			backInQueue(ledger, config, root, r.id, 0, `This unit was quarantined (${why}); the owner said to try again.${a.hint ? ` The owner's hint: ${a.hint}` : ""}`, failure);
+			const byModel = q.answered_by === RESOLVER;
+			backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? "the resolver model" : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "resolver's" : "owner's"} hint: ${a.hint}` : ""}`, failure);
 			back.push(r.id);
 			continue;
 		}
@@ -1240,9 +1243,11 @@ export function keepPortedTests(config: Config, root: string, unitId: string, me
 
 /**
  * Put quarantined or waiting units back into the queue: open attempts end, worktree and branch go, truth stays.
- * Crash counts and "wait" holds are cleared; an owner's requeue is a fresh start. Returns what happened per id.
+ * Crash counts and "wait" holds are cleared; an owner's requeue is a fresh start. `fresh`: the tester drafts the
+ * interface and the tests again (its interface.md and kept tests go; the truth cases from the old code stay).
+ * Returns what happened per id.
  */
-export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string): string[] {
+export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean } = {}): string[] {
 	const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
 	const list = ids === "all" ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : ids;
 	const out: string[] = [];
@@ -1250,6 +1255,15 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 		const u = ledger.getUnit(id);
 		if (!u) {
 			out.push(`${id}: unknown unit`);
+			continue;
+		}
+		const dropDraft = () => {
+			for (const f of ["interface.md", "ported"]) rmSync(join(root, ".bigrefactor", "truth", id, f), { recursive: true, force: true });
+		};
+		if (o.fresh && u.state === "planned") {
+			// already waiting in the queue: only its draft goes
+			dropDraft();
+			out.push(`${id}: requeued`);
 			continue;
 		}
 		if (!stuck(u.state)) {
@@ -1264,7 +1278,8 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 			/* no branch */
 		}
 		ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.crashes', '$.hold', '$.parked') WHERE id = ?").run(id);
-		ledger.transitionUnit(id, "planned", `requeued by ${by}`);
+		if (o.fresh) dropDraft();
+		ledger.transitionUnit(id, "planned", `requeued by ${by}${o.fresh ? " (interface and tests drafted again)" : ""}`);
 		out.push(`${id}: requeued`);
 	}
 	return out;

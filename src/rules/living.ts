@@ -74,6 +74,9 @@ export async function refreshRulesLayout(d: Pick<AskDeps, "ledger"> & { root: st
  * Called by the scheduler after each accepted unit. Cheap no-op unless a stack has ≥ threshold proposals
  * (pending + approved). Without a client nothing is curated (proposals wait).
  */
+/** Bump when the curator's guidance changes: each stack's rules are curated once more under it, with or without new proposals. */
+export const CURATOR_VERSION = "2";
+
 export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { threshold?: number; force?: boolean } = {}): Promise<{ versions: Record<string, number>; asked: number; costUsd: number; refused: Array<{ stack: string; id: number; text: string; reason: string }> }> {
 	syncRuleAnswers(d);
 	const result = { versions: {} as Record<string, number>, asked: 0, costUsd: 0, refused: [] as Array<{ stack: string; id: number; text: string; reason: string }> };
@@ -85,8 +88,10 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 		const seenKey = `rules_seen:${stack}`;
 		const seen = Number(d.ledger.getMeta(seenKey) ?? "0");
 		const fresh = open.filter((p) => p.id > seen || p.status === "approved").length;
-		if (!fresh || (!opts.force && fresh < (opts.threshold ?? 5))) continue;
-		d.ledger.setMeta(seenKey, String(Math.max(seen, ...open.map((p) => p.id))));
+		const curatorKey = `rules_curator:${stack}`;
+		const newGuidance = d.ledger.getMeta(curatorKey) !== CURATOR_VERSION && existsSync(join(rulesDir(d.root, stack), "RULES.md"));
+		if (!newGuidance && (!fresh || (!opts.force && fresh < (opts.threshold ?? 5)))) continue;
+		d.ledger.setMeta(seenKey, String(Math.max(seen, 0, ...open.map((p) => p.id))));
 		const path = join(rulesDir(d.root, stack), "RULES.md");
 		const current = existsSync(path) ? stripLayout(readFileSync(path, "utf8")).trim() : "";
 		const role = d.config.models.escalate;
@@ -106,13 +111,15 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 				},
 			},
 			messages: [
-				{ role: "system", content: `You curate the coding rules for the ${stack} side of an automated migration. Agents follow these rules with tiny context: keep them concrete, short (≤ 150 lines), non-contradictory, grounded in the evidence. Merge proposals that generalize; reject one-off or wrong ones with a reason. A proposal is BREAKING when code written under the current rules would violate it — do not merge breaking ones unless their status is "approved"; list them under breaking. Never add a module layout section: the layout is generated separately and is binding.` },
+				{ role: "system", content: `You curate the coding rules for the ${stack} side of an automated migration. Agents follow these rules with tiny context: keep them concrete, short (≤ 150 lines), non-contradictory, grounded in the evidence. Merge proposals that generalize; reject one-off or wrong ones with a reason. A proposal is BREAKING when code written under the current rules would violate it — do not merge breaking ones unless their status is "approved"; list them under breaking. Never add a module layout section: the layout is generated separately and is binding.
+Rules tell agents how to write code. Reject a proposal that tells a check, gate, reviewer or tool what it must accept, allow or skip: the checks are code and never read these rules. Also reject (and drop from the body, if already there) any rule that lets a unit write no code for its own behaviour, defer that behaviour to other units, or keep tests that do not run the new code (skipped, empty, a constant checked against itself). Code another unit still owns is a stub marked TODO(br:<owning unit>), never a reason to build nothing.` },
 				{ role: "user", content: `Repo brief:\n${loadBrief(d.root).slice(0, 4000)}\n\nCurrent rules (v${rulesVersion(d, stack)}):\n${current}\n\nProposals:\n${JSON.stringify(open.map((p) => ({ id: p.id, kind: p.kind, status: p.status, text: p.text, why: p.why, evidence: p.evidence, unit: p.unit_id })), null, 1)}` },
 			],
 		});
 		result.costUsd += res.usage.costUsd;
 		const j = (res.json ?? {}) as { body?: string; merged?: number[]; rejected?: Array<{ id: number; reason: string }>; breaking?: Array<{ id: number; impact: string }> };
 		if (!j.body?.trim()) continue;
+		d.ledger.setMeta(curatorKey, CURATOR_VERSION);
 		const before = rulesVersion(d, stack);
 		const version = await saveRulesVersion(d, stack, j.body);
 		if (version !== before) result.versions[stack] = version;
