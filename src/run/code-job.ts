@@ -124,6 +124,9 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
  * changed tests pass. Undefined = green. Only what the job changed is checked: the rest of main is not its job.
  */
 async function check(adapter: TargetAdapter, dir: string, changed: string[]): Promise<string | undefined> {
+	// a deleted test checks nothing: the job may not make the check green by removing what was red
+	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
+	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));

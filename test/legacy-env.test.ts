@@ -49,6 +49,18 @@ describe("the old code's environment", () => {
 		const nothing: LegacyFixer = async () => (calls++, "looked around");
 		for (let i = 0; i < MAX_LEGACY_FIXES_PER_PROBLEM + 1; i++) expect(await fixLegacyEnv({ config, root, source, problem: "x", truthDir, signature: "truth: same", fixer: nothing })).toBeUndefined();
 		expect(calls).toBe(MAX_LEGACY_FIXES_PER_PROBLEM);
+		// the next run (its own config) gets its own tries
+		const next = { ...config };
+		expect(await fixLegacyEnv({ config: next, root, source, problem: "x", truthDir, signature: "truth: same", fixer: nothing })).toBeUndefined();
+		expect(calls).toBe(MAX_LEGACY_FIXES_PER_PROBLEM + 1);
+	});
+
+	it("the cases are the JSON array printed last; notices with a [ before it do not hide them", () => {
+		const { root, legacy, truthDir, config, source } = workspace();
+		writeFileSync(join(legacy, "app.sh"), `echo "Notice: [deprecated] something"\necho '[{"symbol":"a::b",'\necho ' "inputs":[],"expected":1}]'\n`);
+		expect(verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: true, cases: [{ symbol: "a::b" }] });
+		writeFileSync(join(legacy, "app.sh"), `echo "Warning: [x] could not connect"\n`);
+		expect(verifyTruthOnOld(truthDir, config, source, root).error).toMatch(/could not connect/);
 	});
 
 	it("the run command can change, but must run the script", async () => {

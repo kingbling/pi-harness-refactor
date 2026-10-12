@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -92,9 +92,14 @@ describe("the builder", () => {
 		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
 	});
 
-	it("what the model cannot fix becomes one question that blocks nothing", async () => {
+	it("what the model cannot fix becomes one question that blocks nothing, and is not repaired again while asked", async () => {
 		const { root, config, adapter, ledger, mergeFix } = setup();
-		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix, repair: async () => "tried", every: { units: 1, minutes: 60 } });
+		let calls = 0;
+		const repair: Repairer = async () => {
+			calls++;
+			return "tried";
+		};
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix, repair, every: { units: 1, minutes: 60 } });
 		b.afterMerge("fake");
 		await b.finish();
 		b.afterMerge("fake");
@@ -102,5 +107,23 @@ describe("the builder", () => {
 		const qs = ledger.openQuestions();
 		expect(qs).toHaveLength(1);
 		expect(qs[0]).toMatchObject({ point: "build", blocks: "none" });
+		expect(calls).toBe(2); // the first cycle's two tries only
+	});
+
+	it("a test file the repair adds is deleted, not checked out, and the fix is merged", async () => {
+		const { root, target, config, adapter, ledger, mergeFix } = setup();
+		const repair: Repairer = async (o) => {
+			writeFileSync(join(o.dir, "src", "a.txt"), "ok\n");
+			mkdirSync(join(o.dir, "src", "new"));
+			writeFileSync(join(o.dir, "src", "new", "b.test.txt"), "a new test\n");
+			return "fixed a.txt";
+		};
+		const logs: string[] = [];
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: (l) => logs.push(l), linkAll: () => {}, mergeFix, repair, every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await b.finish();
+		expect(logs.join("\n")).toMatch(/fixed and merged/);
+		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
+		expect(existsSync(join(target, "src", "new", "b.test.txt"))).toBe(false);
 	});
 });

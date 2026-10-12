@@ -101,6 +101,42 @@ describe("the tidy job", () => {
 		expect(tidyTasks(ledger)[0]!.failure).toMatch(/src\/A\/Old\.txt still exists; src\/B\/New\.txt is missing/);
 	});
 
+	it("a worktree that cannot be made fails the task instead of holding its area back", async () => {
+		const { ledger, jobs } = setup();
+		const bad = { ...tidyTasks(ledger)[0]!, id: "T..7" }; // not a valid branch name: git worktree add fails
+		ledger.setMeta("tidy_tasks", JSON.stringify([bad]));
+		const j = jobs(mover(true));
+		j.next();
+		await j.busy;
+		expect(tidyTasks(ledger)[0]!.status).toBe("failed");
+		expect(j.holds("fake", "a")).toBe(false);
+	});
+
+	it("a unit merged into main while the job ran is checked too: its use of the old path makes the job red", async () => {
+		const { target, ledger, jobs } = setup();
+		const j = jobs(async (o) => {
+			const said = await mover(true)(o);
+			mkdirSync(join(target, "src", "C"), { recursive: true });
+			writeFileSync(join(target, "src", "C", "Use.txt"), "uses src/A/Old.txt\n");
+			commitAll(target, "a unit merged meanwhile");
+			return said;
+		});
+		j.next();
+		await j.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/\(build\)/);
+		expect(existsSync(join(target, "src", "A", "Old.txt"))).toBe(true);
+	});
+
+	it("a task whose question was withdrawn is dropped, not left asked forever", () => {
+		const { ledger } = setup();
+		const id = ledger.askQuestion({ point: "tidy", question: "move?", askedBy: "tidy" });
+		ledger.setMeta("tidy_tasks", JSON.stringify([{ ...tidyTasks(ledger)[0]!, questionId: id, status: "asked" }]));
+		ledger.withdrawQuestion(id, "gone");
+		expect(tidyTasks(ledger)).toEqual([]);
+	});
+
 	it("waits while a unit of the area runs; without a tidy job no unit is held back", async () => {
 		const { ledger, jobs } = setup();
 		let calls = 0;

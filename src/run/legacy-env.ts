@@ -121,8 +121,8 @@ export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: So
 	try {
 		const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script);
 		const out = execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
-		const start = out.indexOf("[");
-		const cases = JSON.parse(out.slice(start)) as TruthCase[];
+		const cases = lastJsonArray(out) as TruthCase[] | undefined;
+		if (!cases) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no JSON array of cases at its end; its output ends with:\n${out.trim().slice(-800) || "(nothing)"}` };
 		if (!Array.isArray(cases) || !cases.length) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases ${NO_CASES_HINT}` };
 		const bad = cases.filter((c) => typeof c.symbol !== "string");
 		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
@@ -132,6 +132,30 @@ export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: So
 	} catch (e: any) {
 		// stderr carries the runtime's own message ("Failed opening required …"); it is captured, never printed into the UI
 		return { ok: false, cases: [], error: [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || String(e?.message ?? e) };
+	}
+}
+
+/**
+ * The cases are the JSON array the script prints last: the output may start with notices or log lines that hold a
+ * "[" too, so it is read from the last line that starts an array that parses to the end (one line or pretty-printed).
+ */
+function lastJsonArray(out: string): unknown[] | undefined {
+	const lines = out.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		if (!lines[i]!.trimStart().startsWith("[")) continue;
+		try {
+			const v = JSON.parse(lines.slice(i).join("\n"));
+			if (Array.isArray(v)) return v;
+		} catch {
+			/* not the start of the array: look further up */
+		}
+	}
+	// the array printed right after other text on the same line
+	try {
+		const v = JSON.parse(out.slice(out.indexOf("[")));
+		return Array.isArray(v) ? v : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -316,7 +340,9 @@ export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
 export const ownerPreference = (truth: Record<string, string>) => `\nThe owner's preference for how the old app runs (from setup): ${JSON.stringify(truth)} (paths relative to the legacy repo). It is a preference, not a requirement: if this machine lacks what it needs (e.g. a tool that is not installed), use what the machine has instead.`;
 
 let fixing: Promise<string | undefined> | undefined;
-const tries = new Map<string, number>();
+// per run: every run loads its own config object, so the counts start over with it (Pi keeps this module loaded
+// across runs of one session; one shared budget would leave later runs with no fixes at all)
+const triesByRun = new WeakMap<Config, Map<string, number>>();
 /** Tries per problem (the same error in different units), and in all: the run goes on, units then ask the owner. */
 export const MAX_LEGACY_FIXES_PER_PROBLEM = 2;
 export const MAX_LEGACY_FIXES = 10;
@@ -331,6 +357,7 @@ export async function fixLegacyEnv(o: { config: Config; root: string; source: So
 		const said = await fixing;
 		return said && verifyTruthOnOld(o.truthDir, o.config, o.source, o.root).ok ? said : undefined;
 	}
+	const tries = triesByRun.get(o.config) ?? triesByRun.set(o.config, new Map()).get(o.config)!;
 	if ((tries.get(o.signature) ?? 0) >= MAX_LEGACY_FIXES_PER_PROBLEM || (tries.get("") ?? 0) >= MAX_LEGACY_FIXES) return undefined;
 	tries.set(o.signature, (tries.get(o.signature) ?? 0) + 1);
 	tries.set("", (tries.get("") ?? 0) + 1);
