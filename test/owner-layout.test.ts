@@ -8,7 +8,7 @@ import { validateManifest } from "../src/adapters/target/generated.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { layoutRulesPath, loadLayoutRules, normalize, validateLayoutRules } from "../src/rules/layout-rules.ts";
-import { askLayout, draftLayout, layoutPreview, ownerRule } from "../src/rules/owner-layout.ts";
+import { askLayout, draftLayout, layoutJob, layoutPreview, ownerRule } from "../src/rules/owner-layout.ts";
 
 /** The owner decides the layout: the framework's convention at onboarding, plain-words changes, nothing applied unasked. */
 const ui = (answers: string[], texts: string[] = []) => {
@@ -71,6 +71,26 @@ describe("owner layout", () => {
 		const style = answer({ checkable: false, summary: "", reason: "this is about code style, not folders", rules: NEST_LAYOUT, mustPass: [], mustFail: [] });
 		expect(await ownerRule({ root, stack: "nestjs", adapter: nestjsAdapter, words: "use early returns", ui: ui([]) as never, client: style, model: "m", ledger })).toMatch(/^not a folder rule the checker can enforce \(this is about code style/);
 		expect(ledger.db.prepare("SELECT text, why FROM rule_proposals").all()).toEqual([{ text: "use early returns", why: "owner (/br rule)" }]);
+	});
+
+	it("the resolver's layout job: a change that only allows more is applied; one that breaks code on main goes to the owner", async () => {
+		const { mkdirSync, writeFileSync } = await import("node:fs");
+		const { saveLayoutRules } = await import("../src/rules/layout-rules.ts");
+		const root = mkdtempSync(join(tmpdir(), "br-lj-"));
+		const projectDir = mkdtempSync(join(tmpdir(), "br-lj-p-"));
+		mkdirSync(join(projectDir, "src/invoice"), { recursive: true });
+		mkdirSync(join(projectDir, "src/invoice/lib"), { recursive: true });
+		writeFileSync(join(projectDir, "src/invoice/lib/money.ts"), "export const cents = (n: number) => n * 100;\n");
+		saveLayoutRules(root, "nestjs", NEST_LAYOUT);
+		const wider = { ...NEST_LAYOUT, files: [...NEST_LAYOUT.files, { path: "webauthn/{name}.ts", doc: "the WebAuthn library" }] };
+		const ok = answer({ checkable: true, summary: "allow webauthn/<name>.ts", reason: "", rules: wider, mustPass: ["webauthn/cbor.ts"], mustFail: [] });
+		expect(await layoutJob({ root, stack: "nestjs", adapter: nestjsAdapter, words: "allow webauthn/{name}.ts", client: ok, model: "m", projectDir })).toEqual({ applied: "allow webauthn/<name>.ts" });
+		expect(loadLayoutRules(root, "nestjs")!.files.some((f) => f.path === "webauthn/{name}.ts")).toBe(true);
+		const narrower = { ...wider, files: wider.files.filter((f) => f.path !== "lib/{name}.ts") };
+		const bad = answer({ checkable: true, summary: "no lib folder", reason: "", rules: narrower, mustPass: [], mustFail: [] });
+		const r = await layoutJob({ root, stack: "nestjs", adapter: nestjsAdapter, words: "drop lib/", client: bad, model: "m", projectDir });
+		expect(r).toMatchObject({ owner: expect.stringMatching(/would make code already on main wrong .*lib\/money\.ts/) });
+		expect(loadLayoutRules(root, "nestjs")!.files.some((f) => f.path === "lib/{name}.ts")).toBe(true);
 	});
 
 	it("generated stacks: layout.rules in the manifest are checked like an owner's", () => {

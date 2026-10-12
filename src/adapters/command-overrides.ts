@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { TargetAdapter } from "./types.ts";
 
@@ -21,6 +21,15 @@ export function overridesPath(root: string, stackId: string): string {
 /** One line per setup fix made during the run: a new line means parked units may work now. */
 export function setupLogPath(root: string, stackId: string): string {
 	return join(root, ".bigrefactor", "commands", `${stackId}.fixes.log`);
+}
+
+/**
+ * Log a fix that landed for a stack (a setup fix, a resolver's code job, a widened layout, a builder repair): the
+ * quarantine heal pass sees the new line and re-checks the units it may unblock right away, without waiting an hour.
+ */
+export function noteFix(root: string, stackId: string, sha: string | undefined, what: string): void {
+	mkdirSync(dirname(setupLogPath(root, stackId)), { recursive: true });
+	appendFileSync(setupLogPath(root, stackId), `${new Date().toISOString()} ${sha ?? "override"} ${what.replace(/\s+/g, " ")}\n`);
 }
 
 export function loadCommandOverrides(root: string | undefined, stackId: string): CommandOverrides {

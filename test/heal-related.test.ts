@@ -71,7 +71,7 @@ describe("self-heal wakes only units a change concerns", () => {
 		expect(await heal(change)).toEqual([]);
 		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
 		const state = (asked()[0]!.req as { state: { changes: string; failure: string } }).state;
-		expect(state.changes).toMatch(/setup fix: .*catch-all route/);
+		expect(state.changes).toMatch(/fix: .*catch-all route/);
 		expect(state.failure).toMatch(/memory size of 134217728 bytes exhausted/);
 		// the same change: the model is not asked again
 		expect(await heal(change)).toEqual([]);

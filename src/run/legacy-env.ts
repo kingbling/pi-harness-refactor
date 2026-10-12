@@ -313,7 +313,7 @@ export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
 };
 
 /** The owner's setup answer is a preference, never a reason to give up: what this machine lacks is worked around. */
-const ownerPreference = (truth: Record<string, string>) => `\nThe owner's preference for how the old app runs (from setup): ${JSON.stringify(truth)} (paths relative to the legacy repo). It is a preference, not a requirement: if this machine lacks what it needs (e.g. a tool that is not installed), use what the machine has instead.`;
+export const ownerPreference = (truth: Record<string, string>) => `\nThe owner's preference for how the old app runs (from setup): ${JSON.stringify(truth)} (paths relative to the legacy repo). It is a preference, not a requirement: if this machine lacks what it needs (e.g. a tool that is not installed), use what the machine has instead.`;
 
 let fixing: Promise<string | undefined> | undefined;
 const tries = new Map<string, number>();

@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
-import { loadCommandOverrides, saveCommandOverride, saveWorktreeCopy, setupLogPath } from "../adapters/command-overrides.ts";
+import { loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -243,8 +243,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });
 		if (!sha && !override) return (wasted(), undefined);
 		const what = said || "the setup was changed";
-		mkdirSync(dirname(setupLogPath(o.root, key)), { recursive: true });
-		appendFileSync(setupLogPath(o.root, key), `${new Date().toISOString()} ${sha ?? "override"} ${what.replace(/\s+/g, " ")}\n`);
+		noteFix(o.root, key, sha, what);
 		return what;
 	})().finally(() => fixing.delete(key));
 	fixing.set(key, p);

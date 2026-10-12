@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import pc from "picocolors";
 import { findConfigPath, loadConfig, statePath, type Config } from "./config.ts";
 import { Ledger } from "./ledger/db.ts";
@@ -45,6 +45,8 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br requeue <unit...>|--all [--fresh]   put quarantined or parked (waiting on an answered question) units back into the queue;
                                --fresh: the tester drafts the interface and tests again (truth cases stay)
   br reopen <unit...> [--why text]   accepted units back to planned, code kept (e.g. DB units after br order changed the table plan)
+  br parity --probe [--again]  can the old app and the new app each start here as a local server? a setup model finds out, code starts each once to confirm
+  br parity <slice> [--rewrite] [--no-judge]  send the same requests to the old app (twice) and the new app, compare the answers and the written data; a judge model re-opens the units that answer wrong and turns odd old behaviour into quirks for you (br run does this by itself when a slice is finished); --rewrite writes the requests anew
   br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, ported tests on main, the reviewer model on the code as it is now); failures go back to planned, code kept
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
@@ -234,6 +236,43 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 			if (ledger.getUnit(id)?.state !== "accepted") console.log(pc.yellow(`${id}: ${ledger.getUnit(id)?.state ?? "unknown"}; only accepted units are re-opened`));
 			else (reopenUnit(ledger, id, `The owner re-opened this accepted unit (its code stays on the branch): ${why}`, `re-opened by the owner: ${why}`), console.log(pc.green(`${id}: back to planned, code kept`)));
 		}
+	},
+	parity: async (args) => {
+		const slice = args.find((a) => !a.startsWith("--"));
+		if (!args.includes("--probe") && !slice) throw new Error("usage: br parity --probe [--again] | br parity <slice> [--rewrite]");
+		const { probeApps } = await import("./run/parity.ts");
+		const { linkDependencies } = await import("./run/run.ts");
+		const { loadCommandOverrides } = await import("./adapters/command-overrides.ts");
+		const { getTargetAdapter } = await import("./adapters/registry.ts");
+		const { projectDir } = await import("./init/init.ts");
+		const { answerValue, askViaModel } = await import("./jev/ask.ts");
+		const { config, root, ledger } = open();
+		const client = makeClient();
+		const adapters = await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const));
+		const linkAll = (wt: string) => {
+			for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(root, id).worktreeCopy ?? []);
+		};
+		if (slice) {
+			const { checkSlice } = await import("./run/parity-check.ts");
+			const serverStack = adapters.find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
+			const r = await checkSlice({ ledger, config, root, slice, linkAll, serverStack, rewrite: args.includes("--rewrite") });
+			if (r.runId !== undefined && r.outcome === "differs" && !args.includes("--no-judge")) {
+				const { judgeRun } = await import("./run/parity-judge.ts");
+				await judgeRun({ ledger, config, root, runId: r.runId, slice, client });
+			}
+			for (const d of r.diffs.slice(0, 30)) console.log(`  ${d.step} ${d.route} ${d.kind}${d.path ? ` ${d.path}` : ""}: old ${JSON.stringify(d.legacy)?.slice(0, 120)} · new ${JSON.stringify(d.target)?.slice(0, 120)}`);
+			if (r.diffs.length > 30) console.log(pc.dim(`  … ${r.diffs.length - 30} more (ledger: parity_diffs, run ${r.runId})`));
+			return;
+		}
+		const up = await probeApps({
+			config,
+			root,
+			linkAll,
+			again: args.includes("--again"),
+			ask: async (q) => (await askViaModel({ ledger, config, root, client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
+			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
+		});
+		for (const [side, ok] of Object.entries(up)) console.log(`${side.padEnd(12)} ${ok ? pc.green("starts") : pc.yellow("does not start")}`);
 	},
 	recheck: async (args) => {
 		const { recheckAccepted } = await import("./run/recheck.ts");

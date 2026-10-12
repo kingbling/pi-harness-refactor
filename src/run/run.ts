@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
-import { loadCommandOverrides, setupLogPath } from "../adapters/command-overrides.ts";
+import { loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { createBuilder, type Repairer } from "./builder.ts";
@@ -201,7 +201,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const stackId = stack && config.target.stacks.includes(stack) ? stack : unit ? placeUnit(config, unit.meta, o.root).stackId : config.target.stacks.length === 1 ? config.target.stacks[0] : undefined;
 		const adapter = stackId ? adapters.get(stackId) : undefined;
 		if (!adapter) return undefined;
-		return runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), sha)) });
+		let merged: string | undefined;
+		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		// a fix on main may unblock quarantined units too, not only the ones waiting on this question
+		if (said && stackId) noteFix(o.root, stackId, merged, `code job q${q.id}: ${said}`);
+		return said;
 	};
 	let resolving: Promise<unknown> | undefined;
 	// a question the resolver model traces to the project setup: the big setup model fixes it on main first
@@ -212,6 +216,17 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (!stackId || !adapter) return undefined;
 		const sameAs = q.context ? (JSON.parse(q.context) as { sameAs?: string }).sameAs : undefined;
 		return fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, stackId), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: sameAs ?? `question ${q.id}`, problem: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once the setup is fixed. Fix the project setup, not a unit's own code.\n${q.question}${q.context ? `\nFacts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 3000)}` : ""}` });
+	};
+	// a path the folder check keeps refusing because the layout has no slot for it: widen the layout (only more allowed)
+	const layoutJob = !o.client || o.spawn ? undefined : async (q: QuestionRow, what: string, stack?: string) => {
+		const unit = q.unit_id ? ledger.getUnit(q.unit_id) : undefined;
+		const stackId = unit ? placeUnit(config, unit.meta, o.root).stackId : stack && config.target.stacks.includes(stack) ? stack : config.target.stacks.length === 1 ? config.target.stacks[0] : undefined;
+		const adapter = stackId ? adapters.get(stackId) : undefined;
+		if (!stackId || !adapter || !o.client) return undefined;
+		const { layoutJob: widen } = await import("../rules/owner-layout.ts");
+		const r = await merge.run(() => widen({ root: o.root, stack: stackId, adapter, words: what, client: o.client!, model: config.models.escalate.id, projectDir: projectDir(config, stackId), ledger }));
+		if ("applied" in r) noteFix(o.root, stackId, undefined, `layout widened (q${q.id}): ${r.applied}`);
+		return r;
 	};
 	const resubmitParked = () => {
 		// a slip in this pass is logged like the passes below, never the end of the run (units keep their state)
@@ -229,7 +244,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
 		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
 		if (resolver)
-			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, codeJob, pluginChangedAt: PLUGIN_TIME, log: (l) => log(pc.cyan(l)) })
+			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, codeJob, layoutJob, pluginChangedAt: PLUGIN_TIME, log: (l) => log(pc.cyan(l)) })
 				.then((r) => r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`)), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
 				.finally(() => (resolving = undefined));
 	};
@@ -289,8 +304,84 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		log,
 		linkAll,
 		repair: o.builderRepair ?? (o.spawn ? false : undefined),
-		mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)),
+		mergeFix: (wt, branch, what) =>
+			merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => {
+				pusher.afterMerge();
+				// builder/<stack>: the repair may unblock quarantined units of that stack
+				if (sha) noteFix(o.root, branch.split("/")[1] ?? "", sha, `builder repair: ${what.split("\n").at(-1)}`);
+				return sha;
+			}),
 	});
+	// parity: can the old app and the new app each start here as a local server? decided once per workspace, on the
+	// side (lanes never wait); a side that does not start asks the owner once, blocking nothing
+	const parityProbe =
+		o.dry || o.spawn || !isRepo(config.target.path)
+			? undefined
+			: import("./parity.ts")
+					.then(({ probeApps }) =>
+						probeApps({
+							config,
+							root: o.root,
+							linkAll,
+							log,
+							ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
+							answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
+						}),
+					)
+					.catch((e) => log(pc.yellow(`parity probe failed: ${e?.message ?? e} (the run goes on without comparing the apps)`)));
+	// parity checks: a slice whose units are all accepted is compared old vs new on the side, one slice at a time;
+	// the judge re-opens the units whose answers differ and turns odd old behaviour into quirks for the owner
+	const serverStack = [...adapters].find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
+	const parityQueue: string[] = [];
+	let parityRunning: Promise<void> | undefined;
+	let parityStopped = false;
+	const sliceOf = (unitId: string) => (JSON.parse(ledger.getUnit(unitId)?.meta ?? "{}") as { slice?: string }).slice;
+	const sliceDone = (slice: string) => {
+		const us = ledger.listUnits().filter((u) => (JSON.parse(u.meta) as { slice?: string }).slice === slice);
+		return us.length > 0 && us.every((u) => u.state === "accepted");
+	};
+	const pumpParity = () => {
+		if (parityRunning || parityStopped || !parityQueue.length) return;
+		const slice = parityQueue.shift()!;
+		parityRunning = (async () => {
+			await parityProbe;
+			const { loadApps } = await import("./parity.ts");
+			const apps = loadApps(o.root);
+			if (!apps["legacy"]?.up || !apps[serverStack]?.up || !sliceDone(slice)) return;
+			const { checkSlice } = await import("./parity-check.ts");
+			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log });
+			if (r.runId !== undefined && r.outcome === "differs") {
+				const { judgeRun } = await import("./parity-judge.ts");
+				await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log });
+			}
+		})()
+			.catch((e) => log(pc.yellow(`parity ${slice}: ${e?.message ?? e}`)))
+			.finally(() => {
+				parityRunning = undefined;
+				pumpParity();
+			});
+	};
+	const queueParity = (slice: string | undefined) => {
+		if (!parityProbe || !slice || parityQueue.includes(slice) || !sliceDone(slice)) return;
+		parityQueue.push(slice);
+		pumpParity();
+	};
+	if (parityProbe) {
+		// at the start: finished slices never compared, and slices waiting on quirks the owner has decided since
+		const checked = new Set((ledger.db.prepare("SELECT DISTINCT slice FROM parity_runs").all() as Array<{ slice: string }>).map((r) => r.slice));
+		const decided = (ledger.db.prepare("SELECT DISTINCT p.slice FROM parity_diffs p JOIN quirks q ON q.id = p.quirk_id WHERE p.status = 'quirk' AND q.status IN ('kept', 'dropped')").all() as Array<{ slice: string }>).map((r) => r.slice);
+		const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((x): x is string => !!x));
+		// and slices of units the owner said to retry after they ran out of parity re-opens: a fresh set, used once per answer
+		const answered: Array<string | undefined> = [];
+		for (const q of ledger.db.prepare("SELECT unit_id, MAX(id) AS id FROM questions WHERE point = 'parity' AND answer IS NOT NULL AND unit_id IS NOT NULL GROUP BY unit_id").all() as Array<{ unit_id: string; id: number }>) {
+			const meta = JSON.parse(ledger.getUnit(q.unit_id)?.meta ?? "{}") as { parityRetried?: number };
+			if (meta.parityRetried === q.id) continue;
+			const retry = answerValue(ledger.getQuestion(q.id)?.answer) === "retry";
+			ledger.updateUnit(q.unit_id, { meta: { parityRetried: q.id, ...(retry ? { parityReopens: 0 } : {}) } });
+			if (retry) answered.push(sliceOf(q.unit_id));
+		}
+		for (const sl of slices) if (!checked.has(sl) || decided.includes(sl) || answered.includes(sl)) queueParity(sl);
+	}
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
 	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
 	const curate = new Semaphore(1);
@@ -501,6 +592,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						if (!o.dry) {
 							builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							pusher.afterMerge();
+							queueParity(sliceOf(unitId));
 						}
 						// living rules: proposals from units are curated into a new rules version once enough piled up
 						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => {
@@ -801,6 +893,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		await new Promise((r) => setImmediate(r));
 	}
 	process.off("SIGINT", onSigint);
+	if (parityProbe) await waitOn("checking whether the old and the new app start", () => parityProbe);
+	// a stop finishes the running parity check only; otherwise the queued slices are compared before the run ends
+	if (stopRecord) parityStopped = true;
+	while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
 	if (!o.dry && !stopRecord) await waitOn("whole-project check of what was merged", () => builder.finish()).catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
 	if (!o.dry) await waitOn("pushing to the target repo's remote", () => pusher.finish());
@@ -1031,7 +1127,7 @@ function changesSince(config: Config, root: string, manifests: Map<string, { too
 				/* the commit is gone */
 			}
 		}
-		out.push(`setup fix: ${line}${diff ? `\n${capText(diff, 4000)}` : ""}`);
+		out.push(`fix: ${line}${diff ? `\n${capText(diff, 4000)}` : ""}`);
 	}
 	for (const f of fixFiles(config, root, manifests, stackId)) if (f !== logFile && mtime(f) > t) out.push(`changed: ${relative(root, f)}`);
 	if (PLUGIN_TIME > t) out.push("the plugin itself was updated");

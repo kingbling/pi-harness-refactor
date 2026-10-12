@@ -130,6 +130,18 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).stuck).toBeUndefined();
 	});
 
+	it("a fix job that lands (the resolver's code job, a widened layout, a builder repair) re-checks quarantined units at once", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { healQuarantined } = await import("../src/run/run.ts");
+		const { noteFix } = await import("../src/adapters/command-overrides.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (build_ok): Cannot find module '../shared/money'");
+		const heal = () => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {});
+		expect(await heal()).toEqual([]); // nothing changed, and the hour is not over
+		noteFix(root, "nestjs", "abc1234", "code job q7: added shared/money with tests");
+		expect(await heal()).toEqual(["U1"]);
+	});
+
 	it("units hitting the same problem share one question: no new question, all wait, one answer releases them all", async () => {
 		const { root, config, ledger, mk } = workspace();
 		for (const id of ["U1", "U2", "U3"]) mk(id, "billing", "implementing");

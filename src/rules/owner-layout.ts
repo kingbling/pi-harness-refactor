@@ -193,3 +193,21 @@ export async function ownerRule(o: { root: string; stack: string; adapter: Targe
 	await applyLayout({ root: o.root, stack: o.stack, rules: d.rules, ledger: o.ledger, projectDir: o.projectDir });
 	return `applied: ${d.summary}${impact.findings.length ? ` (${impact.findings.length} existing finding(s) recorded for cleanup)` : ""}`;
 }
+
+/**
+ * The resolver's layout job: the gate keeps rejecting a path the layout has no slot for (a library already on main
+ * in Security/WebAuthn/, a folder a framework needs). A model widens the layout in the resolver's words, checked like
+ * `/br rule`. Applied without asking when it only allows more (nothing on main breaks that did not before), like a
+ * rules addition; a change that makes existing code wrong goes to the owner.
+ */
+export async function layoutJob(o: { root: string; stack: string; adapter: TargetAdapter; words: string; client: ModelClient; model: string; projectDir: string; ledger?: Ledger }): Promise<{ applied: string } | { owner: string }> {
+	const current = loadLayoutRules(o.root, o.stack) ?? (o.adapter.layoutRules ? normalize(o.adapter.layoutRules) : undefined);
+	if (!current) return { owner: `the ${o.stack} stack has no layout.json to change` };
+	const d = await draftLayout({ client: o.client, model: o.model, stack: o.stack, current, words: `${o.words}\n\nOnly allow more: add a path, never remove or narrow one.` });
+	if (!d.ok) return { owner: `a layout change was tried and the checker refused it (${d.reason}): ${o.words}` };
+	const before = new Set(layoutImpact(o.projectDir, o.adapter, current).findings);
+	const broken = layoutImpact(o.projectDir, o.adapter, d.rules).findings.filter((f) => !before.has(f));
+	if (broken.length) return { owner: `the layout change "${d.summary}" would make code already on main wrong (${broken.length}, e.g. ${broken[0]}); /br rule ${o.stack}: ${o.words} applies it if you want it` };
+	await applyLayout({ root: o.root, stack: o.stack, rules: d.rules, ledger: o.ledger, projectDir: o.projectDir });
+	return { applied: d.summary };
+}

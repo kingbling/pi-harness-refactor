@@ -18,13 +18,16 @@ export const RESOLVER = "resolver model";
 /** Resolver answers on one point of one unit before the owner decides: a backstop, the model hands on earlier. */
 export const MAX_RESOLVER_TRIES = 3;
 
-export type Resolution = { answer: string; why: string } | { owner: string } | { fix: string; then: string; stack?: string } | { code: string; then: string; stack?: string };
+export type Resolution = { answer: string; why: string } | { owner: string } | { fix: string; then: string; stack?: string } | { code: string; then: string; stack?: string } | { layout: string; then: string; stack?: string };
 /** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or undefined. */
 export type FixJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | undefined>;
 export const FIX_JOB = "setup model (fix job)";
 /** A code job: a model writes app code a unit needs but may not write (an endpoint, wiring, a shared fixture) on main, with tests. */
 export type CodeJob = FixJob;
 export const CODE_JOB = "code model (code job)";
+/** A layout job: the stack's folder layout gets the slot the gate keeps refusing; applied when it only allows more, else the owner decides. */
+export type LayoutJob = (q: QuestionRow, what: string, stack?: string) => Promise<{ applied: string } | { owner: string } | undefined>;
+export const LAYOUT_JOB = "layout model (layout job)";
 export type Resolver = (o: {
   config: Config;
   root: string;
@@ -42,6 +45,8 @@ export async function resolveOpenQuestions(d: {
   fixJob?: FixJob;
   /** runs the missing app code a resolver asks for (code_job); without it such questions go to the owner */
   codeJob?: CodeJob;
+  /** widens a stack's folder layout as the resolver asks (layout_job); without it such questions go to the owner */
+  layoutJob?: LayoutJob;
   /** when the plugin's code last changed: a question handed to the owner before that gets one more try (new tools may settle it) */
   pluginChangedAt?: number;
   log?: (l: string) => void;
@@ -72,6 +77,21 @@ export async function resolveOpenQuestions(d: {
       owner: `the resolver model failed: ${e?.message ?? e}`,
     }));
     if (d.ledger.getQuestion(q.id)?.status !== "open") continue; // answered meanwhile (owner, setup model …)
+    if (r && "layout" in r) {
+      const done = d.layoutJob
+        ? await d.layoutJob(q, r.layout, r.stack).catch((e) => ({ owner: `the layout job failed: ${e?.message ?? e}` }))
+        : undefined;
+      if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
+      if (!done || "owner" in done) {
+        d.ledger.markForOwner(q.id, done?.owner ?? `a layout change is needed: ${r.layout}`);
+        forOwner++;
+        continue;
+      }
+      d.ledger.answerQuestion(q.id, optionFor(q, r.then), LAYOUT_JOB);
+      d.log?.(`question #${q.id} (${q.point}${q.unit_id ? ` ${q.unit_id}` : ""}) fixed by a layout job: ${done.applied.slice(0, 160)} → ${answerValue(r.then)}`);
+      answered++;
+      continue;
+    }
     if (r && ("fix" in r || "code" in r)) {
       // the question waits while the job runs; a job that changed main answers it with the option the resolver chose (retry …)
       const [kind, job, what, by] = "fix" in r ? (["fix job", d.fixJob, r.fix, FIX_JOB] as const) : (["code job", d.codeJob, r.code, CODE_JOB] as const);
@@ -110,9 +130,9 @@ function triedBefore(ledger: Ledger, q: QuestionRow): string[] {
   return (
     ledger.db
       .prepare(
-        "SELECT answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND unit_id IS ? AND answered_by IN (?, ?, ?) ORDER BY id",
+        "SELECT answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND unit_id IS ? AND answered_by IN (?, ?, ?, ?) ORDER BY id",
       )
-      .all(q.id, q.point, q.unit_id, RESOLVER, FIX_JOB, CODE_JOB) as Array<{ answered_at: string; answer: string; answered_by: string }>
+      .all(q.id, q.point, q.unit_id, RESOLVER, FIX_JOB, CODE_JOB, LAYOUT_JOB) as Array<{ answered_at: string; answer: string; answered_by: string }>
   ).map((r) => `${r.answered_at}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`);
 }
 
@@ -163,6 +183,12 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) =
         (p) => ({ code: p.what, then: p.then, stack: p.stack }),
       ),
       tool(
+        "layout_job",
+        "The folder check keeps rejecting a path because the stack's layout (.bigrefactor/rules/<stack>/layout.json) has no slot for it, and moving the file is wrong (code next to it on main already lives there, or the framework needs it there). A model adds that slot to the layout; it is applied when it only allows more, else the owner decides. what: the path(s) to allow as a pattern (e.g. Security/{sub}/{Name}.php) and why they belong there. then: the option value to answer once applied (e.g. retry). stack: the target stack.",
+        Type.Object({ what: Type.String(), then: Type.String(), stack: Type.Optional(Type.String()) }),
+        (p) => ({ layout: p.what, then: p.then, stack: p.stack }),
+      ),
+      tool(
         "needs_owner",
         "Only the owner can settle this: say why in one or two plain sentences (what they must do or decide).",
         Type.Object({ why: Type.String() }),
@@ -174,6 +200,7 @@ Read the files the question is about with your tools, then call exactly one tool
 - answer_question when the code, the facts and the owner's goals settle it. Never pick an option that says the owner did something (fixed the environment, raised a budget, edited a file by hand) — you cannot do that for them. A hint for the next attempt is fine when you found the cause and can say what to change.
 - fix_job when the cause is in the project setup and a model can change it (a missing file a config loads, a package, a service binding, a tool config, an env file): the fix runs first, the question waits; never send the owner a setup fix a model can make.
 - code_job when app code is missing outside the unit's files (an endpoint, a service, wiring, a fixture the unit's tests need): a model writes it, the question waits. Missing code is never the owner's job, and "leave parked" or "retry" do not make it appear.
+- layout_job when the folder check ("not an allowed file") keeps refusing a path and moving the file is wrong: look on main where code of the same kind already lives. A retry or a hint to "move it" does not help when nowhere allowed fits.
 - needs_owner only when it needs something only a person can do or decide (credentials, money, a business choice, something outside the code). Missing code, a missing wiring or a red check is never that.${goalsText(config.goals) ? `\n\n${goalsText(config.goals)}` : ""}`,
   });
   try {
@@ -188,7 +215,7 @@ Read the files the question is about with your tools, then call exactly one tool
           ? `Facts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 6000)}`
           : "",
         earlier?.length
-          ? `You answered this point for this unit before, and it came back:\n${earlier.map((e) => `- ${e}`).join("\n")}\nThe same answer again only helps when something changed since (check: git log of the new project, a setup fix, a different error in the facts) or with a hint that changes what the next attempt does. If the cause is in the setup, call fix_job; if code outside the unit is missing, call code_job. If nothing a model can do is left, call needs_owner and say what the owner must do.`
+          ? `You answered this point for this unit before, and it came back:\n${earlier.map((e) => `- ${e}`).join("\n")}\nThe same answer again only helps when something changed since (check: git log of the new project, a setup fix, a different error in the facts) or with a hint that changes what the next attempt does. If the cause is in the setup, call fix_job; if code outside the unit is missing, call code_job; if the folder layout has no slot for the path, call layout_job. If nothing a model can do is left, call needs_owner and say what the owner must do.`
           : "",
         brief ? `What the legacy repo is:\n${brief.slice(0, 4000)}` : "",
       ]

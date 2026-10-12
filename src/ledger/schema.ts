@@ -341,4 +341,30 @@ CREATE TABLE IF NOT EXISTS truth_cases (
   symbol_id TEXT NOT NULL, inputs TEXT NOT NULL, expected TEXT NOT NULL,
   verified_on_old INTEGER NOT NULL DEFAULT 0, ported_test_path TEXT, created_at TEXT NOT NULL
 );
+
+-- Differential parity: the same requests sent to the old and the new app, answers compared by code.
+CREATE TABLE IF NOT EXISTS parity_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slice TEXT NOT NULL,
+  outcome TEXT NOT NULL,              -- same|differs|error
+  steps INTEGER NOT NULL DEFAULT 0,
+  compared INTEGER NOT NULL DEFAULT 0,
+  note TEXT,
+  started_at TEXT NOT NULL, ended_at TEXT
+);
+CREATE TABLE IF NOT EXISTS parity_diffs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES parity_runs(id) ON DELETE CASCADE,
+  slice TEXT NOT NULL,
+  step TEXT NOT NULL,
+  route TEXT NOT NULL,
+  kind TEXT NOT NULL,                 -- status|redirect|body|data|error
+  path TEXT NOT NULL,                 -- where in the answer ('' = the whole answer)
+  legacy TEXT, target TEXT,           -- JSON
+  status TEXT NOT NULL DEFAULT 'open', -- open|bug|quirk|allowed (judge, then code: allowed = a quirk the owner dropped)
+  unit_id TEXT,                       -- the unit the judge holds responsible
+  quirk_id INTEGER REFERENCES quirks(id) ON DELETE SET NULL,
+  note TEXT                           -- the judge's words
+);
+CREATE INDEX IF NOT EXISTS parity_diffs_slice ON parity_diffs(slice, status);
 `;

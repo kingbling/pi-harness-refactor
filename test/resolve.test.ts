@@ -74,6 +74,23 @@ describe("resolver model before the owner", () => {
 		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again", answered_by: CODE_JOB });
 	});
 
+	it("a path the layout has no slot for runs a layout job: applied → answered; it would break code on main → the owner", async () => {
+		const { LAYOUT_JOB } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["symfony"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const ask = () => ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "Security/WebAuthn/WebAuthnException.php is not an allowed file", options: ["retry — try again", "leave — leave quarantined"], askedBy: "orchestrator" });
+		const resolver: Resolver = async () => ({ layout: "allow Security/{sub}/{Name}.php: the WebAuthn library is already there", then: "retry", stack: "symfony" });
+		const a = ask();
+		const jobs: Array<[string, string | undefined]> = [];
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, layoutJob: async (_q, what, stack) => (jobs.push([what, stack]), { applied: "Security/<sub>/<Name>.php allowed" }) });
+		expect(jobs).toEqual([["allow Security/{sub}/{Name}.php: the WebAuthn library is already there", "symfony"]]);
+		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again", answered_by: LAYOUT_JOB });
+		const b = ask();
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, layoutJob: async () => ({ owner: "it would make code already on main wrong" }) });
+		expect(JSON.parse(ledger.getQuestion(b)!.context!).forOwner).toMatch(/already on main wrong/);
+	});
+
 	it("a question handed to the owner gets one more try after the plugin changed, once per change", async () => {
 		const ledger = new Ledger(":memory:");
 		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
