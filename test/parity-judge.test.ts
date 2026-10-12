@@ -6,6 +6,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { renderStatus } from "../src/dashboard/status.ts";
 import { judgeRun, MAX_PARITY_REOPENS, type ParityJudge } from "../src/run/parity-judge.ts";
+import { MAX_PARITY_ERRORS, parityAgain } from "../src/run/run.ts";
 
 /**
  * The judge sorts each difference into a bug of the new app (the unit is re-opened with it) or a quirk of the old
@@ -108,5 +109,33 @@ describe("judging parity differences", () => {
 		];
 		expect(await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge, log: () => {} })).toMatchObject({ open: 2, reopened: [] });
 		expect(status(r)).toEqual(["open", "open"]);
+	});
+	it("an owner's leave is remembered: a later comparison that still differs does not ask again", async () => {
+		const { root, config, ledger, run, ids } = workspace();
+		ledger.updateUnit("U1", { meta: { parityReopens: MAX_PARITY_REOPENS, parityLeft: 7 } });
+		const r = run([{ step: "one", path: "body.total", legacy: 10, target: 11 }]);
+		const res = await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge: async () => [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "tax" }], log: () => {} });
+		expect(res.reopened).toEqual([]);
+		expect(ledger.openQuestions().filter((q) => q.point === "parity")).toHaveLength(0);
+	});
+
+	it("at run start: an error is compared again a few times, unjudged differences again, a decided quirk once", () => {
+		const { ledger, run, ids } = workspace();
+		const add = (slice: string, outcome: string) => ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES (?, ?, datetime('now'))").run(slice, outcome);
+		add("auth", "error");
+		add("users", "same");
+		expect(parityAgain(ledger)).toEqual({ checked: new Set(["auth", "users"]), again: new Set(["auth"]) });
+		for (let i = 1; i < MAX_PARITY_ERRORS; i++) add("auth", "error");
+		expect(parityAgain(ledger).again.has("auth")).toBe(false); // errored too often in a row: left alone
+		// differences nobody judged (the judge failed): compared again
+		const r = run([{ step: "one", path: "body.total", legacy: 10, target: 11 }]);
+		expect(parityAgain(ledger).again.has("invoices")).toBe(true);
+		// a quirk the owner decided: compared again once; a later run that judged it is not queued again
+		const quirk = Number(ledger.db.prepare("INSERT INTO quirks(unit_id, symbol_id, kind, behaviour, opinion, why, status, created_at) VALUES ('U1', 's', 'suspected_bug', 'b', 'drop', 'w', 'kept', datetime('now'))").run().lastInsertRowid);
+		ledger.db.prepare("UPDATE parity_diffs SET status = 'quirk', quirk_id = ? WHERE id = ?").run(quirk, ids(r)[0]!);
+		expect(parityAgain(ledger).again.has("invoices")).toBe(true);
+		const r2 = run([{ step: "one", path: "body.total", legacy: 10, target: 11 }]);
+		ledger.db.prepare("UPDATE parity_diffs SET status = 'bug', quirk_id = ? WHERE id = ?").run(quirk, ids(r2)[0]!);
+		expect(parityAgain(ledger).again.has("invoices")).toBe(false);
 	});
 });

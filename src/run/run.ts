@@ -209,6 +209,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		return said;
 	};
 	let resolving: Promise<unknown> | undefined;
+	/** The resolver answered something since the run last looked: parked units may run again. */
+	let resolvedSome = false;
 	// a question the resolver model traces to the project setup: the big setup model fixes it on main first
 	const fixJob = o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (q: QuestionRow, what: string, stack?: string) => {
 		const unit = q.unit_id ? ledger.getUnit(q.unit_id) : undefined;
@@ -246,7 +248,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
 		if (resolver)
 			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, codeJob, layoutJob, pluginChangedAt: PLUGIN_TIME, log: (l) => log(pc.cyan(l)) })
-				.then((r) => r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`)), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
+				.then((r) => ((resolvedSome ||= r.answered > 0), r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`))), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
 				.finally(() => (resolving = undefined));
 	};
 
@@ -378,20 +380,21 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		pumpParity();
 	};
 	if (parityProbe) {
-		// at the start: finished slices never compared, and slices waiting on quirks the owner has decided since
-		const checked = new Set((ledger.db.prepare("SELECT DISTINCT slice FROM parity_runs").all() as Array<{ slice: string }>).map((r) => r.slice));
-		const decided = (ledger.db.prepare("SELECT DISTINCT p.slice FROM parity_diffs p JOIN quirks q ON q.id = p.quirk_id WHERE p.status = 'quirk' AND q.status IN ('kept', 'dropped')").all() as Array<{ slice: string }>).map((r) => r.slice);
+		// at the start: finished slices never compared, and slices whose last comparison needs another look
+		const { checked, again } = parityAgain(ledger);
 		const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((x): x is string => !!x));
 		// and slices of units the owner said to retry after they ran out of parity re-opens: a fresh set, used once per answer
 		const answered: Array<string | undefined> = [];
 		for (const q of ledger.db.prepare("SELECT unit_id, MAX(id) AS id FROM questions WHERE point = 'parity' AND answer IS NOT NULL AND unit_id IS NOT NULL GROUP BY unit_id").all() as Array<{ unit_id: string; id: number }>) {
 			const meta = JSON.parse(ledger.getUnit(q.unit_id)?.meta ?? "{}") as { parityRetried?: number };
 			if (meta.parityRetried === q.id) continue;
-			const retry = answerValue(ledger.getQuestion(q.id)?.answer) === "retry";
-			ledger.updateUnit(q.unit_id, { meta: { parityRetried: q.id, ...(retry ? { parityReopens: 0 } : {}) } });
+			const value = answerValue(ledger.getQuestion(q.id)?.answer);
+			const retry = value === "retry";
+			// "leave" is remembered, so the judge does not ask about this unit again at the next comparison
+			ledger.updateUnit(q.unit_id, { meta: { parityRetried: q.id, ...(retry ? { parityReopens: 0, parityLeft: undefined } : value === "leave" ? { parityLeft: q.id } : {}) } });
 			if (retry) answered.push(sliceOf(q.unit_id));
 		}
-		for (const sl of slices) if (!checked.has(sl) || decided.includes(sl) || answered.includes(sl)) queueParity(sl);
+		for (const sl of slices) if (!checked.has(sl) || again.has(sl) || answered.includes(sl)) queueParity(sl);
 	}
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
 	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
@@ -594,17 +597,23 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							const mainProject = projectDir(config, stackId);
 							const sha = mergeUnit(config, unitId, wt, branch, mainProject);
 							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
-							if (sha) ledger.updateUnit(unitId, { meta: { ...JSON.parse(ledger.getUnit(unitId)!.meta), commit: sha } });
+							// a success ends the crash count: a later re-open starts with a clean slate
+							ledger.updateUnit(unitId, { meta: { ...(sha ? { commit: sha } : {}), crashes: undefined } });
 							await indexTarget(ledger, adapter, mainProject, res!.gate?.changedFiles).catch(() => 0);
-							afterAccept(ledger, adapter, mainProject, stackId, placementOf(ledger.getUnit(unitId)!.meta).area, (l) => log(`  ${l}`));
-							// Registration/wiring files are generated by the adapter from what landed, never by agents.
-							if (adapter.generateRegistration) {
-								const changed = await adapter.generateRegistration(mainProject, { ledger }).catch((e) => (log(pc.yellow(`  registration generation failed: ${e?.message ?? e}`)), [] as string[]));
-								if (changed.length) {
-									gitIn(config.target.path, ["add", "-A", "--", ...changed.map((c) => relative(config.target.path, join(mainProject, c)))]);
-									gitIn(config.target.path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `chore: regenerate registration after ${unitId}\n\n${changed.join("\n")}`]);
-									log(pc.dim(`  regenerated ${changed.join(", ")}`));
+							// the code is on main now: a slip after this is logged, never a quarantine of a merged unit
+							try {
+								afterAccept(ledger, adapter, mainProject, stackId, placementOf(ledger.getUnit(unitId)!.meta).area, (l) => log(`  ${l}`));
+								// Registration/wiring files are generated by the adapter from what landed, never by agents.
+								if (adapter.generateRegistration) {
+									const changed = await adapter.generateRegistration(mainProject, { ledger }).catch((e) => (log(pc.yellow(`  registration generation failed: ${e?.message ?? e}`)), [] as string[]));
+									if (changed.length) {
+										gitIn(config.target.path, ["add", "-A", "--", ...changed.map((c) => relative(config.target.path, join(mainProject, c)))]);
+										gitIn(config.target.path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `chore: regenerate registration after ${unitId}\n\n${changed.join("\n")}`]);
+										log(pc.dim(`  regenerated ${changed.join(", ")}`));
+									}
 								}
+							} catch (e: any) {
+								log(pc.yellow(`  after-merge step failed (${unitId} stays accepted): ${String(e?.message ?? e).split("\n")[0]}`));
 							}
 						});
 						acceptedNow++;
@@ -744,10 +753,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const samplePause = async (): Promise<string | undefined> => {
 		if (!sampleSize) return undefined;
 		let st = sampleState();
-		if (st.approved) {
-			if (acceptedTotal() >= sampleSize) return undefined;
-			ledger.setMeta("layout_sample", JSON.stringify((st = {}))); // the target was reset since: review the new sample
-		}
+		// approved stays approved: a re-open lowering the count is no reset (target-reset clears the sample itself)
+		if (st.approved) return undefined;
 		if (st.question) {
 			const q = ledger.getQuestion(st.question);
 			if (q && q.status !== "open" && q.status !== "withdrawn") {
@@ -878,6 +885,14 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				}
 				if (tidyJobs.busy) {
 					await waitOn("a tidy job is changing the code on main", () => tidyJobs.busy!);
+					continue;
+				}
+				// the resolver (and a fix or code job it started) finishes before the run ends; what it answered may
+				// release parked units, so the next pass resubmits them at once
+				if (resolving) await waitOn("the resolver model is settling open questions", () => resolving!);
+				if (resolvedSome) {
+					resolvedSome = false;
+					lastResubmitCheck = 0;
 					continue;
 				}
 				// the sample review waits like a decision: a terminal or Pi waits for the answer, scripts end the run
@@ -1081,7 +1096,8 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 			continue;
 		}
 		if (a.action === "quarantine") {
-			ledger.updateUnit(u.id, { meta: { applied: q!.id } });
+			// healQuestion 0: the owner's answer stands, the auto-heal does not put it back nor ask again (br requeue does)
+			ledger.updateUnit(u.id, { meta: { applied: q!.id, healQuestion: 0 } });
 			ledger.transitionUnit(u.id, "quarantined", `owner answered "${q!.answer}" on question #${q!.id}`);
 			removeWorktree(config.target.path, worktreeDir(root, u.id));
 			log(pc.red(`■ ${u.id}: quarantined by the answer to #${q!.id}`));
@@ -1198,6 +1214,9 @@ export function breakerEntry(ledger: Ledger, unitId: string, st: string, res: Un
 		const output = String(bad.output ?? "");
 		return { unit: unitId, ok, triage: crash ? "exception" : res?.triage?.cause, text: `${bad.name}: ${output}`, sig: sig(bad.name, output), step: bad.name, output };
 	}
+	// waiting only on the owner's keep/drop of the old code's quirks: nothing failed, so nothing to heal
+	const waits = st === "quarantined" ? [] : ledger.openQuestions().filter((q) => q.unit_id === unitId && q.blocks !== "none");
+	if (waits.length && waits.every((q) => q.point === "quirk")) return { unit: unitId, ok: true };
 	// no failed gate step (a merge error, truth, a question): the reason of the unit's last transition says why
 	const reason = ledger.transitionsOf("unit", unitId).at(-1)?.reason ?? st;
 	return { unit: unitId, ok, triage: res?.triage?.cause, text: reason, sig: sig(st, reason), step: st };
@@ -1230,6 +1249,29 @@ function capText(t: string, max: number): string {
  * joined at all, so it never blocks.
  */
 const OPEN_DEP = "du.state != 'accepted' AND json_extract(du.meta, '$.exclude') IS NULL";
+
+/** Parity comparisons that failed with an error in a row before a slice is left alone (until a unit of it lands again). */
+export const MAX_PARITY_ERRORS = 3;
+
+/**
+ * Slices compared before (`checked`), and those whose last comparison needs another look at run start (`again`): it
+ * ended in an error (a few times in a row at most), left differences nobody judged, or holds quirks the owner has
+ * decided since. Only the last run counts: once a later run judged a decided quirk, the slice is not queued again.
+ */
+export function parityAgain(ledger: Ledger): { checked: Set<string>; again: Set<string> } {
+	const rows = ledger.db
+		.prepare(
+			`SELECT r.slice, r.outcome,
+			   (SELECT COUNT(*) FROM parity_runs e WHERE e.slice = r.slice AND e.outcome = 'error'
+			      AND e.id > COALESCE((SELECT MAX(g.id) FROM parity_runs g WHERE g.slice = r.slice AND g.outcome != 'error'), 0)) AS errors,
+			   EXISTS (SELECT 1 FROM parity_diffs d WHERE d.run_id = r.id AND d.status = 'open') AS unjudged,
+			   EXISTS (SELECT 1 FROM parity_diffs d JOIN quirks q ON q.id = d.quirk_id WHERE d.run_id = r.id AND d.status = 'quirk' AND q.status IN ('kept', 'dropped')) AS decided
+			 FROM parity_runs r WHERE r.id = (SELECT MAX(id) FROM parity_runs WHERE slice = r.slice)`,
+		)
+		.all() as Array<{ slice: string; outcome: string; errors: number; unjudged: number; decided: number }>;
+	const again = rows.filter((r) => (r.outcome === "error" ? r.errors < MAX_PARITY_ERRORS : r.unjudged || r.decided)).map((r) => r.slice);
+	return { checked: new Set(rows.map((r) => r.slice)), again: new Set(again) };
+}
 
 const ledgerTime = (s: string) => Date.parse(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
 

@@ -148,12 +148,14 @@ export async function judgeRun(o: { ledger: Ledger; config: Config; root: string
 	for (const [unitId, found] of bugs) {
 		const u = o.ledger.getUnit(unitId);
 		if (u?.state !== "accepted") continue; // it is being worked on: the next parity check of the slice sees it again
-		const n = (JSON.parse(u.meta) as { parityReopens?: number }).parityReopens ?? 0;
+		const { parityReopens: n = 0, parityLeft } = JSON.parse(u.meta) as { parityReopens?: number; parityLeft?: number };
 		const note = `The new app answers differently from the old one (parity check of slice "${o.slice}": the same requests sent to both):\n${found.map((f) => `- ${f}`).join("\n")}\nMake the new code behave like the old code here.`;
 		if (n < MAX_PARITY_REOPENS) {
 			reopenUnit(o.ledger, unitId, note, `parity: answers differ from the old app (${found.length})`);
 			o.ledger.updateUnit(unitId, { meta: { parityReopens: n + 1 } });
 			reopened.push(unitId);
+		} else if (parityLeft) {
+			log(pc.dim(`parity ${o.slice}: ${unitId} still differs; the owner said to leave it (#${parityLeft})`));
 		} else {
 			await askViaModel(
 				{ ledger: o.ledger, config: o.config, root: o.root, client: o.client },
