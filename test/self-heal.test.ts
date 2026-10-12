@@ -429,6 +429,23 @@ describe("area curation never touches migrated code", () => {
 	});
 });
 
+describe("an owner's quarantine answer stands", () => {
+	it("leave on a waiting unit quarantines it; the auto-heal neither puts it back nor asks again", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
+		mk("U1", "billing", "implementing");
+		const q = ledger.askQuestion({ unitId: "U1", point: "gate_env", question: "the gate needs redis", options: ["retry", "leave"], askedBy: "orchestrator" });
+		ledger.answerQuestion(q, "leave");
+		resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
+		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
+		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() + 1000, now: Date.now() + 9 * 60 * 60_000 })).toEqual([]);
+		expect(await askStuckUnits({ ledger, config, root })).toBe(0);
+		// a person's requeue still brings it back
+		expect(requeueUnits(ledger, config, root, ["U1"], "owner", { human: true })).toEqual(["U1: requeued"]);
+		ledger.close();
+	});
+});
+
 describe("circuit breaker", () => {
 	it("every failure kind brings its text and a key; the same merge error in 3 units heals by code", async () => {
 		const { ledger, mk } = workspace();
@@ -472,5 +489,16 @@ describe("circuit breaker", () => {
 		expect(breakerPick([f("U7", "x"), f("U8", "y"), f("U10", "w")], tried)).toMatchObject({ same: false });
 		// mostly green: nothing to do
 		expect(breakerPick([...mixed, ...["A", "B", "C", "D"].map((unit) => ({ unit, ok: true }))], new Set())).toBeUndefined();
+	});
+	it("a unit waiting only on quirk questions is no failure; one waiting on an environment question still is", async () => {
+		const { ledger, mk } = workspace();
+		const { breakerEntry } = await import("../src/run/run.ts");
+		const res = (id: string) => ({ unitId: id, state: "truth", attempts: 0, costUsd: 0 });
+		for (const id of ["U1", "U2"]) mk(id, "billing", "implementing");
+		ledger.askQuestion({ unitId: "U1", point: "quirk", question: "keep the trailing space?", askedBy: "tester" });
+		ledger.askQuestion({ unitId: "U2", point: "truth_env", question: "the old code needs a DB", askedBy: "tester" });
+		expect(breakerEntry(ledger, "U1", "implementing", res("U1")).ok).toBe(true);
+		expect(breakerEntry(ledger, "U2", "implementing", res("U2")).ok).toBe(false);
+		ledger.close();
 	});
 });
