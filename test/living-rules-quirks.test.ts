@@ -148,17 +148,24 @@ describe("living rules", () => {
 		expect(r.asked).toBe(0);
 		expect((ledger.db.prepare("SELECT status FROM rule_proposals WHERE id = ?").get(p) as { status: string }).status).toBe("merged");
 	});
-	it("an empty curator answer marks nothing as curated: the proposals still trigger the next curation", async () => {
+	it("an empty curator answer marks nothing as curated, and is not paid for again until a new proposal comes in", async () => {
 		const { root, config, ledger } = setup();
 		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
 		ledger.setMeta("rules_curator:nestjs", CURATOR_VERSION);
 		proposeRule({ ledger }, { stack: "nestjs", kind: "add", text: "Dates are ISO strings", why: "legacy sends Y-m-d" });
 		let body = "";
-		const client = new FakeModelClient({ chat: () => ({ json: { body, merged: [], rejected: [], breaking: [] } }) });
+		let calls = 0;
+		const client = new FakeModelClient({ chat: () => (calls++, { json: { body, merged: [], rejected: [], breaking: [] } }) });
 		expect((await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 })).versions).toEqual({});
 		expect(ledger.getMeta("rules_seen:nestjs")).toBeUndefined();
 		body = "## Errors\n- throw HttpException\n- Dates are ISO strings";
+		// the next accept: nothing new, no second paid call
+		expect((await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 })).versions).toEqual({});
+		expect(calls).toBe(1);
+		// a new proposal: the earlier one is curated with it
+		proposeRule({ ledger }, { stack: "nestjs", kind: "add", text: "Money is integer cents", why: "legacy stores cents" });
 		expect((await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 })).versions).toEqual({ nestjs: 2 });
+		expect(calls).toBe(2);
 	});
 	it("new curator guidance curates each stack's rules once, without new proposals: rules about what the checks accept go", async () => {
 		const { root, config, ledger } = setup();
@@ -260,13 +267,13 @@ describe("tidy review", () => {
 		writeFileSync(join(proj, "src/features/flights/helper2.ts"), "export const x = 1;\n");
 		const client = new FakeModelClient({ chat: (req) => {
 			const sys = req.messages[0]!.content;
-			if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flight-slots.ts"], why: "name says nothing" }, { op: "move", from: ["src/features/flights/flights.service.ts"], to: ["src/list.tpl/x.ts"], why: "outside layout" }], conventions: [{ text: "Name helper files after the domain concept", why: "helper2.ts" }] } };
+			if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flight-slots.ts"], why: "name says nothing" }, { op: "move", from: ["src/features/flights/flights.service.ts"], to: ["src/list.tpl/x.ts"], why: "outside layout" }, { op: "move", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/utils/slots.ts"], why: "the layout check refuses utils/" }], conventions: [{ text: "Name helper files after the domain concept", why: "helper2.ts" }] } };
 			return { json: { id: "tidy", question: "Rename helper2.ts to flight-slots.ts?", options: [{ value: "apply", label: "Rename", hint: "" }, { value: "skip", label: "Keep", hint: "" }], recommended: "apply", opinion: "Clearer." } };
 		} });
 		const d = { ledger, config, root, client };
 		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights", every: 2 })).reviewed).toBe(false);
 		const r = await maybeTidyReview(d, { stackId: "nestjs", area: "flights", every: 2 });
-		expect(r).toMatchObject({ reviewed: true, asked: 1, proposals: 1 }); // the out-of-layout move is refused by code
+		expect(r).toMatchObject({ reviewed: true, asked: 1, proposals: 1 }); // the out-of-layout moves (outside the area, a path the layout check refuses) are refused by code
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
 		const q = ledger.openQuestions().find((x) => x.point === "tidy")!;
 		ledger.answerQuestion(q.id, "apply — Rename");

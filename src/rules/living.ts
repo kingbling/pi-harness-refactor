@@ -91,6 +91,10 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 		const curatorKey = `rules_curator:${stack}`;
 		const newGuidance = d.ledger.getMeta(curatorKey) !== CURATOR_VERSION && existsSync(join(rulesDir(d.root, stack), "RULES.md"));
 		if (!newGuidance && (!fresh || (!opts.force && fresh < (opts.threshold ?? 5)))) continue;
+		// the curator gave back no rules last time: asked again only once a new proposal came in, not on every accept
+		const emptyKey = `rules_empty:${stack}`;
+		const emptyAt = d.ledger.getMeta(emptyKey);
+		if (emptyAt && !opts.force && !open.some((p) => p.id > Number(emptyAt))) continue;
 		const path = join(rulesDir(d.root, stack), "RULES.md");
 		const current = existsSync(path) ? stripLayout(readFileSync(path, "utf8")).trim() : "";
 		const role = d.config.models.escalate;
@@ -117,7 +121,11 @@ Rules tell agents how to write code. Reject a proposal that tells a check, gate,
 		});
 		result.costUsd += res.usage.costUsd;
 		const j = (res.json ?? {}) as { body?: string; merged?: number[]; rejected?: Array<{ id: number; reason: string }>; breaking?: Array<{ id: number; impact: string }> };
-		if (!j.body?.trim()) continue;
+		if (!j.body?.trim()) {
+			d.ledger.setMeta(emptyKey, String(Math.max(0, ...open.map((p) => p.id))));
+			continue;
+		}
+		d.ledger.setMeta(emptyKey, "");
 		const before = rulesVersion(d, stack);
 		const version = await saveRulesVersion(d, stack, j.body);
 		// only a saved body counts as curated: an empty answer keeps the proposals' trigger for the next try
