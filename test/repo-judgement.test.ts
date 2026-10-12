@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -66,6 +66,27 @@ describe("repo brief: the legacy repo only, written by a session that reads it",
 		await phraseDecisions({ ledger, config, root, client, spawn }, [{ id: "truth-env", topic: "truth", intent: "runnable?", evidence: "e", options: [{ value: "local" }, { value: "none" }] }]);
 		expect(prompts.at(-1)).toMatch(/Owner decisions already made[^\n]*\n- target:server = symfony\n- target:ui = react/);
 		expect(readFileSync(briefPath(root), "utf8")).not.toMatch(/not decided/);
+	});
+
+	it("an empty or failed model reply is not saved: the next call writes the brief again", async () => {
+		const root = mkdtempSync(join(tmpdir(), "br-brief-empty-"));
+		const src = join(root, "legacy");
+		mkdirSync(src, { recursive: true });
+		const config = ConfigSchema.parse({ source: { path: src, stack: "php" }, target: { path: join(root, "new"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		// the session answers nothing and the one call over the facts is empty (refusal, cut-off)
+		const silent = (async (): Promise<LeafSession> => ({ run: async () => ({ text: "", toolCalls: 3, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession) as never;
+		const empty = new FakeModelClient({ chat: () => ({ text: "  \n" }) });
+		expect((await repoBrief({ ledger, config, root, client: empty, spawn: silent })).brief).toBe("");
+		expect(existsSync(briefPath(root))).toBe(false);
+		// the call fails outright: nothing saved either
+		const failing = new FakeModelClient({ chat: () => { throw new Error("provider down"); } });
+		await expect(repoBrief({ ledger, config, root, client: failing, spawn: silent })).rejects.toThrow("provider down");
+		expect(existsSync(briefPath(root))).toBe(false);
+		// the next call asks again and saves a real brief
+		const good = new FakeModelClient({ chat: () => ({ text: "# Brief\nPHP app." }) });
+		expect((await repoBrief({ ledger, config, root, client: good, spawn: silent })).brief).toBe("# Brief\nPHP app.");
+		expect(loadBrief(root)).toBe("# Brief\nPHP app.\n");
 	});
 });
 

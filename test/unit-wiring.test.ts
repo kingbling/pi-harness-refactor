@@ -263,6 +263,53 @@ describe("runUnit wiring", () => {
 		expect(gates).toBe(0);
 	});
 
+	it("provider errors count only in a row: a session that works resets the count (error, ok, error, error → no question)", async () => {
+		const ok = { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+		const err = { text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 }, error: "provider returned 503" };
+		const script = [err, ok, err, err, ok];
+		const spawnScripted = async (): Promise<LeafSession> => ({ run: async () => script.shift()!, dispose() {} }) as unknown as LeafSession;
+		let gates = 0;
+		const gate = async (): Promise<GateReport> => (++gates === 1 ? { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: "1 failing" }], changedFiles: [], failedStep: "ported_tests_green", testFiles: [] } : { ok: true, steps: [], changedFiles: [], testFiles: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnScripted as never, gate, log: () => {} });
+		expect(script).toEqual([]);
+		expect(gates).toBe(2);
+		expect(ledger.db.prepare("SELECT count(*) AS n FROM questions").get()).toEqual({ n: 0 });
+		expect(r.state).toBe("review");
+		expect(r.attempts).toBe(2);
+	});
+
+	it("three provider errors in a row: one provider question, no attempt burned, never quarantined", async () => {
+		const err = { text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 }, error: "provider returned 503" };
+		let sessions = 0;
+		const spawnErr = async (): Promise<LeafSession> => ({ run: async () => (sessions++, err), dispose() {} }) as unknown as LeafSession;
+		let gates = 0;
+		const gate = async (): Promise<GateReport> => (gates++, { ok: true, steps: [], changedFiles: [], testFiles: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnErr as never, gate, log: () => {} });
+		expect(sessions).toBe(3);
+		expect(gates).toBe(0);
+		expect(ledger.db.prepare("SELECT point FROM questions WHERE unit_id = 'u1'").all()).toEqual([{ point: "env" }]);
+		expect(r.attempts).toBe(0);
+		expect(r.state).not.toBe("quarantined");
+	});
+
+	it("truth ahead with an interface outside the placement stops after the retests but never quarantines; a real run does", async () => {
+		write(join(ws, ".bigrefactor", "truth", "u1", "interface.md"), "src/features/billing/invoice.service.ts exports InvoiceService\n");
+		const roles: string[] = [];
+		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => (roles.push(opts.role), spawn());
+		let gates = 0;
+		const gate = async (): Promise<GateReport> => (gates++, { ok: true, steps: [], changedFiles: [], testFiles: [] });
+		const ahead = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, truthOnly: true, spawn: spawnRoles as never, gate, log: () => {} });
+		expect(roles).toEqual(["test", "test"]);
+		expect(ahead.state).toBe("planned");
+		expect(ledger.getUnit("u1")!.state).toBe("planned");
+		expect(ledger.transitionsOf("unit", "u1").map((t) => t.to_state)).not.toContain("quarantined");
+		expect(gates).toBe(0);
+		// the same interface on the unit's real run: implementing against it is refused, the unit is quarantined
+		const real = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate, log: () => {} });
+		expect(real.state).toBe("quarantined");
+		expect(gates).toBe(0);
+	});
+
 	describe("reviewer findings outside the unit's files", () => {
 		const outOfScope = "- the autoload map does not cover src/Agency → add the mapping to the project manifest";
 		const reviewer = async () => ({ ok: false, judged: true, output: `outside the unit's files (setup fixer, else the owner):\n${outOfScope}`, outOfScope });
