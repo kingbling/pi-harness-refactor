@@ -933,7 +933,7 @@ export default function (pi: ExtensionAPI) {
 					else {
 						const { requeueUnits } = await import("../run/run.ts");
 						const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
-						text = requeueUnits(ledger, config, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")), "human (pi)", { fresh: rest.includes("--fresh") }).join("\n");
+						text = requeueUnits(ledger, config, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")), "human (pi)", { fresh: rest.includes("--fresh"), human: true }).join("\n");
 					}
 				} else if (sub === "unaccounted") {
 					const rows = ledger.unaccounted();

@@ -1,5 +1,5 @@
 import { globToRegExp } from "../sessions/spawn.ts";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import pc from "picocolors";
 import type { Config } from "../config.ts";
@@ -32,6 +32,8 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	const previousCommit = ledger.getMeta("source_commit");
 	const previousHashes = new Map((ledger.db.prepare("SELECT path, hash FROM files").all() as Array<{ path: string; hash: string }>).map((r) => [r.path, r.hash]));
 	const drift = { changed: [] as string[], added: [] as string[], removed: [] as string[], staleUnits: [] as string[] };
+	/** Changed or removed files an earlier inventory saved but stopped before marking their units stale. */
+	const pendingDrift = JSON.parse(ledger.getMeta("drift_pending") || "[]") as string[];
 
 	// folders the profile model found are not the app (tooling, stubs, vendored libraries, docs, one-off scripts,
 	// tests) are left out on top of the adapter's minimal defaults; a file the adapter calls an entry point stays
@@ -136,6 +138,11 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		}
 		for (const r of routes) insRoute.run(r.id, r.method ?? null, r.path, r.handlerSymbol ? resolve(r.handlerSymbol) ?? r.handlerSymbol : null);
 		writeCodeMap(ledger, resolveCodeMap(indexes, isFramework, { caseInsensitive: adapter.names?.caseInsensitive }));
+		// the new hashes and the files they changed are saved together: if this run stops before the stale marking
+		// below, the next run still marks them (its own hash compare would see nothing changed)
+		const indexed = new Set(indexes.map((f) => f.path));
+		const gone = [...previousHashes.keys()].filter((p) => !indexed.has(p));
+		ledger.setMeta("drift_pending", JSON.stringify([...new Set([...pendingDrift, ...drift.changed, ...gone])]));
 		tx.exec("COMMIT");
 	} catch (e) {
 		tx.exec("ROLLBACK");
@@ -399,7 +406,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// a human decides whether to redo them). Removed files stay in the ledger with a note.
 	const seen = new Set(indexes.map((f) => f.path));
 	for (const p of previousHashes.keys()) if (!seen.has(p)) drift.removed.push(p);
-	for (const p of [...drift.changed, ...drift.removed]) {
+	for (const p of new Set([...pendingDrift, ...drift.changed, ...drift.removed])) {
 		const sym = ledger.db.prepare("SELECT DISTINCT unit_id FROM symbols WHERE path = ? AND unit_id IS NOT NULL").all(p) as Array<{ unit_id: string }>;
 		for (const { unit_id } of sym) {
 			const u = ledger.getUnit(unit_id);
@@ -411,6 +418,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 			}
 		}
 	}
+	ledger.setMeta("drift_pending", "[]");
 	if (sourceCommit) ledger.setMeta("source_commit", sourceCommit);
 	ledger.setMeta("source_is_git", isRepo(srcRoot) ? "1" : "0");
 
@@ -468,7 +476,12 @@ export function listFiles(root: string, adapter: Pick<SourceAdapter, "include" |
 	const include = adapter.include.map(globToRegExp);
 	const exclude = adapter.exclude.map(globToRegExp);
 	const excludedDir = (rel: string) => exclude.some((re) => re.test(`${rel}/x`) || re.test(rel));
+	// a symlink back to a parent folder would walk the same tree again and again: each real folder is read once
+	const walked = new Set<string>();
 	const visit = (dir: string) => {
+		const real = realpathSync(dir);
+		if (walked.has(real)) return;
+		walked.add(real);
 		for (const name of readdirSync(dir)) {
 			const abs = join(dir, name);
 			const rel = relative(root, abs).split(sep).join("/");

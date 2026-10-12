@@ -53,7 +53,7 @@ export interface PlacementRule {
 	/** "taxonomy": written by the area model; its next pass replaces them. Answers' and the owner's rules stay. */
 	by?: "taxonomy";
 }
-type UnitMeta = { files?: string[]; route?: { has_ui?: number }; place?: StoredPlace; placeQuestion?: number; lane?: string };
+type UnitMeta = { files?: string[]; route?: { has_ui?: number }; place?: StoredPlace; placeQuestion?: number; lane?: string; bareTopic?: boolean };
 
 const POINT = "placement";
 
@@ -619,13 +619,15 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 			done.push(r.id);
 			continue;
 		}
-		// "new-topic: cron" names the topic; a bare "new-topic" names nothing and is asked again
+		// "new-topic: cron" names the topic; a bare "new-topic" names nothing and is asked again, once: a second bare
+		// one puts the unit in the stack's shared dir (a tidy review can move it to a topic later) instead of asking forever
 		const named = /^new-topic\s*:\s*([\w-]+)/i.exec(r.answer ?? "");
-		const m = named ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", named[1]] as const) : /^([\w-]+):(shared\/)?([\w-]+)$/.exec(v);
+		const bareAgain = v === NEW_TOPIC && !named && !!(JSON.parse(r.meta) as UnitMeta).bareTopic;
+		const m = named ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", named[1]] as const) : bareAgain ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", SHARED_AREA] as const) : /^([\w-]+):(shared\/)?([\w-]+)$/.exec(v);
 		const stack = m && config.target.stacks.includes(m[1]!) ? m[1]! : (ctx.defaultStack ?? stackFor(config, "server"));
-		const area = v === NEW_TOPIC && !named ? "" : kebab(m ? m[3]! : v);
+		const area = v === NEW_TOPIC && !named && !bareAgain ? "" : kebab(m ? m[3]! : v);
 		if (!area) {
-			ledger.updateUnit(r.id, { meta: { placeQuestion: undefined } }); // unusable answer: the next placement pass asks again
+			ledger.updateUnit(r.id, { meta: { placeQuestion: undefined, bareTopic: v === NEW_TOPIC || undefined } }); // unusable answer: the next placement pass asks again
 			continue;
 		}
 		const shared = !!m?.[2] || area === SHARED_AREA;

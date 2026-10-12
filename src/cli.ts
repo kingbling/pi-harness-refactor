@@ -223,7 +223,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!args.filter((a) => a !== "--fresh").length) throw new Error("usage: br requeue <unit-id...> | --all [--fresh]");
 		const { requeueUnits } = await import("./run/run.ts");
 		const { config, root, ledger } = open();
-		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human", { fresh: args.includes("--fresh") })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
+		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human", { fresh: args.includes("--fresh"), human: true })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
 	},
 	reopen: async (args) => {
 		const { reopenUnit } = await import("./run/recheck.ts");

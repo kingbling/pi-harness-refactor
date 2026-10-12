@@ -65,4 +65,14 @@ describe("a target project created anew", () => {
 		expect(ledger.getUnit("U2")!.state).toBe("quarantined");
 		expect(ledger.getQuestion(sample)!.status).toBe("answered");
 	});
+	it("does nothing when the owner checked out another branch or rewrote the migration branch", () => {
+		const { ws, repo, config, ledger } = workspace();
+		git(repo, "checkout", "-q", "--orphan", "other");
+		commit(repo, "other.txt");
+		expect(resetForNewTarget(ledger, config, ws)).toBeUndefined();
+		git(repo, "checkout", "-q", "main");
+		git(repo, "reset", "-q", "--hard", "HEAD~1");
+		expect(resetForNewTarget(ledger, config, ws)).toBeUndefined();
+		expect(ledger.getUnit("U1")!.state).toBe("accepted");
+	});
 });

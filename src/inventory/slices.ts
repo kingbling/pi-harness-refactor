@@ -71,6 +71,7 @@ export function planSlices(ledger: Ledger, overrides: SliceOverrides = {}): Slic
 	const depth = new Map<string, number>();
 	const depthOf = (id: string): number => {
 		if (depth.has(id)) return depth.get(id)!;
+		depth.set(id, 0); // a dependency cycle ends here instead of recursing forever
 		const u = byId.get(id);
 		const d = u && u.deps.length ? 1 + Math.max(...u.deps.map(depthOf)) : 0;
 		depth.set(id, d);

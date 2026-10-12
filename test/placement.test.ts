@@ -412,6 +412,19 @@ describe("placement: what no area holds, siblings, re-placement, overlaps", () =
 		expect(areas.stacks[0].topics.map((t: { name: string }) => t.name)).toEqual(["ids"]);
 	});
 
+	it("a second bare 'new-topic' for the same unit puts it in the stack's shared dir instead of asking forever", () => {
+		const ask = () => {
+			const q = ledger.askQuestion({ point: "placement", unitId: "uuid", question: "q", blocks: "unit", askedBy: "placement", context: { defaultStack: "nestjs" } });
+			ledger.updateUnit("uuid", { meta: { placeQuestion: q } });
+			ledger.answerQuestion(q, "new-topic — a new shared topic", "human");
+		};
+		ask();
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual([]);
+		ask();
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["uuid"]);
+		expect(place("uuid")).toMatchObject({ stackId: "nestjs", area: "common", shared: true });
+	});
+
 	it("facts: folder siblings placed in the same pass count; what uses the unit counts only where its placement holds", async () => {
 		for (const f of ["app/lib/openx/advertisercreate.php", "app/lib/openx/advertiserdelete.php", "app/www/thing.php"]) {
 			mkdirSync(dirname(join(config.source.path, f)), { recursive: true });

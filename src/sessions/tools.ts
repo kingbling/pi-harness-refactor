@@ -355,6 +355,19 @@ export function ownerOf(ledger: Ledger, target: string, except: string): string[
 
 export const MAX_REPORT_REOPENS = 2;
 
+/** `from` reaches `to` through its deps (directly or through other units). */
+function dependsOn(ledger: Ledger, from: string, to: string): boolean {
+	const seen = new Set<string>();
+	const walk = (id: string): boolean => {
+		if (id === to) return true;
+		if (seen.has(id)) return false;
+		seen.add(id);
+		const u = ledger.getUnit(id);
+		return !!u && (JSON.parse(u.deps) as string[]).some(walk);
+	};
+	return walk(from);
+}
+
 export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "report_migrated_bug",
@@ -369,6 +382,8 @@ export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 			const owner = owners[0]!;
 			const reopens = (JSON.parse(d.ledger.getUnit(owner)!.meta) as { reportReopens?: number }).reportReopens ?? 0;
 			if (reopens >= MAX_REPORT_REOPENS) return text(`${owner} was already re-opened ${reopens} times by reports: not again. Finish this unit with what exists and describe the gap in your final message.`, { error: true });
+			// this unit would wait for the owner while the owner (re-opened) waits for this unit: neither would ever start
+			if (dependsOn(d.ledger, owner, d.unitId)) return text(`${owner} itself depends on this unit, so it cannot be fixed first. Finish this unit with what exists and describe the gap in ${p.target} in your final message.`, { error: true });
 			d.onReport?.({ owner, ...p });
 			return text(`reported to ${owner}: it is re-opened with your report once this session ends, and this unit waits until it is accepted again. Finish what does not depend on it, then stop.`);
 		},

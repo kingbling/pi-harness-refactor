@@ -135,17 +135,25 @@ export const nestjsAdapter: TargetAdapter = {
 		const ext = /from '\.\/[^']+\.js'/.test(cur) ? ".js" : ""; // NodeNext scaffolds import with .js
 		const begin = "// <bigrefactor:modules>";
 		const end = "// </bigrefactor:modules>";
-		const importsBlock = mods.map((m) => `import { ${m.cls} } from '${m.from}${ext}';`).join("\n");
-		const listBlock = mods.map((m) => m.cls).join(", ");
+		// the generated modules live in their own list inside the marker block; `imports: [...]` only spreads it, so
+		// whatever else the project imports there (ConfigModule.forRoot(...), nested arrays) is never touched
+		const block = `${begin}\n${mods.map((m) => `import { ${m.cls} } from '${m.from}${ext}';`).join("\n")}\nconst BR_MODULES = [${mods.map((m) => m.cls).join(", ")}] as const;\n${end}`;
 		let next: string;
-		if (cur.includes(begin)) {
-			next = cur.replace(new RegExp(`${begin}[\\s\\S]*?${end}`), `${begin}\n${importsBlock}\n${end}`).replace(/imports:\s*\[[^\]]*\]/, `imports: [${listBlock}]`);
-		} else {
-			// first time: inject the marker block after the last import and fill `imports: []`
+		if (cur.includes(begin)) next = cur.replace(new RegExp(`${begin}[\\s\\S]*?${end}`), block);
+		else {
+			// first time: inject the marker block after the last import
 			const lastImport = cur.lastIndexOf("\nimport ");
 			const cut = lastImport >= 0 ? cur.indexOf("\n", lastImport + 1) + 1 : 0;
-			next = cur.slice(0, cut) + `${begin}\n${importsBlock}\n${end}\n` + cur.slice(cut);
-			next = next.replace(/imports:\s*\[[^\]]*\]/, `imports: [${listBlock}]`);
+			next = cur.slice(0, cut) + `${block}\n` + cur.slice(cut);
+		}
+		if (!next.includes("...BR_MODULES")) {
+			const list = moduleImports(next);
+			if (!list) return []; // no `imports: [` in @Module: leave the file as it is rather than break it
+			// an older version wrote the generated classes straight into the list: they move into BR_MODULES
+			const oldBlock = new RegExp(`${begin}[\\s\\S]*?${end}`).exec(cur)?.[0] ?? "";
+			const ours = new Set([...mods.map((m) => m.cls), ...[...oldBlock.matchAll(/import \{ (\w+) \}/g)].map((m) => m[1]!)]);
+			const kept = splitTop(next.slice(list.open + 1, list.close)).filter((x) => x && !ours.has(x));
+			next = next.slice(0, list.open + 1) + ["...BR_MODULES", ...kept].join(", ") + next.slice(list.close);
 		}
 		if (next === cur) return [];
 		writeFileSync(appModule, next);
@@ -184,6 +192,40 @@ export const nestjsAdapter: TargetAdapter = {
 			? { cmd: "npx", args: related.length ? ["vitest", "related", "--run", "--reporter=dot", ...related] : ["vitest", "run", "--reporter=dot"] }
 			: { cmd: "npx", args: ["jest", "--ci", "--silent", ...(related.length ? ["--findRelatedTests", ...related] : [])] },
 };
+
+/** Where the `[` and its matching `]` of `imports:` in @Module(...) are (nested brackets and strings skipped). */
+function moduleImports(src: string): { open: number; close: number } | undefined {
+	const at = /@Module\(\s*\{[\s\S]*?\bimports:\s*\[/.exec(src);
+	if (!at) return undefined;
+	const open = at.index + at[0].length - 1;
+	let depth = 0;
+	let quote = "";
+	for (let i = open; i < src.length; i++) {
+		const c = src[i]!;
+		if (quote) {
+			if (c === "\\") i++;
+			else if (c === quote) quote = "";
+		} else if (c === "'" || c === '"' || c === "`") quote = c;
+		else if (c === "[" || c === "(" || c === "{") depth++;
+		else if (c === "]" || c === ")" || c === "}") if (--depth === 0) return c === "]" ? { open, close: i } : undefined;
+	}
+	return undefined;
+}
+
+/** The top-level comma-separated entries of a list's text, trimmed. */
+function splitTop(text: string): string[] {
+	const out: string[] = [];
+	let depth = 0;
+	let start = 0;
+	for (let i = 0; i < text.length; i++) {
+		const c = text[i]!;
+		if ("[({".includes(c)) depth++;
+		else if ("])}".includes(c)) depth--;
+		else if (c === "," && depth === 0) (out.push(text.slice(start, i).trim()), (start = i + 1));
+	}
+	out.push(text.slice(start).trim());
+	return out;
+}
 
 function devDeps(root: string): Set<string> {
 	try {

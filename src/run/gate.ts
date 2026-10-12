@@ -107,7 +107,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
 		}
 		for (const f of othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
-		if (prodFiles.length === 0) problems.push(NOTHING_WRITTEN);
+		if (prodFiles.length === 0 && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
 		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 	});
 	if (!agOk) return done();
@@ -428,3 +428,15 @@ export function scopedCheck(adapter: TargetAdapter, dir: string, name: "build" |
 
 /** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */
 export const NOTHING_WRITTEN = "no production files were written";
+
+/**
+ * A pass may rightly change no code: the unit was re-opened with its merged code kept (recheck, parity, owner) and
+ * that code is already right, or every symbol was proven dropped. Failing it for writing nothing would only burn
+ * its attempts or push a pointless edit.
+ */
+function nothingToWrite(g: GateInput): boolean {
+	const u = g.ledger.getUnit(g.unitId);
+	if (u && (JSON.parse(u.meta) as { commit?: string }).commit) return true;
+	const syms = g.ledger.symbolsOfUnit(g.unitId);
+	return syms.length > 0 && syms.every((s) => s.state === "dropped");
+}

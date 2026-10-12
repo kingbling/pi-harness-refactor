@@ -126,6 +126,11 @@ const fixes = new Map<string, number>();
 export const MAX_FIXES_PER_PROBLEM = 2;
 /** Fix sessions per stack in one process that changed nothing (a cost guard, not a stop: the run goes on); fixes that worked do not count. */
 export const MAX_RUN_FIXES = 20;
+/**
+ * Setup fixes one unit may be parked on (kept in its meta, so a restart or a requeue does not reset it): a fix that
+ * lands but does not help that unit would otherwise park and resubmit it forever. After this many the owner is asked.
+ */
+export const MAX_SETUP_PARKS = 2;
 
 /**
  * Where the migrated code of a project lives: the feature root (the part of moduleDir before the area) and the
@@ -207,8 +212,10 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
  * stack's fixes log, which wakes the units parked on a setup problem, and kept in the ledger as a `__setup__`
  * attempt (what changed, what was put back, what the model said). Returns what changed, or undefined when nothing did.
  */
-export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer; ledger?: Ledger; lock?: <T>(fn: () => Promise<T>) => Promise<T> }): Promise<string | undefined> {
+export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer; ledger?: Ledger; lock?: <T>(fn: () => Promise<T>) => Promise<T>; unitId?: string }): Promise<string | undefined> {
 	const key = o.adapter.id;
+	const parks = () => (o.unitId && o.ledger ? ((JSON.parse(o.ledger.getUnit(o.unitId)?.meta ?? "{}") as { setupParks?: number }).setupParks ?? 0) : 0);
+	if (parks() >= MAX_SETUP_PARKS) return undefined;
 	const running = fixing.get(key);
 	if (running) return running;
 	const problemKey = `${key}|${o.signature ?? o.problem.slice(0, 200)}`;
@@ -244,6 +251,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		if (!sha && !override) return (wasted(), undefined);
 		const what = said || "the setup was changed";
 		noteFix(o.root, key, sha, what);
+		if (o.unitId && o.ledger) o.ledger.updateUnit(o.unitId, { meta: { setupParks: parks() + 1 } });
 		return what;
 	})().finally(() => fixing.delete(key));
 	fixing.set(key, p);

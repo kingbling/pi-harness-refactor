@@ -478,6 +478,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		return { ran: [], accepted: 0, quarantined: 0, waiting: order.length, costUsd: 0 };
 	}
 
+	/** A lane that still throws (e.g. in its clean-up) is logged: a rejected lane must never reach the scheduler's wait. */
+	const laneDone = (unitId: string, p: Promise<unknown>): Promise<void> => p.then(() => undefined, (e: any) => log(pc.red(`✗ ${unitId}: lane failed: ${String(e?.message ?? e).split("\n")[0]}`)));
 	const aheadRunning = new Set<string>();
 	/** Truth-ahead attempts that ended without truth in this run: never retried in a tight loop. */
 	const aheadDone = new Set<string>();
@@ -495,11 +497,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					/* no branch */
 				}
 			};
-			drop();
-			addWorktree(config.target.path, wt, branch);
-			linkAll(wt);
-			log(pc.cyan(`◇ ${unitId}`) + pc.dim("  truth ahead (deps still migrating)"));
 			try {
+				// inside the try: a worktree that cannot be made skips this lane like any other failure
+				drop();
+				addWorktree(config.target.path, wt, branch);
+				linkAll(wt);
+				log(pc.cyan(`◇ ${unitId}`) + pc.dim("  truth ahead (deps still migrating)"));
 				const res = await runUnit({ ledger, config, root: o.root, unitId, client: o.client, accept: false, workDir: wt, truthOnly: true, gateSlot: (fn) => gates.run(fn), log: (l) => log(`  ${l}`), spawn: o.spawn, gate: o.gate });
 				cost += res.costUsd;
 				log(ledger.hasEvidence(unitId, "truth_ahead") ? pc.cyan(`◆ ${unitId}: truth ready`) : pc.yellow(`⏸ ${unitId}: truth ahead failed (waiting on a question)`));
@@ -509,7 +512,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				drop();
 			}
 		});
-		running.set(unitId, p.finally(() => (running.delete(unitId), aheadRunning.delete(unitId), aheadDone.add(unitId))));
+		running.set(unitId, laneDone(unitId, p).finally(() => (running.delete(unitId), aheadRunning.delete(unitId), aheadDone.add(unitId))));
 	};
 	/** Planned units waiting only on deps (not on questions), without truth yet: closest to ready first. */
 	const aheadCandidates = (): string[] => {
@@ -548,14 +551,17 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				linkAll(wt);
 				ledger.updateUnit(unitId, { worktree: wt, branch });
 			};
-			fresh();
-			log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]`));
 			let res: UnitRunResult | undefined;
 			let conflictNote: string | undefined;
-			// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
-			const carried = takeRetryNote(ledger, unitId);
+			let carried: string | undefined;
 			let crash: string | undefined;
 			try {
+				// inside the try: a worktree that cannot be made (disk full, git lock) counts as a crash, so the unit is
+				// quarantined after the second one instead of being picked first again on every restart
+				fresh();
+				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]`));
+				// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
+				carried = takeRetryNote(ledger, unitId);
 				// Playbook: run → (merge conflict → fresh worktree on current main, one more implement pass with the conflict as the gate output) ×2 → accept or quarantine.
 				for (let round = 1; round <= 3; round++) {
 					res = await runUnit({
@@ -660,7 +666,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				await circuit(unitId, st, res, crash);
 			}
 		});
-		running.set(unitId, p.finally(() => running.delete(unitId)));
+		running.set(unitId, laneDone(unitId, p).finally(() => running.delete(unitId)));
 	};
 
 	// ---- circuit breaker: when recent units fail the same way (or Jev judges the failures systemic), the run heals
@@ -794,6 +800,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// a failing pass never ends the run: the error is shown (once a minute while it repeats) and the next pass tries again
 	let passError = "";
 	let passErrorAt = 0;
+	/** When the error now repeating first came (a broken placement.json or areas.json fails every pass the same way). */
+	let passErrorSince = 0;
 	for (;;) {
 		try {
 			reloadLanes();
@@ -891,11 +899,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				}
 				break;
 			}
+			passError = ""; // a pass that got through ends the streak of a repeating error
 		} catch (e: any) {
 			const msg = String(e?.message ?? e);
 			if (msg !== passError || Date.now() - passErrorAt > 60_000) log(pc.red(`run error (the run goes on): ${msg.slice(0, 600)}`));
+			if (msg !== passError) passErrorSince = Date.now();
 			passError = msg;
 			passErrorAt = Date.now();
+			// the same error for 5 minutes with nothing running: no pass can get past it, so the run ends and says why
+			// instead of spinning (running lanes would have finished; the next br run starts again after the fix)
+			if (!running.size && Date.now() - passErrorSince > 5 * 60_000) requestStop(`every pass failed the same way for 5 minutes; fix it, then br run: ${msg.split("\n")[0]!.slice(0, 300)}`);
 		}
 		// wake at least every 2 s: lane changes, resubmits and stops apply without waiting for a unit to end
 		await Promise.race([...running.values(), new Promise((r) => setTimeout(r, 2000))]);
@@ -1353,7 +1366,7 @@ export function keepPortedTests(config: Config, root: string, unitId: string, me
  * interface and the tests again (its interface.md and kept tests go; the truth cases from the old code stay).
  * Returns what happened per id.
  */
-export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean } = {}): string[] {
+export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean; human?: boolean } = {}): string[] {
 	const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
 	const list = ids === "all" ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : ids;
 	const out: string[] = [];
@@ -1384,6 +1397,8 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 			/* no branch */
 		}
 		ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.crashes', '$.hold', '$.parked') WHERE id = ?").run(id);
+		// only a person's requeue gives the setup model new tries for this unit; automatic ones keep the cap
+		if (o.human) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.setupParks') WHERE id = ?").run(id);
 		if (o.fresh) dropDraft();
 		ledger.transitionUnit(id, "planned", `requeued by ${by}${o.fresh ? " (interface and tests drafted again)" : ""}`);
 		out.push(`${id}: requeued`);
