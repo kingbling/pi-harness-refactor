@@ -142,6 +142,15 @@ describe("stubs carry the owning unit; that unit replaces them", () => {
 		expect(text).toContain("- TODO(br:billing): legacy/billing.php::Billing");
 	});
 
+	it("a dependency no unit owns is stubbed TODO(br:unowned), never with the unit's own mark", async () => {
+		ledger.upsertFile({ path: "legacy/fw.php", hash: "h", lang: "php", loc: 5 });
+		ledger.upsertSymbol({ id: "legacy/fw.php::Base", path: "legacy/fw.php", kind: "class", name: "Base" });
+		ledger.db.prepare("INSERT INTO index_deps(from_id, to_id, kind) VALUES (?, ?, 'extends')").run("legacy/agency_pay.php::Pay", "legacy/fw.php::Base");
+		const text = renderTaskCard(await card("agency_pay"), config, { includeSource: false });
+		expect(text).toContain("- TODO(br:unowned): legacy/fw.php::Base");
+		expect(text).not.toContain("TODO(br:agency_pay)");
+	});
+
 	it("billing's own card lists the stubs waiting for it", async () => {
 		execFileSync("git", ["init", "-q"], { cwd: api });
 		write("src/features/agency/billing.stub.ts", "// TODO(br:billing) minimal stand-in\nexport class Billing {}\n");

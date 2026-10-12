@@ -9,7 +9,7 @@ import { FakeModelClient } from "../src/models/fake.ts";
 import { askPendingQuirks, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
 import { rulesText } from "../src/run/prompts.ts";
 import { activeRuleFiles, renderLayoutSection, rulesDir, validateRulesLayout } from "../src/rules/layout.ts";
-import { maybeCurateRules, proposeRule, refreshRulesLayout, saveRulesVersion } from "../src/rules/living.ts";
+import { CURATOR_VERSION, maybeCurateRules, proposeRule, refreshRulesLayout, saveRulesVersion } from "../src/rules/living.ts";
 import { getTargetAdapter } from "../src/adapters/registry.ts";
 
 function setup() {
@@ -135,6 +135,27 @@ describe("living rules", () => {
 		expect(r2.versions).toEqual({ nestjs: 3 });
 		expect(st(p2)).toBe("merged");
 		expect(rulesText(root, "nestjs")).toMatch(/Errors return 200/);
+	});
+	it("a proposal listed as both merged and breaking stays merged, never asked", async () => {
+		const { root, config, ledger } = setup();
+		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
+		const p = proposeRule({ ledger }, { stack: "nestjs", kind: "add", text: "Dates are ISO strings", why: "legacy sends Y-m-d" });
+		const client = new FakeModelClient({ chat: () => ({ json: { body: "## Errors\n- throw HttpException\n- Dates are ISO strings", merged: [p], rejected: [], breaking: [{ id: p, impact: "x" }] } }) });
+		const r = await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 });
+		expect(r.asked).toBe(0);
+		expect((ledger.db.prepare("SELECT status FROM rule_proposals WHERE id = ?").get(p) as { status: string }).status).toBe("merged");
+	});
+	it("an empty curator answer marks nothing as curated: the proposals still trigger the next curation", async () => {
+		const { root, config, ledger } = setup();
+		await saveRulesVersion({ ledger, root }, "nestjs", "## Errors\n- throw HttpException", { version: 1 });
+		ledger.setMeta("rules_curator:nestjs", CURATOR_VERSION);
+		proposeRule({ ledger }, { stack: "nestjs", kind: "add", text: "Dates are ISO strings", why: "legacy sends Y-m-d" });
+		let body = "";
+		const client = new FakeModelClient({ chat: () => ({ json: { body, merged: [], rejected: [], breaking: [] } }) });
+		expect((await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 })).versions).toEqual({});
+		expect(ledger.getMeta("rules_seen:nestjs")).toBeUndefined();
+		body = "## Errors\n- throw HttpException\n- Dates are ISO strings";
+		expect((await maybeCurateRules({ ledger, config, root, client }, { threshold: 1 })).versions).toEqual({ nestjs: 2 });
 	});
 	it("new curator guidance curates each stack's rules once, without new proposals: rules about what the checks accept go", async () => {
 		const { root, config, ledger } = setup();

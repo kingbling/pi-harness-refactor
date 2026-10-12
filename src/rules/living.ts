@@ -91,7 +91,6 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 		const curatorKey = `rules_curator:${stack}`;
 		const newGuidance = d.ledger.getMeta(curatorKey) !== CURATOR_VERSION && existsSync(join(rulesDir(d.root, stack), "RULES.md"));
 		if (!newGuidance && (!fresh || (!opts.force && fresh < (opts.threshold ?? 5)))) continue;
-		d.ledger.setMeta(seenKey, String(Math.max(seen, 0, ...open.map((p) => p.id))));
 		const path = join(rulesDir(d.root, stack), "RULES.md");
 		const current = existsSync(path) ? stripLayout(readFileSync(path, "utf8")).trim() : "";
 		const role = d.config.models.escalate;
@@ -119,9 +118,11 @@ Rules tell agents how to write code. Reject a proposal that tells a check, gate,
 		result.costUsd += res.usage.costUsd;
 		const j = (res.json ?? {}) as { body?: string; merged?: number[]; rejected?: Array<{ id: number; reason: string }>; breaking?: Array<{ id: number; impact: string }> };
 		if (!j.body?.trim()) continue;
-		d.ledger.setMeta(curatorKey, CURATOR_VERSION);
 		const before = rulesVersion(d, stack);
 		const version = await saveRulesVersion(d, stack, j.body);
+		// only a saved body counts as curated: an empty answer keeps the proposals' trigger for the next try
+		d.ledger.setMeta(seenKey, String(Math.max(seen, 0, ...open.map((p) => p.id))));
+		d.ledger.setMeta(curatorKey, CURATOR_VERSION);
 		if (version !== before) result.versions[stack] = version;
 		for (const id of j.merged ?? []) d.ledger.db.prepare("UPDATE rule_proposals SET status = 'merged', version = ? WHERE id = ? AND stack = ?").run(version, id, stack);
 		for (const r of j.rejected ?? []) {
@@ -137,7 +138,8 @@ Rules tell agents how to write code. Reject a proposal that tells a check, gate,
 		}
 		for (const b of j.breaking ?? []) {
 			const p = open.find((x) => x.id === b.id);
-			if (!p || p.status === "approved") continue;
+			// already merged into the new body (or rejected): nothing left to ask
+			if (!p || p.status === "approved" || j.merged?.includes(p.id) || j.rejected?.some((r) => r.id === p.id)) continue;
 			const q = await askViaModel(d, {
 				point: "rule_change",
 				facts: `An agent proposed a ${stack} rule change: "${p.text}" (why: ${p.why}${p.evidence ? `; evidence: ${p.evidence}` : ""}). The curator says it is breaking: ${b.impact}. Applying it means later units follow the new rule; already-accepted code stays as it is until reworked.`,

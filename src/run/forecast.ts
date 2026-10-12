@@ -33,7 +33,8 @@ export function forecast(ledger: Ledger): Forecast {
 	const units = ledger.db
 		.prepare("SELECT id, state, COALESCE(json_extract(meta,'$.loc'),0) loc, COALESCE(json_extract(meta,'$.route.difficulty'),'mechanical') d FROM units")
 		.all() as Array<{ id: string; state: string; loc: number; d: string }>;
-	const open = new Set((ledger.openQuestions() as Array<{ unit_id: string | null }>).map((q) => q.unit_id).filter(Boolean) as string[]);
+	// units held by an open question: the one that asked, its waiters (same problem, other units) and what it blocks
+	const open = new Set(ledger.blockedUnits().keys());
 	const count = (f: (u: (typeof units)[number]) => boolean) => units.filter(f).length;
 	const inFlightStates = ["truth", "implementing", "gating", "review"];
 	const u = {

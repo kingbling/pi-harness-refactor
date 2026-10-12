@@ -298,7 +298,8 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		L.push("", "## Dependencies not migrated yet: stub a minimal interface, marked TODO(br:<the unit that owns it>) as below, so that unit replaces it when it runs. Grep for that mark first and reuse a stub that is already there.");
 		const byOwner = new Map<string, string[]>();
 		for (const d of card.unresolvedDeps) {
-			const owner = card.depOwners[d] ?? card.unit.id;
+			// no owning unit (framework, dead or dropped code): never this unit's own mark, or its reviewer reads the stub as one it left unreplaced
+			const owner = card.depOwners[d] ?? "unowned";
 			byOwner.set(owner, [...(byOwner.get(owner) ?? []), d]);
 		}
 		for (const [owner, deps] of byOwner) L.push(`- TODO(br:${owner}): ${deps.join(", ")}`);
