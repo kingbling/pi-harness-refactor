@@ -13,6 +13,7 @@ import type { GateInput, GateReport } from "./gate.ts";
 import { runGate } from "./gate.ts";
 import { lastRun, runScheduler } from "./run.ts";
 import { lanes } from "./lanes.ts";
+import { reopenUnit } from "./recheck.ts";
 import { execFileSync } from "node:child_process";
 
 /**
@@ -25,14 +26,17 @@ import { execFileSync } from "node:child_process";
  *      and sets config.simulatedAt.
  */
 export async function simulate(opts: { level: 1 | 2 | 3; sample: number }): Promise<void> {
-	if (opts.level === 1) return simulateL1();
+	if (opts.level === 1) {
+		if (!(await simulateL1()).ok) process.exitCode = 1;
+		return;
+	}
 	throw new Error(`simulate --level ${opts.level} is not implemented yet (sample=${opts.sample}); run --level 1 first`);
 }
 
-type Script = Record<string, { implement?: "ok" | "unproven_once" | "build_fail_once" | "always_fail" | "outside_scope_once"; truth?: "ok" | "broken_once" }>;
+type Script = Record<string, { implement?: "ok" | "unproven_once" | "build_fail_once" | "always_fail" | "outside_scope_once"; truth?: "ok" | "broken_once" | "typed_once" }>;
 
 const SCRIPT: Script = {
-	U001_src_Config: { implement: "ok" },
+	U001_src_Config: { implement: "ok", truth: "typed_once" }, // tester types the expected values in first → rejected → rerun
 	U002_src_Money: { implement: "build_fail_once" }, // → triage impl_bug → retry → green
 	U003_src_InvoiceRepo: { implement: "unproven_once" }, // → symbolproof fails deterministically → retry → green
 	U004_src_Pricing: { implement: "outside_scope_once" }, // → write gate blocks, anti-gaming clean, green
@@ -40,22 +44,30 @@ const SCRIPT: Script = {
 	U005_templates_invoice: { implement: "ok", truth: "broken_once" }, // tester's cases.php broken first → truth_red → rerun
 };
 
-export async function simulateL1(): Promise<void> {
+/** `dir`: the throwaway workspace (default .sim/l1 in the plugin); `quiet`: the run's lines are kept, not printed. */
+export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): Promise<{ ok: boolean; problems: string[]; log: string[] }> {
 	const t0 = Date.now();
 	const here = resolve(import.meta.dirname, "../..");
-	const ws = join(here, ".sim", "l1");
+	const ws = opts.dir ?? join(here, ".sim", "l1");
+	const lines: string[] = [];
+	const print = (l: string) => (lines.push(l), opts.quiet || console.log(l));
 	rmSync(ws, { recursive: true, force: true });
 	mkdirSync(join(ws, "legacy"), { recursive: true });
 	cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
 	const target = join(ws, "migrated");
-	mkdirSync(join(target, "src"), { recursive: true });
+	mkdirSync(join(target, "src", "health"), { recursive: true });
 	writeFileSync(join(target, "package.json"), JSON.stringify({ name: "sim", private: true, scripts: {}, devDependencies: { vitest: "x" } }, null, 2));
 	// a real node_modules (as after `pnpm install`): worktrees symlink it; it must never be committed or flagged by the gate
 	mkdirSync(join(target, "node_modules", "fake-dep"), { recursive: true });
 	writeFileSync(join(target, "node_modules", "fake-dep", "index.js"), "module.exports = 1;\n");
 	writeFileSync(join(target, ".gitignore"), "node_modules/\ndist/\n");
+	// a generated app module with one feature module: the first accept regenerates its registration on main
+	writeFileSync(join(target, "src", "app.module.ts"), "import { Module } from '@nestjs/common';\n\n@Module({ imports: [] })\nexport class AppModule {}\n");
+	writeFileSync(join(target, "src", "health", "health.module.ts"), "import { Module } from '@nestjs/common';\n\n@Module({})\nexport class HealthModule {}\n");
 	ensureRepo(target, "migration/main");
 	commitAll(target, "chore: bootstrap (simulated)");
+	// the registration commit after a merge fails (a hook refuses it): the merged unit must stay accepted
+	writeFileSync(join(target, ".git", "hooks", "commit-msg"), "#!/bin/sh\ngrep -q 'regenerate registration' \"$1\" && { echo 'simulated: registration commit refused' >&2; exit 1; }\nexit 0\n", { mode: 0o755 });
 
 	const config: Config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {}, run: { maxImplementAttempts: 2, maxEscalateAttempts: 1, agentConcurrency: 4, gateConcurrency: 1 } });
 	writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
@@ -87,6 +99,7 @@ export async function simulateL1(): Promise<void> {
 		client,
 		shouldStop: () => spawned > 0,
 		handleSigint: false,
+		log: print,
 		spawn: (o) => (spawned++, fakeSpawn(ledger, planFor(unitIdOf(o)), attemptsSeen)(o)),
 		gate: (g) => fakeGate(planFor(g.unitId), attemptsSeen)(g),
 	});
@@ -102,6 +115,7 @@ export async function simulateL1(): Promise<void> {
 		if (ledger.listUnits({ state: "planned" }).length === 0) problems.push("stop: everything ran despite the stop");
 	}
 	// Run 2 also resizes lanes mid-flight (`br lanes 2 --gates 1` while units run): the scheduler must apply it.
+	// Its layout sample is 3 units: the review question is asked once they landed (it blocks nothing).
 	let resized = false;
 	const run2Log: string[] = [];
 	const sched = await runScheduler({
@@ -110,7 +124,8 @@ export async function simulateL1(): Promise<void> {
 		root: ws,
 		client,
 		handleSigint: false,
-		log: (l) => (run2Log.push(l), console.log(l)),
+		sample: 3,
+		log: (l) => (run2Log.push(l), print(l)),
 		spawn: (o) => {
 			if (!resized) {
 				resized = true;
@@ -122,6 +137,46 @@ export async function simulateL1(): Promise<void> {
 	});
 	const results = [...stopped.ran, ...sched.ran];
 	if (resized && !run2Log.some((l) => /lanes \d+ → 2, gate slots \d+ → 1/.test(l))) problems.push("lanes: a mid-run change of run.agentConcurrency was not applied");
+	// the registration commit after the first merge was refused (hook): logged, and that unit stays accepted
+	const postMerge = lines.map((l) => /after-merge step failed \((\S+) stays accepted\)/.exec(l)?.[1]).find(Boolean);
+	if (!postMerge) problems.push("post-merge: the refused registration commit was never reported");
+	else if (ledger.getUnit(postMerge)!.state !== "accepted") problems.push(`post-merge: ${postMerge} should stay accepted after its registration commit failed, got ${ledger.getUnit(postMerge)!.state}`);
+
+	// Run 3: a recheck re-opens U005 (accepted count drops below the sample), it earlier crashed once, and it waits
+	// on a question the resolver model answers slowly — the run must wait for that answer, not end before it.
+	const sampleQ = ledger.openQuestions().find((q) => q.point === "layout_sample");
+	if (!sampleQ) problems.push("sample: no layout review question after 3 accepted units");
+	else ledger.answerQuestion(sampleQ.id, "approve", "human");
+	const reopened = "U005_templates_invoice";
+	reopenUnit(ledger, reopened, "simulated recheck", "recheck: simulated");
+	ledger.updateUnit(reopened, { meta: { crashes: 1 } });
+	ledger.transitionUnit(reopened, "truth", "simulated: waits on a question");
+	const waitQ = ledger.askQuestion({ unitId: reopened, point: "truth_env", question: `${reopened}: can the old code run here?`, options: ["retry — run it again", "leave — leave it waiting"], blocks: "unit", askedBy: "orchestrator" });
+	let resolverDone = false;
+	const run3 = await runScheduler({
+		ledger,
+		config,
+		root: ws,
+		client,
+		handleSigint: false,
+		sample: 5,
+		log: print,
+		resolver: async ({ q }) => {
+			if (q.id !== waitQ) return { owner: "left to the owner (simulation)" };
+			await new Promise((r) => setTimeout(r, 3000)); // slower than a pass: the run would end without waiting
+			resolverDone = true;
+			return { answer: "retry", why: "simulated: the environment is ready", hint: "run the truth script again" };
+		},
+		spawn: (o) => fakeSpawn(ledger, planFor(unitIdOf(o)), attemptsSeen)(o),
+		gate: (g) => fakeGate(planFor(g.unitId), attemptsSeen)(g),
+	});
+	results.push(...run3.ran);
+	if (!resolverDone) problems.push("resolver: the run ended before the resolver answered");
+	if (ledger.getUnit(reopened)!.state !== "accepted") problems.push(`resolver: ${reopened} should run again after the resolver's retry and be accepted, got ${ledger.getUnit(reopened)!.state}`);
+	if ((JSON.parse(ledger.getUnit(reopened)!.meta) as { crashes?: number }).crashes !== undefined) problems.push(`crashes: accepting ${reopened} did not clear its crash count`);
+	if (!(JSON.parse(ledger.getMeta("layout_sample") ?? "{}") as { approved?: string }).approved) problems.push("sample: the approved layout sample was reset when the accepted count dropped");
+	const sampleQs = (ledger.db.prepare("SELECT COUNT(*) n FROM questions WHERE point = 'layout_sample'").get() as { n: number }).n;
+	if (sampleQs !== 1) problems.push(`sample: expected 1 layout review question, got ${sampleQs}`);
 
 	// ---- assertions: what L1 must prove
 	const states = Object.fromEntries(results.map((r) => [r.unitId, ledger.getUnit(r.unitId)!.state]));
@@ -157,16 +212,15 @@ export async function simulateL1(): Promise<void> {
 	}
 	const blockedWrites = (ledger.db.prepare("SELECT COUNT(*) n FROM attempts WHERE json_extract(gate_report,'$.blockedWrites') > 0").get() as { n: number }).n;
 
-	console.log("\n" + renderStatus(ledger));
-	console.log(pc.dim(`decisions: ${decisions.join(", ")}  commits: ${commits}  attempts with blocked writes: ${blockedWrites}  ${Math.round((Date.now() - t0) / 1000)}s`));
-	if (problems.length) {
-		console.log(pc.red(`\nL1 FAILED\n- ${problems.join("\n- ")}`));
-		process.exitCode = 1;
-	} else {
-		console.log(pc.green("\nL1 GREEN: ledger invariants, symbolproof, write gate, anti-gaming, triage retry/escalate/retest/quarantine, truth verification, commits"));
+	print("\n" + renderStatus(ledger));
+	print(pc.dim(`decisions: ${decisions.join(", ")}  commits: ${commits}  attempts with blocked writes: ${blockedWrites}  ${Math.round((Date.now() - t0) / 1000)}s`));
+	if (problems.length) print(pc.red(`\nL1 FAILED\n- ${problems.join("\n- ")}`));
+	else {
+		print(pc.green("\nL1 GREEN: ledger invariants, symbolproof, write gate, anti-gaming, triage retry/escalate/retest/quarantine, truth verification, commits, post-merge slip, resolver wait, crash count, approved sample"));
 		ledger.setMeta("simulated_l1_at", new Date().toISOString());
 	}
 	ledger.close();
+	return { ok: !problems.length, problems, log: lines };
 }
 
 /** The scheduler spawns sessions per unit; the script is keyed by unit id, which the system prompt carries ("Unit <id>"). */
@@ -180,18 +234,21 @@ function unitIdOf(o: SpawnOptions): string {
 
 function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<string, number>) {
 	return async (o: SpawnOptions): Promise<LeafSession> => {
-		const gate = makeWriteGate({ cwd: o.cwd, sourceRoot: o.config.source.path, writeGlobs: o.writeGlobs, protectedGlobs: o.protectedGlobs ?? [] });
+		// write globs are relative to globRoot when set (the tester: workspace), else to cwd — like the real tools
+		const base = o.globRoot ?? o.cwd;
+		const gate = makeWriteGate({ cwd: o.cwd, globRoot: o.globRoot, sourceRoot: o.config.source.path, writeGlobs: o.writeGlobs, protectedGlobs: o.protectedGlobs ?? [] });
 		let blocked = 0;
 		let toolCalls = 0;
 		const write = (rel: string, content: string) => {
 			toolCalls++;
-			const reason = gate(rel);
+			const abs = resolve(base, rel);
+			const reason = gate(abs);
 			if (reason) {
 				blocked++;
 				return false;
 			}
-			mkdirSync(join(o.cwd, rel, ".."), { recursive: true });
-			writeFileSync(join(o.cwd, rel), content);
+			mkdirSync(join(abs, ".."), { recursive: true });
+			writeFileSync(abs, content);
 			return true;
 		};
 		return {
@@ -212,12 +269,36 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 					const targetDir = moduleOf(o.writeGlobs[1]!);
 					const file = fileIn(targetDir);
 					const broken = plan.truth === "broken_once" && n === 1;
-					const cases = symbols.map((s) => ({ symbol: s, inputs: null, expected: `value-of-${s.split("::").pop()}` }));
-					write(`${truthDir}/cases.php`, broken ? "<?php\nthrow new RuntimeException('simulated broken truth script');\n" : `<?php\necho <<<'JSON'\n${JSON.stringify(cases)}\nJSON;\n`);
+					const typed = plan.truth === "typed_once" && n === 1;
+					// the script loads the unit's legacy files and prints what the old code reports for each symbol;
+					// "typed_once" first types the expected values in (code must reject it), "broken_once" first throws
+					const files = [...new Set(symbols.map((s) => s.split("::")[0]!))];
+					const typedCases = symbols.map((s) => ({ symbol: s, inputs: null, expected: `value-of-${s.split("::").pop()}` }));
+					const script = broken
+						? "<?php\nthrow new RuntimeException('simulated broken truth script');\n"
+						: typed
+							? `<?php\nrequire_once '${files[0]}';\necho <<<'JSON'\n${JSON.stringify(typedCases)}\nJSON;\n`
+							: [
+									"<?php",
+									// a template renders on load and may fail without its variables: its output is not a case
+									...files.map((f) => `ob_start(); try { require_once '${f}'; } catch (Throwable $e) {} ob_end_clean();`),
+									"function probe(string $n) {",
+									"  if (str_contains($n, '::')) { [$c, $m] = explode('::', $n, 2); return (new ReflectionMethod($c, $m))->getNumberOfParameters(); }",
+									"  if (function_exists($n)) return (new ReflectionFunction($n))->getNumberOfParameters();",
+									"  if (class_exists($n)) return count(get_class_methods($n));",
+									"  return defined($n) ? constant($n) : null;",
+									"}",
+									`$symbols = ${JSON.stringify(symbols)};`,
+									"echo json_encode(array_map(fn($s) => ['symbol' => $s, 'inputs' => null, 'expected' => probe(explode('::', $s, 2)[1])], $symbols));",
+									"",
+								].join("\n");
+					write(`${truthDir}/cases.php`, script);
 					write(`${truthDir}/interface.md`, `${targetDir}/${file}.ts exports: ${symbols.map((s) => s.split("::").pop()).join(", ")}`);
-					write(`${targetDir}/${specOf(targetDir)}.spec.ts`, `import { describe, it, expect } from "vitest";\nimport * as m from "./${file}";\ndescribe("${unitId}", () => { it("exists", () => expect(m).toBeTruthy()); });\n`);
+					// one test per case, named by its id as the tester prompt asks (case N of the first run is <unit>#N)
+					const tests = symbols.map((s, i) => `\tit("${unitId}#${i + 1} ${s.split("::").pop()}", () => expect(m).toBeTruthy());`);
+					write(`${targetDir}/${specOf(targetDir)}.spec.ts`, `import { describe, it, expect } from "vitest";\nimport * as m from "./${file}";\ndescribe("${unitId}", () => {\n${tests.join("\n")}\n});\n`);
 					write(o.config.source.path + "/src/Hack.php", "<?php // must be blocked"); // read-only source
-					return { text: `TESTER DONE ${cases.length} cases`, toolCalls, blocked, usage };
+					return { text: `TESTER DONE ${symbols.length} cases`, toolCalls, blocked, usage };
 				}
 
 				// implementer / escalate
@@ -225,7 +306,7 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 				if (outsideScope) write("src/other/leak.ts", "export const leak = 1;"); // blocked by the write gate
 				const moduleDir = moduleOf(o.writeGlobs[0]!);
 				const file = fileIn(moduleDir);
-				const existing = existsSync(join(o.cwd, moduleDir, `${file}.ts`)) ? readFileSync(join(o.cwd, moduleDir, `${file}.ts`), "utf8").replace(/\/\/ simulated port of \S+ attempt \d+\n/g, "") : "";
+				const existing = existsSync(join(base, moduleDir, `${file}.ts`)) ? readFileSync(join(base, moduleDir, `${file}.ts`), "utf8").replace(/\/\/ simulated port of \S+ attempt \d+\n/g, "") : "";
 				const own = symbols.map((s) => `export const ${s.split("::").pop()!.replace(/\W/g, "_")} = "value-of-${s.split("::").pop()}";`).filter((l) => !existing.includes(l));
 				write(`${moduleDir}/${file}.ts`, `// simulated port of ${unitId} attempt ${n}\n${existing}${own.join("\n")}\n`);
 				write("package.json", "{}"); // protected → blocked
