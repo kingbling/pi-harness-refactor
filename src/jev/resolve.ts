@@ -17,6 +17,9 @@ import { answerValue, loadBrief, optionFor } from "./ask.ts";
 export const RESOLVER = "resolver model";
 /** Resolver answers on one point of one unit before the owner decides: a backstop, the model hands on earlier. */
 export const MAX_RESOLVER_TRIES = 3;
+/** Resolver calls that failed (provider down, no answer) before the question goes to the owner; tries wait longer each time. */
+export const MAX_RESOLVER_FAILURES = 3;
+const RESOLVER_RETRY_MS = 5 * 60_000;
 
 export type Resolution = { answer: string; why: string } | { owner: string } | { fix: string; then: string; stack?: string } | { code: string; then: string; stack?: string } | { layout: string; then: string; stack?: string };
 /** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or undefined. */
@@ -55,10 +58,13 @@ export async function resolveOpenQuestions(d: {
   let forOwner = 0;
   for (const q of d.ledger.openQuestions()) {
     const ctx = q.context
-      ? (JSON.parse(q.context) as { forOwner?: string; forOwnerAt?: number })
+      ? (JSON.parse(q.context) as { forOwner?: string; forOwnerAt?: number; resolverFailed?: number; resolverFailedAt?: number })
       : {};
     const again = ctx.forOwner !== undefined && !!d.pluginChangedAt && (ctx.forOwnerAt ?? 0) < d.pluginChangedAt;
     if (ctx.forOwner !== undefined && !again) continue;
+    // the resolver failed on it lately (provider outage, rate limit): wait a little longer after each failure
+    const failed = ctx.resolverFailed ?? 0;
+    if (failed && Date.now() - (ctx.resolverFailedAt ?? 0) < failed * RESOLVER_RETRY_MS) continue;
     const earlier = triedBefore(d.ledger, q);
     if (earlier.length >= MAX_RESOLVER_TRIES && !again) {
       d.ledger.markForOwner(
@@ -73,11 +79,25 @@ export async function resolveOpenQuestions(d: {
       root: d.root,
       q,
       earlier,
-    }).catch((e) => ({
-      owner: `the resolver model failed: ${e?.message ?? e}`,
-    }));
+    }).catch((e) => ({ failed: `the resolver model failed: ${e?.message ?? e}` }));
     if (d.ledger.getQuestion(q.id)?.status !== "open") continue; // answered meanwhile (owner, setup model …)
-    if (r && "layout" in r) {
+    if (!r || "failed" in r) {
+      // a failed call says nothing about the question: it stays open and is tried again later; only after a few
+      // failures in a row does the owner get it
+      const why = r?.failed ?? "the resolver model gave no answer";
+      if (failed + 1 < MAX_RESOLVER_FAILURES) {
+        d.ledger.db
+          .prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.resolverFailed', ?, '$.resolverFailedAt', ?) WHERE id = ?")
+          .run(failed + 1, Date.now(), q.id);
+        d.log?.(`question #${q.id}: ${why.slice(0, 160)}; tried again later`);
+        continue;
+      }
+      d.ledger.db.prepare("UPDATE questions SET context = json_remove(context, '$.resolverFailed', '$.resolverFailedAt') WHERE id = ?").run(q.id);
+      d.ledger.markForOwner(q.id, `${why} (${failed + 1} times)`);
+      forOwner++;
+      continue;
+    }
+    if ("layout" in r) {
       const done = d.layoutJob
         ? await d.layoutJob(q, r.layout, r.stack).catch((e) => ({ owner: `the layout job failed: ${e?.message ?? e}` }))
         : undefined;
@@ -92,7 +112,7 @@ export async function resolveOpenQuestions(d: {
       answered++;
       continue;
     }
-    if (r && ("fix" in r || "code" in r)) {
+    if ("fix" in r || "code" in r) {
       // the question waits while the job runs; a job that changed main answers it with the option the resolver chose (retry …)
       const [kind, job, what, by] = "fix" in r ? (["fix job", d.fixJob, r.fix, FIX_JOB] as const) : (["code job", d.codeJob, r.code, CODE_JOB] as const);
       const fixed = job
@@ -109,11 +129,8 @@ export async function resolveOpenQuestions(d: {
       answered++;
       continue;
     }
-    if (!r || "owner" in r) {
-      d.ledger.markForOwner(
-        q.id,
-        r?.owner ?? "the resolver model gave no answer",
-      );
+    if ("owner" in r) {
+      d.ledger.markForOwner(q.id, r.owner);
       forOwner++;
       continue;
     }
@@ -126,13 +143,19 @@ export async function resolveOpenQuestions(d: {
   return { answered, forOwner };
 }
 
+/** Who answers for the run's models: their "retry" is one more try, never the owner's fresh set of tries. */
+export const MODEL_ANSWERERS: readonly string[] = [RESOLVER, FIX_JOB, CODE_JOB, LAYOUT_JOB];
+
 function triedBefore(ledger: Ledger, q: QuestionRow): string[] {
+  // a problem several units share (sameAs) is counted per problem: otherwise each unit that asks it next starts at 0
+  const sameAs = q.context ? (JSON.parse(q.context) as { sameAs?: string }).sameAs : undefined;
+  const who = sameAs ? "json_extract(context, '$.sameAs') = ?" : "unit_id IS ?";
   return (
     ledger.db
       .prepare(
-        "SELECT answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND unit_id IS ? AND answered_by IN (?, ?, ?, ?) ORDER BY id",
+        `SELECT answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND ${who} AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
       )
-      .all(q.id, q.point, q.unit_id, RESOLVER, FIX_JOB, CODE_JOB, LAYOUT_JOB) as Array<{ answered_at: string; answer: string; answered_by: string }>
+      .all(q.id, q.point, sameAs ?? q.unit_id, ...MODEL_ANSWERERS) as Array<{ answered_at: string; answer: string; answered_by: string }>
   ).map((r) => `${r.answered_at}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`);
 }
 

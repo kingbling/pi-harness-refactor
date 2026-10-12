@@ -66,3 +66,38 @@ describe("decisions during a run", () => {
 		ledger.close();
 	});
 });
+
+describe("live decision blocks", () => {
+	it("a slip while recomputing keeps the last blocks and tries again on the next loop", async () => {
+		const ws = join(here, ".sim", "live-blocks");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		const prepare = ledger.db.prepare.bind(ledger.db);
+		let busy = true;
+		let reads = 0;
+		ledger.db.prepare = ((sql: string) => {
+			reads++;
+			if (busy) throw new Error("database is locked");
+			return prepare(sql);
+		}) as typeof ledger.db.prepare;
+		const blocked = liveBlocks(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws);
+		expect(blocked().size).toBe(0);
+		const tried = reads;
+		expect(tried).toBeGreaterThan(0);
+		busy = false;
+		blocked();
+		expect(reads).toBeGreaterThan(tried); // recomputed although decisions.json did not change
+		const after = reads;
+		blocked();
+		expect(reads).toBe(after); // and cached again once it worked
+	});
+
+	it("a bare set-now for the target location is not recorded: the path must come with it", () => {
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t/.sim/x", stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		expect(applyDecision(ledger, config, "/nowhere", "target-location", "set-now")).toMatch(/not recorded/);
+		expect(ledger.openQuestions()).toEqual([]);
+	});
+});

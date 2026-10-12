@@ -105,6 +105,14 @@ describe("DB lane", () => {
 		expect((await readSchema(cfg({ from: ["sqlite"], schemaFiles: ["app.sqlite"] }))).map((x) => x.name)).toEqual(["users"]);
 	});
 
+	it("SQL Server scripts end statements with GO, not `;`: each table is read on its own", async () => {
+		write(join(ws, "legacy", "db", "mssql.sql"), "CREATE TABLE [dbo].[agency] (\n  [id] int NOT NULL\n)\nGO\nCREATE TABLE [dbo].[invoice] (\n  [id] int NOT NULL\n)\nCREATE TABLE [dbo].[customer] (\n  [id] int NOT NULL\n)\n");
+		const t = await readSchema(cfg({ from: ["mssql"], schemaFiles: ["db/mssql.sql"] }));
+		expect(t.map((x) => x.name)).toEqual(["agency", "customer", "invoice"]);
+		expect(t.find((x) => x.name === "agency")!.ddl).not.toMatch(/GO|invoice/);
+		expect(t.find((x) => x.name === "invoice")!.ddl).not.toContain("customer");
+	});
+
 	it("a dump of several databases: each table knows its databases (USE lines, db.table names)", async () => {
 		write(join(ws, "legacy", "db", "all.sql"), "USE `app`;\nCREATE TABLE `agency` (\n  `id` int NOT NULL\n);\nUSE `mysql`;\nCREATE TABLE `help_topic` (id int);\nCREATE TABLE `app_staging`.`agency` (\n  `id` int NOT NULL\n);\n");
 		const t = await readSchema(cfg({ from: ["mariadb"], schemaFiles: ["db/all.sql"] }));
@@ -388,6 +396,18 @@ describe("DB lane: tables no parser reads are found by a model with tools", () =
 		// asked once per set of schema inputs
 		await planDbLane(ledger, config, { root: ws, spawn });
 		expect(seen.runs).toBe(1);
+	});
+
+	it("a session that ends in an error saves nothing: the next inventory asks again", async () => {
+		write(join(ws, "legacy", "db", "schema.rb"), 'create_table "invoices" do |t|\nend\n');
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		let runs = 0;
+		const spawn = (async (): Promise<LeafSession> => ({ run: async () => (runs++, { text: "", error: "provider down", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession) as never;
+		const config = cfg({ from: ["postgresql"], schemaFiles: ["db/schema.rb"] });
+		await planDbLane(new Ledger(":memory:"), config, { root: ws, spawn });
+		expect(existsSync(foundTablesPath(ws))).toBe(false);
+		await planDbLane(new Ledger(":memory:"), config, { root: ws, spawn });
+		expect(runs).toBe(2);
 	});
 
 	it("without models (no client, no session) nothing is asked: the raw schema text stays the fallback", async () => {

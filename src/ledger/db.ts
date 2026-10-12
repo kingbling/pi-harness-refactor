@@ -65,7 +65,8 @@ export class Ledger {
 	readonly db: DatabaseSync;
 
 	constructor(path: string) {
-		this.db = new DatabaseSync(path);
+		// another process (br answer, br decide, br inventory) may hold the write lock for a moment: wait, don't fail
+		this.db = new DatabaseSync(path, { timeout: 10_000 });
 		this.db.exec(DDL);
 		// ledgers from before decisions.state
 		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = 'state'").get())) this.db.exec("ALTER TABLE decisions ADD COLUMN state TEXT");
@@ -245,14 +246,25 @@ export class Ledger {
 		if (s.unit_id !== p.unitId) throw new LedgerError(`${p.srcSymbol} is not in unit ${p.unitId}`);
 		if (p.op !== "dropped" && !(p.targetSymbols?.length)) throw new LedgerError(`op ${p.op} requires targetSymbols`);
 		if (!p.why.trim()) throw new LedgerError("why is required");
-		this.db.prepare("DELETE FROM moves WHERE unit_id = ? AND src_symbol = ?").run(p.unitId, p.srcSymbol); // retries replace; history stays in attempts/transitions
-		this.db
-			.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-			.run(p.unitId, p.srcSymbol, p.op, JSON.stringify(p.targetSymbols ?? []), p.why, p.attemptId ?? null, now());
 		const to: SymbolState = p.op === "dropped" ? "dropped" : "mapped";
-		if (s.state === "clustered") this.transitionSymbol(p.srcSymbol, "in_progress", "implementer started");
-		const cur = this.getSymbol(p.srcSymbol)!;
-		if (cur.state !== to) this.transitionSymbol(p.srcSymbol, to, `${p.op}: ${p.why}`);
+		// the move row and the state change land together: a refused change leaves the earlier move in place
+		this.db.exec("SAVEPOINT prove");
+		try {
+			this.db.prepare("DELETE FROM moves WHERE unit_id = ? AND src_symbol = ?").run(p.unitId, p.srcSymbol); // retries replace; history stays in attempts/transitions
+			this.db
+				.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+				.run(p.unitId, p.srcSymbol, p.op, JSON.stringify(p.targetSymbols ?? []), p.why, p.attemptId ?? null, now());
+			if (s.state === "clustered") this.transitionSymbol(p.srcSymbol, "in_progress", "implementer started");
+			// proved before with another outcome (mapped ↔ dropped): back to in progress first, then the new one
+			else if (s.state !== to && s.state !== "in_progress") this.transitionSymbol(p.srcSymbol, "in_progress", `re-proved as ${p.op}`);
+			const cur = this.getSymbol(p.srcSymbol)!;
+			if (cur.state !== to) this.transitionSymbol(p.srcSymbol, to, `${p.op}: ${p.why}`);
+			this.db.exec("RELEASE prove");
+		} catch (e) {
+			this.db.exec("ROLLBACK TO prove");
+			this.db.exec("RELEASE prove");
+			throw e;
+		}
 	}
 
 	movesOf(srcSymbol: string) {
@@ -488,7 +500,8 @@ export class Ledger {
 			.prepare("SELECT COALESCE(model,'?') model, role, COUNT(*) n, COALESCE(SUM(cost_usd),0) c FROM attempts GROUP BY model, role")
 			.all() as Array<{ model: string; role: string; n: number; c: number }>;
 		const firstPass = this.db
-			.prepare(`SELECT COUNT(*) n FROM units WHERE state = 'accepted' AND attempts <= 2`) // tester + 1 implementer attempt
+			// one implementer attempt (the tester's and reviewer's attempts count in units.attempts too)
+			.prepare(`SELECT COUNT(*) n FROM units u WHERE state = 'accepted' AND (SELECT COUNT(*) FROM attempts a WHERE a.unit_id = u.id AND a.role IN ('implement', 'escalate')) <= 1`)
 			.get() as { n: number };
 		const quarantine = this.listUnits({ state: "quarantined" }).map((u) => u.id);
 		return {

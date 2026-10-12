@@ -19,11 +19,13 @@ export async function sameQuestion(d: { ledger: Ledger; config: Config; client?:
 		const id = d.ledger.openQuestionFor(p, sameAs);
 		if (id !== undefined) return { id, costUsd: 0, by: "key" };
 	}
-	if (!d.client) return { costUsd: 0 };
+	// a key that names its own unit (parity:<unit>) is about that unit only: it never joins another unit's question
+	const ownKey = (key: string, unit: string | null | undefined) => !!unit && key.includes(unit);
+	if (!d.client || ownKey(sameAs, unitId)) return { costUsd: 0 };
 	// only questions asked as shareable (with a key) can be joined
 	const open = d.ledger
 		.openQuestions()
-		.filter((q) => points.includes(q.point) && q.context && JSON.parse(q.context).sameAs)
+		.filter((q) => points.includes(q.point) && q.context && JSON.parse(q.context).sameAs && !ownKey(JSON.parse(q.context).sameAs, q.unit_id))
 		.slice(-MAX_CANDIDATES);
 	if (!open.length) return { costUsd: 0 };
 	const criteria: Record<string, string> = { none: "None of them: a different cause, or cannot tell" }; // first: a neutral answer means "none"
