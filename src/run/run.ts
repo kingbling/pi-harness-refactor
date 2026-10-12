@@ -609,8 +609,23 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 								if (adapter.generateRegistration) {
 									const changed = await adapter.generateRegistration(mainProject, { ledger }).catch((e) => (log(pc.yellow(`  registration generation failed: ${e?.message ?? e}`)), [] as string[]));
 									if (changed.length) {
-										gitIn(config.target.path, ["add", "-A", "--", ...changed.map((c) => relative(config.target.path, join(mainProject, c)))]);
-										gitIn(config.target.path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `chore: regenerate registration after ${unitId}\n\n${changed.join("\n")}`]);
+										const files = changed.map((c) => relative(config.target.path, join(mainProject, c)));
+										try {
+											gitIn(config.target.path, ["add", "-A", "--", ...files]);
+											gitIn(config.target.path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `chore: regenerate registration after ${unitId}\n\n${changed.join("\n")}`]);
+										} catch (e) {
+											// put the wiring files back to the last commit: left changed on main, the next accept would regenerate
+											// the same content, see no change and never commit it
+											gitIn(config.target.path, ["reset", "-q", "--", ...files]);
+											for (const f of files) {
+												try {
+													gitIn(config.target.path, ["checkout", "-q", "HEAD", "--", f]);
+												} catch {
+													rmSync(join(config.target.path, f), { force: true }); // new with this regeneration: not in the last commit
+												}
+											}
+											throw e;
+										}
 										log(pc.dim(`  regenerated ${changed.join(", ")}`));
 									}
 								}

@@ -141,6 +141,9 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 	const postMerge = lines.map((l) => /after-merge step failed \((\S+) stays accepted\)/.exec(l)?.[1]).find(Boolean);
 	if (!postMerge) problems.push("post-merge: the refused registration commit was never reported");
 	else if (ledger.getUnit(postMerge)!.state !== "accepted") problems.push(`post-merge: ${postMerge} should stay accepted after its registration commit failed, got ${ledger.getUnit(postMerge)!.state}`);
+	// and the regenerated wiring was put back, not left changed on main (the next accept would see no change and never commit it)
+	const leftOnMain = execFileSync("git", ["-C", target, "status", "--porcelain", "--", "src/app.module.ts"], { encoding: "utf8" }).trim();
+	if (leftOnMain) problems.push(`post-merge: the refused registration was left changed on main: ${leftOnMain}`);
 
 	// Run 3: a recheck re-opens U005 (accepted count drops below the sample), it earlier crashed once, and it waits
 	// on a question the resolver model answers slowly — the run must wait for that answer, not end before it.
