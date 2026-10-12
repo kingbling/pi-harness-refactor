@@ -31,7 +31,7 @@ import { isDbUnitKind } from "../inventory/db.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
 import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
-import { askPendingQuirks, quirkList, quirkRetestNote, quirkSummary } from "./quirks.ts";
+import { askPendingQuirks, markQuirksApplied, quirkList, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
@@ -145,6 +145,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const gateFn = o.gate ?? runGate;
 	let cost = 0;
 	let providerErrors = 0;
+	// reviews in a row that could not judge (the reviewer's model is down): not the implementer's fault
+	let reviewErrors = 0;
 	const askDeps = { ledger: o.ledger, config: o.config, root: o.root, client: o.client };
 	const ask = async (q: Pick<Parameters<typeof askViaModel>[1], "point" | "facts" | "options" | "context" | "sameAs">): Promise<number> => {
 		const r = await askViaModel(askDeps, { unitId: o.unitId, askedBy: "orchestrator", blocks: "unit", ...q });
@@ -355,7 +357,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const outside = () => draftedOutside(existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "", allowedDirs, targetRel, [targetProjectDir, o.config.source.path, o.root]);
 	for (let i = 0, bad = outside(); bad.length; i++, bad = outside()) {
 		if (i === 2) {
-			// two retests did not fix it: never implement against an interface outside the placement
+			// two retests did not fix it: never implement against an interface outside the placement.
+			// Truth ahead implements nothing: it just stops, and the unit's real run tests again
+			if (o.truthOnly) {
+				log(pc.yellow(`  interface.md still outside the placement after 2 retests; truth ahead stops`));
+				return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 0, costUsd: cost };
+			}
 			o.ledger.transitionUnit(o.unitId, "quarantined", `interface.md still drafts files outside ${moduleDir}/ after 2 retests: ${bad.join(", ")}`);
 			log(pc.red(`  interface.md still outside the placement after 2 retests; quarantined`));
 			return { unitId: o.unitId, state: "quarantined", attempts: 0, costUsd: cost };
@@ -431,7 +438,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const quirkNote = quirkRetestNote({ ledger: o.ledger, root: o.root }, o.unitId);
 	if (quirkNote) {
 		log(pc.dim("  quirk answers differ from the ported tests: retest"));
-		await runTruth(quirkNote);
+		// only a retest that went through counts: a failed or stopped one leaves the note for the next run
+		if (await runTruth(quirkNote)) markQuirksApplied({ ledger: o.ledger }, o.unitId);
 	}
 	let testFiles = loadTests();
 	if (!testFiles.length) log(pc.yellow("  no ported test files found — the gate cannot prove behaviour"));
@@ -447,7 +455,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");
 
 	// ---- implement → gate → triage loop ----------------------------------------------------------
-	if (o.ledger.getUnit(o.unitId)!.state === "truth") o.ledger.transitionUnit(o.unitId, "implementing", "truth ready");
+	// a unit whose truth was kept skipped the tester and is still planned: it is running now all the same
+	if (["truth", "planned"].includes(o.ledger.getUnit(o.unitId)!.state)) o.ledger.transitionUnit(o.unitId, "implementing", "truth ready");
 	const maxImpl = o.config.run.maxImplementAttempts;
 	const maxTotal = maxImpl + o.config.run.maxEscalateAttempts;
 	let gate: GateReport | undefined;
@@ -477,6 +486,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		lastRetest = { progress: files() !== before };
 	};
 	const reports: Array<{ owner: string; target: string; problem: string; evidence: string }> = [];
+	let reviewJudged = true;
+	const providerDown = async (facts: string) => {
+		const q = await ask({
+			point: "env",
+			facts,
+			options: [
+				{ value: "retry", facts: "the provider works again: run the unit again" },
+				{ value: "wait", facts: "keep the unit waiting; the rest of the run goes on" },
+			],
+		});
+		log(pc.red(`  provider failing repeatedly; asked question #${q} (only this unit waits)`));
+	};
 	const outOfScopeRoute = async (problem: string): Promise<UnitRunResult | undefined> => {
 		const signature = errorSignature("wired_ok", problem);
 		const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
@@ -576,19 +597,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			o.ledger.endAttempt(attempt, { outcome: "session_error", costUsd: res.usage.cost, gateReport: { error: res.error } });
 			attemptNo--;
 			if (++providerErrors >= 3) {
-				const q = await ask({
-					point: "env",
-					facts: `Model sessions for ${o.unitId} failed ${providerErrors} times in a row before doing any work (provider error after tier fallback, model ${modelRole.id}): ${res.error}`,
-					options: [
-						{ value: "retry", facts: "the provider works again: run the unit again" },
-						{ value: "wait", facts: "keep the unit waiting; the rest of the run goes on" },
-					],
-				});
-				log(pc.red(`  provider failing repeatedly; asked question #${q} (only this unit waits)`));
+				await providerDown(`Model sessions for ${o.unitId} failed ${providerErrors} times in a row before doing any work (provider error after tier fallback, model ${modelRole.id}): ${res.error}`);
 				break;
 			}
 			continue;
 		}
+		// the session worked: only errors in a row count
+		providerErrors = 0;
 
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
 		const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
@@ -599,6 +614,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					cost += r.costUsd ?? 0;
 					reviewWeak = r.weakTests;
 					reviewOutOfScope = r.outOfScope;
+					reviewJudged = r.judged;
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					return r;
 				}
@@ -611,6 +627,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		lastGateText = `failed step: ${gate.failedStep}\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
+
+		// the reviewer could not judge (its model is down): not the code's fault, so no attempt burned and no triage
+		if (gate.failedStep === "wired_ok" && !reviewJudged) {
+			attemptNo--;
+			if (++reviewErrors >= 3) {
+				await providerDown(`The reviewer of ${o.unitId} could not judge ${reviewErrors} times in a row (model ${o.config.models.escalate.id}):\n${gate.steps.find((s) => !s.ok)?.output.slice(0, 500) ?? ""}`);
+				break;
+			}
+			continue;
+		}
+		reviewErrors = 0;
 
 		// the reviewer found something that must change outside the unit's files: another attempt cannot fix it.
 		// Like a setup problem: the setup model first, then one owner question; only this unit waits.

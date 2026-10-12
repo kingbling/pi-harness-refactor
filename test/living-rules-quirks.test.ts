@@ -6,7 +6,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { answerValue, askViaModel, decideOpenFromGoals, discoverDecisions, phraseDecisions, pointHash } from "../src/jev/ask.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
-import { askPendingQuirks, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
+import { askPendingQuirks, markQuirksApplied, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
 import { rulesText } from "../src/run/prompts.ts";
 import { activeRuleFiles, renderLayoutSection, rulesDir, validateRulesLayout } from "../src/rules/layout.ts";
 import { maybeCurateRules, proposeRule, refreshRulesLayout, saveRulesVersion } from "../src/rules/living.ts";
@@ -83,6 +83,9 @@ describe("quirk file", () => {
 		ledger.answerQuestion(q.question_id!, "keep — keep it 1:1");
 		const note = quirkRetestNote({ ledger, root }, "U1");
 		expect(note).toMatch(/KEEP it/);
+		// the retest did not go through: the note comes back; once it did, the tests are current
+		expect(quirkRetestNote({ ledger, root }, "U1")).toMatch(/KEEP it/);
+		markQuirksApplied({ ledger }, "U1");
 		expect(quirkRetestNote({ ledger, root }, "U1")).toBeUndefined();
 		expect(ledger.blockedUnits().size).toBe(0);
 	});
@@ -294,6 +297,7 @@ describe("the run decides routine questions itself", () => {
 		const q = ledger.db.prepare("SELECT * FROM questions WHERE point = 'quirk'").get() as { id: number; status: string };
 		expect(q.status).toBe("auto");
 		expect(quirkRetestNote({ ledger, root }, "U1")).toMatch(/DROP it/); // the tests pinned the quirk: the tester rewrites them
+		markQuirksApplied({ ledger }, "U1"); // the retest went through
 		expect(quirksOf({ ledger }, "U1")[0]!.status).toBe("dropped");
 		ledger.answerQuestion(q.id, "keep", "human (pi)"); // the owner overrides the run
 		expect(quirksOf({ ledger }, "U1")[0]!.status).toBe("dropped"); // synced on the next read

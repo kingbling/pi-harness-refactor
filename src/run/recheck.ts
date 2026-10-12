@@ -115,11 +115,14 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 				}
 				// 3. the reviewer on the unit's files as they are now: where its moves point, plus its commit's files still there
 				const files = currentFiles(o.ledger, u.id, main, dir, meta.commit);
+				// the reviewer actually looked: no files or a reviewer error is not a clean result
+				let judged = false;
 				if (files.length) {
 					const ra = o.ledger.startAttempt(u.id, "review", o.config.models.escalate.id);
 					const r = await (o.reviewer ?? reviewWithModel)({ ledger: o.ledger, config: o.config, root: o.root, unitId: u.id, adapter, targetProjectDir: dir, moduleDir: placementDir(adapter.layout, place), legacyFiles: meta.files ?? [], changedFiles: files, testFiles: tests, commit: meta.commit, recheck: true, transcriptPath: join(o.root, ".bigrefactor", "sessions", `${u.id}.recheck.${ra}.jsonl`) }).catch((e) => ({ ok: true, judged: false, output: `not judged: ${e?.message ?? e}`, costUsd: 0 }));
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output, recheck: true } });
 					const rr = r as { outOfScope?: string; weakTests?: string };
+					judged = !!r.judged;
 					if (!r.judged) notJudged++;
 					// only things outside the unit's files: re-running the unit cannot fix them; one note for the owner (the resolver tries first)
 					else if (!r.ok && rr.outOfScope && !rr.weakTests && !/^reviewer findings:/m.test(r.output)) {
@@ -127,11 +130,16 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 						log(pc.yellow(`? ${u.id}: problems outside its files — asked, unit stays accepted`));
 					} else if (!r.ok) findings.push(r.output);
 				}
-				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString(), recheckVersion: RECHECK_VERSION } });
+				// a sent-back unit nothing judged keeps its old version, so the next recheck tries it again
+				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString(), ...(judged || findings.length ? { recheckVersion: RECHECK_VERSION } : {}) } });
 				const note = `This unit was accepted before, and its code stays on the branch. A later check found problems; start from the existing code and fix them:\n${findings.join("\n")}`;
 				if (again) {
 					if (findings.length) {
 						o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), retryNote: note } });
+						return;
+					}
+					if (!judged) {
+						log(pc.yellow(`${u.id}: not judged; it stays planned`));
 						return;
 					}
 					try {
@@ -160,7 +168,7 @@ export function reopenUnit(ledger: Ledger, unitId: string, note: string, reason:
 	for (const s of ledger.symbolsOfUnit(unitId)) if (s.state === "accepted") ledger.transitionSymbol(s.id, "clustered", reason.slice(0, 200));
 	if (badTruth) {
 		ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(unitId);
-		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_ahead')").run(unitId);
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_read', 'truth_none', 'truth_ahead')").run(unitId);
 	}
 	ledger.updateUnit(unitId, { meta: { retryNote: note } });
 	ledger.transitionUnit(unitId, "planned", reason.split("\n")[0]!.slice(0, 200));

@@ -104,6 +104,31 @@ describe("br recheck", () => {
 		expect(ledger.transitionsOf("unit", "stub").filter((t) => t.to_state === "planned")).toHaveLength(1);
 	});
 
+	it("a sent-back unit the reviewer could not judge stays planned and is tried again next time", async () => {
+		const { root, config, ledger } = workspace();
+		const { reopenUnit } = await import("../src/run/recheck.ts");
+		const { REQUIRED_FOR_ACCEPTED } = await import("../src/ledger/schema.ts");
+		for (const t of REQUIRED_FOR_ACCEPTED) ledger.addEvidence("fine", t, {});
+		reopenUnit(ledger, "fine", "old note", "recheck: x");
+		ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.rechecked', 't') WHERE id = 'fine'").run();
+		const down: Reviewer = async () => ({ ok: false, judged: false, output: "not judged: provider down" });
+		const r = await recheckAccepted({ ledger, config, root, reviewer: down, runTests: green, log: () => {} });
+		expect(r.restored).toEqual([]);
+		expect(ledger.getUnit("fine")!.state).toBe("planned");
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).retryNote).toBe("old note");
+		// no version stamp: the next recheck picks it up again
+		const again = await recheckAccepted({ ledger, config, root, reviewer: async () => ({ ok: true, judged: true, output: "fine" }), runTests: green, log: () => {} });
+		expect(again.restored).toEqual(["fine"]);
+	});
+
+	it("bad truth is redone whatever kind it was: no truth evidence is left to skip the tester", async () => {
+		const { ledger } = workspace();
+		const { reopenUnit } = await import("../src/run/recheck.ts");
+		for (const t of ["truth_read", "truth_none", "truth_ahead"] as const) ledger.addEvidence("fine", t, {});
+		reopenUnit(ledger, "fine", "note", "recheck: bad truth", true);
+		for (const t of ["truth_green_on_old", "truth_read", "truth_none", "truth_ahead"] as const) expect(ledger.hasEvidence("fine", t)).toBe(false);
+	});
+
 	it("a ported test a tidy moved is found again by its case id and linked to its new file, not reported gone", async () => {
 		const { root, config, ledger } = workspace();
 		const { execFileSync } = await import("node:child_process");
