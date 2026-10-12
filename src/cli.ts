@@ -216,14 +216,24 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!args.includes("--dry")) await assertNoGlobalDecisions();
 		const { run } = await import("./run/run.ts");
 		const limit = flag(args, "--limit");
-		await run({ units: flag(args, "--units")?.split(","), slice: flag(args, "--slice"), limit: limit ? Number(limit) : undefined, dry: args.includes("--dry"), force: args.includes("--force") });
+		// one run per workspace: a second one would clean up the first one's live worktrees
+		const { acquireRunLock } = await import("./run/run-lock.ts");
+		const release = args.includes("--dry") ? () => {} : acquireRunLock(loadConfig().root);
+		try {
+			await run({ units: flag(args, "--units")?.split(","), slice: flag(args, "--slice"), limit: limit ? Number(limit) : undefined, dry: args.includes("--dry"), force: args.includes("--force") });
+		} finally {
+			release();
+		}
 	},
 	requeue: async (args) => {
 		// Put quarantined or waiting units back into the queue (after a fix). Worktree and branch are dropped; truth is kept.
 		if (!args.filter((a) => a !== "--fresh").length) throw new Error("usage: br requeue <unit-id...> | --all [--fresh]");
 		const { requeueUnits } = await import("./run/run.ts");
+		const { requeueScope } = await import("./run/run-lock.ts");
 		const { config, root, ledger } = open();
-		for (const l of requeueUnits(ledger, config, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")), process.env["USER"] ?? "human", { fresh: args.includes("--fresh"), human: true })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
+		const scope = requeueScope(ledger, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")));
+		for (const l of scope.refused) console.log(pc.yellow(l));
+		for (const l of requeueUnits(ledger, config, root, scope.ids, process.env["USER"] ?? "human", { fresh: args.includes("--fresh"), human: true })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
 	},
 	reopen: async (args) => {
 		const { reopenUnit } = await import("./run/recheck.ts");
@@ -240,11 +250,13 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	parity: async (args) => {
 		const { parityCommand } = await import("./run/parity-cli.ts");
 		const { config, root, ledger } = open();
+		await refuseDuringRun(root, "br parity"); // the run's own parity job uses the same worktree and ports
 		for (const l of await parityCommand({ ledger, config, root, client: makeClient(), args })) console.log(l);
 	},
 	recheck: async (args) => {
 		const { recheckAccepted } = await import("./run/recheck.ts");
 		const { config, root, ledger } = open();
+		await refuseDuringRun(root, "br recheck"); // it would judge units the run is working on
 		const limit = flag(args, "--limit");
 		await recheckAccepted({ ledger, config, root, limit: limit ? Number(limit) : undefined, again: args.includes("--again") });
 	},
@@ -422,6 +434,12 @@ async function assertNoOpenDecisions(): Promise<void> {
 function flag(args: string[], name: string): string | undefined {
 	const i = args.indexOf(name);
 	return i >= 0 ? args[i + 1] : undefined;
+}
+
+async function refuseDuringRun(root: string, what: string): Promise<void> {
+	const { liveRun } = await import("./run/run-lock.ts");
+	const pid = liveRun(root);
+	if (pid !== undefined) throw new Error(`a run is going in this workspace (pid ${pid}): ${what} waits until it ends`);
 }
 
 export function open(): { config: Config; root: string; ledger: Ledger } {

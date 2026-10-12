@@ -24,7 +24,18 @@ import { CODE_QUALITY, goalsText } from "../policy.ts";
  * Validation is code: files exist, idioms parse, layout agrees with the adapter.
  */
 export function rulesPresent(root: string, config: Config): boolean {
-	return config.target.stacks.every((s) => existsSync(join(rulesDir(root, s), "RULES.md")));
+	return config.target.stacks.every((s) => stackRulesWritten(root, s));
+}
+
+/** Every file the rules session writes is there (a stopped session may have written RULES.md and nothing else). */
+function stackRulesWritten(root: string, stackId: string): boolean {
+	const dir = rulesDir(root, stackId);
+	if (!["RULES.md", "AGENTS.md", "idioms.json"].every((f) => existsSync(join(dir, f)))) return false;
+	try {
+		return readdirSync(join(dir, "astgrep")).some((f) => f.endsWith(".yml") && !f.endsWith("-test.yml"));
+	} catch {
+		return false;
+	}
 }
 
 export async function generateRules(config: Config, root: string, ledger: Ledger, opts: { force?: boolean; relayout?: boolean; client?: ModelClient; log?: (s: string) => void } = {}): Promise<{ files: string[]; costUsd: number }> {
@@ -65,6 +76,11 @@ export async function generateRules(config: Config, root: string, ledger: Ledger
 
 	for (const adapter of targets) {
 		const stackId = adapter.id;
+		// a stack whose rules are all written is kept; only the missing ones are written (again)
+		if (!opts.force && stackRulesWritten(root, stackId)) {
+			files.push(join(rulesDir(root, stackId), "RULES.md"));
+			continue;
+		}
 		const target = projectDir(config, stackId);
 		if (!existsSync(target)) throw new Error(`target project missing at ${target}; run br setup first`);
 		const targetRel = relative(root, target) || ".";

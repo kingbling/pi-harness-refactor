@@ -521,7 +521,7 @@ export async function verifySourceManifest(m: SourceManifest, o: { root: string;
 	if (shape.length) return `invalid manifest:\n${shape.join("\n")}`;
 	const wasm = grammarPath(m, o.root);
 	if (!wasm) return `grammar not found: neither ${join(grammarsDir(o.root), "node_modules", m.grammar.package, m.grammar.wasm)} nor ${m.grammar.package}/${m.grammar.wasm} in the plugin exists (install it: npm install --prefix ${grammarsDir(o.root)} ${m.grammar.package}; check the .wasm file name inside it)`;
-	registerGrammar(langKey(m), wasm);
+	registerGrammar(langKey(m), wasm, { reload: true });
 	let language;
 	try {
 		language = await getLanguage(langKey(m));

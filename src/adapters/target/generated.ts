@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
-import { runCommand } from "../../proc.ts";
+import { outputCaptured, runCommand } from "../../proc.ts";
+import { progress } from "../../progress.ts";
 import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
 import type { StackChoice, TargetAdapter } from "../types.ts";
@@ -284,14 +285,24 @@ export function restoreManifest(root: string, id: string): boolean {
 	return false;
 }
 
+const warnedManifests = new Set<string>();
 /** Verified manifests of this workspace (an invalid one, e.g. edited by hand, is skipped, never run). */
 export function loadManifests(root: string): AdapterManifest[] {
 	const dir = generatedDir(root);
 	if (!existsSync(dir)) return [];
-	return readdirSync(dir)
-		.filter((n) => n.endsWith(".json"))
-		.map((n) => JSON.parse(readFileSync(join(dir, n), "utf8")) as AdapterManifest)
-		.filter((m) => !validateManifest(m).length);
+	const out: AdapterManifest[] = [];
+	for (const n of readdirSync(dir).filter((x) => x.endsWith(".json"))) {
+		try {
+			const m = JSON.parse(readFileSync(join(dir, n), "utf8")) as AdapterManifest;
+			if (!validateManifest(m).length) out.push(m);
+		} catch (e: any) {
+			// one broken file must not take every other stack down with it; said once, not on every load
+			const msg = `skipping adapter manifest ${join(dir, n)}: ${e?.message ?? e}`;
+			if (!warnedManifests.has(msg)) (outputCaptured() ? progress.log(`  ${msg}`) : console.warn(msg));
+			warnedManifests.add(msg);
+		}
+	}
+	return out;
 }
 
 const S = { type: "string" } as const;
@@ -433,7 +444,10 @@ export async function generateAdapter(
 
 function saveManifest(root: string, m: AdapterManifest): void {
 	mkdirSync(generatedDir(root), { recursive: true });
-	writeFileSync(join(generatedDir(root), `${m.id}.json`), JSON.stringify(m, null, 2) + "\n");
+	// temp file + rename: a cut-off write never leaves half a manifest behind
+	const file = join(generatedDir(root), `${m.id}.json`);
+	writeFileSync(`${file}.tmp`, JSON.stringify(m, null, 2) + "\n");
+	renameSync(`${file}.tmp`, file);
 }
 
 /**
@@ -470,10 +484,19 @@ export async function healWiringFiles(root: string, opts: { client: ModelClient;
 	return done;
 }
 
+/** A generated adapter that could not be made to work: its manifest is gone, the stack choice should be asked again. */
+export class AdapterGaveUpError extends Error {
+	constructor(readonly id: string, readonly role: "server" | "ui", message: string) {
+		super(message);
+	}
+}
+
 /**
  * Prove every adapter written during the questions (verified: false): build and test a fresh project, kept as
  * the seed setup moves into place. A failure goes back to the model (when there is one) for a fixed manifest,
- * proven the same way. Throws in plain words when an adapter cannot be made to work. Returns the ids proven.
+ * proven the same way. Throws in plain words when an adapter cannot be made to work: after the model's repairs
+ * also failed, the manifest is removed (AdapterGaveUpError) so the stack is asked again instead of paid for again
+ * on every resume. Returns the ids proven.
  */
 export async function verifyPendingAdapters(
 	root: string,
@@ -496,7 +519,13 @@ export async function verifyPendingAdapters(
 		log(`  adapter ${m.id}: the check failed — ${failure.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3).join("; ")}`);
 		if (!opts.client) throw new Error(`the ${m.id} setup does not work yet: ${failure.split("\n").slice(0, 4).join(" ")}`);
 		const { verified: _v, seedProject: _s, ...prev } = m;
-		await generateAdapter({ id: m.id, role: m.role, why: "chosen by the owner during onboarding", client: opts.client, model: opts.model, root, previous: { manifest: prev as AdapterManifest, failure }, ensureTools: opts.ensureTools && ((t) => opts.ensureTools!(t, m.id)), log });
+		try {
+			await generateAdapter({ id: m.id, role: m.role, why: "chosen by the owner during onboarding", client: opts.client, model: opts.model, root, previous: { manifest: prev as AdapterManifest, failure }, ensureTools: opts.ensureTools && ((t) => opts.ensureTools!(t, m.id)), log });
+		} catch (e: any) {
+			if (e instanceof MissingToolsError) throw e; // the owner installs them and resumes: the choice stands
+			for (const n of [`${m.id}.json`, `${m.id}.seed`]) rmSync(join(generatedDir(root), n), { recursive: true, force: true });
+			throw new AdapterGaveUpError(m.id, m.role, String(e?.message ?? e));
+		}
 		done.push(m.id);
 	}
 	return done;

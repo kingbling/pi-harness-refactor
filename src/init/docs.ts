@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import pc from "picocolors";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
@@ -28,7 +28,6 @@ export async function fetchDocs(config: Config, root: string, opts: { force?: bo
 	const log = opts.log ?? ((l: string) => console.log(l));
 	const dir = statePath(root, "docs");
 	const indexPath = join(dir, "index.json");
-	if (!opts.force && existsSync(indexPath)) return JSON.parse(readFileSync(indexPath, "utf8")) as DocEntry[];
 
 	const sources: Array<{ tech: string; name: string; url: string }> = [];
 	const src = getSourceAdapter(config.source.stack);
@@ -38,6 +37,18 @@ export async function fetchDocs(config: Config, root: string, opts: { force?: bo
 		for (const d of effectiveDocs(t, config.target.choices)) sources.push({ tech: t.id, ...d });
 	}
 	for (const d of config.docs.extra) sources.push({ tech: "extra", ...d });
+	// the index counts as done only for the docs it was fetched for: other stack choices, or a fetch where nothing
+	// came back (offline), fetch again
+	const forPath = join(dir, "fetched-for.json");
+	const wanted = JSON.stringify(sources.map((x) => `${x.tech}|${x.url}`).sort());
+	const fetchedFor = () => {
+		try {
+			return readFileSync(forPath, "utf8");
+		} catch {
+			return undefined;
+		}
+	};
+	if (!opts.force && existsSync(indexPath) && fetchedFor() === wanted) return JSON.parse(readFileSync(indexPath, "utf8")) as DocEntry[];
 
 	const entries: DocEntry[] = [];
 	const byUrl = new Map<string, DocEntry>(); // several doc pages of one site resolve to the same llms-full.txt
@@ -55,7 +66,11 @@ export async function fetchDocs(config: Config, root: string, opts: { force?: bo
 			log(pc.yellow(`  ${s.tech}: ${s.name} FAILED ${err?.message ?? err}`));
 		}
 	}
-	writeFileSync(indexPath, JSON.stringify(entries, null, 2));
+	// temp file + rename: a stop mid-write never leaves a cut-off index
+	writeFileSync(`${indexPath}.tmp`, JSON.stringify(entries, null, 2));
+	renameSync(`${indexPath}.tmp`, indexPath);
+	if (entries.length || !sources.length) writeFileSync(forPath, wanted);
+	else rmSync(forPath, { force: true });
 	return entries;
 }
 

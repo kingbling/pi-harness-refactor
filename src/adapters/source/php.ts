@@ -601,8 +601,9 @@ export const phpAdapter: SourceAdapter = {
 	isEntryPoint(path) {
 		// The framework profile names the entry points (its model read the repo: front controllers, CLI/cron scripts,
 		// scan-discovered files). The common front-controller names stay as a floor: keeping a file alive is the safe
-		// side, and before a file is dropped as dead Jev is asked about it (src/init/dead.ts).
-		return /(^|\/)(index|app|bootstrap|run_console|start)(\.inc)?\.php$/.test(path) || /(^|\/)www\//.test(path) || (activeProfile?.entryPoint?.test(path) ?? false);
+		// side, and before a file is dropped as dead Jev is asked about it (src/init/dead.ts). The profile is loaded here,
+		// not read from the cache: a fresh process or a just-rewritten profile has nothing cached yet.
+		return /(^|\/)(index|app|bootstrap|run_console|start)(\.inc)?\.php$/.test(path) || /(^|\/)www\//.test(path) || (profileFor(process.env["BR_SOURCE_ROOT"] ?? "")?.entryPoint?.test(path) ?? false);
 	},
 
 	frameworkDirs(root) {

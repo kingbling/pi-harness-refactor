@@ -8,7 +8,8 @@ import { progress } from "./progress.ts";
  * progress feed instead of the terminal (raw writes corrupt the TUI); otherwise it streams to stdio as before.
  * Rejects with the command's tail output on a non-zero exit.
  * Silence is reported, not guessed at: every 30 s without output the feed says the command still runs (slow
- * downloads look like a hang); after `idleKillMs` (default 15 min) without any output it is stopped as hung.
+ * downloads look like a hang); after `idleKillMs` (default 15 min) without any output it is stopped as hung
+ * (only when output is captured: with inherited stdio the silence cannot be seen).
  */
 /**
  * Who owns the terminal. "ui": a full-screen host (Pi) draws it; a child process that writes to it directly breaks
@@ -33,16 +34,27 @@ export function runCommand(cmd: string, args: string[], opts: { cwd: string; env
 		let hung = false;
 		const idleKillMs = opts.idleKillMs ?? 15 * 60_000;
 		const secs = (ms: number) => (ms < 120_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)} min`);
+		// Kill the whole group; SIGKILL follows if SIGTERM is ignored.
+		let killTimer: NodeJS.Timeout | undefined;
+		const killTree = () => {
+			const sig = (s: NodeJS.Signals) => {
+				try {
+					if (child.pid) process.kill(-child.pid, s);
+				} catch {
+					child.kill(s);
+				}
+			};
+			sig("SIGTERM");
+			killTimer ??= setTimeout(() => sig("SIGKILL"), 10_000);
+			killTimer.unref();
+		};
 		const watch = setInterval(() => {
 			const quiet = Date.now() - lastOutput;
-			if (quiet >= idleKillMs && child.exitCode === null && child.pid) {
+			// Only piped output can be seen; with inherited stdio silence says nothing, so no idle kill there.
+			if (tracked && quiet >= idleKillMs && child.exitCode === null && child.pid) {
 				hung = true;
 				progress.log(`  ${cmd} │ no output for ${secs(quiet)}: stopping it as hung`);
-				try {
-					process.kill(-child.pid, "SIGTERM");
-				} catch {
-					child.kill("SIGTERM");
-				}
+				killTree();
 			} else if (quiet >= 30_000 && tracked) progress.log(`  ${cmd} │ … still running (${secs(Date.now() - started)} total, no new output for ${secs(quiet)}; downloads can be slow)`);
 		}, 30_000);
 		const feed = (chunk: Buffer) => {
@@ -57,24 +69,30 @@ export function runCommand(cmd: string, args: string[], opts: { cwd: string; env
 		child.stdout?.on("data", feed);
 		child.stderr?.on("data", feed);
 		const onStop = progress.subscribe((s) => {
-			if (s.stopping && progress.aborting && child.exitCode === null && child.pid) {
-				try {
-					process.kill(-child.pid, "SIGTERM");
-				} catch {
-					child.kill("SIGTERM");
-				}
-			}
+			if (s.stopping && progress.aborting && child.exitCode === null && child.pid) killTree();
 		});
-		child.on("error", (e) => {
+		let settled = false;
+		let exitGrace: NodeJS.Timeout | undefined;
+		const finish = (err?: Error) => {
+			if (settled) return;
+			settled = true;
 			clearInterval(watch);
+			clearTimeout(exitGrace);
 			onStop();
-			reject(e);
-		});
-		child.on("close", (code, signal) => {
-			clearInterval(watch);
-			onStop();
-			if (code === 0) resolve();
-			else reject(new Error(`${cmd} ${args.slice(0, 3).join(" ")} ${hung ? `hung (no output for ${secs(idleKillMs)})` : "failed"} (${signal ?? `exit ${code}`})${tail.length ? `:\n${tail.slice(-8).join("\n")}` : ""}`));
+			// Let go of pipes a leftover grandchild may still hold.
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			if (err) reject(err);
+			else resolve();
+		};
+		const done = (code: number | null, signal: NodeJS.Signals | null) =>
+			finish(code === 0 ? undefined : new Error(`${cmd} ${args.slice(0, 3).join(" ")} ${hung ? `hung (no output for ${secs(idleKillMs)})` : "failed"} (${signal ?? `exit ${code}`})${tail.length ? `:\n${tail.slice(-8).join("\n")}` : ""}`));
+		child.on("error", (e) => finish(e));
+		child.on("close", done);
+		// A background grandchild (a server, a watcher) can hold the pipes open so "close" never comes:
+		// settle a little after the main process exits anyway.
+		child.on("exit", (code, signal) => {
+			exitGrace = setTimeout(() => done(code, signal), 2_000);
 		});
 	});
 }
