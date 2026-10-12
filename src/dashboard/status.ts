@@ -66,6 +66,9 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 	lines.push(`first-pass accepted ${s.firstPassAccepted}/${accepted}${accepted ? ` (${Math.round((100 * s.firstPassAccepted) / accepted)}%)` : ""}   cost $${s.costUsd.toFixed(3)}`);
 	for (const r of s.costByModel) lines.push(`  ${r.role.padEnd(11)} ${r.model.padEnd(28)} ${String(r.n).padStart(4)} calls  $${r.c.toFixed(3)}`);
 	if (s.quarantine.length) lines.push(c.red(`quarantine: ${s.quarantine.join(", ")}`));
+	// parked by the resolver model: nothing a model can do is left, and nobody is asked about them
+	const parked = ledger.listUnits({ state: "quarantined" }).filter((u) => JSON.parse(u.meta).parkedWhy).map((u) => u.id);
+	if (parked.length) lines.push(c.dim(`  parked, no question (nothing a model can do is left): ${parked.slice(0, 8).join(", ")}${parked.length > 8 ? " …" : ""} → br requeue <unit> after a change`));
 	const qs = ledger.openQuestions();
 	if (qs.length) {
 		const waiting = ledger.blockedUnits().size;

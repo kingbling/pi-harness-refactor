@@ -18,7 +18,8 @@ describe("resolver model before the owner", () => {
 		let calls = 0;
 		const resolver: Resolver = async ({ q }) => (calls++, q.point === "quarantine" ? { answer: "retry", why: "the mock path is wrong" } : { owner: "money is the owner's call" });
 		expect(await resolveOpenQuestions({ ledger, config, root: "/r", resolver })).toEqual({ answered: 1, forOwner: 1 });
-		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again", answered_by: RESOLVER });
+		// what the model found goes with the answer (a bare retry would run the unit again blind)
+		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again\nhint: what the resolver found: the mock path is wrong", answered_by: RESOLVER });
 		expect(JSON.parse(ledger.getQuestion(b)!.context!).forOwner).toBe("money is the owner's call");
 		// once per question
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
@@ -27,6 +28,26 @@ describe("resolver model before the owner", () => {
 		ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "u1 keeps failing", options: ["retry — try again", "leave — leave it"], askedBy: "orchestrator" });
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
 		expect(calls).toBe(3);
+	});
+
+	it("the resolver's hint and why stay with its retry, and a hint typed after the value is kept too", async () => {
+		const { applyParkedAnswer } = await import("../src/run/run.ts");
+		const { optionFor } = await import("../src/jev/ask.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const options = ["retry — Retry with a hint (recommended)", "leave — leave it"];
+		const a = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "u1 keeps failing", options, askedBy: "orchestrator" });
+		const resolver: Resolver = async () => ({ answer: "retry", why: "the reviewer flags the eager load in services.php", hint: "load the TTD lazily in services.php" });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+		const answer = ledger.getQuestion(a)!.answer!;
+		expect(applyParkedAnswer(answer, options)).toEqual({ action: "requeue", hint: "load the TTD lazily in services.php\nwhat the resolver found: the reviewer flags the eager load in services.php" });
+		// "retry: <text>" keeps its text; the bare option has no hint; leave stays leave with a hint on it
+		const q = ledger.getQuestion(a)!;
+		expect(applyParkedAnswer(optionFor(q, "retry: move the class to Service/"), options)).toEqual({ action: "requeue", hint: "move the class to Service/" });
+		expect(applyParkedAnswer(optionFor(q, "retry — Try again"), options)).toEqual({ action: "requeue", hint: undefined });
+		expect(applyParkedAnswer(optionFor(q, "leave", "nothing a model can do"), options)).toEqual({ action: "quarantine" });
+		expect(applyParkedAnswer("retry: the DB runs on 5433", options)).toEqual({ action: "requeue", hint: "the DB runs on 5433" });
 	});
 
 	it("a question that comes back is the model's call (it sees its earlier answers), up to a cap", async () => {
@@ -166,5 +187,50 @@ describe("the owner's question count", () => {
 		ledger.markForOwner(b, "money is the owner's call");
 		expect(forOwnerCount(ledger, true)).toBe(1);
 		expect(forOwnerCount(ledger, false)).toBe(2);
+	});
+});
+
+describe("a parked unit's question", () => {
+	it("a parked unit never goes to the owner as retry-or-leave: out of tries, nothing left or a retry that changes nothing → it stays parked", async () => {
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		for (const id of ["u1", "u2", "u3"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const options = ["retry — try again", "leave — leave it"];
+		const ask = (context?: Record<string, unknown>, unitId = "u1") => ledger.askQuestion({ unitId, point: "quarantine", question: "u1 keeps failing", options, askedBy: "orchestrator", context });
+		const run = (r: Awaited<ReturnType<Resolver>>) => resolveOpenQuestions({ ledger, config, root: "/r", resolver: async () => r });
+		const parked = (id: number) => expect(ledger.getQuestion(id)).toMatchObject({ status: "answered", answer: expect.stringMatching(/^leave — leave it\nhint: /), answered_by: RESOLVER });
+		// retried on this kind of failure before: a plain retry is no answer, one with a hint is
+		const sameKind = { retry: "with a hint", failureKind: "wired_ok: gate still red" };
+		const a = ask(sameKind);
+		expect(await run({ answer: "retry", why: "looks flaky" })).toEqual({ answered: 1, forOwner: 0 });
+		parked(a);
+		const b = ask(sameKind);
+		await run({ answer: "retry", why: "the reviewer wants the lazy load", hint: "load the TTD lazily in services.php" });
+		expect(ledger.getQuestion(b)!.answer).toMatch(/^retry — try again\nhint: load the TTD lazily/);
+		// automatic tries used up: even a hint does not bring it back, only a job
+		const c = ask({ retry: "none" });
+		await run({ answer: "retry", why: "x", hint: "y" });
+		parked(c);
+		// nothing a model can do is left: parked, the owner is not asked
+		const d = ask();
+		await run({ park: "the legacy screen is dead code" });
+		parked(d);
+		expect(ledger.getQuestion(d)!.context).toBeNull(); // no forOwner
+		// only what a person must do reaches the owner, in those words
+		const e = ask(undefined, "u3");
+		expect(await run({ owner: "the TTD account id is a credential only you have" })).toEqual({ answered: 0, forOwner: 1 });
+		expect(ledger.getQuestion(e)).toMatchObject({ status: "open", question: "u3 is parked until you do this: the TTD account id is a credential only you have", options: JSON.stringify(["retry — done, run it again", "leave — leave it parked"]) });
+		ledger.answerQuestion(e, "leave");
+		// the resolver answered it MAX_RESOLVER_TRIES times or more: parked, not handed to the owner
+		const f = ask();
+		let called = false;
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver: async () => ((called = true), { answer: "retry", why: "again" }) });
+		expect(called).toBe(false);
+		parked(f);
+		expect(ledger.getQuestion(f)!.answer).toMatch(/answered this \d+ times and it came back/);
+		// another point keeps its leave for the owner: parity's "leave it as it is" is not parking
+		const g = ledger.askQuestion({ unitId: "u2", point: "parity", question: "differs", options: ["retry — re-open", "leave — leave it as it is"], askedBy: "parity" });
+		await run({ park: "nothing left" });
+		expect(JSON.parse(ledger.getQuestion(g)!.context!).forOwner).toBe("nothing left");
 	});
 });

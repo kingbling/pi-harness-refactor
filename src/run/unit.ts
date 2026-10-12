@@ -207,8 +207,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		});
 		let res;
 		try {
-			// the orchestrator's note (owner hint, earlier diagnosis) reaches the first tester too, not only the implementer
-			const note = o.retryNote && !extra ? `\n\n## Note from the orchestrator\n${o.retryNote}` : "";
+			// the orchestrator's note (owner hint, earlier diagnosis) reaches every tester run too, not only the implementer
+			const note = o.retryNote ? `\n\n## Note from the orchestrator\n${o.retryNote}` : "";
 			const quirks = quirkList({ ledger: o.ledger }, o.unitId);
 			const keep = testsOnly ? `\nThe truth cases stay exactly as they are (${truthFiles.filter((_, i) => before![i] !== undefined).join(", ") || "recorded in the ledger"}; truth_lookup lists them): do not change them, only add or fix the tests${extra?.includes("interface.md") ? " and interface.md" : ""}.` : "";
 			res = await tester.run(
@@ -562,7 +562,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			`## Ported tests (read-only): ${testFiles.map((t) => t.path).join(", ") || "none"}`,
 			...testFiles.filter((t) => existsSync(join(targetProjectDir, t.path))).map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
 			lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
-			o.retryNote && attemptNo === 1 ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
+			// every attempt reads it: each is a new session, and a later (stronger) one needs the hint as much as the first
+			o.retryNote ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
 		].join("\n");
 		let res;
 		try {

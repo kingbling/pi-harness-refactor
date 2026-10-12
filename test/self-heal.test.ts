@@ -76,7 +76,7 @@ describe("answers are applied per option", () => {
 		for (let i = 2; i <= config.run.maxAutoHeals + 1; i++) {
 			for (const id of ["U1", "U2"]) {
 				ledger.transitionUnit(id, "truth", "t");
-				ledger.transitionUnit(id, "quarantined", `gate still red after 5 attempts (${["lint_ok", "build_ok", "test_ok"][i % 3]})`); // a new failure each time
+				ledger.transitionUnit(id, "quarantined", `gate still red after 5 attempts (${["lint_ok", "build_ok", "test_ok", "wired_ok", "rules_ok", "structure_ok"][i - 1]})`); // a new kind of failure each time
 			}
 			expect((await heal({ now: Date.now() + hour + 1000 })).length).toBe(i <= config.run.maxAutoHeals ? 2 : 0); // an hour later
 		}
@@ -93,22 +93,51 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.getUnit("U2")!.meta)).toMatchObject({ autoHeals: 0, retryNote: expect.stringMatching(/hint: the lint config was wrong/) });
 	});
 
-	it("the resolver model's retry is one more try, not a fresh set: a unit it keeps sending back runs out of tries", async () => {
+	it("the resolver model's retry counts against the automatic tries: past them the unit stays parked and nobody is asked", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		const { RESOLVER } = await import("../src/jev/resolve.ts");
 		mk("U1", "billing", "implementing");
 		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (antigaming_ok)");
-		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals } });
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals - 1, stuck: true } });
+		const at = ledger.startAttempt("U1", "implement");
+		ledger.endAttempt(at, { outcome: "gate_red:antigaming_ok", gateReport: { ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output: "src/a.spec.ts: the test asserts nothing" }], changedFiles: [] } });
+		const heal = () => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { now: Date.now() + 9 * 60 * 60_000 });
 		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
-		ledger.answerQuestion(ledger.openQuestions()[0]!.id, "retry", RESOLVER);
-		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {})).toEqual(["U1"]);
-		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals + 1, retryNote: expect.stringMatching(/the resolver model said to try again/) });
-		// it fails again: no automatic try is left, it is asked about again (the resolver hands it to the owner after its tries)
+		ledger.answerQuestion(ledger.openQuestions()[0]!.id, "retry\nhint: keep the fixture ids", RESOLVER);
+		expect(await heal()).toEqual(["U1"]);
+		// the note carries the hint and the last red report (the worktree is gone, this is all the next run has); the kind of failure is kept
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals, retriedOn: ["antigaming_ok: gate still red after N attempts (antigaming_ok)"], retryNote: expect.stringMatching(/the resolver model said to try again\. The resolver's hint: keep the fixture ids\nIts last failure \(antigaming_ok\):\nsrc\/a\.spec\.ts: the test asserts nothing/) });
+		// it fails again: no automatic try is left, it is asked about, and the question says a retry is no answer now
 		ledger.transitionUnit("U1", "truth", "t");
-		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (wired_ok)");
-		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { now: Date.now() + 9 * 60 * 60_000 })).toEqual([]);
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (antigaming_ok)");
+		expect(await heal()).toEqual([]);
 		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		const q = ledger.openQuestions()[0]!;
+		expect(JSON.parse(q.context!)).toMatchObject({ retry: "none" });
+		// the resolver's retry anyway: it stays parked, nobody is asked again, br status lists it
+		ledger.answerQuestion(q.id, "retry\nhint: keep the fixture ids", RESOLVER);
+		expect(await heal()).toEqual([]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ healQuestion: 0, parkedWhy: expect.stringMatching(/automatic tries are used up/) });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(0);
+		const { renderStatus } = await import("../src/dashboard/status.ts");
+		expect(renderStatus(ledger, { color: false })).toMatch(/parked, no question .*U1/);
+	});
+
+	it("a failure in new words of a kind the unit was retried on is the same failure: stuck, and a plain retry is no answer", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (wired_ok); attempt cap 5 reached");
+		const hour = 60 * 60_000;
+		const heal = () => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, now: Date.now() + hour + 1000 });
+		expect(await heal()).toEqual(["U1"]);
+		ledger.transitionUnit("U1", "truth", "t");
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 4 attempts (wired_ok); decision model unsure: 0.35");
+		expect(await heal()).toEqual([]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ stuck: true });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		expect(JSON.parse(ledger.openQuestions()[0]!.context!)).toMatchObject({ retry: "with a hint", failureKind: "-: gate still red after N attempts (wired_ok)" });
 	});
 
 	it("the same failure again with nothing changed is not retried: the unit is asked about, and a later fix still brings it back", async () => {

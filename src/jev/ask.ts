@@ -431,8 +431,11 @@ export function decideOpenFromGoals(ledger: Ledger, config: Config): number {
 
 /** The machine value of an answer given to an askViaModel question ("drop — remove it" → "drop"). */
 export function answerValue(answer: string | null | undefined): string {
-	return (answer ?? "").split(/\s+—\s+|:\s/)[0]!.trim();
+	return (answer ?? "").split(/\s+—\s+|:\s|\n/)[0]!.trim();
 }
+
+/** How a hint rides on an option answer ("retry — try again" + HINT + "move X to Y"); applyParkedAnswer reads it back. */
+export const HINT = "\nhint: ";
 
 /**
  * Open questions grouped so one answer can serve several: identical questions, or model-phrased ones that ask
@@ -453,10 +456,16 @@ export function groupQuestions(rows: QuestionRow[]): QuestionRow[][] {
 	return [...groups.values()];
 }
 
-/** The row's own option string for an answer picked on another row of its group (same value, its own label). */
-export function optionFor(q: QuestionRow, picked: string): string {
+/**
+ * The row's own option string for an answer picked on another row of its group (same value, its own label). A hint
+ * typed after the value ("retry: move X") or passed as `hint` is kept after the option (HINT), not dropped.
+ */
+export function optionFor(q: QuestionRow, picked: string, hint?: string): string {
 	const v = answerValue(picked);
-	return (q.options ? (JSON.parse(q.options) as string[]) : []).find((o) => answerValue(o) === v) ?? picked;
+	const option = (q.options ? (JSON.parse(q.options) as string[]) : []).find((o) => answerValue(o) === v);
+	const typed = option && picked.startsWith(`${v}: `) ? picked.slice(v.length + 2).trim() : "";
+	const hints = [typed, hint?.trim()].filter(Boolean).join("\n");
+	return `${option ?? picked}${hints ? `${HINT}${hints}` : ""}`;
 }
 
 async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & { costUsd: number }> {

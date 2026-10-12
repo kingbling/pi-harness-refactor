@@ -95,6 +95,16 @@ describe("runUnit wiring", () => {
 		expect(r.state).toBe("quarantined");
 	});
 
+	it("the orchestrator's note (a retry's hint and last failure) reaches every implementer attempt, not only the first", async () => {
+		const tasks: string[] = [];
+		const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role !== "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "impl_bug" } : undefined), chat: () => ({ json: { action: "reimplement", summary: "create() returns the wrong id", command: "", note: "return the new row's id" } }) });
+		const gate = async (): Promise<GateReport> => ({ ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: "", exitCode: 1 }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "ported_tests_green", testFiles: [] });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnTasks as never, gate, client, retryNote: "The owner's hint: create() must return the id from the insert", log: () => {} });
+		expect(tasks.length).toBeGreaterThan(1);
+		for (const t of tasks) expect(t).toMatch(/Note from the orchestrator\nThe owner's hint: create\(\) must return the id/);
+	});
+
 	it("a doctor 'reimplement' past its two actions goes to the stronger model and then the cap: no environment question", async () => {
 		const roles: string[] = [];
 		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => (roles.push(opts.role), spawn());

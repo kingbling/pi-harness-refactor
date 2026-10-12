@@ -4,6 +4,7 @@ import { recordSpend } from "../spend.ts";
 import { describeArgs, progress } from "../progress.ts";
 import { mkdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { tmpdir } from "node:os";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
@@ -63,6 +64,34 @@ export function bashTouchesReadOnly(command: string, sourceRoot: string, cwd: st
 	const harmless = command.replace(/\d*>{1,2}\s*(\/dev\/null|&\d)/g, " ").replace(/\d*>{1,2}\s*([^\s;&|]+)/g, (m, target: string) => (resolve(cwd, target).startsWith(src) ? m : " "));
 	if (mentions && (WRITE_VERBS.test(harmless) || mutating?.test(harmless))) return "the legacy source repo is read-only: no writes, moves, deletes, redirects or git operations there";
 	if (/\bgit\s+(commit|push|rebase|merge|reset|checkout|clean|stash)\b/.test(command)) return "git is driven by the orchestrator (commits per accepted unit); do not run git mutations";
+	return undefined;
+}
+
+const DELETES = /^(rm|rmdir|unlink|mv)$/;
+
+/**
+ * Deletes and moves stay inside the session's own folder: a shell slip like `rm -rf ../../*` from a worktree would
+ * wipe the other lanes, the ledger and every transcript. A path counts as inside when it is under cwd, under the
+ * temp dir, or somewhere `mayWrite` allows (the session's own write globs, e.g. the tester's truth folder).
+ */
+export function bashDeletesOutside(command: string, cwd: string, mayWrite: (abs: string) => boolean = () => false): string | undefined {
+	const home = process.env["HOME"] ?? "~";
+	const inside = (arg: string) => {
+		if (/\$(?!HOME\b|\{HOME\})/.test(arg)) return false; // a variable code cannot resolve: not provably inside
+		const p = arg.replace(/^["']|["']$/g, "").replace(/^~(?=\/|$)/, home).replace(/\$\{?HOME\}?/g, home);
+		const abs = resolve(cwd, p);
+		return [resolve(cwd), resolve(tmpdir()), "/tmp", "/private/tmp"].some((r) => abs !== r && abs.startsWith(r + sep)) || mayWrite(abs);
+	};
+	for (const seg of command.split(/&&|\|\||[;|\n]/)) {
+		const words = seg.trim().split(/\s+/).filter(Boolean);
+		while (words[0] && /^(sudo|command|xargs|\w+=\S*)$/.test(words[0])) words.shift();
+		const verb = words[0] ?? "";
+		let paths: string[] = [];
+		if (DELETES.test(verb)) paths = words.slice(1).filter((w) => !w.startsWith("-"));
+		else if (verb === "find" && words.some((w) => w === "-delete" || /^rm$/.test(w))) paths = words.slice(1, words.findIndex((w, i) => i > 0 && w.startsWith("-")) >>> 0 || undefined);
+		const outside = paths.find((p) => !inside(p));
+		if (outside !== undefined) return `only files inside your working directory (${cwd}) may be deleted or moved; "${outside}" is not`;
+	}
 	return undefined;
 }
 
@@ -238,7 +267,8 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				reason = gate(path);
 				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""));
 			} else if (event.toolName === "bash") {
-				reason = ROLE_TOOLS[opts.role].includes("bash") ? bashTouchesReadOnly(String(input["command"] ?? ""), opts.config.source.path, opts.cwd, findSourceAdapter(opts.config.source.stack)?.traits?.mutatingCommands) : "bash is not available to this role";
+				const command = String(input["command"] ?? "");
+				reason = ROLE_TOOLS[opts.role].includes("bash") ? (bashTouchesReadOnly(command, opts.config.source.path, opts.cwd, findSourceAdapter(opts.config.source.stack)?.traits?.mutatingCommands) ?? bashDeletesOutside(command, opts.cwd, (abs) => opts.writeGlobs.length > 0 && !gate(abs))) : "bash is not available to this role";
 			}
 			if (progress.aborting) return { block: true, terminate: true, reason: "stopped by the user" };
 			if (reason) {
