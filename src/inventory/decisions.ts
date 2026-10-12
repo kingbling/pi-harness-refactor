@@ -71,6 +71,14 @@ export function recordEarlyDecision(root: string, id: string, answer: string, by
 	saveDecisions(root, d);
 }
 
+/** Take an answer back: the decision is open again (a picked stack whose adapter could not be made to work). */
+export function forgetDecision(root: string, id: string): void {
+	const d = loadDecisions(root);
+	if (!(id in d.answers)) return;
+	delete d.answers[id];
+	saveDecisions(root, d);
+}
+
 /** `raw` = the code's points without the model's phrasing (input for `br advise`). */
 export function openDecisions(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string, opts: { raw?: boolean } = {}): Decision[] {
 	process.env["BR_WORKSPACE"] = root; // the generated framework profile lives in this workspace

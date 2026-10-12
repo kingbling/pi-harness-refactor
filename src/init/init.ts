@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { CONFIG_FILE, ConfigSchema, saveConfig, type Config } from "../config.ts";
+import { CONFIG_FILE, ConfigSchema, saveConfig, statePath, type Config } from "../config.ts";
 import { findSourceAdapter, getSourceAdapter, getTargetAdapter, knownSources, knownTargets, registerGeneratedSources, registerGeneratedTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdFor } from "../adapters/registry.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { commitAll, ensureRepo, headOf } from "../git.ts";
@@ -318,6 +318,32 @@ export async function setup(config: Config, root: string, opts: { creator?: Proj
 	for (const id of config.target.stacks) await checkToolchain(config, await getTargetAdapter(id), { root });
 	const sha = commitAll(target, `chore: bootstrap ${config.target.stacks.join(" + ")} with official generators\n\nsource: ${config.source.stack} @ ${config.source.commit ?? "unpinned"}`);
 	console.log(sha ? pc.green(`committed ${sha.slice(0, 7)} on ${config.target.git.branch}`) : pc.dim("nothing new to commit"));
+	writeFileSync(statePath(root, "setup-done.json"), setupKey(config));
+}
+
+/** What a finished setup was built for: other stacks or choices mean setup runs again. */
+function setupKey(config: Config): string {
+	return JSON.stringify({ stacks: config.target.stacks, choices: Object.fromEntries(config.target.stacks.map((s) => [s, config.target.choices[s] ?? {}])) });
+}
+/**
+ * Setup finished (toolchain checked, committed) for exactly these stacks and choices. A target bootstrapped
+ * without this plugin (or before the marker existed) counts when every project is there, committed, and has
+ * every chosen package; a stopped setup or other choices run setup again.
+ */
+export function setupDone(config: Config, root: string, adapters: TargetAdapter[]): boolean {
+	if (!adapters.every((a) => a.toolchain.isProjectReady(projectDir(config, a.id)))) return false;
+	let marker: string | undefined;
+	try {
+		marker = readFileSync(statePath(root, "setup-done.json"), "utf8");
+	} catch {
+		/* no marker */
+	}
+	if (marker !== undefined) return marker === setupKey(config);
+	if (!headOf(config.target.path)) return false;
+	return adapters.every((a) => {
+		const installed = new Set(a.toolchain.installedPackages(projectDir(config, a.id)));
+		return resolveChoices(a, config.target.choices).every((c) => (c.option.packages ?? []).every((p) => installed.has(p)));
+	});
 }
 
 /** Where a stack's project lives inside the target repo. Single stack → the target root itself. */

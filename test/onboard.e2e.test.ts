@@ -19,10 +19,11 @@ function workspace(name: string) {
 	rmSync(ws, { recursive: true, force: true });
 	mkdirSync(join(ws, "legacy"), { recursive: true });
 	cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
-	// target pre-bootstrapped (what the official generator would leave) so the test needs no network
+	// target pre-bootstrapped (what the official generator would leave, with the default choices' packages) so the
+	// test needs no network; a target missing a chosen package is set up again
 	const target = join(ws, "migrated");
 	mkdirSync(join(target, "src"), { recursive: true });
-	writeFileSync(join(target, "package.json"), JSON.stringify({ name: "sim", private: true, dependencies: {}, devDependencies: { vitest: "x" } }, null, 2));
+	writeFileSync(join(target, "package.json"), JSON.stringify({ name: "sim", private: true, dependencies: Object.fromEntries(["prisma", "@prisma/client", "class-validator", "class-transformer", "@nestjs/passport", "passport", "passport-jwt", "@nestjs/jwt", "express-session", "passport-local"].map((p) => [p, "x"])), devDependencies: { vitest: "x" } }, null, 2));
 	writeFileSync(join(target, "nest-cli.json"), "{}");
 	writeFileSync(join(target, ".gitignore"), "node_modules/\n");
 	ensureRepo(target, "migration/main");

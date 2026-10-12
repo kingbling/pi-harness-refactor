@@ -17,9 +17,15 @@ const GRAMMARS: Record<string, string> = {};
  * `lang` → npm module path of the grammar wasm (resolved from this package's dependencies), or an absolute path
  * (a grammar a model installed into the workspace for a generated source adapter).
  */
-export function registerGrammar(lang: string, wasmModule: string): void {
-	if (GRAMMARS[lang] !== undefined && GRAMMARS[lang] !== wasmModule) languages.delete(lang);
+export function registerGrammar(lang: string, wasmModule: string, opts: { reload?: boolean } = {}): void {
+	// A reinstalled grammar keeps its path, so a verify asks for a reload instead of trusting the cached one.
+	if (opts.reload || (GRAMMARS[lang] !== undefined && GRAMMARS[lang] !== wasmModule)) forget(lang);
 	GRAMMARS[lang] = wasmModule;
+}
+
+function forget(lang: string): void {
+	languages.delete(lang);
+	for (const k of queries.keys()) if (k.startsWith(`${lang}\u0000`)) queries.delete(k);
 }
 
 let initialized: Promise<void> | undefined;
@@ -35,6 +41,10 @@ export async function getLanguage(lang: string): Promise<Language> {
 		if (!rel) throw new Error(`no tree-sitter grammar registered for "${lang}" (have: ${Object.keys(GRAMMARS).join(", ") || "none"}; an adapter registers its grammar)`);
 		p = Language.load(isAbsolute(rel) ? rel : require.resolve(rel));
 		languages.set(lang, p);
+		// A failed load is not kept: the next try (after a repair) loads again.
+		p.catch(() => {
+			if (languages.get(lang) === p) languages.delete(lang);
+		});
 	}
 	return p;
 }

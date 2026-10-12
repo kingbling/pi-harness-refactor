@@ -520,6 +520,9 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 		const { getSourceAdapter, getTargetAdapter } = await import("../adapters/registry.ts");
 		const { runScheduler } = await import("../run/run.ts");
 		const { OpenRouterClient } = await import("../models/openrouter.ts");
+		// one run per workspace (a br run in a terminal counts too)
+		const { acquireRunLock } = await import("../run/run-lock.ts");
+		const release = flags.includes("--dry") ? () => {} : acquireRunLock(root);
 		const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
 		let runDone = false;
 		runActive = true;
@@ -630,6 +633,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 		} finally {
 			runDone = true;
 			runActive = false;
+			release();
 			ledger.close();
 		}
 	});
@@ -946,8 +950,11 @@ export default function (pi: ExtensionAPI) {
 					if (!rest.filter((a) => a !== "--fresh").length) text = "usage: /br requeue <unit-id...> | --all [--fresh]";
 					else {
 						const { requeueUnits } = await import("../run/run.ts");
+						const { requeueScope } = await import("../run/run-lock.ts");
 						const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
-						text = requeueUnits(ledger, config, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")), "human (pi)", { fresh: rest.includes("--fresh"), human: true }).join("\n");
+						// units a live run holds are left alone; --all then means the quarantined ones
+						const scope = requeueScope(ledger, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")));
+						text = [...scope.refused, ...requeueUnits(ledger, config, root, scope.ids, "human (pi)", { fresh: rest.includes("--fresh"), human: true })].join("\n");
 					}
 				} else if (sub === "unaccounted") {
 					const rows = ledger.unaccounted();

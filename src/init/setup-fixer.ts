@@ -163,24 +163,28 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 	const dirs = migratedCodeDirs(adapter);
 	const exts = adapter.layout.sourceExtensions ?? [];
 	const entries = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0");
-	const changes: Array<{ path: string; rel?: string; isNew: boolean; undo: "always" | "newCode" | "keep" }> = [];
+	const changes: Array<{ path: string; rel?: string; isNew: boolean; from?: string; undo: "always" | "newCode" | "keep" }> = [];
+	const relOf = (p: string) => (!proj ? p : p.startsWith(`${proj}/`) ? p.slice(proj.length + 1) : undefined);
 	for (let i = 0; i < entries.length; i++) {
 		const e = entries[i]!;
 		if (e.length < 4) continue;
 		const code = e.slice(0, 2);
 		const path = e.slice(3);
-		if (code[0] === "R" || code[0] === "C") i++; // the old name follows
-		const rel = !proj ? path : path.startsWith(`${proj}/`) ? path.slice(proj.length + 1) : undefined;
-		const isNew = code === "??" || code[0] === "A";
+		// the old name follows; a rename (`git mv`) is put back by its old path, a copy left the old file alone
+		const from = code[0] === "R" ? entries[++i] : code[0] === "C" ? (i++, undefined) : undefined;
+		const fromRel = from === undefined ? undefined : relOf(from);
+		const rel = relOf(path);
+		const isNew = code === "??" || code[0] === "A" || code[0] === "C" || from !== undefined;
 		if (rel === undefined) {
 			changes.push({ path, isNew, undo: "keep" });
 			continue;
 		}
 		const inCodeDirs = dirs.some((d) => rel.startsWith(d));
 		const newCode = isNew && inCodeDirs && (!exts.length || exts.some((x) => rel.endsWith(x)));
-		let undo: "always" | "newCode" | "keep" = adapter.layout.isTestFile(rel) || (migrated ? migrated.has(rel) : inCodeDirs) ? "always" : newCode ? "newCode" : "keep";
+		const guarded = (r: string) => adapter.layout.isTestFile(r) || (migrated ? migrated.has(r) : dirs.some((d) => r.startsWith(d)));
+		let undo: "always" | "newCode" | "keep" = guarded(rel) || (fromRel !== undefined && guarded(fromRel)) ? "always" : newCode ? "newCode" : "keep";
 		if (undo === "always" && !isNew && whitespaceOnly(repo, path)) undo = "keep"; // a formatter's fix changes no behaviour
-		changes.push({ path, rel, isNew, undo });
+		changes.push({ path, rel, isNew, from, undo });
 	}
 	// what the fix keeps: a new code file one of them names by path belongs to the fix
 	const kept = changes.filter((c) => c.undo === "keep").map((c) => {
@@ -197,6 +201,7 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		if (c.isNew) {
 			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", c.path], { stdio: "pipe" });
 			rmSync(join(repo, c.path), { force: true });
+			if (c.from) execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", c.from], { stdio: "pipe" });
 		} else execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", c.path], { stdio: "pipe" });
 		undone.push(c.path);
 	}
@@ -239,11 +244,24 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 			return undefined;
 		}
 		const { sha, undone, changed } = await lock(async () => {
-			const migrated = o.ledger ? new Set((o.ledger.db.prepare("SELECT target_symbols FROM moves WHERE op != 'dropped'").all() as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!))) : undefined;
-			const undone = undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
-			const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
-			const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
-			return { sha, undone, changed };
+			try {
+				const migrated = o.ledger ? new Set((o.ledger.db.prepare("SELECT target_symbols FROM moves WHERE op != 'dropped'").all() as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!))) : undefined;
+				const undone = undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
+				const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
+				const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
+				return { sha, undone, changed };
+			} catch (e: any) {
+				// a failed put-back or commit (a hook) must not leave the fixer's edits on main for the next commit to sweep up
+				try {
+					execFileSync("git", ["-C", repo, "reset", "-q", "--hard", "HEAD"], { stdio: "pipe" });
+					execFileSync("git", ["-C", repo, "clean", "-fdq"], { stdio: "pipe" });
+				} catch {
+					/* best effort */
+				}
+				if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "exception", gateReport: { said, error: `commit failed, the fix was dropped: ${String(e?.message ?? e).slice(0, 2000)}` } });
+				wasted();
+				throw e;
+			}
 		});
 		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} test or migrated-code file(s) it changed: ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
 		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;

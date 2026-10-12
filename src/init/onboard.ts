@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import pc from "picocolors";
@@ -6,7 +5,8 @@ import { progress } from "../progress.ts";
 import { loadConfig, type Config } from "../config.ts";
 import { Ledger } from "../ledger/db.ts";
 import { registerGeneratedTargets } from "../adapters/registry.ts";
-import { type InitPrompter, init, projectDir, setup, terminalPrompter } from "./init.ts";
+import { type InitPrompter, init, projectDir, setup, setupDone, terminalPrompter } from "./init.ts";
+import { PROFILE_DONE } from "./profile.ts";
 
 /**
  * `br onboard`: the whole onboarding as one seamless, resumable flow. Every step is idempotent and
@@ -97,7 +97,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 	const reload = () => (config = loadConfig(configPath).config);
 	/** Build and test the adapters written during the questions (questions first, slow work after); true = any proven. */
 	const verifyAdapters = async (): Promise<boolean> => {
-		const { loadManifests, verifyPendingAdapters } = await import("../adapters/target/generated.ts");
+		const { loadManifests, verifyPendingAdapters, AdapterGaveUpError } = await import("../adapters/target/generated.ts");
 		if (!loadManifests(root).some((m) => m.verified === false)) return false;
 		const { OpenRouterClient } = await import("../models/openrouter.ts");
 		const done = await verifyPendingAdapters(root, {
@@ -108,6 +108,26 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				const { ensureTools } = await import("./toolchain-install.ts");
 				return ensureTools({ stack, tools: missing, ui, yes, log: (x) => progress.log(x), client: noLlm ? undefined : new OpenRouterClient(), model: config.models.escalate.id });
 			},
+		}).catch(async (e) => {
+			// the adapter could not be made to work: its stack question opens again, so a resume asks it instead of
+			// paying for the same failing check again
+			if (e instanceof AdapterGaveUpError) {
+				const { forgetDecision } = await import("../inventory/decisions.ts");
+				forgetDecision(root, `target:${e.role}`);
+				// the config must not name a stack with no adapter (every later load would fail); a built-in one of the
+				// same role holds the place until the question is answered again
+				const { saveConfig } = await import("../config.ts");
+				const { TARGET_ROLES } = await import("../adapters/registry.ts");
+				const raw = loadConfig(configPath).config;
+				const left = raw.target.stacks.filter((s) => s !== e.id);
+				raw.target.stacks = left.length ? left : Object.keys(TARGET_ROLES).filter((id) => TARGET_ROLES[id] === e.role).slice(0, 1);
+				delete raw.target.choices[e.id];
+				saveConfig(root, raw);
+				reload();
+				registerGeneratedTargets(root);
+				throw new Error(`no working ${e.id} adapter: ${e.message}\nThe ${e.role} stack is asked again on resume (br resume), or pick another with br decide.`);
+			}
+			throw e;
 		});
 		registerGeneratedTargets(root);
 		return done.length > 0;
@@ -174,7 +194,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 		// always profiled when the adapter supports it: the profile model decides which folders are the framework
 		// (none is a valid answer) and names the entry points, which a plain app needs too
-		await step("profile", () => (noLlm ? "skipped (--no-llm)" : !source.profileExample ? "adapter has no framework profiles" : has(".bigrefactor", "framework-profile.json") ? "profile present" : undefined), async () => {
+		await step("profile", () => (noLlm ? "skipped (--no-llm)" : !source.profileExample ? "adapter has no framework profiles" : has(".bigrefactor", "framework-profile.json") && ledgerMeta(root, PROFILE_DONE) ? "profile present" : undefined), async () => {
 			const { generateProfile } = await import("./profile.ts");
 			const { OpenRouterClient } = await import("../models/openrouter.ts");
 			const l = ledger();
@@ -351,9 +371,9 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			}
 		});
 
-		// Bootstrapped = every project exists AND setup's final commit landed. An interrupted setup (half a
-		// generator run, chosen packages not added) has files but no commit, so a resume redoes it idempotently.
-		await step("setup", () => (targets.every((t) => t.toolchain.isProjectReady(projectDir(config, t.id))) && targetHasCommit(config.target.path) ? "target already bootstrapped" : undefined), async () => {
+		// Bootstrapped = every project exists AND setup finished (toolchain checked, committed) for these stacks and
+		// choices. An interrupted setup or one for other choices is redone; setup is idempotent.
+		await step("setup", () => (setupDone(config, root, targets) ? "target already bootstrapped" : undefined), async () => {
 			// an adapter whose check failed or was interrupted earlier is proven first
 			if (await verifyAdapters()) {
 				registerGeneratedTargets(root);
@@ -376,7 +396,8 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			return `push ${got.push}${got.remote ? ` → ${got.remote}` : ""}`;
 		});
 
-		await step("docs", () => (has(".bigrefactor", "docs", "index.json") || args.includes("--no-docs") ? "docs present" : undefined), async () => {
+		// fetchDocs itself keeps an index fetched for the same stacks (a file alone may be empty or for other choices)
+		await step("docs", () => (args.includes("--no-docs") ? "--no-docs" : undefined), async () => {
 			const { fetchDocs } = await import("./docs.ts");
 			const entries = await fetchDocs(config, root, { log: (l) => log(pc.dim(l)) });
 			return `${entries.length} docs`;
@@ -470,8 +491,14 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				l.close();
 			}
 		});
-	} catch {
-		/* step already recorded the failure */
+	} catch (e: any) {
+		// a step records its own failure; anything else (a stop between steps, the submodule check, an adapter lookup)
+		// must not end as "onboarding is done"
+		if (report.ok) {
+			report.ok = false;
+			report.steps.push({ name: "onboarding", status: "failed", note: e?.message ?? String(e), ms: 0 });
+			log(pc.red(`✗ onboarding: ${e?.message ?? e}`));
+		}
 	}
 
 	if (report.ok) log(summary(root));
@@ -520,12 +547,15 @@ function summary(root: string): string {
 	return L.join("\n");
 }
 
-function targetHasCommit(dir: string): boolean {
+
+function ledgerMeta(root: string, key: string): string | undefined {
+	const p = join(root, ".bigrefactor", "ledger.sqlite");
+	if (!existsSync(p)) return undefined;
+	const l = new Ledger(p);
 	try {
-		execFileSync("git", ["-C", dir, "rev-parse", "--verify", "-q", "HEAD"], { stdio: "ignore" });
-		return true;
-	} catch {
-		return false;
+		return l.getMeta(key) || undefined;
+	} finally {
+		l.close();
 	}
 }
 
