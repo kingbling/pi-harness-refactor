@@ -335,6 +335,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const parityQueue: string[] = [];
 	let parityRunning: Promise<void> | undefined;
 	let parityStopped = false;
+	let parityLast: string | undefined;
+	const showParity = (what?: string) => progress.setParity({ now: what ? { what, since: Date.now() } : undefined, queued: parityQueue.length, last: parityLast });
 	const sliceOf = (unitId: string) => (JSON.parse(ledger.getUnit(unitId)?.meta ?? "{}") as { slice?: string }).slice;
 	const sliceDone = (slice: string) => {
 		const us = ledger.listUnits().filter((u) => (JSON.parse(u.meta) as { slice?: string }).slice === slice);
@@ -344,26 +346,34 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (parityRunning || parityStopped || !parityQueue.length) return;
 		const slice = parityQueue.shift()!;
 		parityRunning = (async () => {
+			showParity("checking whether the old and the new app start");
 			await parityProbe;
 			const { loadApps } = await import("./parity.ts");
 			const apps = loadApps(o.root);
-			if (!apps["legacy"]?.up || !apps[serverStack]?.up || !sliceDone(slice)) return;
+			if (!apps["legacy"]?.up || !apps[serverStack]?.up) return void (parityLast = `off: ${!apps["legacy"]?.up ? "the old app" : "the new app"} does not start here (br parity --probe)`);
+			if (!sliceDone(slice)) return;
+			showParity(`comparing ${slice} with the old app`);
 			const { checkSlice } = await import("./parity-check.ts");
 			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log });
+			parityLast = `${slice}: ${r.outcome === "same" ? "answers like the old app" : r.outcome === "error" ? `not compared (${r.note.slice(0, 80)})` : `${r.diffs.length} difference(s)`}`;
 			if (r.runId !== undefined && r.outcome === "differs") {
+				showParity(`judging ${r.diffs.length} difference(s) in ${slice}`);
 				const { judgeRun } = await import("./parity-judge.ts");
-				await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log });
+				const j = await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log });
+				parityLast = `${slice}: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you${j.allowed ? `, ${j.allowed} allowed` : ""}`;
 			}
 		})()
 			.catch((e) => log(pc.yellow(`parity ${slice}: ${e?.message ?? e}`)))
 			.finally(() => {
 				parityRunning = undefined;
+				showParity();
 				pumpParity();
 			});
 	};
 	const queueParity = (slice: string | undefined) => {
 		if (!parityProbe || !slice || parityQueue.includes(slice) || !sliceDone(slice)) return;
 		parityQueue.push(slice);
+		if (parityRunning) progress.setParity({ ...progress.snapshot().parity, queued: parityQueue.length });
 		pumpParity();
 	};
 	if (parityProbe) {

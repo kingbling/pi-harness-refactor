@@ -31,6 +31,8 @@ export interface ProgressSnapshot {
 	agents: AgentState[];
 	/** Scheduler lanes (runs only): running/max, ready units, and why nothing new starts. */
 	lanes?: { running: number; max: number; ready: number; ahead: number; reason?: string; reasonSince?: number };
+	/** Parity checks of a run (old app vs new app, on the side): what runs now, how many slices wait, the last result. */
+	parity?: { now?: { what: string; since: number }; queued: number; last?: string };
 	/** What the job is waiting on right now when no agent shows it (a run's start checks, a shared fix), and since when. */
 	waiting?: { what: string; since: number };
 	/** Cost per unit/job label, accumulated over finished and live sessions. */
@@ -99,6 +101,12 @@ class ProgressTracker {
 		if (a && a.running === l.running && a.max === l.max && a.ready === l.ready && a.ahead === l.ahead && a.reason === l.reason) return;
 		this.s.lanes = { ...l, reasonSince: l.reason && l.reason === a?.reason ? a.reasonSince : l.reason ? Date.now() : undefined };
 		if (l.reason && l.reason !== a?.reason) this.log(`⏳ ${l.reason}`);
+		this.emit();
+	}
+	setParity(p: NonNullable<ProgressSnapshot["parity"]>) {
+		const a = this.s.parity;
+		this.s.parity = { ...p, now: p.now && a?.now?.what === p.now.what ? a.now : p.now };
+		if (p.last && p.last !== a?.last) this.log(`⚖ parity ${p.last}`);
 		this.emit();
 	}
 	/** The job waits on something long (undefined: no longer); the UI shows it with a timer. */

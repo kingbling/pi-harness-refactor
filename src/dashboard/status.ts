@@ -47,6 +47,21 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 		const notRechecked = ledger.listUnits().filter((u) => u.state === "accepted" && !JSON.parse(u.meta).rechecked).length;
 		if (notRechecked) lines.push(c.yellow(`${notRechecked} accepted unit${notRechecked > 1 ? "s" : ""} not rechecked since the checks changed → br recheck`));
 	}
+	{
+		// parity: the last comparison of each slice with the old app, and what its differences became
+		const last = ledger.db.prepare("SELECT id, slice, outcome FROM parity_runs WHERE id IN (SELECT MAX(id) FROM parity_runs GROUP BY slice)").all() as Array<{ id: number; slice: string; outcome: string }>;
+		if (last.length) {
+			const by = (o: string) => last.filter((r) => r.outcome === o).length;
+			const ids = last.map((r) => r.id);
+			const diffs = ledger.db.prepare(`SELECT status, COUNT(*) AS n FROM parity_diffs WHERE run_id IN (${ids.map(() => "?").join(",")}) GROUP BY status`).all(...ids) as Array<{ status: string; n: number }>;
+			const n = (st: string) => diffs.find((d) => d.status === st)?.n ?? 0;
+			const errors = last.filter((r) => r.outcome === "error").map((r) => r.slice);
+			lines.push(
+				`parity  slices ${c.green(`same ${by("same")}`)}  ${by("differs") ? c.yellow(`differ ${by("differs")}`) : "differ 0"}  ${errors.length ? c.red(`not compared ${errors.length}`) : "not compared 0"}   differences: bugs ${n("bug")}  quirks ${n("quirk")}  allowed ${n("allowed")}  not judged ${n("open")}` +
+					c.dim(errors.length ? `  (not compared: ${errors.slice(0, 3).join(", ")}${errors.length > 3 ? " …" : ""} → br parity <slice>)` : "  (br parity <slice>)"),
+			);
+		}
+	}
 	const accepted = u["accepted"] ?? 0;
 	lines.push(`first-pass accepted ${s.firstPassAccepted}/${accepted}${accepted ? ` (${Math.round((100 * s.firstPassAccepted) / accepted)}%)` : ""}   cost $${s.costUsd.toFixed(3)}`);
 	for (const r of s.costByModel) lines.push(`  ${r.role.padEnd(11)} ${r.model.padEnd(28)} ${String(r.n).padStart(4)} calls  $${r.c.toFixed(3)}`);

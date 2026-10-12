@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
+import { renderStatus } from "../src/dashboard/status.ts";
 import { judgeRun, MAX_PARITY_REOPENS, type ParityJudge } from "../src/run/parity-judge.ts";
 
 /**
@@ -82,6 +83,17 @@ describe("judging parity differences", () => {
 		expect(status(r3)).toEqual(["bug"]);
 		expect(res.reopened).toEqual(["U2"]);
 		expect(JSON.parse(ledger.getUnit("U2")!.meta).retryNote).toMatch(/the owner kept the old behaviour/);
+	});
+
+	it("br status shows each slice's last comparison and what its differences became", async () => {
+		const { root, config, ledger, run, ids } = workspace();
+		ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES ('invoices', 'error', datetime('now'))").run(); // older: replaced below
+		const r = run([{ step: "one", path: "body.total", legacy: 10, target: 11 }]);
+		await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge: async () => [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "tax" }], log: () => {} });
+		ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES ('auth', 'error', datetime('now'))").run();
+		const line = renderStatus(ledger, { color: false }).split("\n").find((l) => l.startsWith("parity"))!;
+		expect(line).toMatch(/same 0 +differ 1 +not compared 1 +differences: bugs 1 +quirks 0/);
+		expect(line).toMatch(/not compared: auth/);
 	});
 
 	it("a verdict naming an unknown unit or another run's differences changes nothing; what is not judged stays open", async () => {

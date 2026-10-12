@@ -51,6 +51,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	questions: "open questions waiting for you (list)",
 	requeue: "requeue <unit...> | --all [--fresh]: put quarantined or waiting units back into the queue (after a fix); --fresh: the tester drafts the interface and tests again",
 	recheck: "recheck [--limit N] [--again] [--then-run]: accepted units under the newer checks; failures go back to planned with their code kept (background); --then-run starts the migration run when it is done",
+	parity: "parity --probe [--again]: can the old and the new app start here · parity <slice> [--rewrite] [--no-judge]: send the same requests to both, compare, judge (background; br run does it by itself for finished slices)",
 	answer: "answer: walk through the open questions one dialog at a time (identical ones together) · answer <id> <text>",
 	init: "init: give the old and the new folder; gathers data, asks the decisions, builds the workspace",
 	start: "start: same as init",
@@ -292,6 +293,10 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 		if (s.lanes) {
 			const free = s.lanes.max - s.lanes.running;
 			L.push(`${pc.bold(`lanes ${s.lanes.running}/${s.lanes.max}`)}${s.lanes.ahead ? pc.cyan(` · ${s.lanes.running - s.lanes.ahead} migrating, ${s.lanes.ahead} capturing truth ahead`) : ""}${s.lanes.reason ? pc.yellow(` · ${s.lanes.reason}${s.lanes.reasonSince ? ` (${ELAPSED(now - s.lanes.reasonSince)})` : ""}`) : free === 0 ? pc.dim(" · all busy: a new unit starts as soon as one finishes") : pc.dim(` · ${s.lanes.ready} more ready`)}`.slice(0, width + 40));
+		}
+		if (s.parity && (s.parity.now || s.parity.queued || s.parity.last)) {
+			const p = s.parity;
+			L.push(`${pc.bold("parity")} ${p.now ? pc.cyan(`${spinner(now)} ${p.now.what} ${pc.dim(`(${ELAPSED(now - p.now.since)})`)}`) : pc.dim("idle")}${p.queued ? pc.dim(` · ${p.queued} slice${p.queued > 1 ? "s" : ""} waiting`) : ""}${p.last ? pc.dim(` · last: ${p.last}`) : ""}`.slice(0, width + 40));
 		}
 		if (s.waiting) L.push(`${pc.yellow(`${spinner(now)} ${s.waiting.what}`)} ${pc.dim(`(${ELAPSED(now - s.waiting.since)})`)}`.slice(0, width + 20));
 		if (totals) {
@@ -727,6 +732,23 @@ export default function (pi: ExtensionAPI) {
 						// --then-run: the migration run starts right after (recheck and run never touch main at the same time)
 						if (rest.includes("--then-run")) return { lines: [...lines, "starting the migration run"], next: async () => startRun(pi, ctx, []) };
 						return { lines: [...lines, "continue with /br run"] };
+					} finally {
+						ledger.close();
+					}
+				});
+			}
+			if (sub === "parity") {
+				return startJob(pi, ctx, rest.includes("--probe") ? "parity: can the apps start" : `parity check of ${rest.find((a) => !a.startsWith("--")) ?? "?"}`, async () => {
+					const cp = findConfigPath(ctx.cwd);
+					if (!cp) return { error: "no bigrefactor.config.json here" };
+					const { config, root } = loadConfig(cp);
+					const { parityCommand } = await import("../run/parity-cli.ts");
+					const { OpenRouterClient } = await import("../models/openrouter.ts");
+					const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+					try {
+						return { lines: await parityCommand({ ledger, config, root, client: new OpenRouterClient(), args: rest, log: (l) => progress.log(l) }) };
+					} catch (e: any) {
+						return { error: String(e?.message ?? e) };
 					} finally {
 						ledger.close();
 					}
