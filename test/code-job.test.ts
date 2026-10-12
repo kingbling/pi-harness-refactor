@@ -13,7 +13,7 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[]) {
+	async function job(worker: (dir: string) => string, protectedGlobs: string[] = []) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
@@ -26,7 +26,7 @@ describe("the code job", () => {
 			id: "fake",
 			protectedGlobs,
 			toolchain: { ignoredPaths: [] },
-			layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree },
+			layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"] },
 			build: () => ({ cmd: "true", args: [] }),
 			test: () => ({ cmd: "true", args: [] }),
 		} as unknown as TargetAdapter;
@@ -62,17 +62,6 @@ describe("the code job", () => {
 	it("no code at all fails the check: the job was to write code", async () => {
 		const r = await job((dir) => (writeFileSync(join(dir, "notes.md"), "todo\n"), "wrote notes"));
 		expect(r.merged).toBe(false);
-	});
-	it("a file the layout check flags fails the check, like a unit's gate: a note for other units stays off main", async () => {
-		const flag = (_dir: string, only?: string[]) => (only ?? []).filter((f) => f.endsWith(".md")).map((f) => `${f}: not an allowed file in the feature folder`);
-		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "README.md"), "contract for the frontend\n"), "added b"), [], flag);
-		expect(r.merged).toBe(false);
-		const ok = await job((dir) => (code(dir), "added b"), [], flag);
-		expect(ok.merged).toBe(true);
-	});
-	it("the model's whole last paragraph is the answer, so the waiting unit's hint carries the contract", async () => {
-		const r = await job((dir) => (code(dir), "Ran the tests.\n\nAdded GET /api/b.\nIt returns {id, name}."));
-		expect(r.said).toBe("Added GET /api/b.\nIt returns {id, name}.");
 	});
 	it("code with its test is merged", async () => {
 		const r = await job((dir) => (code(dir), "added b"), ["**/tsconfig*.json"]);

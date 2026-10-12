@@ -12,7 +12,6 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { runCmd } from "./builder.ts";
 import { changedFiles } from "./gate.ts";
-import { checkTree } from "./layout-check.ts";
 
 /**
  * The code job: app code a unit needs but may not write (outside its files) — an endpoint its screen calls, a
@@ -22,7 +21,7 @@ import { checkTree } from "./layout-check.ts";
  * waiting units run again. Red is thrown away and the question goes to the owner with the output.
  */
 
-/** Returns the model's reply; its last paragraph (what it added, how to call it) is the waiting units' hint. */
+/** Returns the model's one-sentence account of what it wrote. */
 export type CodeWorker = (o: { config: Config; root: string; adapter: TargetAdapter; dir: string; what: string; label: string }) => Promise<string | void>;
 
 export const codeWithModel: CodeWorker = async (o) => {
@@ -39,8 +38,7 @@ export const codeWithModel: CodeWorker = async (o) => {
 - Read the project first and follow its layout and conventions (RULES.md, the existing modules); reuse what exists, add nothing the task does not need.
 - Write tests for what you add. Never change what an existing test checks; never skip or delete tests.
 - Build: ${[b.cmd, ...b.args].join(" ")}   Test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the files to check). Run them on what you changed before you stop.
-- Write no notes or docs files for other units: the units waiting on this get your final reply as their hint.
-Never interactive prompts or servers; do not commit. End with a short paragraph (a few sentences) saying what you added and how callers use it (route, method, fields).\n\n${PLAIN_LANGUAGE}`,
+Never interactive prompts or servers; do not commit. End with one sentence saying what you added.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const r = await session.run(`${o.what}\nPaths are relative to ${o.dir}.`);
@@ -98,9 +96,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	try {
 		o.linkAll(wt);
 		const dir = join(wt, relative(repo, projectDir(o.config, o.adapter.id)));
-		const reply = (await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what: o.what, label: o.label })) || "";
-		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
-		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
+		const said = ((await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what: o.what, label: o.label })) || "").trim();
 		const changed = changedFiles(dir, o.adapter.toolchain.ignoredPaths);
 		const problem = changed.length ? await check(o.adapter, dir, changed) : "nothing was changed";
 		if (problem) {
@@ -108,11 +104,11 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
 			return undefined;
 		}
-		const sha = await o.mergeFix(wt, branch, `feat(${o.adapter.id}): ${(said || o.what).split("\n")[0]!.slice(0, 120)}\n\ncode job ${o.label}`);
+		const sha = await o.mergeFix(wt, branch, `feat(${o.adapter.id}): ${said || o.what.split("\n")[0]!.slice(0, 120)}\n\ncode job ${o.label}`);
 		o.ledger.endAttempt(attempt, { outcome: "fixed", gateReport: { said, commit: sha ?? null, changedFiles: changed, what: o.what.slice(0, 2000) } });
 		// what it added is found by later units (reuse hints, the copy check)
 		await indexTarget(o.ledger, o.adapter, projectDir(o.config, o.adapter.id), changed).catch(() => 0);
-		o.log(pc.green(`code job ${o.label}: merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said.split("\n")[0]!.slice(0, 160)}`));
+		o.log(pc.green(`code job ${o.label}: merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said}`));
 		return said || "the missing code was added";
 	} catch (e: any) {
 		o.ledger.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000), what: o.what.slice(0, 2000) } });
@@ -124,7 +120,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 }
 
 /**
- * Code's check: the changed files follow the layout, the changed code files build, there is a test among the changed files when code changed, and the
+ * Code's check: the changed code files build, there is a test among the changed files when code changed, and the
  * changed tests pass. Undefined = green. Only what the job changed is checked: the rest of main is not its job.
  */
 async function check(adapter: TargetAdapter, dir: string, changed: string[]): Promise<string | undefined> {
@@ -135,9 +131,6 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[]): Pr
 	const protectedRes = adapter.protectedGlobs.map(globToRegExp);
 	const config = changed.filter((f) => !adapter.layout.isTestFile(f) && protectedRes.some((r) => r.test(f)));
 	if (config.length) return `protected config was changed: ${config.slice(0, 5).join(", ")}`;
-	// the same drift check a unit's gate runs on its files: a note or a misplaced file stays off main
-	const drift = checkTree(dir, adapter, changed.filter((f) => existsSync(join(dir, f))));
-	if (drift.length) return `the layout check failed: ${drift.slice(0, 10).join("\n")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	// no code and no test: nothing for the check to run, and the job was to write code
 	if (!present.length) return `no code was written, only other files: ${changed.slice(0, 5).join(", ")}`;

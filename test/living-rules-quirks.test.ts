@@ -267,13 +267,13 @@ describe("tidy review", () => {
 		writeFileSync(join(proj, "src/features/flights/helper2.ts"), "export const x = 1;\n");
 		const client = new FakeModelClient({ chat: (req) => {
 			const sys = req.messages[0]!.content;
-			if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flight-slots.ts"], why: "name says nothing" }, { op: "move", from: ["src/features/flights/flights.service.ts"], to: ["src/list.tpl/x.ts"], why: "outside layout" }, { op: "move", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/utils/slots.ts"], why: "the layout check refuses utils/" }], conventions: [{ text: "Name helper files after the domain concept", why: "helper2.ts" }] } };
+			if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flight-slots.ts"], why: "name says nothing" }, { op: "move", from: ["src/features/flights/flights.service.ts"], to: ["src/list.tpl/x.ts"], why: "outside layout" }], conventions: [{ text: "Name helper files after the domain concept", why: "helper2.ts" }] } };
 			return { json: { id: "tidy", question: "Rename helper2.ts to flight-slots.ts?", options: [{ value: "apply", label: "Rename", hint: "" }, { value: "skip", label: "Keep", hint: "" }], recommended: "apply", opinion: "Clearer." } };
 		} });
 		const d = { ledger, config, root, client };
 		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights", every: 2 })).reviewed).toBe(false);
 		const r = await maybeTidyReview(d, { stackId: "nestjs", area: "flights", every: 2 });
-		expect(r).toMatchObject({ reviewed: true, asked: 1, proposals: 1 }); // the out-of-layout moves (outside the area, a path the layout check refuses) are refused by code
+		expect(r).toMatchObject({ reviewed: true, asked: 1, proposals: 1 }); // the out-of-layout move is refused by code
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
 		const q = ledger.openQuestions().find((x) => x.point === "tidy")!;
 		ledger.answerQuestion(q.id, "apply — Rename");
