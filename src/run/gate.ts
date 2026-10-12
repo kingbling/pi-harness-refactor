@@ -55,6 +55,8 @@ export interface GateStep {
 	name: EvidenceType;
 	ok: boolean;
 	ms: number;
+	/** Time the step held a gate slot (the wait for one not counted); what `br lanes` measures gate load by. */
+	slotMs?: number;
 	output: string;
 }
 export interface GateReport {
@@ -72,11 +74,22 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const tracked = new Set(trackedFiles(g.targetProjectDir));
 	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
 	const timeout = g.timeoutMs ?? 240_000;
-	const cpu = g.slot ?? (<T>(fn: () => Promise<T>) => fn());
+	const slot = g.slot ?? (<T>(fn: () => Promise<T>) => fn());
+	let slotMs = 0;
+	const cpu = <T>(fn: () => Promise<T>) =>
+		slot(async () => {
+			const t0 = Date.now();
+			try {
+				return await fn();
+			} finally {
+				slotMs += Date.now() - t0;
+			}
+		});
 	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number; judged?: boolean }>) => {
 		const t0 = Date.now();
+		slotMs = 0;
 		const r = await fn();
-		steps.push({ name, ok: r.ok, ms: Date.now() - t0, output: r.output.slice(-6000), exitCode: r.exitCode });
+		steps.push({ name, ok: r.ok, ms: Date.now() - t0, slotMs, output: clipOutput(r.output), exitCode: r.exitCode });
 		if (r.ok) g.ledger.addEvidence(g.unitId, name, { ms: Date.now() - t0, ...(r.judged === false ? { judged: false, note: r.output.slice(0, 300) } : {}) });
 		return r.ok;
 	};
@@ -93,8 +106,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const problems: string[] = [];
 		const allow = g.writeGlobs.map(globToRegExp);
 		const appendOnly = (g.appendOnlyGlobs ?? []).map(globToRegExp);
+		// the unit's own ported tests are the tester's (a re-port edits one already on main): the hash check below covers them
+		const own = new Set(g.testFiles.map((t) => t.path));
 		for (const f of changed) {
-			if (allow.some((r) => r.test(f))) continue;
+			if (own.has(f) || allow.some((r) => r.test(f))) continue;
 			if (appendOnly.some((r) => r.test(f))) {
 				if (tracked.has(f)) problems.push(`edited an existing shared file (add-only zone): ${f}`);
 				continue;
@@ -136,7 +151,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 
 	// 4. build and 5. lint on the unit's files only. A command that cannot take files checks the whole project:
 	//    the builder runs it after merges now and then, not every unit (it grew with the project and ran out of memory)
-	const unitFiles = changed.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f)));
+	const unitFiles = buildFiles(g.targetProjectDir, g.adapter, changed);
 	const scopedStep = (name: "build" | "lint") => () => {
 		const c = scopedCheck(g.adapter, g.targetProjectDir, name, unitFiles);
 		return "skip" in c ? Promise.resolve({ ok: true, output: c.skip }) : cpu(() => run(c.cmd, c.args, g.targetProjectDir, timeout));
@@ -147,15 +162,15 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// 6. the stack's ast-grep rules on the changed production files
 	if (!(await step("rules_ok", () => cpu(() => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout))))) return done();
 
-	// 7. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
-	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
-
-	// 8. the ported characterization tests (one per truth case)
+	// 7. the ported characterization tests (one per truth case), before the review: a red test is cheaper to find than a review
 	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
 	const cases = (g.ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ?").get(g.unitId) as { n: number }).n;
 	// a unit the tester found without runtime behaviour (a pure contract, constants) has nothing to pin: no tests to run
 	const none = !cases && !g.testFiles.length ? noBehaviour(g.ledger, g.unitId) : undefined;
 	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
+
+	// 8. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
+	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
 
 	return done();
 
@@ -163,6 +178,31 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const failed = steps.find((s) => !s.ok);
 		return { ok: !failed, steps, changedFiles: changed, failedStep: failed?.name, testFiles: g.testFiles.map((t) => t.path) };
 	}
+}
+
+/**
+ * A step's output for the report and the next prompt, at most `max` chars. Long output (phpstan, phpunit) keeps its
+ * start (the command, the first file and errors) and its end (the summary): trailing padding goes, a line already
+ * shown twice is left out, and what still does not fit is cut from the middle.
+ */
+export function clipOutput(out: string, max = 6000): string {
+	if (out.length <= max) return out;
+	const seen = new Map<string, number>();
+	let dropped = 0;
+	const kept = out
+		.split("\n")
+		.map((l) => l.trimEnd())
+		.filter((l) => {
+			const n = (seen.get(l.trim()) ?? 0) + 1;
+			seen.set(l.trim(), n);
+			if (n <= 2 || !l.trim()) return true;
+			dropped++;
+			return false;
+		});
+	const text = (dropped ? [`(${dropped} repeated line(s) left out)`, ...kept] : kept).join("\n");
+	if (text.length <= max) return text;
+	const head = Math.floor(max / 3);
+	return `${text.slice(0, head)}\n… ${text.length - max} chars left out …\n${text.slice(-(max - head))}`;
 }
 
 /** The tester's reason why the unit has no runtime behaviour to pin (latest truth_none evidence), or undefined. */
@@ -320,6 +360,11 @@ export function addedLines(dir: string, f: string, isTracked: boolean): Array<{ 
 		else if (l.startsWith("+") && !l.startsWith("+++")) out.push({ line: at++, text: l.slice(1) });
 	}
 	return out;
+}
+
+/** The changed files the gate builds and lints (check_my_code checks the same): in a language of the stack, still on disk. */
+export function buildFiles(dir: string, adapter: TargetAdapter, changed: string[]): string[] {
+	return changed.filter((f) => adapter.layout.lang(f) && existsSync(join(dir, f)));
 }
 
 export function changedFiles(dir: string, ignored: string[] = []): string[] {

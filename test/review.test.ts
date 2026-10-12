@@ -51,6 +51,8 @@ describe("wired_ok: the reviewer model", () => {
 		const seen: SpawnOptions[] = [];
 		const finding = { file: "src/features/campaign/campaign.service.ts", line: 2, problem: "changes() returns [] where the legacy code lists every changed field", fix: "port the field comparison from mailchanges.cmd.php" };
 		const review = (changedFiles: string[]) => reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: ["campaign/mailchanges.cmd.php"], changedFiles, spawn: reviewerSession({ ok: false, findings: [finding] }, seen) });
+		// the ported tests run before the review: a contract-only unit has none to fail first
+		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });
 		const g = await runGate({ ledger, unitId: "u1", adapter, targetProjectDir: dir, writeGlobs: ["src/features/campaign/**"], testFiles: [], review });
 		expect(g.failedStep).toBe("wired_ok");
 		expect(g.steps.find((s) => s.name === "wired_ok")!.output).toMatch(/campaign\.service\.ts:2: changes\(\) returns \[\].*→ port the field comparison/);
@@ -103,6 +105,8 @@ describe("wired_ok: the reviewer model", () => {
 		const { dir, ledger, config } = project();
 		const prompts: string[] = [];
 		const review = (changedFiles: string[]) => reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles, spawn: reviewerSession(undefined, [], prompts) });
+		// the ported tests run before the review: a contract-only unit has none to fail first
+		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });
 		const g = await runGate({ ledger, unitId: "u1", adapter, targetProjectDir: dir, writeGlobs: ["src/features/campaign/**"], testFiles: [], review });
 		expect(prompts).toHaveLength(2);
 		expect(prompts[1]).toMatch(/review_verdict/);
@@ -149,6 +153,25 @@ describe("wired_ok: the reviewer model", () => {
 		await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
 		expect(system).toContain("TODO(br:<the owning unit>): that is not a finding");
 		expect(system).toMatch(/A stub marked TODO\(br:u1\) \(grep for it\) that stands in for this unit's own legacy code[^:]*: one still there[^.]* is a finding/);
+	});
+
+	it("gets its earlier open findings, says which are fixed and lists all open ones at once", async () => {
+		const { dir, ledger, config } = project();
+		let system = "";
+		const prompts: string[] = [];
+		const earlier = "- src/features/campaign/campaign.service.ts:2: changes() returns [] → port the field comparison";
+		const verdict = { ok: false, fixed: ["changes() returns []"], findings: [{ file: "src/features/campaign/campaign.service.ts", line: 1, problem: "no route", fix: "register it" }] };
+		const spawn = (async (opts: SpawnOptions) => {
+			system = opts.systemPrompt ?? "";
+			return (reviewerSession(verdict, [], prompts) as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts);
+		}) as never;
+		const r = await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: ["src/features/campaign/campaign.service.ts"], openFindings: [earlier], spawn });
+		expect(system).toMatch(/list ALL open problems in this one verdict/);
+		expect(system).not.toMatch(/\band few\b/);
+		expect(prompts[0]).toContain(`Your earlier reviews of this unit found these, still open`);
+		expect(prompts[0]).toContain(earlier);
+		expect(r.findings).toEqual(["- src/features/campaign/campaign.service.ts:1: no route → register it"]);
+		expect(r.output).toMatch(/fixed since the earlier review:\n- changes\(\) returns \[\]/);
 	});
 
 	it("the review runs outside the CPU slot; the commands inside it", async () => {

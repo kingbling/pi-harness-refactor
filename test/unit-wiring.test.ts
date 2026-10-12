@@ -310,6 +310,30 @@ describe("runUnit wiring", () => {
 		expect(gates).toBe(0);
 	});
 
+	it("the reviewer's open findings are kept in the unit's meta: every implementer and reviewer gets them; a pass clears them", async () => {
+		const tasks: string[] = [];
+		const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role !== "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+		const lists = [["- a.ts:1: A → fix A", "- b.ts:2: B → fix B"], ["- b.ts:2: B → fix B"]];
+		const seen: Array<string[] | undefined> = [];
+		let n = 0;
+		const reviewer = async (i: { openFindings?: string[] }) => {
+			seen.push(i.openFindings);
+			const findings = lists[n++];
+			return findings ? { ok: false, judged: true, output: `reviewer findings:\n${findings.join("\n")}`, findings } : { ok: true, judged: true, output: "fine", findings: [] };
+		};
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!(["src/features/agency/agency.service.ts"]);
+			return { ok: r.ok, steps: [{ name: "wired_ok", ok: r.ok, ms: 1, output: r.output }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: r.ok ? undefined : "wired_ok", testFiles: [] };
+		};
+		// each attempt is a new session: only the list kept in the unit's meta carries the earlier findings
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnTasks as never, gate, reviewer: reviewer as never, setupFixer: false, log: () => {} });
+		expect(seen).toEqual([[], lists[0], lists[1]]);
+		expect(tasks[0]).not.toContain("Open reviewer findings");
+		expect(tasks[1]).toMatch(/Open reviewer findings for this unit[^\n]*\n- a\.ts:1: A → fix A\n- b\.ts:2: B → fix B/);
+		expect(tasks[2]).toMatch(/Open reviewer findings for this unit[^\n]*\n- b\.ts:2: B → fix B/);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).reviewFindings).toEqual([]);
+	});
+
 	describe("reviewer findings outside the unit's files", () => {
 		const outOfScope = "- the autoload map does not cover src/Agency → add the mapping to the project manifest";
 		const reviewer = async () => ({ ok: false, judged: true, output: `outside the unit's files (setup fixer, else the owner):\n${outOfScope}`, outOfScope });

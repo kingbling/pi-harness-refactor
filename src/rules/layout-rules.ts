@@ -276,6 +276,8 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 			continue;
 		}
 		if (!f.startsWith(mod)) {
+			// a tidy path or a stub an earlier unit left for this one: the unit was told to write it there
+			if (ctx.sanctioned?.includes(f)) continue;
 			out.push(`${f}: outside this unit's feature folder ${mod} and the shared dirs (${o.sharedDirs.join(", ")})`);
 			continue;
 		}

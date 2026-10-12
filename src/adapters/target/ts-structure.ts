@@ -105,6 +105,8 @@ export function tsCheckStructure(files: string[], moduleDir: string, area: strin
 			continue;
 		}
 		if (!f.startsWith(mod)) {
+			// a tidy path or a stub an earlier unit left for this one: the unit was told to write it there
+			if (ctx.sanctioned?.includes(f)) continue;
 			out.push(`${f}: outside this unit's module ${mod} and the shared dirs (${base.sharedDirs.join(", ")})`);
 			continue;
 		}

@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ConfigSchema, type Config } from "../src/config.ts";
+import { renderStatus } from "../src/dashboard/status.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { runUnit } from "../src/run/unit.ts";
@@ -71,9 +72,112 @@ describe("models fix each other's work", () => {
 			const r = await g.review!([]);
 			return r.ok ? green(g) : red(g, "wired_ok", r.output);
 		};
-		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
-		expect(calls.map((c) => c.role)).toEqual(["implement", "test", "implement"]);
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
+		// the code was fine: after the retest the gate runs again on it, no new implementer session, no attempt counted
+		expect(calls.map((c) => c.role)).toEqual(["implement", "test"]);
 		expect(calls[1]!.task).toMatch(/The reviewer finds these tests too weak[\s\S]*only checks it renders/);
+		expect(reviews).toBe(2);
+		expect(r).toMatchObject({ state: "review", attempts: 1 });
+		expect(ledger.db.prepare("SELECT role FROM attempts WHERE unit_id = 'u1' AND role != 'review' ORDER BY id").all()).toEqual([{ role: "implement" }, { role: "test" }, { role: "gate" }]);
+	});
+
+	it("tests still called weak after 2 tester rounds: the code passes with a note on the unit, no owner question", async () => {
+		const calls: Call[] = [];
+		const weak = "- agency.service.spec.ts: only checks it renders";
+		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests (the tester rewrites them):\n${weak}`, weakTests: weak, findings: [] });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!([]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
+		expect(calls.map((c) => c.role)).toEqual(["implement", "test", "test"]);
+		expect(r).toMatchObject({ state: "review", attempts: 1 });
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toMatch(/after 2 tester rounds[\s\S]*only checks it renders/);
+		// the owner sees it in br status once the unit is accepted
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'u1'").run();
+		expect(renderStatus(ledger, { color: false })).toMatch(/accepted with tests the reviewer still finds weak \(1\):\n\s+u1: - agency\.service\.spec\.ts: only checks it renders/);
+		expect(ledger.db.prepare("SELECT COUNT(*) n FROM questions").get()).toEqual({ n: 0 });
+	});
+
+	it("tester rounds spent on disputes do not count toward the weak-tests pass: weak tests are never waved through untried", async () => {
+		const calls: Call[] = [];
+		const weak = "- agency.service.spec.ts: only checks it renders";
+		// the implementer disputes a test in every attempt; the first two gates fail on the tests, then only the review is red
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (task: string) => {
+					calls.push({ role: opts.role, task });
+					if (opts.role !== "test") await (opts.customTools!.find((t) => t.name === "dispute_test") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { test: "u1#1", why: "expects true", evidence: "returns the id" });
+					return { text: opts.role === "test" ? "u1#1: kept — the legacy code returns true\nTESTER DONE 1 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		let gates = 0;
+		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests (the tester rewrites them):\n${weak}`, weakTests: weak, findings: [] });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			if (++gates <= 2) return red(g, "ported_tests_green");
+			const r = await g.review!([]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, log: () => {} });
+		expect(r.state).not.toBe("review");
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toBeUndefined();
+	});
+
+	it("a unit with no behaviour to pin and no tests is never passed on weak tests: the reviewer says it computes something", async () => {
+		rmSync(join(ws, "migrated", SPEC));
+		ledger.db.prepare("DELETE FROM truth_cases").run();
+		ledger.addEvidence("u1", "truth_none", { reason: "only constants" });
+		const calls: Call[] = [];
+		// the tester writes no test (it says again there is nothing to pin)
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (task: string) => (calls.push({ role: opts.role, task }), { text: opts.role === "test" ? "TESTER DONE 0 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }),
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		const weak = "- the unit computes the agency fee: nothing pins it";
+		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!([]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, log: () => {} });
+		expect(calls.filter((c) => c.role === "test")).toHaveLength(2);
+		expect(r.state).not.toBe("review");
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toBeUndefined();
+	});
+
+	it("the reviewer cannot judge a re-gate: the review runs again on the same code, no implementer session, no attempt given back", async () => {
+		const calls: Call[] = [];
+		let reviews = 0;
+		const weak = "- agency.service.spec.ts: only checks it renders";
+		const reviewer = async () => {
+			const n = ++reviews;
+			if (n === 1) return { ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] };
+			if (n === 2) return { ok: false, judged: false, output: "not judged: the reviewer model is down" };
+			return { ok: true, judged: true, output: "fine" };
+		};
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!([]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
+		expect(calls.map((c) => c.role)).toEqual(["implement", "test"]);
+		expect(reviews).toBe(3);
+		expect(r).toMatchObject({ state: "review", attempts: 1 });
+	});
+
+	it("weak tests next to a code finding still cost the implementer an attempt", async () => {
+		const calls: Call[] = [];
+		let reviews = 0;
+		const reviewer = async () => (++reviews === 1 ? { ok: false, judged: true, output: "findings and weak tests", findings: ["- a.ts:1: stub → port it"], weakTests: "- spec: weak" } : { ok: true, judged: true, output: "fine" });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!([]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
+		expect(calls.map((c) => c.role)).toEqual(["implement", "test", "implement"]);
+		expect(r.attempts).toBe(2);
 	});
 
 	it("a bug in another unit's accepted code re-opens that unit; this unit waits for it as a dependency", async () => {

@@ -45,7 +45,9 @@ function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimite
 	try {
 		const sess = db.prepare("SELECT role, AVG((julianday(ended_at)-julianday(started_at))*86400) s, COUNT(*) n FROM attempts WHERE ended_at IS NOT NULL AND role IN ('test','implement') GROUP BY role").all() as Array<{ role: string; s: number; n: number }>;
 		if (!sess.length) return undefined;
-		const gate = db.prepare("SELECT AVG((SELECT SUM(json_extract(s.value,'$.ms')) FROM json_each(json_extract(gate_report,'$.steps')) s)) ms FROM attempts WHERE gate_report IS NOT NULL").get() as { ms: number | null };
+		// only the time a step held a gate slot (slotMs): the review runs outside the slots, and reports from before
+		// slotMs was recorded count as nothing measured (NULL), not as gate time
+		const gate = db.prepare("SELECT AVG((SELECT SUM(json_extract(s.value,'$.slotMs')) FROM json_each(json_extract(gate_report,'$.steps')) s)) ms FROM attempts WHERE gate_report IS NOT NULL").get() as { ms: number | null };
 		const rateLimited = (db.prepare("SELECT COUNT(*) n FROM attempts WHERE outcome LIKE '%429%' OR outcome LIKE '%rate%'").get() as { n: number }).n;
 		return { unitS: sess.reduce((a, r) => a + r.s, 0), gateS: (gate.ms ?? 0) / 1000, rateLimited };
 	} finally {

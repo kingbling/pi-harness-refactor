@@ -69,6 +69,12 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 	// parked by the resolver model: nothing a model can do is left, and nobody is asked about them
 	const parked = ledger.listUnits({ state: "quarantined" }).filter((u) => JSON.parse(u.meta).parkedWhy).map((u) => u.id);
 	if (parked.length) lines.push(c.dim(`  parked, no question (nothing a model can do is left): ${parked.slice(0, 8).join(", ")}${parked.length > 8 ? " …" : ""} → br requeue <unit> after a change`));
+	// accepted although the reviewer still found the tests weak after the tester's rounds (meta.weakTestsNote)
+	const weak = ledger.listUnits({ state: "accepted" }).flatMap((u) => {
+		const note = (JSON.parse(u.meta) as { weakTestsNote?: string }).weakTestsNote;
+		return note ? [`    ${u.id}: ${(note.split("\n")[1] ?? note).slice(0, 160)}`] : [];
+	});
+	if (weak.length) lines.push(c.yellow(`accepted with tests the reviewer still finds weak (${weak.length}):`), ...weak.slice(0, 8).map((l) => c.dim(l)));
 	const qs = ledger.openQuestions();
 	if (qs.length) {
 		const waiting = ledger.blockedUnits().size;

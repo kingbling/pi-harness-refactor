@@ -567,9 +567,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				// inside the try: a worktree that cannot be made (disk full, git lock) counts as a crash, so the unit is
 				// quarantined after the second one instead of being picked first again on every restart
 				fresh();
-				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]`));
+				const restored = restoreKeptWork(ledger, wt, unitId);
+				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]${restored ? " (earlier code kept)" : ""}`));
 				// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
-				carried = takeRetryNote(ledger, unitId);
+				carried = [takeRetryNote(ledger, unitId), restored && "The worktree already holds your code from the earlier try, put on top of the current main: fix what failed instead of starting over."].filter(Boolean).join("\n\n") || undefined;
 				// Playbook: run → (merge conflict → fresh worktree on current main, one more implement pass with the conflict as the gate output) ×2 → accept or quarantine.
 				for (let round = 1; round <= 3; round++) {
 					res = await runUnit({
@@ -684,12 +685,17 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			} finally {
 				const st = ledger.getUnit(unitId)!.state;
 				if (st === "accepted" || st === "quarantined") {
+					// a quarantined unit's code stays on its branch: a self-heal requeue starts from it (an owner's requeue drops it)
+					const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? keepUnitWork(wt, unitId) : undefined;
 					if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
 					removeWorktree(config.target.path, wt);
-					try {
-						execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
-					} catch {
-						/* branch already gone */
+					if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
+					else {
+						try {
+							execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+						} catch {
+							/* branch already gone */
+						}
 					}
 				}
 				ran.push({ unitId, state: st, attempts: res?.attempts ?? 0, gate: res?.gate, triage: res?.triage, costUsd: res?.costUsd ?? 0 });
@@ -726,7 +732,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		recent.length = 0;
 		if (fixed) {
-			const back = requeueUnits(ledger, config, o.root, units.filter((u) => ["quarantined", "truth", "implementing", "gating"].includes(ledger.getUnit(u)?.state ?? "") && !running.has(u)), "self-heal");
+			const back = requeueUnits(ledger, config, o.root, units.filter((u) => ["quarantined", "truth", "implementing", "gating"].includes(ledger.getUnit(u)?.state ?? "") && !running.has(u)), "self-heal", { keepCode: true });
 			log(pc.green(`⚕ healed: ${fixed} — ${back.filter((l) => l.endsWith("requeued")).length} unit(s) back in the queue`));
 		} else log(pc.yellow(`⚕ could not heal it here; those units stay quarantined (br requeue after a fix), the run goes on`));
 	};
@@ -1315,7 +1321,7 @@ const quarantinedUnits = (ledger: Ledger) =>
  * the same failure again is not retried blindly.
  */
 function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string, from: string, retriedOn: string[]): void {
-	requeueUnits(ledger, config, root, [id], "self-heal");
+	requeueUnits(ledger, config, root, [id], "self-heal", { keepCode: true });
 	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion', '$.stuck', '$.parkedWhy'), '$.autoHeals', ?, '$.retryNote', ?, '$.healedFrom', ?, '$.retriedOn', json(?)) WHERE id = ?").run(heals, note, from, JSON.stringify(retriedOn), id);
 }
 
@@ -1336,10 +1342,10 @@ async function changeTouches(d: { ledger: Ledger; config: Config; client: ModelC
 
 /**
  * Quarantined units heal by themselves, up to run.maxAutoHeals times: back into the queue when something of their
- * own stack changed after they failed (see lastFixAt), or after run.healEveryMinutes when the failure is new. The
- * same failure again with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model
- * tries first, one question per kind of failure), and the answer is applied here. A stuck unit runs again on a change
- * only when the decide model says the change touches its failure (without a client: on any change).
+ * own stack changed after they failed (see lastFixAt) and the decide model says the change touches their own failure
+ * (without a client: on any change), or after run.healEveryMinutes when the failure is new. The same failure again
+ * with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model tries first, one
+ * question per kind of failure), and the answer is applied here. A requeue here keeps the unit's code (keepUnitWork).
  */
 export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient } = {}): Promise<string[]> {
 	// one change time per stack per pass
@@ -1353,27 +1359,34 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
 		const failure = errorSignature("quarantine", r.reason ?? "");
-		// the failure itself goes into the note: the worktree goes with the requeue, so this is all the next run has
+		// the failure itself goes into the note: the kept code may not apply on main any more, then this is all the next run has
 		const last = lastRedReport(ledger, r.id);
 		const lastFailure = last ? `\nIts last failure (${last.step}):\n${capText(last.output, 3000)}` : "";
 		const kind = failureKind(r.id, r.reason ?? "", last);
 		const retriedOn = [...new Set([...(meta.retriedOn ?? []), kind])];
-		const park = (parkedWhy: string) => ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0, '$.parkedWhy', ?, '$.parkedAt', ?) WHERE id = ?").run(parkedWhy, Date.now(), r.id);
+		const park = (parkedWhy: string, at = Date.now()) => ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0, '$.parkedWhy', ?, '$.parkedAt', ?) WHERE id = ?").run(parkedWhy, at, r.id);
 		const stackId = placeUnit(config, r.meta, root).stackId;
 		const since = sinceOf(stackId);
-		const changed = ledgerTime(r.at) < since;
+		// a change counts only when the decide model says it touches this unit's own failure: a setup fix about something
+		// else would only run the unit into the same failure again
+		let changed = ledgerTime(r.at) < since;
 		// a unit a model parked waits for a change on main after the park, past its automatic tries (the owner's leave stands)
 		const parked = meta.healQuestion === 0 && !!meta.parkedWhy && since > (meta.parkedAt ?? 0);
-		// a change the decide model already said does not touch this failure is not asked about again
-		if (changed && ((meta.stuck && meta.healQuestion !== 0 && heals < config.run.maxAutoHeals) || parked) && since > (meta.healChecked ?? 0)) {
-			const touches = o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+		const mayRun = (meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && (meta.stuck || !meta.healQuestion)) || parked;
+		if (changed && mayRun) {
+			// a change the decide model already said does not touch this failure is not asked about again
+			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
 			if (touches) {
-				// something changed since the unit got stuck that may fix it: worth a try, an open question about it or not
-				backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
+				// something changed since the unit failed that may fix it: worth a try, an open question about it or not
+				backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${parked ? ` It was parked: ${meta.parkedWhy}` : ""}${lastFailure}`, failure, retriedOn);
 				back.push(r.id);
 				continue;
 			}
-			if (touches === false) ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healChecked', ?) WHERE id = ?").run(since, r.id);
+			// the decide model is unavailable: the unit stays as it is, it is asked next pass
+			if (touches === undefined) continue;
+			ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healChecked', ?) WHERE id = ?").run(since, r.id);
+			// no: as if nothing changed
+			changed = false;
 		}
 		if (meta.healQuestion) {
 			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it.
@@ -1389,10 +1402,11 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				else ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
 				continue;
 			}
-			// the resolver's retry counts against the automatic tries: past them it stays parked, no question. A job's retry
-			// goes through: the job changed main, the change the cap waits for
-			if (q.answered_by === RESOLVER && heals >= config.run.maxAutoHeals) {
-				park(`the resolver model said to try again, but its ${config.run.maxAutoHeals} automatic tries are used up`);
+			// a model's retry counts against the automatic tries: past them it stays parked, no question. A job changed main:
+			// parked as of the failure, its change goes through the decide model (changeTouches) next pass, never straight back
+			if (byModel && heals >= config.run.maxAutoHeals) {
+				const job = q.answered_by !== RESOLVER;
+				park(`the ${q.answered_by} said to try again, but its ${config.run.maxAutoHeals} automatic tries are used up${job && a.hint ? `. Its hint: ${a.hint}` : ""}`, job ? ledgerTime(r.at) : Date.now());
 				log(pc.yellow(`⏸ ${r.id}: stays parked, no automatic try left (br requeue ${r.id} after a change)`));
 				continue;
 			}
@@ -1402,7 +1416,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		}
 		if (meta.healQuestion === 0 || meta.stuck || heals >= config.run.maxAutoHeals) continue;
 		if (!changed) {
-			// nothing changed and it failed the same way (the same words, or a kind it was retried on): another try would only cost money
+			// nothing changed (nothing that touches its failure) and it failed the same way (the same words, or a kind it was retried on): another try would only cost money
 			if (failure === meta.healedFrom || meta.retriedOn?.includes(kind)) {
 				ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.stuck', json('true')) WHERE id = ?").run(r.id);
 				continue;
@@ -1468,12 +1482,68 @@ export function keepPortedTests(config: Config, root: string, unitId: string, me
 }
 
 /**
+ * A quarantined unit's code, committed on its branch before its worktree goes: a self-heal requeue starts from it
+ * instead of from nothing. Returns the commit, or undefined when the unit wrote nothing.
+ */
+export function keepUnitWork(wt: string, unitId: string): string | undefined {
+	try {
+		gitIn(wt, ["add", "-A"]); // generated paths are excluded repo-wide, as in mergeUnit
+		if (!gitIn(wt, ["diff", "--cached", "--name-only"])) return undefined;
+		gitIn(wt, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `wip: ${unitId} as it was quarantined`]);
+		return headOf(wt);
+	} catch {
+		return undefined; // no worktree: nothing to keep
+	}
+}
+
+/**
+ * Whether a quarantined unit's code is worth keeping: not when its last gate failed antigaming_ok, as the kept files
+ * (outside its scope, edited shared ones) would fail it the same way on every self-heal.
+ */
+export function mayKeepCode(ledger: Ledger, unitId: string): boolean {
+	const last = ledger.db.prepare("SELECT outcome FROM attempts WHERE unit_id = ? AND outcome LIKE 'gate_%' ORDER BY id DESC LIMIT 1").get(unitId) as { outcome: string } | undefined;
+	return last?.outcome !== "gate_red:antigaming_ok";
+}
+
+/**
+ * A self-healed unit goes on from its kept code (keptWork), put on top of current main in its fresh worktree; the
+ * kept code is used once. The reviewer's open findings point at that code: they carry over only when it does.
+ */
+export function restoreKeptWork(ledger: Ledger, wt: string, unitId: string): boolean {
+	const keptWork = (JSON.parse(ledger.getUnit(unitId)!.meta) as { keptWork?: string }).keptWork;
+	const restored = !!keptWork && restoreUnitWork(wt, keptWork);
+	if (keptWork) ledger.updateUnit(unitId, { meta: { keptWork: undefined } });
+	if (!restored) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.reviewFindings') WHERE id = ?").run(unitId);
+	return restored;
+}
+
+/**
+ * Put kept code (keepUnitWork) back into a fresh worktree on current main, uncommitted as it was. false when it no
+ * longer applies on main: the worktree is left clean.
+ */
+export function restoreUnitWork(wt: string, sha: string): boolean {
+	try {
+		gitIn(wt, ["cherry-pick", "--no-commit", sha]);
+		gitIn(wt, ["reset", "-q"]);
+		return true;
+	} catch {
+		try {
+			gitIn(wt, ["reset", "-q", "--hard"]);
+		} catch {
+			/* nothing was applied */
+		}
+		return false;
+	}
+}
+
+/**
  * Put quarantined or waiting units back into the queue: open attempts end, worktree and branch go, truth stays.
+ * `keepCode` (a self-heal): the branch and the code kept on it at quarantine stay, the next run starts from them.
  * Crash counts and "wait" holds are cleared; an owner's requeue is a fresh start. `fresh`: the tester drafts the
  * interface and the tests again (its interface.md and kept tests go; the truth cases from the old code stay).
  * Returns what happened per id.
  */
-export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean; human?: boolean } = {}): string[] {
+export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean; human?: boolean; keepCode?: boolean } = {}): string[] {
 	const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
 	const list = ids === "all" ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : ids;
 	const out: string[] = [];
@@ -1498,10 +1568,13 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 		}
 		for (const a of ledger.db.prepare("SELECT id FROM attempts WHERE unit_id = ? AND ended_at IS NULL").all(id) as Array<{ id: number }>) ledger.endAttempt(a.id, { outcome: "aborted:requeue" });
 		removeWorktree(config.target.path, worktreeDir(root, id));
-		try {
-			execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", `unit/${id}`], { stdio: "pipe" });
-		} catch {
-			/* no branch */
+		if (!o.keepCode || o.fresh || o.human) {
+			try {
+				execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", `unit/${id}`], { stdio: "pipe" });
+			} catch {
+				/* no branch */
+			}
+			ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.keptWork', '$.reviewFindings') WHERE id = ?").run(id);
 		}
 		ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.crashes', '$.hold', '$.parked') WHERE id = ?").run(id);
 		// only a person's requeue gives the unit new tries (setup model, self-heal) and lets a later quarantine be healed

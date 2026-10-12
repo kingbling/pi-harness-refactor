@@ -124,6 +124,22 @@ describe("answers are applied per option", () => {
 		expect(renderStatus(ledger, { color: false })).toMatch(/parked, no question .*U1/);
 	});
 
+	it("a job's retry counts against the automatic tries too: past them the unit parks, and only a change since its failure brings it back", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { healQuarantined } = await import("../src/run/run.ts");
+		const { FIX_JOB } = await import("../src/jev/resolve.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "truth cases without a ported test after 2 retests: U1#1");
+		const q = ledger.askQuestion({ unitId: "U1", point: "quarantine", question: "U1 keeps failing", options: ["retry — try again", "leave — leave it"], askedBy: "orchestrator" });
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals, stuck: true, healQuestion: q } });
+		ledger.answerQuestion(q, "retry — try again\nhint: what the fix job changed on main: the autoload mapping", FIX_JOB);
+		const heal = (since: number) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since });
+		expect(await heal(Date.now() - 60 * 60_000)).toEqual([]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals, healQuestion: 0, parkedWhy: expect.stringMatching(/fix job\) said to try again, but its 5 automatic tries are used up/) });
+		// the job's change on main is weighed like any other change (here without a decide model: any change counts)
+		expect(await heal(Date.now() + 1000)).toEqual(["U1"]);
+	});
+
 	it("the same error in new words is the same failure: stuck, and a plain retry is no answer; a new error at the same step is not", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
@@ -149,7 +165,7 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.openQuestions()[0]!.context!)).toMatchObject({ retry: "with a hint", failureKind: "wired_ok: Error: route GET <path> not found in <path>" });
 	});
 
-	it("a job's retry goes through the cap: the job changed main, and what it changed goes to the next attempt", async () => {
+	it("a job's retry past the cap parks the unit; its change on main brings it back, and what it changed goes to the next attempt", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		const { resolveOpenQuestions, CODE_JOB } = await import("../src/jev/resolve.ts");
@@ -161,8 +177,12 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(q.context!)).toMatchObject({ retry: "none", failureKind: expect.any(String) });
 		await resolveOpenQuestions({ ledger, config, root, resolver: async () => ({ code: "add the DspHourlyStats class", then: "retry" }), codeJob: async () => "added src/Stats/DspHourlyStats.php with tests" });
 		expect(ledger.getQuestion(q.id)!.answered_by).toBe(CODE_JOB);
-		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {})).toEqual(["U1"]);
-		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals + 1, retryNote: expect.stringMatching(/the code model \(code job\) said to try again\. The model's hint: what the code job changed on main: added src\/Stats\/DspHourlyStats\.php/) });
+		const heal = () => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {});
+		expect(await heal()).toEqual([]);
+		const { noteFix } = await import("../src/adapters/command-overrides.ts");
+		noteFix(root, "nestjs", "abc1234", "code job: added src/Stats/DspHourlyStats.php with tests");
+		expect(await heal()).toEqual(["U1"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals + 1, retryNote: expect.stringMatching(/It was parked: the code model \(code job\) said to try again, but its 5 automatic tries are used up\. Its hint: what the code job changed on main: added src\/Stats\/DspHourlyStats\.php/) });
 	});
 
 	it("a unit a model parked comes back when main changes after the park; the owner's leave stands", async () => {

@@ -55,13 +55,13 @@ export function caseCoverage(targetProjectDir: string, moduleDir: string, layout
  * scopes it: the error output, or undefined when clean. `skipped` when the command checks the whole project (the
  * builder runs it after merges, so it is never the tester's to fix).
  */
-export function checkTests(targetProjectDir: string, adapter: TargetAdapter, name: "build" | "lint", files: string[]): Promise<{ command: string; error?: string; skipped?: string }> {
+export function checkTests(targetProjectDir: string, adapter: TargetAdapter, name: "build" | "lint", files: string[], timeoutMs = 5 * 60_000): Promise<{ command: string; error?: string; skipped?: string }> {
 	const c = scopedCheck(adapter, targetProjectDir, name, files.filter((f) => adapter.layout.lang(f)));
 	if ("skip" in c) return Promise.resolve({ command: "", skipped: c.skip });
 	const command = [c.cmd, ...c.args].join(" ");
 	return new Promise((res) =>
-		execFile(c.cmd, c.args, { cwd: targetProjectDir, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: 5 * 60_000 }, (e, out, err) =>
-			res({ command, error: e ? `${String(err)}\n${String(out)}`.trim().slice(-2500) || String(e.message) : undefined }),
+		execFile(c.cmd, c.args, { cwd: targetProjectDir, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: timeoutMs }, (e, out, err) =>
+			res({ command, error: e ? `${String(err)}\n${String(out)}${e.killed ? "\n[timed out]" : ""}`.trim().slice(-2500) || String(e.message) : undefined }),
 		),
 	);
 }

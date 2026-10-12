@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
 import { caseCoverage, checkTests } from "../run/ported.ts";
+import { buildFiles, changedFiles, run } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { Config } from "../config.ts";
@@ -46,6 +47,10 @@ export interface ToolDeps {
 	truthDir?: string;
 	/** Tester: the truth cases as code would load them now (runs the truth script / reads cases.json), for check_ported_tests. */
 	currentTruth?: () => TruthResult;
+	/** Implementer: the unit's ported test files (project-relative) as they are now, for check_my_code. */
+	testFiles?: () => string[];
+	/** The gate's CPU slot: check_my_code runs its commands inside it, like the gate. */
+	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 const text = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details });
@@ -423,10 +428,54 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 				for (const name of ["build", "lint"] as const) {
 					const r = await checkTests(d.targetProjectDir, d.adapter, name, cov.files);
 					const NAME = name.toUpperCase();
-					out.push(r.skipped ? `${NAME} not run per unit (${r.skipped}).` : r.error ? `${NAME} FAILED (\`${r.command}\`, run in ${d.targetProjectDir}); fix the test files (${name === "lint" ? "formatting/static issues only" : "the errors in them"}, behaviour unchanged):\n${r.error}` : `${NAME} clean (\`${r.command}\`, run in ${d.targetProjectDir}).`);
+					out.push(r.skipped ? `${NAME} not run per unit (${r.skipped}).` : r.error ? `${NAME} FAILED (\`${r.command}\`, run in ${d.targetProjectDir}); fix the test files (${name === "lint" ? "formatting/static issues only" : "the errors in them; code from interface.md that does not exist yet is the implementer's to write, not yours"}, behaviour unchanged):\n${r.error}` : `${NAME} clean (\`${r.command}\`, run in ${d.targetProjectDir}).`);
 				}
 			}
 			return text(out.join("\n"), { missing: cov.missing, files: cov.files });
+		},
+	});
+}
+
+/** Each command check_my_code runs gets this long: the gate runs it anyway, so a slow one is not waited for. */
+export const CHECK_MY_CODE_TIMEOUT_MS = 120_000;
+
+/**
+ * The implementer checks its code the way the gate will before it says DONE: the stack's build and lint on the
+ * files it changed (scoped as the gate scopes them), then the unit's ported tests. It stops at the first failure,
+ * like the gate, so a broken build does not also wait for the tests.
+ */
+export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "check_my_code",
+		label: "Check my code",
+		description: "Run the gate's own checks on the code you changed: the target stack's build and lint on your changed files, then the unit's ported tests (run in the target project dir, the same commands the gate runs). It stops at the first failure. Call it before you finish and fix what it reports.",
+		promptSnippet: "check_my_code: the gate's build, lint and ported tests on your changed files — call before IMPLEMENTER DONE",
+		parameters: Type.Object({}),
+		execute: async () => {
+			const dir = d.targetProjectDir;
+			const slot = d.slot ?? (<T>(fn: () => Promise<T>) => fn());
+			const secs = CHECK_MY_CODE_TIMEOUT_MS / 1000;
+			const files = buildFiles(dir, d.adapter, changedFiles(dir, d.adapter.toolchain.ignoredPaths));
+			const out = [`Changed files checked: ${files.length ? files.join(", ") : "none"}.`];
+			for (const name of ["build", "lint"] as const) {
+				const r = await slot(() => checkTests(dir, d.adapter, name, files, CHECK_MY_CODE_TIMEOUT_MS));
+				const NAME = name.toUpperCase();
+				if (r.skipped) out.push(`${NAME} not run per unit (${r.skipped}).`);
+				else if (!r.error) out.push(`${NAME} clean (\`${r.command}\`).`);
+				else {
+					out.push(`${NAME} FAILED (\`${r.command}\`, run in ${dir}${r.error.endsWith("[timed out]") ? `, stopped after ${secs} s: the gate runs it again with more time` : ""}); fix it and call check_my_code again:\n${r.error}`);
+					return text(out.join("\n"), { ok: false, failed: name, files });
+				}
+			}
+			const tests = (d.testFiles?.() ?? []).filter((f) => existsSync(join(dir, f)));
+			if (!tests.length) {
+				out.push("TESTS not run: this unit has no ported test files.");
+				return text(out.join("\n"), { ok: true, files });
+			}
+			const t = d.adapter.test(dir, tests);
+			const r = await slot(() => run(t.cmd, t.args, dir, CHECK_MY_CODE_TIMEOUT_MS));
+			out.push(r.ok ? `TESTS green (${tests.join(", ")}).` : `TESTS FAILED${r.output.endsWith("[timed out]") ? ` (stopped after ${secs} s: the gate runs them again with more time)` : ""}; fix the code, not the tests (or call dispute_test with evidence):\n${r.output.slice(-2500)}`);
+			return text(out.join("\n"), { ok: r.ok, failed: r.ok ? undefined : "tests", files });
 		},
 	});
 }
@@ -485,7 +534,7 @@ async function behaviourFound(d: ToolDeps, reason: string): Promise<string | und
 const MAX_BODY_CHARS = 20_000;
 
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), reportMigratedBugTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), reportMigratedBugTool(d), checkMyCodeTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
 	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d), checkPortedTestsTool(d), noBehaviourTool(d)];

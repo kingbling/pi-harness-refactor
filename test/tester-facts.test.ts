@@ -162,6 +162,36 @@ describe("a full tester pass with the same cases", () => {
 	});
 });
 
+describe("a tester that leaves cases without a test", () => {
+	it("is told the interface's code is the implementer's; the quarantine saves a truth_red attempt with its blocked writes and last answer", async () => {
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
+		// an older, unrelated red report: self-heal must not read this one
+		const old = ledger.startAttempt("u1", "implement");
+		ledger.endAttempt(old, { outcome: "review_red", gateReport: { ok: false, steps: [{ name: "wired_ok", ok: false, output: "autoload mapping" }] } });
+		let prompt = "";
+		let sessions = 0;
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => {
+					sessions++;
+					prompt = opts.systemPrompt;
+					opts.onToolCall?.({ toolName: "write", blocked: "outside this unit's scope: src/features/agency/agency.service.ts" });
+					return { text: "TESTER DONE 0 cases. I could not create the interface.", ...ok };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate: async (g) => green(g), log: () => {} });
+		expect(prompt).toMatch(/interface\.md is the implementer's job, written after you: never create it/);
+		expect(ledger.getUnit("u1")!.state).toBe("quarantined");
+		const last = ledger.db.prepare("SELECT role, outcome, gate_report FROM attempts WHERE unit_id = 'u1' ORDER BY id DESC LIMIT 1").get() as { role: string; outcome: string; gate_report: string };
+		expect(last).toMatchObject({ role: "test", outcome: "truth_red" });
+		expect(JSON.parse(last.gate_report).error).toMatch(/u1#1[\s\S]*outside this unit's scope: src\/features\/agency\/agency\.service\.ts[\s\S]*TESTER DONE 0 cases/);
+		// it is the tester's own last session, not an extra zero-length tester attempt (br lanes averages their time)
+		expect(ledger.db.prepare("SELECT COUNT(*) n FROM attempts WHERE unit_id = 'u1' AND role = 'test'").get()).toEqual({ n: sessions });
+	});
+});
+
 describe("truth case ids stay put", () => {
 	const truthDir = () => join(ws, ".bigrefactor", "truth", "u1");
 	const casesOf = (inputs: number[]) => JSON.stringify(inputs.map((i) => ({ symbol: "s", inputs: [i], expected: i * 10 })));

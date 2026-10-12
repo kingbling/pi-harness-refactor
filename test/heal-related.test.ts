@@ -7,6 +7,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { ownerAnswersOn } from "../src/jev/ask.ts";
+import { errorSignature } from "../src/run/gate.ts";
 import { askStuckUnits, healQuarantined } from "../src/run/run.ts";
 
 /**
@@ -82,6 +83,114 @@ describe("self-heal wakes only units a change concerns", () => {
 		expect(await heal(change + 5000)).toEqual(["U1"]);
 		expect(asked()).toHaveLength(2);
 		expect(ledger.getUnit("U1")!.state).toBe("planned");
+		ledger.close();
+	});
+
+	it("the decide model unavailable: the unit stays as it is this pass, it is not made stuck", async () => {
+		const { root, config, ledger, quarantined, fixLogged, manifests } = workspace();
+		quarantined("U1", "nestjs", "src/Billing/U1.php: Class Invoice not found");
+		// it failed the same way once before: with the change counted as none, it would be stuck at once
+		ledger.updateUnit("U1", { meta: { autoHeals: 1, healedFrom: errorSignature("quarantine", "gate still red after 5 attempts (lint_ok)") } });
+		fixLogged("nestjs", "phpunit runs each test in isolation");
+		let down = true;
+		const client = new FakeModelClient({ decide: () => (down ? (() => { throw new Error("provider down"); })() : { touches: true }) });
+		const heal = (since: number) => healQuarantined(ledger, config, root, new Set(), () => {}, manifests, { since, client });
+		const change = Date.now() + 1000;
+		expect(await heal(change)).toEqual([]);
+		const meta = JSON.parse(ledger.getUnit("U1")!.meta);
+		expect([meta.stuck, meta.healChecked]).toEqual([undefined, undefined]);
+		// the model is back next pass: it is asked about the same change
+		down = false;
+		expect(await heal(change)).toEqual(["U1"]);
+		ledger.close();
+	});
+});
+
+describe("self-heal asks about every change and keeps the unit's code", () => {
+	it("a unit not yet stuck also runs again on a change only when the decide model says it touches its own failure", async () => {
+		const { root, config, ledger, quarantined, fixLogged, manifests } = workspace();
+		quarantined("U1", "nestjs", "src/Billing/U1.php: Class Invoice not found");
+		fixLogged("nestjs", "phpunit runs each test in isolation");
+		let touches = false;
+		const client = new FakeModelClient({ decide: (req) => ("touches" in req.questions ? { touches } : {}) });
+		const asked = () => client.calls.filter((c) => c.kind === "decide" && "touches" in (c.req as { questions: object }).questions);
+		const heal = (since: number) => healQuarantined(ledger, config, root, new Set(), () => {}, manifests, { since, client });
+		const change = Date.now() + 1000;
+		expect(await heal(change)).toEqual([]);
+		expect((asked()[0]!.req as { state: { failure: string } }).state.failure).toMatch(/Class Invoice not found/);
+		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
+		touches = true;
+		expect(await heal(change + 5000)).toEqual(["U1"]);
+		ledger.close();
+	});
+
+	it("a self-heal requeue keeps the unit's code and the next start puts it on current main; an owner's requeue drops it", async () => {
+		const { root, config, ledger } = workspace();
+		const { keepUnitWork, requeueUnits, restoreKeptWork } = await import("../src/run/run.ts");
+		const { addWorktree } = await import("../src/git.ts");
+		const { execFileSync } = await import("node:child_process");
+		const repo = config.target.path;
+		const git = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
+		mkdirSync(repo, { recursive: true });
+		git(repo, "init", "-q", "-b", "main");
+		writeFileSync(join(repo, "a.txt"), "a\n");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-q", "-m", "init");
+		for (const id of ["U1", "U2"]) {
+			ledger.createUnit({ id, tier: "T0", symbolIds: [], meta: {} });
+			ledger.transitionUnit(id, "truth", "t");
+			ledger.transitionUnit(id, "quarantined", "gate still red after 5 attempts (wired_ok)");
+			const wt = join(root, "wt", id);
+			addWorktree(repo, wt, `unit/${id}`);
+			writeFileSync(join(wt, `${id}.txt`), "code\n");
+			ledger.updateUnit(id, { meta: { keptWork: keepUnitWork(wt, id), reviewFindings: [`- ${id}.txt:1: stub → port it`] } });
+			git(repo, "worktree", "remove", "--force", wt);
+		}
+		requeueUnits(ledger, config, root, ["U1"], "self-heal", { keepCode: true });
+		requeueUnits(ledger, config, root, ["U2"], "owner", { human: true });
+		const kept = JSON.parse(ledger.getUnit("U1")!.meta).keptWork as string;
+		expect(kept).toBeTruthy();
+		expect(git(repo, "branch", "--list", "unit/*")).toBe("unit/U1");
+		// the owner's requeue drops the code, and with it the reviewer's findings about that code
+		expect(JSON.parse(ledger.getUnit("U2")!.meta)).not.toHaveProperty("keptWork");
+		expect(JSON.parse(ledger.getUnit("U2")!.meta)).not.toHaveProperty("reviewFindings");
+		// main moved on meanwhile: the code comes back on top of it, uncommitted as it was
+		writeFileSync(join(repo, "b.txt"), "b\n");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-q", "-m", "another unit");
+		const wt = join(root, "wt", "U1-again");
+		addWorktree(repo, wt, "unit/U1");
+		expect(restoreKeptWork(ledger, wt, "U1")).toBe(true);
+		expect(git(wt, "status", "--porcelain")).toBe("?? U1.txt");
+		// the kept code is used once; the findings about it stay with it
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).not.toHaveProperty("keptWork");
+		expect(JSON.parse(ledger.getUnit("U1")!.meta).reviewFindings).toEqual(["- U1.txt:1: stub → port it"]);
+		expect(git(wt, "ls-files")).toContain("b.txt");
+		// main wrote the same file another way: the code no longer applies, the unit starts clean
+		writeFileSync(join(repo, "U1.txt"), "other\n");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-q", "-m", "clash");
+		const wt2 = join(root, "wt", "U1-clash");
+		addWorktree(repo, wt2, "unit/U1-clash");
+		ledger.updateUnit("U1", { meta: { keptWork: kept } });
+		expect(restoreKeptWork(ledger, wt2, "U1")).toBe(false);
+		expect(git(wt2, "status", "--porcelain")).toBe("");
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).not.toHaveProperty("reviewFindings");
+		ledger.close();
+	});
+});
+
+describe("the code a quarantined unit keeps", () => {
+	it("is not kept when its last gate failed antigaming_ok: the same files would fail it again", async () => {
+		const { ledger, quarantined } = workspace();
+		const { mayKeepCode } = await import("../src/run/run.ts");
+		quarantined("U1", "nestjs", "lint: 2 errors");
+		expect(mayKeepCode(ledger, "U1")).toBe(true);
+		const a = ledger.startAttempt("U1", "implement", "m");
+		ledger.endAttempt(a, { outcome: "gate_red:antigaming_ok", gateReport: { ok: false, failedStep: "antigaming_ok", steps: [] } });
+		// a review after it is no gate outcome: the gate's antigaming_ok still decides
+		ledger.endAttempt(ledger.startAttempt("U1", "review", "m"), { outcome: "review_red" });
+		expect(mayKeepCode(ledger, "U1")).toBe(false);
 		ledger.close();
 	});
 });

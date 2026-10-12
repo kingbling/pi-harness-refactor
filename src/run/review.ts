@@ -48,21 +48,24 @@ export interface ReviewInput {
 	greenBefore?: string;
 	/** The ported tests (the tester's): weak ones go back to the tester, not the implementer. */
 	testFiles?: string[];
+	/** The unit's code findings still open from its earlier reviews (kept in unit meta across attempts and runs). */
+	openFindings?: string[];
 	transcriptPath?: string;
 	spawn?: typeof spawnLeaf;
 }
 export type Finding = { file: string; line?: number; problem: string; fix: string };
-export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number; weakTests?: string; outOfScope?: string }>;
-type Verdict = { ok: boolean; findings: Finding[]; weakTests?: Array<{ file: string; problem: string }>; outOfScope?: Array<{ problem: string; fix: string }> };
+/** findings: every code finding still open after this review, one line each (the unit keeps them for the next round). */
+export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number; weakTests?: string; outOfScope?: string; findings?: string[] }>;
+type Verdict = { ok: boolean; findings: Finding[]; fixed?: string[]; weakTests?: Array<{ file: string; problem: string }>; outOfScope?: Array<{ problem: string; fix: string }> };
 
 export const reviewWithModel: Reviewer = async (o) => {
 	let verdict: Verdict | undefined;
 	const verdictTool = {
 		name: "review_verdict",
 		label: "Review verdict",
-		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester. outOfScope: what must change outside the files the implementer may write (project setup, config, manifests, folder names, the migration tool); they go to the setup fixer or the owner, never to the implementer.",
+		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. findings lists ALL open problems, earlier ones still open included. fixed: your earlier findings that the code fixes now. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester. outOfScope: what must change outside the files the implementer may write (project setup, config, manifests, folder names, the migration tool); they go to the setup fixer or the owner, never to the implementer.",
 		promptSnippet: "review_verdict: your verdict (ok + findings for the code, weakTests for the tester, outOfScope for setup/config)",
-		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))), outOfScope: Type.Optional(Type.Array(Type.Object({ problem: Type.String(), fix: Type.String() }))) }),
+		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), fixed: Type.Optional(Type.Array(Type.String())), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))), outOfScope: Type.Optional(Type.Array(Type.Object({ problem: Type.String(), fix: Type.String() }))) }),
 		execute: async (_id: string, p: Verdict) => {
 			verdict = p;
 			return { content: [{ type: "text" as const, text: "verdict recorded; stop here" }], details: {} };
@@ -84,7 +87,7 @@ export const reviewWithModel: Reviewer = async (o) => {
 2. Connected: the new code can be reached the way the legacy callers (listed below) reached the old code — an HTTP handler has its route/page registered the way this stack does it; code the legacy callers reached through a factory or another class is reached that way, not turned into an entry point nobody calls — and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet. Code owned by planned units (listed below) is expected as a minimal stub marked TODO(br:<the owning unit>): that is not a finding. A stub marked TODO(br:${o.unitId}) (grep for it) that stands in for this unit's own legacy code was left by an earlier unit for this one: one still there, not replaced by the real code or pointed at it, is a finding.
 3. On the chosen stack: the owner's stack choices below are used where they apply (data access, rendering, data fetching, routing, forms, styling …), not gone around.
 4. The tests: the ported tests (listed below) really check the legacy behaviour — they assert the expected values, not only that something renders or exists. Weak tests go in weakTests (the tester rewrites them), never in findings.
-Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and few: only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
+Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and complete: list ALL open problems in this one verdict, not a few at a time (the implementer fixes them in one go), but only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
 		});
 		const r = await session.run(facts(o));
 		// no verdict: ask once more in the same session; still none is red, never a pass
@@ -98,12 +101,14 @@ Judge only what this unit added or changed, against the facts below: the behavio
 		const weakTests = v.weakTests?.length ? v.weakTests.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
 		const outOfScope = v.outOfScope?.length ? v.outOfScope.map((f) => `- ${f.problem} → ${f.fix}`).join("\n") : undefined;
 		const ok = v.ok && !v.findings.length && !weakTests && !outOfScope;
+		const findings = v.findings.map((f) => `- ${f.file}${f.line ? `:${f.line}` : ""}: ${f.problem} → ${f.fix}`);
 		const out = [
-			v.findings.length ? `reviewer findings:\n${v.findings.map((f) => `- ${f.file}${f.line ? `:${f.line}` : ""}: ${f.problem} → ${f.fix}`).join("\n")}` : "",
+			findings.length ? `reviewer findings:\n${findings.join("\n")}` : "",
+			v.fixed?.length ? `fixed since the earlier review:\n${v.fixed.map((f) => `- ${f}`).join("\n")}` : "",
 			weakTests ? `weak tests (the tester rewrites them):\n${weakTests}` : "",
 			outOfScope ? `outside the unit's files (setup fixer, else the owner):\n${outOfScope}` : "",
 		].filter(Boolean).join("\n");
-		return { ok, judged: true, costUsd: r.usage.cost, weakTests, outOfScope, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
+		return { ok, judged: true, costUsd: r.usage.cost, weakTests, outOfScope, findings, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
 	} catch (e: any) {
 		return { ok: false, judged: false, output: `not judged: ${e?.message ?? e}` };
 	} finally {
@@ -129,6 +134,7 @@ function facts(o: ReviewInput): string {
 		`Ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
 		...(o.writeGlobs?.length ? [`The implementer may write only: ${o.writeGlobs.join(", ")}. A fix anywhere else is an outOfScope item, not a finding.`] : []),
 		...(o.greenBefore ? [o.greenBefore] : []),
+		...(o.openFindings?.length ? [`\nYour earlier reviews of this unit found these, still open as far as the ledger knows. Check each against the code now: a fixed one goes in fixed, one still open goes in findings again (with any new ones), so findings is the whole open list. Raise a new one only when it is a real blocker, not a change of mind:\n${o.openFindings.join("\n")}`] : []),
 		...(o.ownerNote ? [`Note from the orchestrator for this run (only an answer by the owner, a person, counts as decided; a model's hint is context to check against the legacy code): ${o.ownerNote}`] : []),
 		...legacyFacts(o),
 		...(none ? [`The tester found no runtime behaviour to pin in this unit, so it has no truth cases and no ported tests. Its reason: ${none}. Check that against the legacy code: if the unit does compute or decide something, name it in weakTests (the tester then writes cases for it).`] : []),
