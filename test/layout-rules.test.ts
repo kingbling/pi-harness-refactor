@@ -212,4 +212,23 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 		writeFileSync(join(dir, "src/Shared/Kernel.php"), "<?php // changed\n");
 		expect(checkLayoutTree(dir, sym, symOpts)).toContainEqual(expect.stringMatching(/^src\/Shared\/Kernel\.php: shared files go in/));
 	});
+	it("wiring files the unit is told to edit (config/services.yaml, a route table) pass the folder check", () => {
+		const run = (f: string, wiringFiles?: string[]) => checkLayoutRules([f], "src/Plans", "plans", "/nonexistent", sym, { ...symOpts, sharedDirs: ["src/Shared", "config"], wiringFiles }, NEW);
+		expect(run("config/services.yaml")).toContainEqual(expect.stringMatching(/^config\/services\.yaml: shared files go in config\/<topic>/));
+		expect(run("config/services.yaml", ["config/bundles.php", "config/services.yaml"])).toEqual([]);
+		expect(run("src/Kernel.php", ["src/*.php"])).toEqual([]);
+		expect(run("src/Other/Kernel.php", ["src/*.php"])).toContainEqual(expect.stringMatching(/outside this unit's feature folder/));
+	});
+
+	it("repeated placeholders: nested folders and file-name parts are their own value; a file name repeating its folder is that folder", () => {
+		const r = normalize({ moduleDir: "src/{Area}", files: [{ path: "{sub}/{sub}/{Name}.php", doc: "" }, { path: "translations/{name}.{name}.yaml", doc: "" }, { path: "config/{name}.php", doc: "" }, { path: "{sub}/{Name}/{Name}.php", doc: "" }], require: [], forbidDirs: ["Utils"] });
+		const run = (f: string) => checkLayoutRules([f], "src/Users", "users", "/nonexistent", r, symOpts, NEW);
+		expect(run("src/Users/Security/WebAuthn/WebAuthnException.php")).toEqual([]);
+		expect(run("src/Users/translations/messages.en.yaml")).toEqual([]);
+		expect(run("src/Users/config/one_time_login.php")).toEqual([]);
+		expect(run("src/Users/Security/Utils/X.php")).toContainEqual(expect.stringMatching(/folder "Utils" is not allowed/));
+		expect(run("src/Users/Login/Form/Form.php")).toEqual([]);
+		// the message says how each placeholder is spelled
+		expect(run("src/Users/Login/Form/Deep/Other.php")).toContainEqual(expect.stringMatching(/not an allowed file .*\(<name> kebab-case or snake_case, <Name> PascalCase, <sub> a PascalCase folder\)$/));
+	});
 });

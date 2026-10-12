@@ -1098,9 +1098,11 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 			continue;
 		}
 		if (a.action === "quarantine") {
-			// healQuestion 0: the owner's answer stands, the auto-heal does not put it back nor ask again (br requeue does)
-			ledger.updateUnit(u.id, { meta: { applied: q!.id, healQuestion: 0 } });
-			ledger.transitionUnit(u.id, "quarantined", `owner answered "${q!.answer}" on question #${q!.id}`);
+			// healQuestion 0: the owner's answer stands, the auto-heal does not put it back nor ask again (br requeue does).
+			// A model's leave parks it (parkedWhy): a later change on main that touches the failure brings it back
+			const byModel = MODEL_ANSWERERS.includes(q!.answered_by ?? "");
+			ledger.updateUnit(u.id, { meta: { applied: q!.id, healQuestion: 0, ...(byModel ? { parkedWhy: a.hint || `the ${q!.answered_by} left it parked`, parkedAt: Date.now() } : {}) } });
+			ledger.transitionUnit(u.id, "quarantined", `${byModel ? q!.answered_by : "owner"} answered "${q!.answer}" on question #${q!.id}`);
 			removeWorktree(config.target.path, worktreeDir(root, u.id));
 			log(pc.red(`■ ${u.id}: quarantined by the answer to #${q!.id}`));
 			continue;
@@ -1193,11 +1195,13 @@ function lastRedReport(ledger: Ledger, unitId: string): { step: string; output: 
 }
 
 /**
- * A failure by its failed step and kind, not its words ("wired_ok: gate still red after N attempts (wired_ok)"): a unit
- * keeps the ones it was retried on (meta.retriedOn), so the same failure in new words is still the same failure.
+ * A failure by its error, not its words: the failed step's first error line, normalized (errorSignature), else the
+ * quarantine reason. A unit keeps the ones it was retried on (meta.retriedOn), so the same error in new words is still
+ * the same failure, and a new error at the same step is not.
  */
-export function failureKind(reason: string, step?: string): string {
-	return `${step ?? "-"}: ${reason.split(/[;:\n]/)[0]!.replace(/\d+/g, "N").trim()}`;
+export function failureKind(unitId: string, reason: string, last?: { step: string; output: string }): string {
+	// the unit's own id is never part of the key
+	return last ? errorSignature(last.step, last.output.replaceAll(unitId, "<unit>")) : errorSignature("quarantine", reason);
 }
 
 /** One finished unit as the circuit breaker sees it: the failure text and its key, whatever kind of failure it was. */
@@ -1330,21 +1334,23 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[] };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number };
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
 		const failure = errorSignature("quarantine", r.reason ?? "");
 		// the failure itself goes into the note: the worktree goes with the requeue, so this is all the next run has
 		const last = lastRedReport(ledger, r.id);
 		const lastFailure = last ? `\nIts last failure (${last.step}):\n${capText(last.output, 3000)}` : "";
-		const kind = failureKind(r.reason ?? "", last?.step);
+		const kind = failureKind(r.id, r.reason ?? "", last);
 		const retriedOn = [...new Set([...(meta.retriedOn ?? []), kind])];
-		const park = (parkedWhy: string) => ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0, '$.parkedWhy', ?) WHERE id = ?").run(parkedWhy, r.id);
+		const park = (parkedWhy: string) => ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0, '$.parkedWhy', ?, '$.parkedAt', ?) WHERE id = ?").run(parkedWhy, Date.now(), r.id);
 		const stackId = placeUnit(config, r.meta, root).stackId;
 		const since = sinceOf(stackId);
 		const changed = ledgerTime(r.at) < since;
+		// a unit a model parked waits for a change on main after the park, past its automatic tries (the owner's leave stands)
+		const parked = meta.healQuestion === 0 && !!meta.parkedWhy && since > (meta.parkedAt ?? 0);
 		// a change the decide model already said does not touch this failure is not asked about again
-		if (changed && meta.stuck && meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && since > (meta.healChecked ?? 0)) {
+		if (changed && ((meta.stuck && meta.healQuestion !== 0 && heals < config.run.maxAutoHeals) || parked) && since > (meta.healChecked ?? 0)) {
 			const touches = o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
 			if (touches) {
 				// something changed since the unit got stuck that may fix it: worth a try, an open question about it or not
@@ -1364,17 +1370,18 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 			const byModel = MODEL_ANSWERERS.includes(q.answered_by ?? "");
 			if (a.action !== "requeue") {
 				// the resolver's leave: nothing a model can do is left; it stays parked (br status), the owner is not asked
-				if (byModel) park(q.answer?.split(HINT)[1]?.trim() || "the resolver model left it parked");
+				if (byModel) park(a.hint || "the resolver model left it parked");
 				else ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
 				continue;
 			}
-			// the resolver's retry counts against the automatic tries: past them it stays parked, no question
-			if (byModel && heals >= config.run.maxAutoHeals) {
+			// the resolver's retry counts against the automatic tries: past them it stays parked, no question. A job's retry
+			// goes through: the job changed main, the change the cap waits for
+			if (q.answered_by === RESOLVER && heals >= config.run.maxAutoHeals) {
 				park(`the resolver model said to try again, but its ${config.run.maxAutoHeals} automatic tries are used up`);
 				log(pc.yellow(`⏸ ${r.id}: stays parked, no automatic try left (br requeue ${r.id} after a change)`));
 				continue;
 			}
-			backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? "the resolver model" : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "resolver's" : "owner's"} hint: ${a.hint}` : ""}${lastFailure}`, failure, retriedOn);
+			backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? `the ${q.answered_by}` : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "model's" : "owner's"} hint: ${a.hint}` : ""}${lastFailure}`, failure, retriedOn);
 			back.push(r.id);
 			continue;
 		}
@@ -1406,7 +1413,7 @@ export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: s
 		if (meta.healQuestion !== undefined || (!meta.stuck && (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals)) continue;
 		const last = lastRedReport(d.ledger, r.id);
 		// what a retry may still be: none once the automatic tries are used up; only with a hint (or a job) after one on this kind of failure
-		const kind = failureKind(r.reason ?? "", last?.step);
+		const kind = failureKind(r.id, r.reason ?? "", last);
 		const retry = (meta.autoHeals ?? 0) >= d.config.run.maxAutoHeals ? "none" : meta.retriedOn?.includes(kind) ? "with a hint" : undefined;
 		const q = await askViaModel(d, {
 			point: "quarantine",
@@ -1418,9 +1425,9 @@ export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: s
 			],
 			blocks: "unit",
 			askedBy: "orchestrator",
-			context: retry ? { retry, failureKind: kind } : undefined,
-			// the unit's own id is never part of the key
-			sameAs: [errorSignature("quarantine", r.reason ?? ""), last && errorSignature(last.step, last.output.replaceAll(r.id, "<unit>"))].filter(Boolean).join(" | "),
+			context: { failureKind: kind, ...(retry ? { retry } : {}) },
+			// units with a different retry left never share a question: one's "retry is no answer" is not the other's
+			sameAs: [errorSignature("quarantine", r.reason ?? ""), last && kind, retry && `retry ${retry}`].filter(Boolean).join(" | "),
 		});
 		d.ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', ?) WHERE id = ?").run(q.id, r.id);
 		if (!q.shared) asked++;
@@ -1515,7 +1522,7 @@ export function applyParkedAnswer(answer: string | undefined, options: string[])
 	const a = at < 0 ? full : full.slice(0, at).trim();
 	const carried = at < 0 ? "" : full.slice(at + HINT.length).trim();
 	const value = a.split(/\s+[—-]\s+|:\s/)[0]!.toLowerCase();
-	if (["quarantine", "leave", "investigate"].includes(value)) return { action: "quarantine" };
+	if (["quarantine", "leave", "investigate"].includes(value)) return { action: "quarantine", hint: carried || undefined };
 	if (value === "wait") return { action: "hold" };
 	const isOption = options.some((o) => o.toLowerCase() === a.toLowerCase() || o.toLowerCase().startsWith(`${value} `) || o.toLowerCase() === value);
 	const typed = isOption ? (a.toLowerCase().startsWith(`${value}: `) ? a.slice(value.length + 2).trim() : "") : a;

@@ -12,8 +12,8 @@ import { answerValue, loadBrief, optionFor } from "./ask.ts";
  * project and the facts, then answers (an option, or a hint the next attempt gets) or says why only the owner can
  * decide. Questions it hands on carry context.forOwner; those are the ones shown in the foreground. When the resolver
  * answered the same point for the same unit before and it came back, it sees those answers and decides whether
- * something changed or the owner must act; after MAX_RESOLVER_TRIES answers the owner decides. A parked unit's
- * question (quarantine) never goes to the owner as "retry or leave": when the model's tries are used up or nothing a
+ * something changed or the owner must act; after MAX_RESOLVER_TRIES answers the owner decides. A parked or waiting unit's
+ * question (quarantine, gate_env) never goes to the owner as "retry or leave": when the model's tries are used up or nothing a
  * model can do is left, the unit stays parked (br status lists it); only something a person must do or decide is
  * asked, in those words.
  */
@@ -26,15 +26,17 @@ const RESOLVER_RETRY_MS = 5 * 60_000;
 
 /** Why a retry answer is no answer to this question (askStuckUnits' context.retry), or undefined when it is one. */
 export function retryRefused(q: QuestionRow, answer: string, hint?: string): string | undefined {
-  if (answerValue(answer) !== "retry") return undefined;
+  if (answerValue(answer).toLowerCase() !== "retry") return undefined;
+  // "retry: <text>" carries its hint inline (optionFor, applyParkedAnswer read it the same way)
+  const inline = /^retry: /i.test(answer) ? answer.slice(7).trim() : "";
   const ctx = q.context ? (JSON.parse(q.context) as { retry?: string; failureKind?: string }) : {};
   if (ctx.retry === "none") return "the unit's automatic tries are used up: a retry is no answer; a job (code_job, fix_job, layout_job) that changes main is";
-  if (ctx.retry && !hint?.trim()) return `the unit was already retried on this kind of failure (${ctx.failureKind}) and it came back: a plain retry runs it again blind. Give a hint that changes the attempt (what to do differently, or what changed on main and how to use it), or call a job`;
+  if (ctx.retry && !hint?.trim() && !inline) return `the unit was already retried on this kind of failure (${ctx.failureKind}) and it came back: a plain retry runs it again blind. Give a hint that changes the attempt (what to do differently, or what changed on main and how to use it), or call a job`;
   return undefined;
 }
 
-/** A parked unit's question: its "leave" keeps it parked without asking the owner. */
-const parks = (q: QuestionRow) => q.point === "quarantine";
+/** A parked or waiting unit's question (quarantine, an environment it fails on): its "leave" keeps it parked without asking the owner. */
+const parks = (q: QuestionRow) => q.point === "quarantine" || q.point === "gate_env";
 
 export type Resolution = { answer: string; why: string; hint?: string } | { owner: string } | { park: string } | { fix: string; then: string; stack?: string } | { code: string; then: string; stack?: string } | { layout: string; then: string; stack?: string };
 /** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or undefined. */
@@ -81,6 +83,9 @@ export async function resolveOpenQuestions(d: {
     const failed = ctx.resolverFailed ?? 0;
     if (failed && Date.now() - (ctx.resolverFailedAt ?? 0) < failed * RESOLVER_RETRY_MS) continue;
     const earlier = triedBefore(d.ledger, q);
+    // what only a person can do, in those words: not "retry or leave"
+    const askOwnerTo = (why: string) =>
+      d.ledger.db.prepare("UPDATE questions SET question = ?, options = ? WHERE id = ?").run(`${q.unit_id} is parked until you do this: ${why}`, JSON.stringify(["retry — done, run it again", "leave — leave it parked"]), q.id);
     // a parked unit stays parked, quietly: br status lists it, the owner is not asked "retry or leave"
     const park = (why: string) => {
       d.ledger.answerQuestion(q.id, optionFor(q, "leave", why), RESOLVER);
@@ -118,6 +123,10 @@ export async function resolveOpenQuestions(d: {
         continue;
       }
       d.ledger.db.prepare("UPDATE questions SET context = json_remove(context, '$.resolverFailed', '$.resolverFailedAt') WHERE id = ?").run(q.id);
+      if (parks(q)) {
+        park(`${why} (${failed + 1} times)`);
+        continue;
+      }
       d.ledger.markForOwner(q.id, `${why} (${failed + 1} times)`);
       forOwner++;
       continue;
@@ -128,11 +137,13 @@ export async function resolveOpenQuestions(d: {
         : undefined;
       if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
       if (!done || "owner" in done) {
-        d.ledger.markForOwner(q.id, done?.owner ?? `a layout change is needed: ${r.layout}`);
+        const why = done?.owner ?? `a layout change is needed: ${r.layout}`;
+        if (parks(q)) askOwnerTo(why);
+        d.ledger.markForOwner(q.id, why);
         forOwner++;
         continue;
       }
-      d.ledger.answerQuestion(q.id, optionFor(q, r.then), LAYOUT_JOB);
+      d.ledger.answerQuestion(q.id, optionFor(q, r.then, `the layout now allows: ${done.applied}`), LAYOUT_JOB);
       d.log?.(`question #${q.id} (${q.point}${q.unit_id ? ` ${q.unit_id}` : ""}) fixed by a layout job: ${done.applied.slice(0, 160)} → ${answerValue(r.then)}`);
       answered++;
       continue;
@@ -144,12 +155,17 @@ export async function resolveOpenQuestions(d: {
         ? await job(q, what, r.stack).catch((e) => (d.log?.(`${kind} for question #${q.id} failed: ${e?.message ?? e}`), undefined))
         : undefined;
       if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
+      if (!fixed && parks(q)) {
+        park(`a ${kind} was tried and changed nothing: ${what}`);
+        continue;
+      }
       if (!fixed) {
         d.ledger.markForOwner(q.id, `a ${kind} was tried and changed nothing: ${what}`);
         forOwner++;
         continue;
       }
-      d.ledger.answerQuestion(q.id, optionFor(q, r.then), by);
+      // what the job changed goes with the answer: the next attempt uses it instead of writing it again
+      d.ledger.answerQuestion(q.id, optionFor(q, r.then, `what the ${kind} changed on main: ${fixed}`), by);
       d.log?.(`question #${q.id} (${q.point}${q.unit_id ? ` ${q.unit_id}` : ""}) fixed by a ${kind}: ${fixed.slice(0, 160)} → ${answerValue(r.then)}`);
       answered++;
       continue;
@@ -168,8 +184,7 @@ export async function resolveOpenQuestions(d: {
     }
     if ("owner" in r || "park" in r) {
       const why = "owner" in r ? r.owner : r.park;
-      // what only a person can do, in those words: not "retry or leave"
-      if ("owner" in r && parks(q)) d.ledger.db.prepare("UPDATE questions SET question = ?, options = ? WHERE id = ?").run(`${q.unit_id} is parked until you do this: ${why}`, JSON.stringify(["retry — done, run it again", "leave — leave it parked"]), q.id);
+      if ("owner" in r && parks(q)) askOwnerTo(why);
       d.ledger.markForOwner(q.id, why);
       forOwner++;
       continue;

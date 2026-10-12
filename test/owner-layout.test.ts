@@ -81,6 +81,9 @@ describe("owner layout", () => {
 		mkdirSync(join(projectDir, "src/invoice"), { recursive: true });
 		mkdirSync(join(projectDir, "src/invoice/lib"), { recursive: true });
 		writeFileSync(join(projectDir, "src/invoice/lib/money.ts"), "export const cents = (n: number) => n * 100;\n");
+		// already wrong on main: the change rewrites its "allowed:" list, yet it is nothing new
+		mkdirSync(join(projectDir, "src/invoice/stuff"), { recursive: true });
+		writeFileSync(join(projectDir, "src/invoice/stuff/loose.ts"), "export const x = 1;\n");
 		saveLayoutRules(root, "nestjs", NEST_LAYOUT);
 		const wider = { ...NEST_LAYOUT, files: [...NEST_LAYOUT.files, { path: "webauthn/{name}.ts", doc: "the WebAuthn library" }] };
 		const ok = answer({ checkable: true, summary: "allow webauthn/<name>.ts", reason: "", rules: wider, mustPass: ["webauthn/cbor.ts"], mustFail: [] });

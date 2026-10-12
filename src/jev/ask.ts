@@ -370,12 +370,33 @@ export function ownPick(config: Config, q: AskRequest, phrased: PhrasedQuestion)
 /** Points about a unit that keeps failing (retry or leave): the owner's earlier answers on them go to the phrasing model by themselves. */
 const OWNER_ANSWERS_POINTS = new Set(["quarantine", "gate_env"]);
 
-/** The owner's own earlier answers on a point (not the run's, a model's or a bulk "accepted the summary"): what was asked and what they said. */
-export function ownerAnswersOn(ledger: Ledger, point: string, limit = 10): string {
+/** A question's context is about this failure: its key (or one joined to it), or the same kind of failure. */
+const SAME_FAILURE = "(json_extract(context, '$.sameAs') = @sameAs OR EXISTS (SELECT 1 FROM json_each(context, '$.alsoSameAs') WHERE value = @sameAs) OR (@kind IS NOT NULL AND json_extract(context, '$.failureKind') = @kind))";
+
+/**
+ * The owner's own earlier answers on this same failure (not the run's, a model's or a bulk "accepted the summary"):
+ * what was asked, what they said, and what happened to the unit after it (a retry that failed the same way again
+ * is no reason to retry once more). Answers on other failures are left out: they say nothing about this one.
+ */
+export function ownerAnswersOn(ledger: Ledger, point: string, sameAs: string | undefined, kind?: string, limit = 10): string {
+	if (!sameAs && !kind) return "";
 	const rows = ledger.db
-		.prepare("SELECT question, context, answer FROM questions WHERE point = ? AND status = 'answered' AND answered_by LIKE 'human%' AND answered_by NOT LIKE '%accepted the summary%' ORDER BY id DESC LIMIT ?")
-		.all(point, limit) as Array<{ question: string; context: string | null; answer: string }>;
-	return rows.map((r) => `- ${String((r.context ? (JSON.parse(r.context) as { facts?: string }).facts : undefined) ?? r.question).replace(/\s+/g, " ").slice(0, 300)} → ${r.answer.slice(0, 200)}`).join("\n");
+		.prepare(`SELECT id, unit_id, question, context, answer FROM questions WHERE point = @point AND status = 'answered' AND answered_by LIKE 'human%' AND answered_by NOT LIKE '%accepted the summary%' AND ${SAME_FAILURE} ORDER BY id DESC LIMIT @limit`)
+		.all({ point, sameAs: sameAs ?? null, kind: kind ?? null, limit }) as Array<{ id: number; unit_id: string | null; question: string; context: string | null; answer: string }>;
+	const next = ledger.db.prepare(`SELECT ${SAME_FAILURE} AS same FROM questions WHERE unit_id = @unit AND id > @id AND point IN ('quarantine', 'gate_env') ORDER BY id LIMIT 1`);
+	const after = (r: (typeof rows)[number]): string => {
+		if (!r.unit_id) return "";
+		const n = next.get({ unit: r.unit_id, id: r.id, sameAs: sameAs ?? null, kind: kind ?? null }) as { same: number } | undefined;
+		if (n) return n.same ? "failed the same way again" : "failed another way";
+		const state = ledger.getUnit(r.unit_id)?.state;
+		return state === "accepted" ? "the unit then passed" : state ? `the unit is ${state} now` : "";
+	};
+	return rows
+		.map((r) => {
+			const then = after(r);
+			return `- ${String((r.context ? (JSON.parse(r.context) as { facts?: string }).facts : undefined) ?? r.question).replace(/\s+/g, " ").slice(0, 300)} → ${r.answer.slice(0, 200)}${then ? ` → after it: ${then}` : ""}`;
+		})
+		.join("\n");
 }
 
 /** Answer given by the run itself (status "auto"); the owner sees these in br questions. */
@@ -392,7 +413,7 @@ export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: numb
 		if (q.unitId) d.ledger.addWaiter(same.id, q.unitId);
 		return { id: same.id, phrased: unphrased(q), costUsd: same.costUsd, shared: true };
 	}
-	const earlier = !q.ownerAnswers && OWNER_ANSWERS_POINTS.has(q.point) ? ownerAnswersOn(d.ledger, q.point) : "";
+	const earlier = !q.ownerAnswers && OWNER_ANSWERS_POINTS.has(q.point) ? ownerAnswersOn(d.ledger, q.point, q.sameAs, (q.context as { failureKind?: string } | undefined)?.failureKind) : "";
 	const phrased = d.client ? await phraseOne(d, earlier ? { ...q, ownerAnswers: earlier } : q) : unphrased(q);
 	const id = d.ledger.askQuestion({
 		unitId: q.unitId,
@@ -479,7 +500,7 @@ async function phraseOne(d: AskDeps, q: AskRequest): Promise<PhrasedQuestion & {
 			effort: "low",
 			schema: { type: "object", additionalProperties: false, required: PHRASE_SCHEMA.properties.questions.items.required, properties: PHRASE_SCHEMA.properties.questions.items.properties },
 			messages: [
-				{ role: "system", content: `You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion${q.recommended || q.agentOpinion ? ` (agree or disagree with the ${q.agentOpinion ? "agent's opinion" : "current pick"}, with a reason)` : " (your own pick and why; no other pick was made)"}.${q.ownerAnswers ? " The owner's earlier answers on like questions show what they want; follow them where the case is the same." : ""}\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
+				{ role: "system", content: `You ask the owner of a legacy app ONE question on behalf of an automated migration. Short, concrete, about this repo; say what happens with each answer. Keep option values exactly; label them in plain words. Always recommend one and give your opinion${q.recommended || q.agentOpinion ? ` (agree or disagree with the ${q.agentOpinion ? "agent's opinion" : "current pick"}, with a reason)` : " (your own pick and why; no other pick was made)"}.${q.ownerAnswers ? " The owner's earlier answers show what they want; follow them where the case is the same. Where an answer says what happened after it, weigh that: a retry that failed the same way again counts against a plain retry now." : ""}\n\n${PLAIN_LANGUAGE}${goalsText(d.config.goals) ? `\n\n${goalsText(d.config.goals)}` : ""}` },
 				{ role: "user", content: `${brief ? `Repo brief (the legacy repo as it is):\n${brief.slice(0, 4000)}\n\n` : ""}${decided ? `Owner decisions already made (binding):\n${decided.slice(0, 2000)}\n\n` : ""}Point: ${q.point}${q.unitId ? ` (unit ${q.unitId})` : ""}\nFacts:\n${q.facts}\n\nOptions: ${JSON.stringify(q.options)}\n${q.recommended ? `Current pick: ${q.recommended}\n` : ""}${q.agentOpinion ? `Agent's opinion: ${q.agentOpinion}\n` : ""}${q.ownerAnswers ? `Owner's earlier answers:\n${q.ownerAnswers}\n` : ""}\nReturn id "${q.point}".` },
 			],
 		});

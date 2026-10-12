@@ -214,6 +214,12 @@ describe("gate structure_ok: one area extends one class per kind (the incident)"
 		rmSync(join(project, "src/shared/agency"), { recursive: true });
 		expect(step(await gate("agency", { sanctioned: ["src/shared/list/list.ts"] }), "structure_ok")!.ok).toBe(true);
 	});
+	it("a wiring file in a shared dir (where a unit registers itself) is never a new shared topic", async () => {
+		write("src/shared/registry/features.ts", "export const features = [];\n");
+		const wired = { ...adapter, layout: { ...adapter.layout, wiringFiles: ["src/shared/registry/*.ts"] } };
+		expect(step(await gate("agency"), "structure_ok")!.output).toMatch(/new shared topic src\/shared\/registry\//);
+		expect(step(await gate("agency", { adapter: wired }), "structure_ok")!.output).not.toMatch(/new shared topic/);
+	});
 });
 
 describe("ts shapes", () => {

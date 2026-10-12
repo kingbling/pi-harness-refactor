@@ -8,6 +8,7 @@ import { targetBodies, targetClasses } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { EvidenceType } from "../ledger/schema.ts";
 import { activeRuleFiles } from "../rules/layout.ts";
+import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 
@@ -185,7 +186,8 @@ function sharedTopicProblems(g: GateInput, present: string[], tracked: Set<strin
 	const out: string[] = [];
 	for (const f of present) {
 		const d = dirs.find((x) => f.startsWith(x));
-		if (!d || tracked.has(f) || g.sanctioned?.includes(f) || g.adapter.layout.isTestFile(f)) continue;
+		// a wiring file (config/bundles.php) is where a unit registers itself: never a new topic
+		if (!d || tracked.has(f) || g.sanctioned?.includes(f) || g.adapter.layout.isTestFile(f) || isWiringFile(f, g.adapter.layout.wiringFiles)) continue;
 		const topic = f.slice(d.length).split("/")[0]!;
 		if (topic === g.area) out.push(`${f}: the area's code goes in ${g.moduleDir}/, not in a shared topic named after the area`);
 		else if (![...tracked].some((t) => t.startsWith(`${d}${topic}/`))) out.push(`${f}: new shared topic ${d}${topic}/ from an area unit; put the code in ${g.moduleDir}/ (shared units and tidy tasks start shared topics) or import an existing one`);

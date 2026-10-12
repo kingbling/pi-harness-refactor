@@ -107,7 +107,7 @@ describe("answers are applied per option", () => {
 		ledger.answerQuestion(ledger.openQuestions()[0]!.id, "retry\nhint: keep the fixture ids", RESOLVER);
 		expect(await heal()).toEqual(["U1"]);
 		// the note carries the hint and the last red report (the worktree is gone, this is all the next run has); the kind of failure is kept
-		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals, retriedOn: ["antigaming_ok: gate still red after N attempts (antigaming_ok)"], retryNote: expect.stringMatching(/the resolver model said to try again\. The resolver's hint: keep the fixture ids\nIts last failure \(antigaming_ok\):\nsrc\/a\.spec\.ts: the test asserts nothing/) });
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals, retriedOn: ["antigaming_ok: <path> the test asserts nothing in a.spec.ts"], retryNote: expect.stringMatching(/the resolver model said to try again\. The model's hint: keep the fixture ids\nIts last failure \(antigaming_ok\):\nsrc\/a\.spec\.ts: the test asserts nothing/) });
 		// it fails again: no automatic try is left, it is asked about, and the question says a retry is no answer now
 		ledger.transitionUnit("U1", "truth", "t");
 		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (antigaming_ok)");
@@ -124,20 +124,80 @@ describe("answers are applied per option", () => {
 		expect(renderStatus(ledger, { color: false })).toMatch(/parked, no question .*U1/);
 	});
 
-	it("a failure in new words of a kind the unit was retried on is the same failure: stuck, and a plain retry is no answer", async () => {
+	it("the same error in new words is the same failure: stuck, and a plain retry is no answer; a new error at the same step is not", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
-		mk("U1", "billing", "implementing");
-		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (wired_ok); attempt cap 5 reached");
 		const hour = 60 * 60_000;
 		const heal = () => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, now: Date.now() + hour + 1000 });
-		expect(await heal()).toEqual(["U1"]);
-		ledger.transitionUnit("U1", "truth", "t");
-		ledger.transitionUnit("U1", "quarantined", "gate still red after 4 attempts (wired_ok); decision model unsure: 0.35");
-		expect(await heal()).toEqual([]);
+		const fail = (id: string, reason: string, output: string) => {
+			if (ledger.getUnit(id)!.state === "quarantined") ledger.transitionUnit(id, "truth", "t");
+			const at = ledger.startAttempt(id, "implement");
+			ledger.endAttempt(at, { outcome: "gate_red:wired_ok", gateReport: { ok: false, failedStep: "wired_ok", steps: [{ name: "wired_ok", ok: false, output }], changedFiles: [] } });
+			ledger.transitionUnit(id, "quarantined", reason);
+		};
+		for (const id of ["U1", "U2"]) {
+			mk(id, "billing", "implementing");
+			fail(id, "gate still red after 5 attempts (wired_ok); attempt cap 5 reached", "Error: route GET /api/totals/12 not found in src/routes.ts");
+		}
+		expect((await heal()).sort()).toEqual(["U1", "U2"]);
+		// U1: the same error, other words (another id, another file); U2: a new error at the same step
+		fail("U1", "gate still red after 4 attempts (wired_ok); decision model unsure: 0.35", "Error: route GET /api/totals/57 not found in src/app.routes.ts");
+		fail("U2", "gate still red after 4 attempts (wired_ok); decision model unsure: 0.35", "Error: BillingService.total returns the wrong type");
+		expect(await heal()).toEqual(["U2"]);
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ stuck: true });
 		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
-		expect(JSON.parse(ledger.openQuestions()[0]!.context!)).toMatchObject({ retry: "with a hint", failureKind: "-: gate still red after N attempts (wired_ok)" });
+		expect(JSON.parse(ledger.openQuestions()[0]!.context!)).toMatchObject({ retry: "with a hint", failureKind: "wired_ok: Error: route GET <path> not found in <path>" });
+	});
+
+	it("a job's retry goes through the cap: the job changed main, and what it changed goes to the next attempt", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
+		const { resolveOpenQuestions, CODE_JOB } = await import("../src/jev/resolve.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "gate still red after 5 attempts (build_ok)");
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals } });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		const q = ledger.openQuestions()[0]!;
+		expect(JSON.parse(q.context!)).toMatchObject({ retry: "none", failureKind: expect.any(String) });
+		await resolveOpenQuestions({ ledger, config, root, resolver: async () => ({ code: "add the DspHourlyStats class", then: "retry" }), codeJob: async () => "added src/Stats/DspHourlyStats.php with tests" });
+		expect(ledger.getQuestion(q.id)!.answered_by).toBe(CODE_JOB);
+		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {})).toEqual(["U1"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: config.run.maxAutoHeals + 1, retryNote: expect.stringMatching(/the code model \(code job\) said to try again\. The model's hint: what the code job changed on main: added src\/Stats\/DspHourlyStats\.php/) });
+	});
+
+	it("a unit a model parked comes back when main changes after the park; the owner's leave stands", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { healQuarantined } = await import("../src/run/run.ts");
+		const { RESOLVER } = await import("../src/jev/resolve.ts");
+		for (const id of ["U1", "U2"]) {
+			mk(id, "billing", "implementing");
+			ledger.transitionUnit(id, "quarantined", "gate still red after 5 attempts (build_ok)");
+		}
+		const q1 = ledger.askQuestion({ unitId: "U1", point: "quarantine", question: "U1 keeps failing", options: ["retry — try again", "leave — leave it"], askedBy: "orchestrator" });
+		const q2 = ledger.askQuestion({ unitId: "U2", point: "quarantine", question: "U2 keeps failing", options: ["retry — try again", "leave — leave it"], askedBy: "orchestrator" });
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals, healQuestion: q1 } });
+		ledger.updateUnit("U2", { meta: { autoHeals: config.run.maxAutoHeals, healQuestion: q2 } });
+		ledger.answerQuestion(q1, "leave — leave it\nhint: a class outside the unit is missing", RESOLVER);
+		ledger.answerQuestion(q2, "leave — leave it");
+		const heal = (since?: number) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since });
+		expect(await heal(Date.now() - 60_000)).toEqual([]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ healQuestion: 0, parkedWhy: "a class outside the unit is missing" });
+		expect(await heal(Date.now() - 60_000)).toEqual([]); // nothing changed since the park
+		expect(await heal(Date.now() + 1000)).toEqual(["U1"]); // a change landed after it: worth a try
+		expect(JSON.parse(ledger.getUnit("U1")!.meta).parkedWhy).toBeUndefined();
+	});
+
+	it("a model's leave on a waiting unit's question parks it with the model's reason; the owner's leave does not", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { RESOLVER } = await import("../src/jev/resolve.ts");
+		for (const id of ["U1", "U2"]) mk(id, "billing", "implementing");
+		const ask = (unitId: string) => ledger.askQuestion({ unitId, point: "gate_env", question: "lint fails", options: ["retry — run it again", "leave — leave it parked"], askedBy: "orchestrator" });
+		ledger.answerQuestion(ask("U1"), "leave — leave it parked\nhint: a fix job was tried and changed nothing: add the lint config", RESOLVER);
+		ledger.answerQuestion(ask("U2"), "leave — leave it parked");
+		resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
+		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ healQuestion: 0, parkedWhy: "a fix job was tried and changed nothing: add the lint config" });
+		expect(JSON.parse(ledger.getUnit("U2")!.meta).parkedWhy).toBeUndefined();
 	});
 
 	it("the same failure again with nothing changed is not retried: the unit is asked about, and a later fix still brings it back", async () => {

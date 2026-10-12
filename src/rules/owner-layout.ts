@@ -85,7 +85,7 @@ export function examplesProblems(r: LayoutRules, mustPass: string[], mustFail: s
 export function layoutImpact(projectDir: string, adapter: TargetAdapter, r: LayoutRules): { findings: string[]; areas: number } {
 	if (!existsSync(projectDir)) return { findings: [], areas: 0 };
 	const l = adapter.layout;
-	const findings = checkLayoutTree(projectDir, r, { sharedDirs: l.sharedDirs, dataDirs: l.dataDirs, isTestFile: (f) => l.isTestFile(f), sourceExtensions: l.sourceExtensions, ignoreDirs: l.ignoreDirs, fileFindings: l.fileFindings });
+	const findings = checkLayoutTree(projectDir, r, { sharedDirs: l.sharedDirs, dataDirs: l.dataDirs, isTestFile: (f) => l.isTestFile(f), sourceExtensions: l.sourceExtensions, ignoreDirs: l.ignoreDirs, wiringFiles: l.wiringFiles, fileFindings: l.fileFindings });
 	const root = r.moduleDir.split("/").slice(0, -1).join("/");
 	const areas = new Set(findings.map((f) => f.startsWith(`${root}/`) ? f.slice(root.length + 1).split("/")[0] : "").filter(Boolean));
 	return { findings, areas: areas.size };
@@ -205,8 +205,10 @@ export async function layoutJob(o: { root: string; stack: string; adapter: Targe
 	if (!current) return { owner: `the ${o.stack} stack has no layout.json to change` };
 	const d = await draftLayout({ client: o.client, model: o.model, stack: o.stack, current, words: `${o.words}\n\nOnly allow more: add a path, never remove or narrow one.` });
 	if (!d.ok) return { owner: `a layout change was tried and the checker refused it (${d.reason}): ${o.words}` };
-	const before = new Set(layoutImpact(o.projectDir, o.adapter, current).findings);
-	const broken = layoutImpact(o.projectDir, o.adapter, d.rules).findings.filter((f) => !before.has(f));
+	// by path: a finding's text names the allowed files, which the change itself rewrites
+	const path = (f: string) => f.split(": ")[0];
+	const before = new Set(layoutImpact(o.projectDir, o.adapter, current).findings.map(path));
+	const broken = layoutImpact(o.projectDir, o.adapter, d.rules).findings.filter((f) => !before.has(path(f)));
 	if (broken.length) return { owner: `the layout change "${d.summary}" would make code already on main wrong (${broken.length}, e.g. ${broken[0]}); /br rule ${o.stack}: ${o.words} applies it if you want it` };
 	await applyLayout({ root: o.root, stack: o.stack, rules: d.rules, ledger: o.ledger, projectDir: o.projectDir });
 	return { applied: d.summary };

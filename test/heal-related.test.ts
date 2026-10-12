@@ -6,6 +6,7 @@ import { setupLogPath } from "../src/adapters/command-overrides.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
+import { ownerAnswersOn } from "../src/jev/ask.ts";
 import { askStuckUnits, healQuarantined } from "../src/run/run.ts";
 
 /**
@@ -104,7 +105,7 @@ describe("quarantine questions", () => {
 		ledger.close();
 	});
 
-	it("the owner's earlier answers on quarantine questions go to the phrasing model", async () => {
+	it("only the owner's earlier answers on the same failure go to the phrasing model, each with what happened after it", async () => {
 		const { root, config, ledger, quarantined } = workspace();
 		const prompts: string[] = [];
 		const client = new FakeModelClient({ chat: (req) => (prompts.push(req.messages.map((m) => m.content).join("\n")), undefined) });
@@ -112,11 +113,34 @@ describe("quarantine questions", () => {
 		ledger.updateUnit("U1", { meta: { stuck: true, autoHeals: 1 } });
 		await askStuckUnits({ ledger, config, root, client });
 		expect(prompts.at(-1)).not.toContain("Owner's earlier answers");
-		ledger.answerQuestion(ledger.openQuestions()[0]!.id, "retry — try again");
+		const first = ledger.openQuestions()[0]!;
+		ledger.answerQuestion(first.id, "retry — try again");
+		// another failure: the answer on U1 says nothing about it
 		quarantined("U2", "nestjs", "phpstan: Allowed memory size exhausted");
 		ledger.updateUnit("U2", { meta: { stuck: true, autoHeals: 1 } });
 		await askStuckUnits({ ledger, config, root, client });
-		expect(prompts.at(-1)).toMatch(/Owner's earlier answers:\n- U1 was quarantined[^\n]*Class Invoice not found[^\n]*→ retry — try again/);
+		expect(prompts.at(-1)).not.toContain("Owner's earlier answers");
+		// U1 ran again and failed the same way (asked and answered by the resolver); U3 now fails like U1 did
+		ledger.answerQuestion(ledger.askQuestion({ unitId: "U1", point: "quarantine", question: "again", context: JSON.parse(first.context!), askedBy: "orchestrator" }), "leave", "resolver model");
+		quarantined("U3", "nestjs", "Class Invoice not found");
+		ledger.updateUnit("U3", { meta: { stuck: true, autoHeals: 1 } });
+		await askStuckUnits({ ledger, config, root, client });
+		expect(prompts.at(-1)).toMatch(/Owner's earlier answers:\n- U1 was quarantined[^\n]*Class Invoice not found[^\n]*→ retry — try again → after it: failed the same way again/);
+		expect(prompts.at(-1)).toMatch(/a retry that failed the same way again counts against a plain retry/);
+		ledger.close();
+	});
+
+	it("an earlier answer whose unit passed afterwards says so", async () => {
+		const { root, config, ledger, quarantined } = workspace();
+		quarantined("U1", "nestjs", "Class Invoice not found");
+		ledger.updateUnit("U1", { meta: { stuck: true, autoHeals: 1 } });
+		await askStuckUnits({ ledger, config, root });
+		const q = ledger.openQuestions()[0]!;
+		ledger.answerQuestion(q.id, "retry — try again");
+		const sameAs = JSON.parse(q.context!).sameAs as string;
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'U1'").run();
+		expect(ownerAnswersOn(ledger, "quarantine", sameAs)).toMatch(/→ retry — try again → after it: the unit then passed$/);
+		expect(ownerAnswersOn(ledger, "quarantine", "quarantine: something else")).toBe("");
 		ledger.close();
 	});
 });

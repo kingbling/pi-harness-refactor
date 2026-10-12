@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { join, matchesGlob } from "node:path";
 import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
 
 /**
@@ -12,10 +12,12 @@ import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
  *
  * Path patterns (relative to the feature folder):
  *   {area} {Area} {area_snake}  the unit's area (kebab, Pascal, snake case)
- *   {name} {Name} {name_snake}  any kebab-case / PascalCase / snake_case name (pick the stack's own file-name style)
+ *   {name} {Name} {name_snake}  any lower-case (kebab or snake) / PascalCase / snake_case name
  *   {sub}                       one folder named after what the code does, spelled like the area folders ({area} → kebab,
- *                               {Area} → Pascal, {area_snake} → snake); the same value where it repeats; never a banned
- *                               name or a folder another pattern names literally (dto, entities …)
+ *                               {Area} → Pascal, {area_snake} → snake); never a banned name or a folder another pattern
+ *                               names literally (dto, entities …)
+ *   A placeholder in the file name that repeats one of its folders is that folder's value (creation/campaign-creation.ts,
+ *   Button/Button.tsx); every other repeat is its own value (Security/WebAuthn/, messages.en.yaml).
  *   (a|b)                       either word
  */
 export interface LayoutRules {
@@ -42,6 +44,7 @@ export const DEFAULT_FORBID_DIRS = ["extended", "misc", "common", "helpers", "ut
 const KEBAB = "[a-z0-9]+(?:-[a-z0-9]+)*";
 const PASCAL = "[A-Z][A-Za-z0-9]*";
 const SNAKE = "[a-z0-9]+(?:_[a-z0-9]+)*";
+const LOWER = "[a-z0-9]+(?:[-_][a-z0-9]+)*"; // kebab or snake
 
 /** How a {sub} folder is spelled: like the layout's own area folders (src/{Area} → Pascal sub-folders). */
 export interface SubStyle { re: string; sample: string; word: string }
@@ -55,7 +58,9 @@ export function subStyle(moduleDir: string): SubStyle {
 	return SUB_STYLES[last]!;
 }
 const GROUP: Record<string, string> = { name: "n", Name: "N", name_snake: "ns", sub: "sub" };
-const NAME_RE: Record<string, string> = { name: KEBAB, Name: PASCAL, name_snake: SNAKE };
+const NAME_RE: Record<string, string> = { name: LOWER, Name: PASCAL, name_snake: SNAKE };
+/** How a name placeholder is spelled, for the gate's message. */
+const NAME_WORD: Record<string, string> = { name: "kebab-case or snake_case", Name: "PascalCase", name_snake: "snake_case" };
 const PLACEHOLDERS = new Set(["area", "Area", "area_snake", "name", "Name", "name_snake", "sub"]);
 const pascal = (s: string) => s.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("");
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -71,19 +76,33 @@ type Matcher = { test(rel: string): boolean; pattern: string };
 /** A path pattern for one area → matcher. Throws on an unknown placeholder or a malformed group. */
 export function compilePattern(pattern: string, area: string, reserved: Set<string> = new Set(), sub: SubStyle = SUB_STYLES["area"]!): Matcher {
 	let src = "";
-	const seen = new Set<string>(); // {name} {Name} {name_snake} {sub} repeated in one path = the same value
+	const last = pattern.split("/").length - 1;
+	let seg = 0; // the path part the pattern is at
+	const seen = new Map<string, { seg: number; group: string }>(); // first place of each {name} {Name} {name_snake} {sub}
 	for (const m of pattern.matchAll(/\{([^}]*)\}|\(([^)]*)\)|([^{(]+)|(.)/g)) {
 		if (m[1] !== undefined) {
 			if (!PLACEHOLDERS.has(m[1])) throw new Error(`unknown placeholder {${m[1]}} in "${pattern}" (use ${[...PLACEHOLDERS].map((p) => `{${p}}`).join(" ")})`);
 			if (m[1] === "area") src += esc(area);
 			else if (m[1] === "Area") src += esc(pascal(area));
 			else if (m[1] === "area_snake") src += esc(area.replace(/-/g, "_"));
-			else src += seen.has(m[1]) ? `\\k<${GROUP[m[1]]}>` : (seen.add(m[1]), `(?<${GROUP[m[1]]}>${m[1] === "sub" ? sub.re : NAME_RE[m[1]]})`);
+			else {
+				// the file name repeating a folder's value is that value; other repeats are their own
+				const first = seen.get(m[1]);
+				if (first && first.seg < seg && seg === last) src += `\\k<${first.group}>`;
+				else {
+					const group = `${GROUP[m[1]]}${src.length}`; // src only grows: a unique name
+					if (!first) seen.set(m[1], { seg, group });
+					src += `(?<${group}>${m[1] === "sub" ? sub.re : NAME_RE[m[1]]})`;
+				}
+			}
 		} else if (m[2] !== undefined) {
 			const words = m[2].split("|");
 			if (words.some((w) => !/^[A-Za-z0-9_.-]+$/.test(w))) throw new Error(`"(${m[2]})" in "${pattern}": only plain words separated by |`);
 			src += `(?:${words.map(esc).join("|")})`;
-		} else if (m[3] !== undefined) src += esc(m[3]);
+		} else if (m[3] !== undefined) {
+			src += esc(m[3]);
+			seg += m[3].split("/").length - 1;
+		}
 		else throw new Error(`unbalanced "${m[4]}" in "${pattern}"`);
 	}
 	const re = new RegExp(`^${src}$`);
@@ -91,7 +110,7 @@ export function compilePattern(pattern: string, area: string, reserved: Set<stri
 		pattern,
 		test: (rel) => {
 			const x = re.exec(rel);
-			return !!x && !(x.groups?.["sub"] && reserved.has(x.groups["sub"].toLowerCase()));
+			return !!x && !Object.entries(x.groups ?? {}).some(([g, v]) => g.startsWith("sub") && v && reserved.has(v.toLowerCase()));
 		},
 	};
 }
@@ -184,9 +203,16 @@ function checkFiles(rels: string[], area: string, r: LayoutRules): string[] {
 		const dirs = rel.split("/").slice(0, -1);
 		const bad = dirs.find((d) => banned(r, d));
 		if (bad) out.push(`folder "${bad}" is not allowed (banned names: ${r.forbidDirs.join(", ")}); name the folder after what the code does (e.g. creation/, tracking/)`);
-		else if (!allowed.some((m) => m.test(rel))) out.push(`not an allowed file in the feature folder; allowed: ${r.files.map((f) => show(f.path, area)).join(" | ")}`);
+		else if (!allowed.some((m) => m.test(rel))) out.push(`not an allowed file in the feature folder; allowed: ${r.files.map((f) => show(f.path, area)).join(" | ")}${spelling(r)}`);
 	}
 	return out;
+}
+
+/** How the placeholders the rules use are spelled (` (<name> kebab-case or snake_case, <sub> a PascalCase folder)`). */
+function spelling(r: LayoutRules): string {
+	const used = new Set(r.files.flatMap((f) => [...f.path.matchAll(/\{(\w+)\}/g)].map((m) => m[1]!)));
+	const words = [...Object.entries(NAME_WORD).filter(([p]) => used.has(p)).map(([p, w]) => `<${p}> ${w}`), ...(used.has("sub") ? [`<sub> a ${subStyle(r.moduleDir).word} folder`] : [])];
+	return words.length ? ` (${words.join(", ")})` : "";
 }
 
 const show = (pattern: string, area: string) => pattern.replace(/\{area\}/g, area).replace(/\{Area\}/g, pascal(area)).replace(/\{area_snake\}/g, area.replace(/-/g, "_")).replace(/\{(\w+)\}/g, "<$1>");
@@ -198,9 +224,14 @@ export interface LayoutCheckOptions {
 	sourceExtensions?: string[];
 	/** Folders the stack's tools make that are never code (the adapter's layout.ignoreDirs: __pycache__, build …). */
 	ignoreDirs?: string[];
+	/** Files (globs) where a feature is registered (the adapter's wiringFiles): units are told to edit them, so never a finding. */
+	wiringFiles?: string[];
 	/** Stack-specific per-file findings (size, one class per file) that do not depend on the folder layout. */
 	fileFindings?(projectDir: string, file: string, moduleDir?: string, area?: string): string[];
 }
+
+/** A file the stack registers features in (route table, main module): a unit edits it to wire itself in. */
+export const isWiringFile = (f: string, globs: string[] = []) => globs.some((w) => w === f || (/[*?[{]/.test(w) && matchesGlob(f, w)));
 
 /** The gate: files a unit wrote (project-relative) against the rules. One `<path>: <problem>; <what to do>` per line. */
 export function checkLayoutRules(files: string[], moduleDir: string, area: string, projectDir: string, r: LayoutRules, o: LayoutCheckOptions, ctx: StructureContext = {}, checkRequire = true): string[] {
@@ -210,6 +241,7 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 	let touched = false;
 	for (const f of files) {
 		if (o.dataDirs?.some((d) => f.startsWith(d))) continue;
+		if (isWiringFile(f, o.wiringFiles)) continue;
 		const legacy = legacyWord(f, ctx.legacyWords);
 		if (legacy && !o.isTestFile(f)) {
 			out.push(`${f}: "${legacy}" is a legacy file kind; name files and classes after what they do, never after the legacy file`);
@@ -409,7 +441,7 @@ export function normalize(r: Partial<LayoutRules>): LayoutRules {
 export function withLayoutRules(adapter: TargetAdapter, root: string | undefined): TargetAdapter {
 	const base = { ...adapter.layout, sharedDirs: adapter.layout.sharedDirs.map(slashed) };
 	const rules = () => (root ? loadLayoutRules(root, adapter.id) : undefined);
-	const opts: LayoutCheckOptions = { sharedDirs: base.sharedDirs, dataDirs: base.dataDirs, isTestFile: (f) => base.isTestFile(f), sourceExtensions: base.sourceExtensions, ignoreDirs: base.ignoreDirs, fileFindings: base.fileFindings };
+	const opts: LayoutCheckOptions = { sharedDirs: base.sharedDirs, dataDirs: base.dataDirs, isTestFile: (f) => base.isTestFile(f), sourceExtensions: base.sourceExtensions, ignoreDirs: base.ignoreDirs, wiringFiles: base.wiringFiles, fileFindings: base.fileFindings };
 	const layout = {
 		...base,
 		moduleDir: (area: string) => {
@@ -419,7 +451,7 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 		checkStructure: (files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext) => {
 			const r = rules();
 			if (r) return checkLayoutRules(files, moduleDir, area, projectDir, r, opts, ctx);
-			const own = base.checkStructure?.(files, moduleDir, area, projectDir, ctx) ?? [];
+			const own = base.checkStructure?.(files.filter((f) => !isWiringFile(f, base.wiringFiles)), moduleDir, area, projectDir, ctx) ?? [];
 			return own;
 		},
 		checkTree: (projectDir: string, only?: string[]) => {

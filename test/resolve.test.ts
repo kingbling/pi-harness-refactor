@@ -46,7 +46,7 @@ describe("resolver model before the owner", () => {
 		const q = ledger.getQuestion(a)!;
 		expect(applyParkedAnswer(optionFor(q, "retry: move the class to Service/"), options)).toEqual({ action: "requeue", hint: "move the class to Service/" });
 		expect(applyParkedAnswer(optionFor(q, "retry — Try again"), options)).toEqual({ action: "requeue", hint: undefined });
-		expect(applyParkedAnswer(optionFor(q, "leave", "nothing a model can do"), options)).toEqual({ action: "quarantine" });
+		expect(applyParkedAnswer(optionFor(q, "leave", "nothing a model can do"), options)).toEqual({ action: "quarantine", hint: "nothing a model can do" });
 		expect(applyParkedAnswer("retry: the DB runs on 5433", options)).toEqual({ action: "requeue", hint: "the DB runs on 5433" });
 	});
 
@@ -60,12 +60,13 @@ describe("resolver model before the owner", () => {
 		for (let i = 0; i <= MAX_RESOLVER_TRIES; i++) {
 			const q = ledger.askQuestion({ unitId: "u1", point: "gate_env", question: "lint fails", options: ["retry — retry", "leave — leave"], askedBy: "orchestrator" });
 			await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
-			if (i === MAX_RESOLVER_TRIES) expect(JSON.parse(ledger.getQuestion(q)!.context!).forOwner).toMatch(/came back/);
+			// a waiting unit's question (gate_env) is not handed to the owner as retry-or-leave: the unit stays parked
+			if (i === MAX_RESOLVER_TRIES) expect(ledger.getQuestion(q)).toMatchObject({ answer: expect.stringMatching(/^leave — leave\nhint: .*came back/), answered_by: RESOLVER });
 		}
 		expect(seen).toEqual([...Array(MAX_RESOLVER_TRIES).keys()]);
 	});
 
-	it("a setup cause runs a fix job first: fixed → answered with the resolver's option; nothing changed → the owner", async () => {
+	it("a setup cause runs a fix job first: fixed → answered with the resolver's option and what changed; nothing changed → parked, or the owner on other points", async () => {
 		const { FIX_JOB } = await import("../src/jev/resolve.ts");
 		const ledger = new Ledger(":memory:");
 		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
@@ -76,10 +77,13 @@ describe("resolver model before the owner", () => {
 		const jobs: string[] = [];
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async (_q, what) => (jobs.push(what), "created the bootstrap file") });
 		expect(jobs).toEqual(["create the bootstrap file the lint config loads"]);
-		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — retry after fixing the setup", answered_by: FIX_JOB });
+		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — retry after fixing the setup\nhint: what the fix job changed on main: created the bootstrap file", answered_by: FIX_JOB });
 		const b = ask();
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => undefined });
-		expect(JSON.parse(ledger.getQuestion(b)!.context!).forOwner).toMatch(/fix job was tried and changed nothing/);
+		expect(ledger.getQuestion(b)).toMatchObject({ status: "answered", answer: expect.stringMatching(/^leave — leave it parked\nhint: a fix job was tried and changed nothing/), answered_by: RESOLVER });
+		const c = ledger.askQuestion({ point: "budget", question: "the setup needs a paid service", options: ["retry — retry", "stop — stop"], askedBy: "orchestrator" });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => undefined });
+		expect(JSON.parse(ledger.getQuestion(c)!.context!).forOwner).toMatch(/fix job was tried and changed nothing/);
 	});
 
 	it("missing app code outside the unit runs a code job in the stack the resolver names; merged → answered", async () => {
@@ -92,7 +96,8 @@ describe("resolver model before the owner", () => {
 		const jobs: Array<[string, string | undefined]> = [];
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => "wrong job", codeJob: async (_q, what, stack) => (jobs.push([what, stack]), "added the endpoint with tests") });
 		expect(jobs).toEqual([["add GET /api/x returning the formatted totals", "backend"]]);
-		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again", answered_by: CODE_JOB });
+		// what the job wrote goes with the retry: the next attempt uses it instead of writing it again
+		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again\nhint: what the code job changed on main: added the endpoint with tests", answered_by: CODE_JOB });
 	});
 
 	it("a path the layout has no slot for runs a layout job: applied → answered; it would break code on main → the owner", async () => {
@@ -106,10 +111,12 @@ describe("resolver model before the owner", () => {
 		const jobs: Array<[string, string | undefined]> = [];
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, layoutJob: async (_q, what, stack) => (jobs.push([what, stack]), { applied: "Security/<sub>/<Name>.php allowed" }) });
 		expect(jobs).toEqual([["allow Security/{sub}/{Name}.php: the WebAuthn library is already there", "symfony"]]);
-		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again", answered_by: LAYOUT_JOB });
+		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again\nhint: the layout now allows: Security/<sub>/<Name>.php allowed", answered_by: LAYOUT_JOB });
 		const b = ask();
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, layoutJob: async () => ({ owner: "it would make code already on main wrong" }) });
 		expect(JSON.parse(ledger.getQuestion(b)!.context!).forOwner).toMatch(/already on main wrong/);
+		// the owner is asked what to do, not "retry or leave"
+		expect(ledger.getQuestion(b)!.question).toBe("u1 is parked until you do this: it would make code already on main wrong");
 	});
 
 	it("a question handed to the owner gets one more try after the plugin changed, once per change", async () => {
@@ -165,7 +172,7 @@ describe("resolver failures and shared problems", () => {
 			last = ledger.askQuestion({ unitId: `u${i}`, point: "gate_env", question: "lint fails", options: ["retry — retry"], context: { sameAs: "lint:missing-config" }, askedBy: "orchestrator" });
 			await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
 		}
-		expect(JSON.parse(ledger.getQuestion(last)!.context!).forOwner).toMatch(/came back/);
+		expect(ledger.getQuestion(last)!.answer).toMatch(/answered this \d+ times and it came back/);
 	});
 
 	it("a key that names its own unit never joins another unit's question", async () => {
@@ -232,5 +239,32 @@ describe("a parked unit's question", () => {
 		const g = ledger.askQuestion({ unitId: "u2", point: "parity", question: "differs", options: ["retry — re-open", "leave — leave it as it is"], askedBy: "parity" });
 		await run({ park: "nothing left" });
 		expect(JSON.parse(ledger.getQuestion(g)!.context!).forOwner).toBe("nothing left");
+	});
+
+	it("a hint typed after retry counts as a hint, a capital Retry is still a retry, and a resolver that keeps failing parks the unit", async () => {
+		const { MAX_RESOLVER_FAILURES, retryRefused } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const options = ["retry — try again", "leave — leave it"];
+		const a = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "u1 keeps failing", options, askedBy: "orchestrator", context: { retry: "with a hint", failureKind: "wired_ok: route missing" } });
+		const q = ledger.getQuestion(a)!;
+		expect(retryRefused(q, "retry: move X to Y")).toBeUndefined();
+		expect(retryRefused(q, "Retry")).toMatch(/plain retry runs it again blind/);
+		expect(retryRefused(q, "Retry: move X to Y")).toBeUndefined();
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver: async () => ({ answer: "retry: move X to Y", why: "the route is in the wrong module" }) });
+		expect(ledger.getQuestion(a)!.answer).toMatch(/^retry — try again\nhint: move X to Y/);
+		// the resolver call fails again and again (no answer, provider down): parked, not retry-or-leave for the owner
+		const b = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "u1 keeps failing", options, askedBy: "orchestrator" });
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			for (let i = 1; i <= MAX_RESOLVER_FAILURES; i++) {
+				await resolveOpenQuestions({ ledger, config, root: "/r", resolver: async () => undefined });
+				vi.setSystemTime(Date.now() + i * 5 * 60_000 + 1);
+			}
+		} finally {
+			vi.useRealTimers();
+		}
+		expect(ledger.getQuestion(b)).toMatchObject({ status: "answered", answer: expect.stringMatching(/^leave — leave it\nhint: the resolver model gave no answer \(3 times\)/), answered_by: RESOLVER });
 	});
 });
