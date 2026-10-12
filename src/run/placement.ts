@@ -214,7 +214,8 @@ export function planPlacements(config: Config, units: Array<Pick<UnitRow, "id" |
 	const out = new Map<string, Planned>();
 	for (const u of units) {
 		const meta = JSON.parse(u.meta) as UnitMeta;
-		if (meta.place && (!force || KEPT.has(meta.place.source))) out.set(u.id, { place: placeUnit(config, u.meta, root), surfaceKnown: true, stored: true });
+		// a placement on a stack that is no target any more (target.stacks changed) counts as none: the unit is placed again
+		if (meta.place && config.target.stacks.includes(meta.place.stack) && (!force || KEPT.has(meta.place.source))) out.set(u.id, { place: placeUnit(config, u.meta, root), surfaceKnown: true, stored: true });
 		else out.set(u.id, { ...codePlace(config, meta, root), stored: false });
 	}
 	// shared: dependents in the same stack span ≥ 2 feature areas other than the unit's own, and its own area is

@@ -151,6 +151,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const u = ledger.getUnit(a.unit_id);
 		if (u && ["truth", "implementing", "gating"].includes(u.state)) {
 			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now') WHERE id = ?").run(a.unit_id);
+			ledger.clearStale(a.unit_id);
 			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', datetime('now'))").run(a.unit_id, u.state);
 			removeWorktree(config.target.path, worktreeDir(o.root, a.unit_id));
 		}
@@ -438,6 +439,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const n = urgencyOf(id).blocks;
 		return n ? ` — blocks ${n} unit${n === 1 ? "" : "s"}` : "";
 	};
+	// deps that are no unit any more (a re-inventory regrouped or renamed it) cannot be waited for: said once, then ignored
+	const dangling = ledger.db.prepare("SELECT u.id, d.value AS dep FROM units u, json_each(u.deps) d WHERE NOT EXISTS (SELECT 1 FROM units x WHERE x.id = d.value)").all() as Array<{ id: string; dep: string }>;
+	if (dangling.length) log(pc.yellow(`${dangling.length} dependency(ies) on units that no longer exist are ignored: ${dangling.slice(0, 5).map((x) => `${x.id} → ${x.dep}`).join(", ")}${dangling.length > 5 ? ", …" : ""}`));
 	const ready = (): string[] => {
 		applyPlacementAnswers(ledger, config, o.root); // an answered placement question places its unit before it can start
 		syncTaxonomyAnswers({ ledger, root: o.root }); // answered area questions: new area, or the owner excluded the unit
@@ -452,7 +456,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				`SELECT u.id, u.meta FROM units u
 				 WHERE u.state = 'planned'
 				   AND COALESCE(json_extract(u.meta, '$.stale'), 0) = 0
-				   AND NOT EXISTS (SELECT 1 FROM json_each(u.deps) d LEFT JOIN units du ON du.id = d.value WHERE du.state IS NULL OR du.state != 'accepted')`,
+				   AND NOT EXISTS (SELECT 1 FROM json_each(u.deps) d JOIN units du ON du.id = d.value WHERE ${OPEN_DEP})`,
 			)
 			.all() as Array<{ id: string; meta: string }>;
 		const units = rows.filter((u) => {
@@ -520,7 +524,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const rows = ledger.db
 			.prepare(
 				`SELECT u.id, u.meta,
-				   (SELECT COUNT(*) FROM json_each(u.deps) d LEFT JOIN units du ON du.id = d.value WHERE du.state IS NULL OR du.state != 'accepted') AS open
+				   (SELECT COUNT(*) FROM json_each(u.deps) d JOIN units du ON du.id = d.value WHERE ${OPEN_DEP}) AS open
 				 FROM units u
 				 WHERE u.state = 'planned' AND COALESCE(json_extract(u.meta, '$.stale'), 0) = 0
 				   AND substr(COALESCE(u.kind, ''), 1, 3) != 'db_' -- the DB lane has no tester truth to capture ahead
@@ -1085,7 +1089,7 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 		}
 		// what the run learned before parking (diagnosis) and the owner's hint go to the next attempt
 		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `The owner's hint: ${a.hint}`].filter(Boolean).join(" ");
-		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
+		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
 		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, datetime('now'))").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`);
 		removeWorktree(config.target.path, worktreeDir(root, u.id));
 		parked.push(u);
@@ -1219,6 +1223,13 @@ export function breakerPick(recent: BreakerEntry[], tried: Set<string>): { same:
 function capText(t: string, max: number): string {
 	return t.length <= max ? t : `${t.slice(0, Math.floor(max * 0.4))}\n…\n${t.slice(-Math.floor(max * 0.6))}`;
 }
+
+/**
+ * SQL (on a dep row `du`) for a dependency still to wait for: not accepted, and not excluded by the owner (not app
+ * code: it never runs, so waiting for it would hold its dependents forever). A dep that is no unit any more is not
+ * joined at all, so it never blocks.
+ */
+const OPEN_DEP = "du.state != 'accepted' AND json_extract(du.meta, '$.exclude') IS NULL";
 
 const ledgerTime = (s: string) => Date.parse(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
 
@@ -1397,8 +1408,12 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 			/* no branch */
 		}
 		ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.crashes', '$.hold', '$.parked') WHERE id = ?").run(id);
-		// only a person's requeue gives the setup model new tries for this unit; automatic ones keep the cap
-		if (o.human) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.setupParks') WHERE id = ?").run(id);
+		// only a person's requeue gives the unit new tries (setup model, self-heal) and lets a later quarantine be healed
+		// or asked about again; automatic ones keep the caps
+		if (o.human) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.setupParks', '$.healQuestion', '$.stuck', '$.healedFrom', '$.autoHeals', '$.healChecked') WHERE id = ?").run(id);
+		// what it waited on no longer holds it: back in the queue it runs, and a late answer cannot act on it any more
+		for (const q of ledger.db.prepare("SELECT id FROM questions WHERE unit_id = ? AND status = 'open' AND point NOT IN ('placement', 'area_taxonomy', 'area_overlap')").all(id) as Array<{ id: number }>) ledger.withdrawQuestion(q.id, `${id} was requeued by ${by}`);
+		ledger.db.prepare("DELETE FROM question_waiters WHERE unit_id = ?").run(id);
 		if (o.fresh) dropDraft();
 		ledger.transitionUnit(id, "planned", `requeued by ${by}${o.fresh ? " (interface and tests drafted again)" : ""}`);
 		out.push(`${id}: requeued`);

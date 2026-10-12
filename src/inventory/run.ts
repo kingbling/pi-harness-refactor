@@ -34,6 +34,8 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	const drift = { changed: [] as string[], added: [] as string[], removed: [] as string[], staleUnits: [] as string[] };
 	/** Changed or removed files an earlier inventory saved but stopped before marking their units stale. */
 	const pendingDrift = JSON.parse(ledger.getMeta("drift_pending") || "[]") as string[];
+	/** Gone from the source, not only left out of this inventory (not app code, an exclude): only that is drift. */
+	const removedUpstream = (p: string) => !existsSync(join(srcRoot, p));
 
 	// folders the profile model found are not the app (tooling, stubs, vendored libraries, docs, one-off scripts,
 	// tests) are left out on top of the adapter's minimal defaults; a file the adapter calls an entry point stays
@@ -141,7 +143,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		// the new hashes and the files they changed are saved together: if this run stops before the stale marking
 		// below, the next run still marks them (its own hash compare would see nothing changed)
 		const indexed = new Set(indexes.map((f) => f.path));
-		const gone = [...previousHashes.keys()].filter((p) => !indexed.has(p));
+		const gone = [...previousHashes.keys()].filter((p) => !indexed.has(p) && removedUpstream(p));
 		ledger.setMeta("drift_pending", JSON.stringify([...new Set([...pendingDrift, ...drift.changed, ...gone])]));
 		tx.exec("COMMIT");
 	} catch (e) {
@@ -405,7 +407,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// Drift: units already past planning whose source files changed upstream are flagged stale (not reset —
 	// a human decides whether to redo them). Removed files stay in the ledger with a note.
 	const seen = new Set(indexes.map((f) => f.path));
-	for (const p of previousHashes.keys()) if (!seen.has(p)) drift.removed.push(p);
+	for (const p of previousHashes.keys()) if (!seen.has(p) && removedUpstream(p)) drift.removed.push(p);
 	for (const p of new Set([...pendingDrift, ...drift.changed, ...drift.removed])) {
 		const sym = ledger.db.prepare("SELECT DISTINCT unit_id FROM symbols WHERE path = ? AND unit_id IS NOT NULL").all(p) as Array<{ unit_id: string }>;
 		for (const { unit_id } of sym) {

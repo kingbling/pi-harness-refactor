@@ -190,6 +190,10 @@ export class Ledger {
 			.run(patch.model ?? u.model, patch.worktree ?? u.worktree, patch.branch ?? u.branch, patch.kind ?? u.kind, meta, now(), id);
 	}
 
+	clearStale(id: string): void {
+		this.db.prepare("UPDATE units SET meta = json_remove(meta, '$.stale', '$.staleReason') WHERE id = ?").run(id);
+	}
+
 	transitionUnit(id: string, to: UnitState, reason?: string): void {
 		const u = this.getUnit(id);
 		if (!u) throw new LedgerError(`unknown unit ${id}`);
@@ -200,6 +204,8 @@ export class Ledger {
 			if (unproven.length) throw new LedgerError(`unit ${id} cannot be accepted; unproven symbols: ${unproven.map((s) => s.id).join(", ")}`);
 		}
 		this.db.prepare("UPDATE units SET state = ?, updated_at = ? WHERE id = ?").run(to, now(), id);
+		// back in the queue it is redone from the source as it is now: "stale" (done against older source) no longer holds
+		if (to === "planned") this.clearStale(id);
 		this.recordTransition("unit", id, u.state, to, reason);
 		if (to === "accepted") {
 			for (const s of this.symbolsOfUnit(id)) {
