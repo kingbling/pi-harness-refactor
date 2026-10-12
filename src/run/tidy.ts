@@ -8,6 +8,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { proposeRule } from "../rules/living.ts";
 import { stackTagLike } from "../inventory/target.ts";
+import { STRAY } from "./layout-check.ts";
 import { placementDir } from "./placement.ts";
 
 /**
@@ -26,7 +27,8 @@ export interface TidyTask {
 	id: string;
 	stack: string;
 	area: string;
-	op: "move" | "rename" | "merge" | "split";
+	/** delete: a file that is not code (a note) and nothing uses; `to` is empty. */
+	op: "move" | "rename" | "merge" | "split" | "delete";
 	from: string[];
 	to: string[];
 	why: string;
@@ -49,25 +51,40 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const n = Number(d.ledger.getMeta(key) ?? "0") + 1;
 	d.ledger.setMeta(key, String(n));
 	const none = { reviewed: false, asked: 0, proposals: 0, costUsd: 0 };
-	if (!d.client || (!o.force && n < (o.every ?? 10))) return none;
-	d.ledger.setMeta(key, "0");
-
+	if (!d.client) return none;
 	const adapter = await getTargetAdapter(o.stackId);
 	const proj = projectDir(d.config, o.stackId);
 	// a shared topic lives in the shared dir, not in a feature folder
 	const areaDir = placementDir(adapter.layout, { stackId: o.stackId, area: o.area, shared: !!o.shared, moduleKey: `${o.stackId}:${o.area}`, source: "code" });
+	const recorded = (d.ledger.getMeta(`drift:${o.stackId}`) ?? "").split("\n").filter(Boolean);
+	// drift in the area the last review did not see gets a review now, not after `every` more accepts (an area may
+	// have no more units); the same files flagged again (a file that grew a few lines) do not bring one again
+	const ownDrift = [...new Set(recorded.filter((l) => l.startsWith(`${areaDir}/`)).map((l) => l.slice(0, l.indexOf(": "))))].sort().join("\n");
+	const driftKey = `tidy_drift:${o.stackId}:${o.area}`;
+	const fresh = !!ownDrift && ownDrift !== (d.ledger.getMeta(driftKey) ?? "");
+	if (!o.force && !fresh && n < (o.every ?? 10)) return none;
+	d.ledger.setMeta(key, "0");
+	d.ledger.setMeta(driftKey, ownDrift);
+
 	const files = listFiles(join(proj, areaDir)).map((f) => relative(proj, f));
 	if (!files.length) return none;
 	const tree = files.map((f) => `${f} (${lineCount(join(proj, f))} lines)`).join("\n");
 	const exports = d.ledger.db.prepare("SELECT path, kind, name FROM index_symbols WHERE side = 'target' AND path LIKE ? AND tags LIKE ? ORDER BY path, line").all(`${areaDir}/%`, stackTagLike(o.stackId)) as Array<{ path: string; kind: string; name: string }>;
 	const cards = d.ledger.db.prepare("SELECT path, name, summary FROM capabilities WHERE stack = ? AND path LIKE ?").all(o.stackId, `${areaDir}/%`) as Array<{ path: string; name: string; summary: string }>;
-	const drift = (d.ledger.getMeta(`drift:${o.stackId}`) ?? "").split("\n").filter((l) => l.startsWith(`${areaDir}/`)).slice(0, 40).join("\n");
+	// a source folder outside the layout (src/api/ next to the feature root) is shared code in the wrong place: every
+	// review of the stack sees it and may move it into the shared dir (the topic is the model's pick)
+	const stray = recorded.filter((l) => l.endsWith(`: ${STRAY}`)).map((l) => l.slice(0, l.indexOf(": ")));
+	const strayFiles = stray.flatMap((s) => listFiles(join(proj, s)).map((f) => relative(proj, f)));
+	const drift = [...recorded.filter((l) => l.startsWith(`${areaDir}/`)).slice(0, 40), ...stray.map((s) => `${s}: ${STRAY}; move its files into the shared dir (${strayFiles.filter((f) => f.startsWith(s)).slice(0, 20).join(", ")})`)].join("\n");
 	const open = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "asked" || t.status === "approved");
 	const rejected = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "rejected");
 	// a change whose job failed its check is not proposed again every review (its failure stays on the task)
 	const failed = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "failed");
 	const sig = (op: string, from: string[], to: string[]) => `${op}|${[...from].sort().join(",")}|${[...to].sort().join(",")}`;
 	const seen = new Set([...open, ...rejected, ...failed].map((t) => sig(t.op, t.from, t.to)));
+	// a stray folder's move may come from any review of the stack: once one is pending, the others do not ask again
+	const pending = tidyTasks(d.ledger, o.stackId).filter((t) => t.status === "asked" || t.status === "approved").flatMap((t) => t.from);
+	const takenStray = (from: string[]) => from.some((f) => stray.some((s) => f.startsWith(s)) && pending.includes(f));
 
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -85,14 +102,14 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 						type: "object",
 						additionalProperties: false,
 						required: ["op", "from", "to", "why"],
-						properties: { op: { type: "string", enum: ["move", "rename", "merge", "split"] }, from: { type: "array", items: { type: "string" } }, to: { type: "array", items: { type: "string" } }, why: { type: "string" } },
+						properties: { op: { type: "string", enum: ["move", "rename", "merge", "split", "delete"] }, from: { type: "array", items: { type: "string" } }, to: { type: "array", items: { type: "string" } }, why: { type: "string" } },
 					},
 				},
 				conventions: { type: "array", items: { type: "object", additionalProperties: false, required: ["text", "why"], properties: { text: { type: "string" }, why: { type: "string" } } } },
 			},
 		},
 		messages: [
-			{ role: "system", content: `You review one feature module of a codebase under migration for tidiness: a new developer must find things by name, every file has one clear job, names are professional and consistent, nothing reads like a legacy artifact. Propose only changes worth their cost (at most 6; never a new layer or abstraction the module does not need), all paths relative to the project and inside ${areaDir}/ or the shared dirs (${adapter.layout.sharedDirs.join(", ")}); never break the binding layout below. Conventions = patterns the whole stack should follow from now on.\n\nBinding layout:\n${adapter.layout.structureDoc}` },
+			{ role: "system", content: `You review one feature module of a codebase under migration for tidiness: a new developer must find things by name, every file has one clear job, names are professional and consistent, nothing reads like a legacy artifact. Propose only changes worth their cost (at most 6; never a new layer or abstraction the module does not need), all paths relative to the project and inside ${areaDir}/ or the shared dirs (${adapter.layout.sharedDirs.join(", ")}); never break the binding layout below. A file that is not code (a note or doc the layout has no place for) and that nothing uses is a delete (to: []); code is never deleted.${stray.length ? ` A move may also take files out of ${stray.join(", ")} (outside the layout) into the shared dirs, under the topic that fits; the job updates every import.` : ""} Conventions = patterns the whole stack should follow from now on.\n\nBinding layout:\n${adapter.layout.structureDoc}` },
 			{ role: "user", content: `${loadBrief(d.root) ? `Repo brief:\n${loadBrief(d.root).slice(0, 2500)}\n\n` : ""}Area "${o.area}" (${o.stackId}):\n${tree}\n\nExports:\n${exports.map((e) => `${e.path}: ${e.kind} ${e.name}`).join("\n")}\n\nWhat the code does:\n${cards.map((c) => `${c.path} ${c.name}: ${c.summary}`).join("\n") || "(no cards)"}\n${drift ? `\nCode checks flagged:\n${drift}\n` : ""}${open.length ? `\nAlready pending (do not repeat):\n${open.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}${rejected.length ? `\nRejected by the owner (never propose these again, nor variants of them):\n${rejected.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}${failed.length ? `\nTried and failed the build or tests (do not propose again):\n${failed.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}` },
 		],
 	});
@@ -104,10 +121,16 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 		proposals++;
 	}
 	const allowed = (p: string) => p.startsWith(`${areaDir}/`) || adapter.layout.sharedDirs.some((s) => p.startsWith(s));
+	const allowedFrom = (p: string) => allowed(p) || stray.some((s) => p.startsWith(s));
+	// a target file the layout check would refuse is never proposed: the tidy job would only fail its check (only the
+	// file's own findings: a folder missing a required file is not the move's fault)
+	const misfit = (to: string[]) => to.some((p) => (adapter.layout.checkStructure?.([p], areaDir, o.area, proj, { isNew: () => false }) ?? []).some((l) => l.startsWith(`${p}: `)));
+	// only what is not code and not a test is ever deleted; whether anything uses it, the job's build and tests say
+	const deletable = (c: { op: string; from: string[]; to: string[] }) => c.op !== "delete" || (!c.to.length && c.from.every((f) => !adapter.layout.isTestFile(f) && !adapter.layout.sourceExtensions.some((e) => f.endsWith(e))));
 	const tasks = loadTasks(d.ledger);
 	let asked = 0;
 	for (const c of j.changes ?? []) {
-		if (!c.from.length || !c.to.length || ![...c.from, ...c.to].every(allowed) || seen.has(sig(c.op, c.from, c.to)) || onlyCase(c)) continue;
+		if (!c.from.length || (c.op !== "delete" && !c.to.length) || !deletable(c) || !c.from.every(allowedFrom) || !c.to.every(allowed) || seen.has(sig(c.op, c.from, c.to)) || takenStray(c.from) || onlyCase(c) || misfit(c.to)) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
 			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, a separate job does it once on the main branch and updates every file that uses the moved code; it is kept only when the build and the tests of the changed files pass. Nothing waits for this answer.`,

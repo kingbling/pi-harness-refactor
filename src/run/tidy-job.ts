@@ -13,13 +13,14 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { runCmd } from "./builder.ts";
 import { changedFiles, wholeProjectSteps } from "./gate.ts";
+import { checkTree } from "./layout-check.ts";
 import { endTidyTask, onlyCase, tidyMissing, tidyTasks, type TidyTask } from "./tidy.ts";
 
 /**
  * The tidy job: each approved tidy task runs once, on its own, in a worktree of main. A model does the move and
  * finds every file that uses the moved names (it searches; code does not guess), tests included, and changes
  * only their imports and namespaces; it also deletes shims an earlier attempt left (deprecated copies, aliases).
- * Code then checks: the tree shows the task done, the build passes, the tests of the changed files pass.
+ * Code then checks: the tree shows the task done, the moved files follow the layout, the build passes, the tests of the changed files pass.
  * Green: merged into main, the task is done. Red: thrown away, the task is failed with the output; units go on.
  * Units never do tidy work: while a task of their area is approved, the scheduler holds them back (`holds`).
  */
@@ -37,7 +38,7 @@ export const tidyWithModel: TidyWorker = async (o) => {
 		writeGlobs: ["**"],
 		protectedGlobs: [".git/**", ...o.adapter.protectedGlobs],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__tidy__.${o.task.id}.jsonl`),
-		systemPrompt: `You do one approved tidy change in a ${o.adapter.id} project under migration: move, rename, merge or split files so the code is easier to find. Keep behaviour identical.
+		systemPrompt: `You do one approved tidy change in a ${o.adapter.id} project under migration: move, rename, merge or split files so the code is easier to find, or delete a file that is not code and nothing uses. Keep behaviour identical.
 - Do the change itself in the files it names (old and new paths).
 - Search the whole project (grep) for every use of the old paths, class names and namespaces, tests included, and update those files. In those files change only imports, namespaces and the moved names; never change what a test checks.
 - No compatibility shims: nothing may stay at the old name (no copy, alias, re-export or deprecated class). Delete such shims an earlier attempt left, and point their users at the new name.
@@ -151,12 +152,20 @@ export function createTidyJobs(o: {
 }
 
 /**
- * Code's check of a tidy job: the task is done in the tree, the build passes (the whole project when the build
+ * Code's check of a tidy job: the task is done in the tree, the moved files follow the layout, the build passes (the whole project when the build
  * cannot take files, else the changed code files) and the tests among the changed files pass. Undefined = green.
  */
 async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[]): Promise<string | undefined> {
 	const missing = tidyMissing(dir, t);
 	if (missing.length) return `the change is not complete: ${missing.join("; ")}`;
+	// a delete removes only the files it names
+	const gone = t.op === "delete" ? changed.filter((f) => !existsSync(join(dir, f)) && !t.from.includes(f)) : [];
+	if (gone.length) return `more was deleted than the task names: ${gone.slice(0, 5).join(", ")}`;
+	// the same layout check a unit's gate runs on its files: a move may not put a file where the gate refuses it
+	// (only the task's targets: a file touched just for an import keeps its old drift, that is another task's job)
+	const moved = changed.filter((f) => existsSync(join(dir, f)) && t.to.some((p) => f === p || f.startsWith(p.replace(/\/*$/, "/"))));
+	const drift = moved.length ? checkTree(dir, adapter, moved) : [];
+	if (drift.length) return `the layout check failed: ${drift.slice(0, 10).join("\n")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const whole = wholeProjectSteps(adapter, dir).filter((s) => s.step === "build");

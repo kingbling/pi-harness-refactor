@@ -135,12 +135,15 @@ describe("review fixes: what an agent can no longer slip through, and what keeps
 		expect(check(dir, [`${mod}/campaign-stats.service.ts`], { isNew: () => false })).toEqual([]); // already there: not new
 	});
 
-	it("required files: asked when a unit starts a feature folder; an older folder missing one is drift, not a failed unit", () => {
+	it("required files: a unit writing in its feature folder makes it whole, new folder or older one (nothing else creates a missing file)", () => {
 		const dir = project({ [`${mod}/campaign.module.ts`]: "x\n", [`${mod}/campaign.service.ts`]: "x\n" });
 		expect(check(dir, [`${mod}/campaign.service.ts`], { isNew: () => true })).toContainEqual(expect.stringMatching(/missing campaign\.controller\.ts/));
-		expect(check(dir, [`${mod}/campaign.service.ts`], { isNew: (f) => f.endsWith("service.ts") })).toEqual([]);
+		// an older folder (another job started it without the file): the area's next unit is asked for it
+		expect(check(dir, [`${mod}/campaign.service.ts`], { isNew: (f) => f.endsWith("service.ts") })).toContainEqual(expect.stringMatching(/missing campaign\.controller\.ts/));
 		expect(checkLayoutTree(dir, rules, opts)).toContainEqual(expect.stringMatching(/^src\/campaign\/: missing campaign\.controller\.ts/));
+		// the drift check on some files (a code job): only a folder those files start must be whole
 		expect(checkLayoutTree(dir, rules, opts, [`${mod}/campaign.service.ts`])).toEqual([]);
+		expect(checkLayoutTree(dir, rules, opts, [`${mod}/campaign.module.ts`, `${mod}/campaign.service.ts`])).toContainEqual(expect.stringMatching(/^src\/campaign\/: missing campaign\.controller\.ts/));
 	});
 
 	it("rules that contradict themselves or put a placeholder in the parent folders are refused; area folders must be kebab-case", () => {
@@ -212,6 +215,37 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 		writeFileSync(join(dir, "src/Shared/Kernel.php"), "<?php // changed\n");
 		expect(checkLayoutTree(dir, sym, symOpts)).toContainEqual(expect.stringMatching(/^src\/Shared\/Kernel\.php: shared files go in/));
 	});
+	it("a shared dir the generator made (config/, translations/, tests/ in an older manifest) is the framework's: its files are no findings", () => {
+		const dir = project({ "config/packages/framework.yaml": "x\n", "translations/.gitignore": "", "tests/bootstrap.php": "<?php\n", "src/Kernel.php": "<?php\n" });
+		execFileSync("git", ["init", "-q"], { cwd: dir });
+		execFileSync("git", ["add", "-A"], { cwd: dir });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "scaffold"], { cwd: dir });
+		const root = mkdtempSync(join(tmpdir(), "br-lw-"));
+		saveLayoutRules(root, "symfony", sym);
+		const base = { ...nestjsAdapter, id: "symfony", layout: { ...nestjsAdapter.layout, ...symOpts, sharedDirs: ["src/Shared", "config", "translations", "tests"], dataDirs: [], wiringFiles: [], fileFindings: undefined, checkTree: undefined, checkStructure: undefined } };
+		const a = withLayoutRules(base as never, root);
+		for (const [f, t] of Object.entries({ "config/phpstan-bootstrap.php": "<?php\n", "translations/app.en.yaml": "a: b\n", "tests/bootstrap.php": "<?php // changed\n", "src/Shared/Money.php": "<?php\n" })) (mkdirSync(dirname(join(dir, f)), { recursive: true }), writeFileSync(join(dir, f), t));
+		expect(a.layout.checkTree!(dir)).toEqual([expect.stringMatching(/^src\/Shared\/Money\.php: shared files go in src\/Shared\/<topic>/)]);
+		expect(a.layout.checkStructure!(["config/phpstan-bootstrap.php", "translations/app.en.yaml"], "src/Plans", "plans", dir, NEW)).toEqual([]);
+		// with the workspace's config the doc, the tidy review and placement name only the units' shared dir too
+		writeFileSync(join(root, "bigrefactor.config.json"), JSON.stringify({ target: { path: dir, stacks: ["symfony"] } }));
+		const w = withLayoutRules(base as never, root);
+		expect(w.layout.sharedDirs).toEqual(["src/Shared/"]);
+		expect(w.layout.structureDoc).toMatch(/Code used by several areas: src\/Shared\/<topic>\/<name> \(topic/);
+	});
+
+	it("the shared dirs hold code: a note or doc there is a finding, the kinds of file the layout has are not", () => {
+		const r = { ...sym, files: [...sym.files, { path: "config/{name}.(yaml|xml)", doc: "bundle config" }] };
+		const run = (f: string) => checkLayoutRules([f], "src/Plans", "plans", "/nonexistent", r, symOpts, NEW);
+		expect(run("src/Shared/Navigation/README.md")).toEqual([expect.stringMatching(/^src\/Shared\/Navigation\/README\.md: not a kind of file the layout has \(\.php, .*\.yaml.*\); the shared dirs hold code several areas use, never notes or docs$/)]);
+		expect(run("src/Shared/Navigation/Menu.php")).toEqual([]);
+		expect(run("src/Shared/Navigation/menu.yaml")).toEqual([]);
+	});
+
+	it("a test file is never told to move into a shared topic", () => {
+		expect(checkLayoutRules(["src/Shared/MoneyTest.php"], "src/Plans", "plans", "/nonexistent", sym, symOpts, NEW)).toEqual([]);
+	});
+
 	it("wiring files the unit is told to edit (config/services.yaml, a route table) pass the folder check", () => {
 		const run = (f: string, wiringFiles?: string[]) => checkLayoutRules([f], "src/Plans", "plans", "/nonexistent", sym, { ...symOpts, sharedDirs: ["src/Shared", "config"], wiringFiles }, NEW);
 		expect(run("config/services.yaml")).toContainEqual(expect.stringMatching(/^config\/services\.yaml: shared files go in config\/<topic>/));
@@ -223,12 +257,26 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 	it("repeated placeholders: nested folders and file-name parts are their own value; a file name repeating its folder is that folder", () => {
 		const r = normalize({ moduleDir: "src/{Area}", files: [{ path: "{sub}/{sub}/{Name}.php", doc: "" }, { path: "translations/{name}.{name}.yaml", doc: "" }, { path: "config/{name}.php", doc: "" }, { path: "{sub}/{Name}/{Name}.php", doc: "" }], require: [], forbidDirs: ["Utils"] });
 		const run = (f: string) => checkLayoutRules([f], "src/Users", "users", "/nonexistent", r, symOpts, NEW);
-		expect(run("src/Users/Security/WebAuthn/WebAuthnException.php")).toEqual([]);
+		expect(run("src/Users/Login/Passkey/WebAuthnException.php")).toEqual([]);
 		expect(run("src/Users/translations/messages.en.yaml")).toEqual([]);
 		expect(run("src/Users/config/one_time_login.php")).toEqual([]);
 		expect(run("src/Users/Security/Utils/X.php")).toContainEqual(expect.stringMatching(/folder "Utils" is not allowed/));
 		expect(run("src/Users/Login/Form/Form.php")).toEqual([]);
 		// the message says how each placeholder is spelled
 		expect(run("src/Users/Login/Form/Deep/Other.php")).toContainEqual(expect.stringMatching(/not an allowed file .*\(<name> kebab-case or snake_case, <Name> PascalCase, <sub> a PascalCase folder\)$/));
+	});
+
+	it("a folder another pattern names (Security/, Repository/) is never a <sub>, and the message and the layout doc say so", () => {
+		const r = normalize({ moduleDir: "src/{Area}", files: [{ path: "Security/{Name}.php", doc: "auth" }, { path: "Repository/{Name}Repository.php", doc: "queries" }, { path: "{sub}/{Name}.php", doc: "" }, { path: "{sub}/{sub}/{Name}.php", doc: "" }], require: [], forbidDirs: ["Utils"] });
+		const run = (f: string) => checkLayoutRules([f], "src/Users", "users", "/nonexistent", r, symOpts, NEW);
+		expect(run("src/Users/Security/LoginAuthenticator.php")).toEqual([]);
+		expect(run("src/Users/Login/Passkey/WebAuthnException.php")).toEqual([]);
+		const nested = run("src/Users/Security/WebAuthn/WebAuthnException.php");
+		expect(nested).toHaveLength(1);
+		expect(nested[0]).toMatch(/not an allowed file .*Security\/ is a named folder, never a <sub>: only Security\/<Name>\.php there; .*a new slot such as Security\/<sub>\/<Name>\.php$/);
+		expect(run("src/Users/Repository/MediaFileListCampaignLookup.php")[0]).toMatch(/Repository\/ is a named folder, never a <sub>: only Repository\/<Name>Repository\.php there; rename or move the file to fit$/);
+		// a path that fits nothing at all gets no named-folder hint
+		expect(run("src/Users/Security/a/b/c/X.php")[0]).not.toMatch(/named folder/);
+		expect(renderLayoutDoc(r, [])).toMatch(/Never a folder a line above names \(Security\/, Repository\/\): those hold only the files listed for them/);
 	});
 });

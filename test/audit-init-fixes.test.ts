@@ -18,7 +18,8 @@ function targetRepo(id: string) {
 	const adapter = {
 		id,
 		toolchain: { isProjectReady: () => true },
-		layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], isTestFile: (p: string) => /\.spec\./.test(p) },
+		layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], isTestFile: (p: string) => /\.spec\./.test(p), sourceExtensions: [".ts"], ignoreDirs: [] },
+		generatedFiles: [],
 	} as unknown as TargetAdapter;
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: [id] }, models: {} });
 	return { root, target, adapter, config };

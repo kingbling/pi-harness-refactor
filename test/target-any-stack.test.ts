@@ -75,6 +75,11 @@ describe("a wrong test must fail, on any stack", () => {
 		expect(await verifyManifest(manifest("blind", { test: { cmd: "node", args: ["--version", "{files}"] } }))).toMatch(/passes probeTest.failing/);
 		expect(await verifyManifest(manifest("good"))).toBeUndefined();
 	});
+
+	it("a shared dir the generator already made (config/, tests/) is the framework's own, never shared app code", async () => {
+		const m = manifest("fw", { postScaffold: [{ cmd: "touch", args: ["ready.txt"] }, { cmd: "mkdir", args: ["config"] }] });
+		expect(await verifyManifest({ ...m, layout: { ...m.layout, sharedDirs: ["src/shared/", "config"] } })).toMatch(/layout\.sharedDirs config: the generator already made this folder/);
+	});
 });
 
 describe("ported tests are found by path", () => {

@@ -13,7 +13,7 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string, protectedGlobs: string[] = []) {
+	async function job(worker: (dir: string) => string, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = []) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
@@ -26,7 +26,8 @@ describe("the code job", () => {
 			id: "fake",
 			protectedGlobs,
 			toolchain: { ignoredPaths: [] },
-			layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"] },
+			generatedFiles: [],
+			layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], ignoreDirs: [], isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree, wiringFiles },
 			build: () => ({ cmd: "true", args: [] }),
 			test: () => ({ cmd: "true", args: [] }),
 		} as unknown as TargetAdapter;
@@ -59,9 +60,29 @@ describe("the code job", () => {
 		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "tsconfig.json"), '{"strict":false}\n'), "added b"), ["**/tsconfig*.json"]);
 		expect(r.merged).toBe(false);
 	});
+	it("a protected wiring file (bundle list, route table) may change: a new feature folder is registered there", async () => {
+		const wire = (dir: string) => (code(dir), mkdirSync(join(dir, "config"), { recursive: true }), writeFileSync(join(dir, "config", "bundles.txt"), "B\n"), "added b");
+		expect((await job(wire, ["config/**"], undefined, ["config/bundles.txt"])).merged).toBe(true);
+		expect((await job(wire, ["config/**"])).merged).toBe(false);
+	});
 	it("no code at all fails the check: the job was to write code", async () => {
 		const r = await job((dir) => (writeFileSync(join(dir, "notes.md"), "todo\n"), "wrote notes"));
 		expect(r.merged).toBe(false);
+	});
+	it("a file the layout check flags fails the check, like a unit's gate: a note for other units stays off main", async () => {
+		const flag = (_dir: string, only?: string[]) => (only ?? []).filter((f) => f.endsWith(".md")).map((f) => `${f}: not an allowed file in the feature folder`);
+		const r = await job((dir) => (code(dir), mkdirSync(join(dir, "src", "features", "b"), { recursive: true }), writeFileSync(join(dir, "src", "features", "b", "README.md"), "contract for the frontend\n"), "added b"), [], flag);
+		expect(r.merged).toBe(false);
+		const ok = await job((dir) => (code(dir), "added b"), [], flag);
+		expect(ok.merged).toBe(true);
+	});
+	it("a new file in a folder outside the layout (src/api/ next to the feature root) fails the check: the gate's own folder check does not run here", async () => {
+		const r = await job((dir) => (code(dir), mkdirSync(join(dir, "src", "api"), { recursive: true }), writeFileSync(join(dir, "src", "api", "client.txt"), "client\n"), "added b"), [], () => []);
+		expect(r.merged).toBe(false);
+	});
+	it("the model's whole last paragraph is the answer, so the waiting unit's hint carries the contract", async () => {
+		const r = await job((dir) => (code(dir), "Ran the tests.\n\nAdded GET /api/b.\nIt returns {id, name}."));
+		expect(r.said).toBe("Added GET /api/b.\nIt returns {id, name}.");
 	});
 	it("code with its test is merged", async () => {
 		const r = await job((dir) => (code(dir), "added b"), ["**/tsconfig*.json"]);

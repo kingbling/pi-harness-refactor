@@ -208,7 +208,13 @@ function scanDir(dir: string, a: TargetAdapter): StackTree {
 	return { stackId: a.id, dir, moduleRoot, features, shared, stray, srcRoot };
 }
 
-const STRAY = "outside the feature root, the shared dirs and the scaffold";
+export const STRAY = "outside the feature root, the shared dirs and the scaffold";
+
+/** Source folders straight under the source root outside the feature root, the shared dirs and the scaffold, project-relative with a trailing slash (`src/api/`). */
+export function strayDirs(dir: string, a: TargetAdapter): string[] {
+	const t = scanDir(dir, a);
+	return t.stray.map((d) => `${t.srcRoot}/${d}/`);
+}
 
 /**
  * Whole-tree drift of one stack project, one `<project-relative path>: <finding>` per line: the adapter's findings
@@ -220,8 +226,7 @@ export function checkTree(dir: string, a: TargetAdapter, only?: string[]): strin
 	const scaffold = new Set(scaffoldFiles(dir));
 	const lines = (a.layout.checkTree?.(dir, only) ?? []).filter((l) => !scaffold.has(l.slice(0, l.indexOf(": "))));
 	if (only) return lines;
-	const t = scanDir(dir, a);
-	return [...lines, ...t.stray.map((d) => `${t.srcRoot}/${d}/: ${STRAY}`)];
+	return [...lines, ...strayDirs(dir, a).map((d) => `${d}: ${STRAY}`)];
 }
 
 /** After an accept: the stack's drift findings, stored line-oriented in ledger meta `drift:<stackId>` (tidy reads it). */

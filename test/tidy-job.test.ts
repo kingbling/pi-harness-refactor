@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,7 +17,7 @@ import { createTidyJobs, type TidyWorker } from "../src/run/tidy-job.ts";
  */
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
-function setup() {
+function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "br-tidy-job-")));
 	const target = join(root, "new");
 	mkdirSync(join(target, "src", "A"), { recursive: true });
@@ -31,7 +31,7 @@ function setup() {
 		id: "fake",
 		protectedGlobs: [],
 		toolchain: { ignoredPaths: [] },
-		layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"] },
+		layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree },
 		// the whole-project build (it cannot take files): red while anything still points at the old path
 		build: () => ({ cmd: "sh", args: ["-c", "! grep -rq 'src/A/Old.txt' src"] }),
 		lint: (_r: string, files: string[]) => ({ cmd: "true", args: files }),
@@ -91,6 +91,40 @@ describe("the tidy job", () => {
 		expect(existsSync(join(target, "src", "B", "New.txt"))).toBe(false);
 		expect(git(target, ["status", "--porcelain"])).toBe("");
 		expect(j.holds("fake", "a")).toBe(false); // units are not blocked
+	});
+
+	it("a move to a path the layout check refuses is failed like the gate would, before any build; files touched only for imports are not checked", async () => {
+		const seen: string[][] = [];
+		const { target, ledger, jobs } = setup((_dir, only) => (seen.push(only ?? []), (only ?? []).filter((f) => f.startsWith("src/B/")).map((f) => `${f}: not an allowed file in the feature folder`)));
+		const j = jobs(mover(true));
+		j.next();
+		await j.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/the layout check failed: src\/B\/New\.txt: not an allowed file/);
+		expect(t.failure).not.toMatch(/\(build\)/);
+		expect(seen).toEqual([["src/B/New.txt"]]); // the test changed only for its import is not the task's target
+		expect(existsSync(join(target, "src", "A", "Old.txt"))).toBe(true);
+	});
+
+	it("a delete of a note: done when the note is gone; deleting more than the task names fails", async () => {
+		const { target, ledger, jobs } = setup();
+		writeFileSync(join(target, "src", "A", "README.md"), "notes for other units\n");
+		writeFileSync(join(target, "src", "A", "Old.test.txt"), "expects Old\n"); // main builds green
+		commitAll(target, "note");
+		const del: TidyTask = { id: "T8", stack: "fake", area: "a", op: "delete", from: ["src/A/README.md"], to: [], why: "a handoff note, not code", questionId: 8, status: "approved" };
+		ledger.setMeta("tidy_tasks", JSON.stringify([del]));
+		const greedy = jobs(async ({ dir }) => (rmSync(join(dir, "src", "A", "README.md")), rmSync(join(dir, "src", "A", "Old.test.txt")), "deleted the note"));
+		greedy.next();
+		await greedy.busy;
+		expect(tidyTasks(ledger)[0]).toMatchObject({ status: "failed", failure: expect.stringMatching(/more was deleted than the task names: src\/A\/Old\.test\.txt/) });
+		ledger.setMeta("tidy_tasks", JSON.stringify([del]));
+		const j = jobs(async ({ dir }) => (rmSync(join(dir, "src", "A", "README.md")), "deleted the note"));
+		j.next();
+		await j.busy;
+		expect(tidyTasks(ledger)[0]!.status).toBe("done");
+		expect(existsSync(join(target, "src", "A", "README.md"))).toBe(false);
+		expect(existsSync(join(target, "src", "A", "Old.test.txt"))).toBe(true);
 	});
 
 	it("a move the model did not finish is failed by code before any build", async () => {

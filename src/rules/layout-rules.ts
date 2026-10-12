@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join, matchesGlob } from "node:path";
+import { join, matchesGlob, resolve } from "node:path";
+import { CONFIG_FILE } from "../config.ts";
 import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
 
 /**
@@ -17,7 +18,7 @@ import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
  *                               {Area} → Pascal, {area_snake} → snake); never a banned name or a folder another pattern
  *                               names literally (dto, entities …)
  *   A placeholder in the file name that repeats one of its folders is that folder's value (creation/campaign-creation.ts,
- *   Button/Button.tsx); every other repeat is its own value (Security/WebAuthn/, messages.en.yaml).
+ *   Button/Button.tsx); every other repeat is its own value (Login/Passkey/, messages.en.yaml).
  *   (a|b)                       either word
  */
 export interface LayoutRules {
@@ -203,9 +204,23 @@ function checkFiles(rels: string[], area: string, r: LayoutRules): string[] {
 		const dirs = rel.split("/").slice(0, -1);
 		const bad = dirs.find((d) => banned(r, d));
 		if (bad) out.push(`folder "${bad}" is not allowed (banned names: ${r.forbidDirs.join(", ")}); name the folder after what the code does (e.g. creation/, tracking/)`);
-		else if (!allowed.some((m) => m.test(rel))) out.push(`not an allowed file in the feature folder; allowed: ${r.files.map((f) => show(f.path, area)).join(" | ")}${spelling(r)}`);
+		else if (!allowed.some((m) => m.test(rel))) out.push(`not an allowed file in the feature folder; allowed: ${r.files.map((f) => show(f.path, area)).join(" | ")}${spelling(r)}${namedFolder(rel, area, r)}`);
 	}
 	return out;
+}
+
+/**
+ * Why a path that would fit a {sub} pattern still fails: its first folder is one another pattern names (Security/),
+ * and such a folder is never a <sub>. Said plainly, so a model sees the gap (move the file, or ask for a layout slot).
+ */
+function namedFolder(rel: string, area: string, r: LayoutRules): string {
+	const first = rel.split("/")[0]!;
+	if (!rel.includes("/") || !reservedSubs(r).has(first.toLowerCase())) return "";
+	const open = new Set(r.forbidDirs.map((d) => d.toLowerCase()));
+	if (!r.files.some((f) => compilePattern(f.path, area, open, subStyle(r.moduleDir)).test(rel))) return "";
+	const own = r.files.filter((f) => f.path.split("/")[0]!.toLowerCase() === first.toLowerCase()).map((f) => show(f.path, area));
+	const deeper = rel.split("/").length > 2 ? `, or, when the code really belongs in a deeper folder there, the layout needs a new slot such as ${first}/<sub>/<Name>${rel.slice(rel.lastIndexOf("."))}` : "";
+	return `. ${first}/ is a named folder, never a <sub>: only ${own.join(" or ")} there; rename or move the file to fit${deeper}`;
 }
 
 /** How the placeholders the rules use are spelled (` (<name> kebab-case or snake_case, <sub> a PascalCase folder)`). */
@@ -239,6 +254,7 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 	const isNew = (f: string) => ctx.isNew?.(f) === true;
 	const out: string[] = [];
 	let touched = false;
+	const kinds = fileKinds(r, o);
 	for (const f of files) {
 		if (o.dataDirs?.some((d) => f.startsWith(d))) continue;
 		if (isWiringFile(f, o.wiringFiles)) continue;
@@ -247,17 +263,18 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 			out.push(`${f}: "${legacy}" is a legacy file kind; name files and classes after what they do, never after the legacy file`);
 			continue;
 		}
+		// tests go where the stack's test runner finds them (the adapter's test globs), inside the feature folder or not
+		if (!f.startsWith(mod) && o.isTestFile(f)) continue;
 		const shared = o.sharedDirs.map(slashed).find((d) => f.startsWith(d));
 		if (shared) {
 			const parts = f.slice(shared.length).split("/");
 			// a banned topic only for new files: shared code that is already there keeps working
 			const bad = isNew(f) ? parts.slice(0, -1).find((d) => banned(r, d)) : undefined;
 			if (parts.length < 2) out.push(`${f}: shared files go in ${shared}<topic>/<name>; put it in a topic folder named after what it does`);
+			else if (kinds.size && !kinds.has(kindOf(f))) out.push(`${f}: not a kind of file the layout has (${[...kinds].map((k) => `.${k}`).join(", ")}); the shared dirs hold code several areas use, never notes or docs`);
 			else if (bad) out.push(`${f}: shared topic "${bad}" is not allowed (banned names: ${r.forbidDirs.join(", ")}); name the topic after what the code does`);
 			continue;
 		}
-		// tests go where the stack's test runner finds them (the adapter's test globs), inside the feature folder or not
-		if (!f.startsWith(mod) && o.isTestFile(f)) continue;
 		if (!f.startsWith(mod)) {
 			out.push(`${f}: outside this unit's feature folder ${mod} and the shared dirs (${o.sharedDirs.join(", ")})`);
 			continue;
@@ -276,10 +293,21 @@ export function checkLayoutRules(files: string[], moduleDir: string, area: strin
 		}
 		out.push(...placeProblems(projectDir, f, mod, area, r));
 	}
-	// the gate asks for the required files when a unit starts a feature folder; for older folders it is drift (tidy)
-	const startsFolder = !ctx.isNew || listFiles(join(projectDir, mod), o.ignoreDirs).every((x) => isNew(mod + x));
-	if (touched && checkRequire && startsFolder) out.push(...missingRequired(projectDir, mod, area, r, files, o.ignoreDirs));
+	// a unit that writes in its feature folder makes it whole: nothing else creates a missing required file (tidy only
+	// moves and renames), so an older folder another job started without one gets it from the area's next unit
+	if (touched && checkRequire) out.push(...missingRequired(projectDir, mod, area, r, files, o.ignoreDirs));
 	return out;
+}
+
+const kindOf = (f: string) => /\.([A-Za-z0-9]+)$/.exec(f.split("/").at(-1)!)?.[1]?.toLowerCase() ?? "";
+
+/** The kinds of file (last extension) the layout knows: the stack's source extensions and those a feature folder may hold. */
+function fileKinds(r: LayoutRules, o: LayoutCheckOptions): Set<string> {
+	const ends = r.files.flatMap((f) => {
+		const m = /\.(\([^)]*\)|[A-Za-z0-9]+)$/.exec(f.path);
+		return m ? m[1]!.replace(/[()]/g, "").split("|") : [];
+	});
+	return new Set([...(o.sourceExtensions ?? []), ...ends].map((x) => x.split(".").at(-1)!.toLowerCase()).filter(Boolean));
 }
 
 /**
@@ -344,7 +372,8 @@ export function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutChe
 		const files = listFiles(join(projectDir, mod), o.ignoreDirs).map((f) => `${mod}/${f}`).filter((f) => !scaffold.has(f));
 		const checked = want ? files.filter((f) => want.has(f)) : files;
 		if (!checked.length) continue;
-		out.push(...checkLayoutRules(checked, mod, area, projectDir, r, o, {}, !want));
+		// required files: the whole tree always; with `only`, a folder these files start (a code job's new folder)
+		out.push(...checkLayoutRules(checked, mod, area, projectDir, r, o, {}, !want || files.every((f) => want.has(f))));
 		for (const f of checked.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, mod, area, r, o));
 	}
 	const shared = o.sharedDirs.map(slashed).flatMap((s) => listFiles(join(projectDir, s), o.ignoreDirs).map((f) => s + f)).filter((f) => !scaffold.has(f) && (!want || want.has(f)));
@@ -380,7 +409,8 @@ export function renderLayoutDoc(r: LayoutRules, sharedDirs: string[], testGlobs:
 	if (r.require.length) lines.push(`Every feature folder has: ${r.require.map(d).join(", ")}.`);
 	for (const p of r.place ?? []) lines.push(`Placement: ${p.doc} (only in ${p.in.map(d).join(" or ")}).`);
 	const sub = subStyle(r.moduleDir);
-	lines.push(`<sub> is one ${sub.word} folder named after what the code does (e.g. ${sub.sample}/). Never a folder named ${r.forbidDirs.join(", ")}.`);
+	const named = r.files.map((f) => f.path.split("/")[0]!).filter((d, i, a) => a.indexOf(d) === i && reservedSubs(r).has(d.toLowerCase()) && !banned(r, d));
+	lines.push(`<sub> is one ${sub.word} folder named after what the code does (e.g. ${sub.sample}/). Never a folder named ${r.forbidDirs.join(", ")}.${named.length ? ` Never a folder a line above names (${named.map((d) => `${d}/`).join(", ")}): those hold only the files listed for them.` : ""}`);
 	if (testGlobs.length) lines.push(`Tests of an area go where the test runner finds them: ${testGlobs.join(" or ")} (for the area invoice).`);
 	if (sharedDirs.length) lines.push(`Code used by several areas: ${sharedDirs.map((x) => `${slashed(x)}<topic>/<name>`).join(" or ")} (topic named after what it does).`);
 	if (r.maxLines) lines.push(`A file stays under ${r.maxLines} lines.`);
@@ -442,6 +472,23 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 	const base = { ...adapter.layout, sharedDirs: adapter.layout.sharedDirs.map(slashed) };
 	const rules = () => (root ? loadLayoutRules(root, adapter.id) : undefined);
 	const opts: LayoutCheckOptions = { sharedDirs: base.sharedDirs, dataDirs: base.dataDirs, isTestFile: (f) => base.isTestFile(f), sourceExtensions: base.sourceExtensions, ignoreDirs: base.ignoreDirs, wiringFiles: base.wiringFiles, fileFindings: base.fileFindings };
+	// a shared dir the generator made (config/, tests/ in an older manifest) is the framework's, never shared app code:
+	// the layout doc, layout.sharedDirs (placement, the tidy review, units' write rules) and both checks leave it out,
+	// and its files are never layout findings. Read from the stack's project in the workspace, else the checked one.
+	let home: string | undefined;
+	const framework = (projectDir?: string) => {
+		home ??= root ? workspaceProject(root, adapter) : undefined;
+		const at = home ?? projectDir;
+		return at ? generatorDirs(at, base.sharedDirs) : [];
+	};
+	const sharedOf = (projectDir?: string) => {
+		const own = framework(projectDir);
+		return base.sharedDirs.filter((d) => !own.includes(d));
+	};
+	const optsFor = (projectDir: string): LayoutCheckOptions => {
+		const own = framework(projectDir);
+		return own.length ? { ...opts, sharedDirs: sharedOf(projectDir), dataDirs: [...(base.dataDirs ?? []), ...own] } : opts;
+	};
 	const layout = {
 		...base,
 		moduleDir: (area: string) => {
@@ -450,36 +497,59 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 		},
 		checkStructure: (files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext) => {
 			const r = rules();
-			if (r) return checkLayoutRules(files, moduleDir, area, projectDir, r, opts, ctx);
+			if (r) return checkLayoutRules(files, moduleDir, area, projectDir, r, optsFor(projectDir), ctx);
 			const own = base.checkStructure?.(files.filter((f) => !isWiringFile(f, base.wiringFiles)), moduleDir, area, projectDir, ctx) ?? [];
 			return own;
 		},
 		checkTree: (projectDir: string, only?: string[]) => {
 			const r = rules();
-			return r ? checkLayoutTree(projectDir, r, opts, only, scaffoldDirs(projectDir, r.moduleDir.split("/").slice(0, -1).join("/"))) : (base.checkTree?.(projectDir, only) ?? []);
+			return r ? checkLayoutTree(projectDir, r, optsFor(projectDir), only, scaffoldDirs(projectDir, r.moduleDir.split("/").slice(0, -1).join("/"))) : (base.checkTree?.(projectDir, only) ?? []);
 		},
 	};
 	// the adapter's own notes stay next to the layout written from layout.json
-	const doc = (r: LayoutRules) => [renderLayoutDoc(r, base.sharedDirs, base.testFileGlobs(expandModuleDir(r, "invoice"))), base.structureDoc.trim() && `Notes for this stack (where they name other folders or files than the layout above, the layout above wins):\n${base.structureDoc.trim()}`].filter(Boolean).join("\n\n");
+	const doc = (r: LayoutRules) => [renderLayoutDoc(r, sharedOf(), base.testFileGlobs(expandModuleDir(r, "invoice"))), base.structureDoc.trim() && `Notes for this stack (where they name other folders or files than the layout above, the layout above wins):\n${base.structureDoc.trim()}`].filter(Boolean).join("\n\n");
 	Object.defineProperty(layout, "structureDoc", { enumerable: true, get: () => (rules() ? doc(rules()!) : base.structureDoc) });
+	Object.defineProperty(layout, "sharedDirs", { enumerable: true, get: () => sharedOf() });
 	return { ...adapter, layout };
 }
 
 // ---- helpers ------------------------------------------------------------------------------------------------
 
+/** The stack's project in the workspace's target repo (init's projectDir), or undefined before there is a config. */
+function workspaceProject(root: string, adapter: TargetAdapter): string | undefined {
+	try {
+		const c = JSON.parse(readFileSync(join(root, CONFIG_FILE), "utf8")) as { target?: { path?: string; stacks?: string[] } };
+		if (!c.target?.path) return undefined;
+		const repo = resolve(root, c.target.path);
+		return c.target.stacks?.length === 1 ? repo : join(repo, adapter.subdir);
+	} catch {
+		return undefined;
+	}
+}
+
 /** A folder path with exactly one trailing slash (`src/Shared` → `src/Shared/`), so folder + file never run together. */
 export const slashed = (d: string) => d.replace(/\/*$/, "/");
+
+/** The project's first commit (what the official generator made), or undefined (no repo or no commit yet). */
+function firstCommit(dir: string): string | undefined {
+	try {
+		return execFileSync("git", ["-C", dir, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n").at(-1) || undefined;
+	} catch {
+		return undefined;
+	}
+}
+const gitOut = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 
 /**
  * Files of the project's first commit (what the official generator made) still as generated, relative to `dir`:
  * never drift. A scaffold file a unit changed is checked like any other.
  */
 export function scaffoldFiles(dir: string): string[] {
+	const first = firstCommit(dir);
+	if (!first) return [];
 	try {
-		const git = (args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-		const first = git(["rev-list", "--max-parents=0", "HEAD"]).trim().split("\n").at(-1)!;
-		const changed = new Set(git(["diff", "--name-only", "--relative", first]).split("\n").filter(Boolean));
-		return git(["ls-tree", "-r", "--name-only", first]).split("\n").filter((f) => f && !changed.has(f));
+		const changed = new Set(gitOut(dir, ["diff", "--name-only", "--relative", first]).split("\n").filter(Boolean));
+		return gitOut(dir, ["ls-tree", "-r", "--name-only", first]).split("\n").filter((f) => f && !changed.has(f));
 	} catch {
 		return [];
 	}
@@ -487,15 +557,41 @@ export function scaffoldFiles(dir: string): string[] {
 
 /** Dirs under `srcRoot` in the project's first commit (what the official generator made): never feature folders. */
 export function scaffoldDirs(dir: string, srcRoot: string): string[] {
+	const first = firstCommit(dir);
+	if (!first) return [];
 	try {
-		const first = execFileSync("git", ["-C", dir, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n").at(-1)!;
-		return execFileSync("git", ["-C", dir, "ls-tree", "-d", "--name-only", first, `${srcRoot}/`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+		return gitOut(dir, ["ls-tree", "-d", "--name-only", first, `${srcRoot}/`])
 			.split("\n")
 			.filter(Boolean)
 			.map((p) => p.split("/").at(-1)!);
 	} catch {
 		return [];
 	}
+}
+
+/** generatorDirs per project and list: the first commit never changes, so one lookup each. */
+const generated = new Map<string, string[]>();
+
+/**
+ * Those of `dirs` (project-relative, with a trailing slash) that the project's first commit (what the official
+ * generator made) already has as folders, such as config/ or tests/: the framework's folders, never shared app code.
+ */
+export function generatorDirs(dir: string, dirs: string[]): string[] {
+	if (!dirs.length) return [];
+	const key = `${dir}\0${dirs.join("\0")}`;
+	const hit = generated.get(key);
+	if (hit) return hit;
+	const first = firstCommit(dir);
+	if (!first) return []; // no project yet: asked again once there is one
+	let out: string[] = [];
+	try {
+		const have = new Set(gitOut(dir, ["ls-tree", "-d", "--name-only", first, "--", ...dirs.map((d) => d.replace(/\/+$/, ""))]).split("\n").filter(Boolean).map(slashed));
+		out = dirs.filter((d) => have.has(slashed(d)));
+	} catch {
+		/* unreadable first commit: no generator folders known */
+	}
+	generated.set(key, out);
+	return out;
 }
 
 /**

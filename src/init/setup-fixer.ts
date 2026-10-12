@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
@@ -11,7 +11,8 @@ import type { Ledger } from "../ledger/db.ts";
 import { commitAll, isRepoRoot, whitespaceOnly } from "../git.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { testCannotFail } from "./init.ts";
+import { strayDirs } from "../run/layout-check.ts";
+import { projectDir as stackDir, testCannotFail } from "./init.ts";
 
 /**
  * When a setup check fails (gate build/test on a fresh project, stack choices not installed), a model with tools
@@ -103,7 +104,7 @@ async function setupSession(o: { config: Config; root: string; adapter: TargetAd
 /** One model session that fixes the setup problem in the new project. */
 export const fixSetupWithModel: SetupFixer = async (o) => {
 	console.log(pc.cyan(`  ${o.adapter.id}: setup check failed; a model with tools is fixing it (attempt ${o.attempt})`));
-	return setupSession(o, "fix", `You set up a ${o.adapter.id} project so a migration tool can build and test code in it. Find the cause of the failure and fix it the way the tool's documentation says: install or configure what is missing, with the project's own package manager. Do not write app code or add source folders (${migratedCodeDirs(o.adapter).join(", ") || "the code folders"} are the migration's units' work): fix config, dependencies and tool files.`, `The setup check failed:\n${o.problem.slice(-4000)}\n\nFix it, then run the failing command yourself to confirm.`);
+	return setupSession(o, "fix", `You set up a ${o.adapter.id} project so a migration tool can build and test code in it. Find the cause of the failure and fix it the way the tool's documentation says: install or configure what is missing, with the project's own package manager. Do not write app code or add source folders (${migratedCodeDirs(o.adapter).join(", ") || "the code folders"} are the migration's units' work; new source files in a new folder are put back unless a config you keep points at them): fix config, dependencies and tool files. When the problem asks for app code (a shared client, helper or module), leave that part: the units write it where the layout says.`, `The setup check failed:\n${o.problem.slice(-4000)}\n\nFix it, then run the failing command yourself to confirm.`);
 };
 
 export type ProjectCreator = (o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; packages: Array<{ choice: string; option: string; packages: string[] }> }) => Promise<string | void>;
@@ -138,6 +139,7 @@ export const MAX_SETUP_PARKS = 2;
  * shared dirs. A setup fix may touch config, dependencies and tool files, never these: they are the units' work.
  */
 function migratedCodeDirs(adapter: TargetAdapter): string[] {
+	// (layout.sharedDirs leaves out a shared dir the generator made, such as config/: the framework's, not the units' code)
 	const dirs = [...adapter.layout.sharedDirs];
 	try {
 		const m = adapter.layout.moduleDir("zzarea");
@@ -156,13 +158,23 @@ function migratedCodeDirs(adapter: TargetAdapter): string[] {
  * folder that also holds the stack's own wiring (a config folder) is no reason to put back a feature registration.
  * New source files in the code folders are new app code: put back too, unless a file the fix keeps names them by
  * their path (a tool config loading a bootstrap file): then they are part of the fix, and putting them back would
- * leave main pointing at a missing file. Without the ledger, the folders decide.
+ * leave main pointing at a missing file. New source files in a folder outside the layout (`src/api/` next to the feature
+ * root, see strayDirs) or in a folder the fix made (`config/reports/`) are new app code too: a setup fix makes no
+ * source folders. Without the ledger, the folders decide.
  * Returns the paths put back (relative to the repo).
  */
 export function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter, migrated?: Set<string>): string[] {
 	const proj = relative(repo, projectDir);
 	const dirs = migratedCodeDirs(adapter);
 	const exts = adapter.layout.sourceExtensions ?? [];
+	const stray = strayDirs(projectDir, adapter);
+	// folders main already has (repo-relative): a new file outside them sits in a folder the fix made
+	let folders: Set<string> | undefined;
+	try {
+		folders = new Set(execFileSync("git", ["-C", repo, "ls-tree", "-r", "-d", "--name-only", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean));
+	} catch {
+		/* no commit yet: no folder is the fix's own */
+	}
 	const entries = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0");
 	const changes: Array<{ path: string; rel?: string; isNew: boolean; from?: string; undo: "always" | "newCode" | "keep" }> = [];
 	const relOf = (p: string) => (!proj ? p : p.startsWith(`${proj}/`) ? p.slice(proj.length + 1) : undefined);
@@ -180,7 +192,7 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 			changes.push({ path, isNew, undo: "keep" });
 			continue;
 		}
-		const inCodeDirs = dirs.some((d) => rel.startsWith(d));
+		const inCodeDirs = [...dirs, ...stray].some((d) => rel.startsWith(d)) || (isNew && !!folders && path.includes("/") && !folders.has(dirname(path)));
 		const newCode = isNew && inCodeDirs && (!exts.length || exts.some((x) => rel.endsWith(x)));
 		const guarded = (r: string) => adapter.layout.isTestFile(r) || (migrated ? migrated.has(r) : dirs.some((d) => r.startsWith(d)));
 		let undo: "always" | "newCode" | "keep" = guarded(rel) || (fromRel !== undefined && guarded(fromRel)) ? "always" : newCode ? "newCode" : "keep";
@@ -207,6 +219,23 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		undone.push(c.path);
 	}
 	return undone;
+}
+
+/**
+ * The adapter's probe test is the check's own file: a copy the model wrote to try the check (or one an earlier fix
+ * committed) is removed, so it never stays in the project as a test.
+ */
+function removeProbe(adapter: TargetAdapter, projectDir: string): void {
+	const probe = adapter.probeTest?.(projectDir);
+	if (!probe) return;
+	const at = join(projectDir, probe.path);
+	let text: string;
+	try {
+		text = readFileSync(at, "utf8").trim();
+	} catch {
+		return;
+	}
+	if ([probe.content, probe.failing].some((c) => c !== undefined && c.trim() === text)) rmSync(at, { force: true });
 }
 
 /**
@@ -258,7 +287,22 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 					execFileSync("git", ["-C", repo, "clean", "-fdq", "--", o.projectDir], { stdio: "pipe" }); // ignored dirs (installs) stay
 					return { sha: undefined, undone, changed: [], cannotFail };
 				}
-				const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
+				removeProbe(o.adapter, o.projectDir);
+				// another stack's project is never committed by this fix: its changes there are put back unless that
+				// stack's own fix is running (whose edits they may be)
+				const others = o.config.target.stacks.filter((s) => s !== key).map((s) => ({ s, dir: relative(repo, stackDir(o.config, s)) })).filter((x) => x.dir && !x.dir.startsWith(".."));
+				for (const x of others.filter((x) => !fixing.has(x.s))) {
+					const there = execFileSync("git", ["-C", repo, "status", "--porcelain", "-uall", "--", x.dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean).map((l) => l.slice(3));
+					if (!there.length) continue;
+					try {
+						execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", x.dir], { stdio: "pipe" });
+					} catch {
+						/* nothing of that project committed yet: only new files to remove */
+					}
+					execFileSync("git", ["-C", repo, "clean", "-fdq", "--", x.dir], { stdio: "pipe" });
+					undone.push(...there);
+				}
+				const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`, { exclude: others.map((x) => x.dir) });
 				const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
 				return { sha, undone, changed, cannotFail: undefined };
 			} catch (e: any) {
@@ -280,7 +324,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 			wasted();
 			return undefined;
 		}
-		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} test or migrated-code file(s) it changed: ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
+		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} file(s) it changed (tests, migrated code, another stack's project): ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
 		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
 		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });
 		if (!sha && !override) return (wasted(), undefined);

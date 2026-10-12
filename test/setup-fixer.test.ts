@@ -22,7 +22,8 @@ function stack(over: Partial<TargetAdapter> = {}) {
 		lint: () => ({ cmd: "true", args: [] }),
 		// the "old flag": always fails, like vitest 5 on --related
 		test: () => ({ cmd: "sh", args: ["-c", "echo 'Unknown option --related' >&2; exit 1"] }),
-		layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], isTestFile: (p: string) => /\.spec\./.test(p) },
+		layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], isTestFile: (p: string) => /\.spec\./.test(p), sourceExtensions: [".ts", ".tsx"], ignoreDirs: ["node_modules"] },
+		generatedFiles: [],
 		...over,
 	} as unknown as TargetAdapter;
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fixme"] }, models: {} });
@@ -95,12 +96,14 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		const { execFileSync } = await import("node:child_process");
 		const { existsSync, readFileSync } = await import("node:fs");
 		const { root, target, adapter, config } = stack({ id: "keepcode" } as never);
+		// the first commit is the generator's; the code folders come later
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "scaffold");
 		mkdirSync(join(target, "src", "features", "orders"), { recursive: true });
 		mkdirSync(join(target, "src", "shared"), { recursive: true });
 		writeFileSync(join(target, "src", "features", "orders", "orders.ts"), "export const a = 1;\n");
 		writeFileSync(join(target, "src", "features", "orders", "orders.spec.ts"), "expect(a).toBe(1)\n");
 		writeFileSync(join(target, "src", "shared", "money.ts"), "export const m = 1;\n");
-		ensureRepo(target, "migration/main", []);
 		commitAll(target, "init");
 		const ledger = new Ledger(":memory:");
 		// orders.ts holds an accepted unit's code (a move points to it); money.ts sits in the shared folder but no unit wrote it
@@ -134,6 +137,59 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		expect(report.changedFiles.sort()).toEqual(["lint.config.json", "src/shared/lint-bootstrap.ts", "src/shared/money.ts", "vitest.config.ts"]);
 		expect(report.undone.sort()).toEqual(["src/features/orders/extra.spec.ts", "src/features/orders/orders.spec.ts", "src/features/orders/orders.ts", "src/shared/helper.ts"]);
 		expect(report.said).toBe("added the vitest config");
+	});
+});
+
+describe("setup fixes during the run: no new source folders", () => {
+	it("new code in a new folder next to the feature root (src/api/) is put back; a top-level wiring file and the dependency stay", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { execFileSync } = await import("node:child_process");
+		const { existsSync } = await import("node:fs");
+		const { root, target, adapter, config } = stack({ id: "nostray" } as never);
+		writeFileSync(join(target, "package.json"), "{}\n");
+		writeFileSync(join(target, "src", "main.tsx"), "import './icons'\n");
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "scaffold");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "package.json"), JSON.stringify({ dependencies: { highcharts: "12" } }));
+			writeFileSync(join(o.projectDir, "src", "highcharts.ts"), "export {};\n");
+			writeFileSync(join(o.projectDir, "src", "main.tsx"), "import './highcharts'\nimport './icons'\n");
+			// the reviewer asked for "the shared client in src/api": app code, not setup
+			mkdirSync(join(o.projectDir, "src", "api"), { recursive: true });
+			writeFileSync(join(o.projectDir, "src", "api", "client.ts"), "export const apiFetch = 1;\n");
+			writeFileSync(join(o.projectDir, "src", "api", "index.ts"), "export * from './client';\n");
+			return "installed highcharts and added the client in src/api";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "highcharts missing; provide the client in src/api", fixer })).toBeTruthy();
+		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim().split("\n").sort()).toEqual(["package.json", "src/highcharts.ts", "src/main.tsx"]);
+		expect(existsSync(join(target, "src", "api", "client.ts"))).toBe(false);
+	});
+});
+
+describe("setup fixes during the run: a folder the fix made holds no app code", () => {
+	it("new code in a new folder inside the framework's config/ is put back; a bootstrap file a kept config names stays", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { execFileSync } = await import("node:child_process");
+		const { existsSync } = await import("node:fs");
+		const { root, target, adapter, config } = stack({ id: "noconfigcode" } as never);
+		mkdirSync(join(target, "config", "packages"), { recursive: true });
+		writeFileSync(join(target, "config", "packages", "framework.ts"), "export {};\n");
+		writeFileSync(join(target, "lint.json"), "{}\n");
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "scaffold");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "lint.json"), JSON.stringify({ bootstrap: "config/lint-bootstrap.ts" }));
+			writeFileSync(join(o.projectDir, "config", "lint-bootstrap.ts"), "export {};\n");
+			writeFileSync(join(o.projectDir, "config", "packages", "cache.ts"), "export {};\n");
+			mkdirSync(join(o.projectDir, "config", "reports"), { recursive: true });
+			writeFileSync(join(o.projectDir, "config", "reports", "queue-factory.ts"), "export class QueueFactory {}\n");
+			return "configured the linter";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "lint: bootstrap missing", fixer })).toBeTruthy();
+		expect(execFileSync("git", ["-C", target, "show", "--name-only", "--format=", "HEAD"], { encoding: "utf8" }).trim().split("\n").sort()).toEqual(["config/lint-bootstrap.ts", "config/packages/cache.ts", "lint.json"]);
+		expect(existsSync(join(target, "config", "reports", "queue-factory.ts"))).toBe(false);
 	});
 });
 
@@ -289,5 +345,31 @@ describe("the gate commands file belongs to the setup fixer", () => {
 		saveCommandOverride(root, "s1", "test", grep, "flag gone");
 		expect(kept.restore()).toBe(false);
 		expect(loadCommandOverrides(root, "s1").test).toEqual(grep);
+	});
+});
+
+describe("setup fixes during the run: one stack's fix stays in its own project", () => {
+	it("another stack's project is put back, not committed; the probe test copy is removed, also one committed earlier", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { execFileSync } = await import("node:child_process");
+		const { existsSync } = await import("node:fs");
+		const probe = { path: "src/probe.spec.txt", content: "expect(1 + 1).toBe(2)\n" };
+		const { root, target, adapter } = stack({ id: "web", probeTest: () => probe } as never);
+		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["web", "api"] }, models: {} });
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "scaffold");
+		for (const [f, t] of Object.entries({ "web/src/probe.spec.txt": probe.content, "api/config.yaml": "a: 1\n" })) (mkdirSync(join(target, f, ".."), { recursive: true }), writeFileSync(join(target, f), t));
+		commitAll(target, "leaked probe");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
+			writeFileSync(join(target, "api", "config.yaml"), "a: 2\n");
+			writeFileSync(join(target, "api", "app.en.yaml"), "x: y\n");
+			return "added the vitest config";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: join(target, "web"), problem: "vitest: no config", fixer })).toBe("added the vitest config");
+		expect(execFileSync("git", ["-C", target, "show", "--name-status", "--format=", "HEAD"], { encoding: "utf8" }).trim().split("\n").sort()).toEqual(["A\tweb/vitest.config.ts", "D\tweb/src/probe.spec.txt"]);
+		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+		expect(existsSync(join(target, "api", "app.en.yaml"))).toBe(false);
 	});
 });

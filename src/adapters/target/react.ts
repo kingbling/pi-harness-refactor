@@ -46,7 +46,7 @@ export const reactAdapter: TargetAdapter = {
 			question: "Styling",
 			default: "tailwind",
 			options: [
-				{ id: "tailwind", label: "Tailwind CSS", hint: "utility classes, no CSS files per component", docs: [{ name: "Tailwind CSS", url: "https://tailwindcss.com/docs" }], platform: { styling: "Tailwind utility classes; shared tokens in src/styles" }, packages: ["tailwindcss", "@tailwindcss/vite"] },
+				{ id: "tailwind", label: "Tailwind CSS", hint: "utility classes, no CSS files per component", docs: [{ name: "Tailwind CSS", url: "https://tailwindcss.com/docs" }], platform: { styling: "Tailwind utility classes; shared tokens in the shared dir" }, packages: ["tailwindcss", "@tailwindcss/vite"] },
 				{ id: "css-modules", label: "CSS Modules", hint: "one .module.css per component, Vite built-in", platform: { styling: "CSS Modules (*.module.css) per component" } },
 				{ id: "styled-components", label: "styled-components", hint: "CSS-in-JS", docs: [{ name: "styled-components", url: "https://styled-components.com/docs" }], platform: { styling: "styled-components per component" }, packages: ["styled-components"] },
 				{ id: "mui", label: "MUI (Material UI)", hint: "component kit + theme", docs: [{ name: "MUI", url: "https://mui.com/material-ui/getting-started/" }], platform: { styling: "MUI components + theme; sx prop for one-offs" }, packages: ["@mui/material", "@emotion/react", "@emotion/styled"] },
@@ -57,10 +57,10 @@ export const reactAdapter: TargetAdapter = {
 			question: "Server data / API client",
 			default: "tanstack-query",
 			options: [
-				{ id: "tanstack-query", label: "TanStack Query", hint: "caching, retries, mutations", docs: [{ name: "TanStack Query", url: "https://tanstack.com/query/latest/docs/framework/react/overview" }], platform: { data: "TanStack Query hooks over a typed fetch client (src/api)" }, packages: ["@tanstack/react-query"] },
-				{ id: "swr", label: "SWR", docs: [{ name: "SWR", url: "https://swr.vercel.app/docs/getting-started" }], platform: { data: "SWR hooks over a typed fetch client (src/api)" }, packages: ["swr"] },
-				{ id: "redux-toolkit", label: "Redux Toolkit + RTK Query", docs: [{ name: "Redux Toolkit", url: "https://redux-toolkit.js.org/introduction/getting-started" }], platform: { data: "RTK Query endpoints; store in src/store" }, packages: ["@reduxjs/toolkit", "react-redux"] },
-				{ id: "fetch", label: "Plain fetch hooks", hint: "no library", platform: { data: "hand-written hooks over a typed fetch client (src/api)" } },
+				{ id: "tanstack-query", label: "TanStack Query", hint: "caching, retries, mutations", docs: [{ name: "TanStack Query", url: "https://tanstack.com/query/latest/docs/framework/react/overview" }], platform: { data: "TanStack Query hooks over a typed fetch client in the shared dir" }, packages: ["@tanstack/react-query"] },
+				{ id: "swr", label: "SWR", docs: [{ name: "SWR", url: "https://swr.vercel.app/docs/getting-started" }], platform: { data: "SWR hooks over a typed fetch client in the shared dir" }, packages: ["swr"] },
+				{ id: "redux-toolkit", label: "Redux Toolkit + RTK Query", docs: [{ name: "Redux Toolkit", url: "https://redux-toolkit.js.org/introduction/getting-started" }], platform: { data: "RTK Query endpoints; one store in the shared dir" }, packages: ["@reduxjs/toolkit", "react-redux"] },
+				{ id: "fetch", label: "Plain fetch hooks", hint: "no library", platform: { data: "hand-written hooks over a typed fetch client in the shared dir" } },
 			],
 		},
 		{

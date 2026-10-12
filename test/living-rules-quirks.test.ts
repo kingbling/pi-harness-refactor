@@ -267,19 +267,19 @@ describe("tidy review", () => {
 		writeFileSync(join(proj, "src/features/flights/helper2.ts"), "export const x = 1;\n");
 		const client = new FakeModelClient({ chat: (req) => {
 			const sys = req.messages[0]!.content;
-			if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flight-slots.ts"], why: "name says nothing" }, { op: "move", from: ["src/features/flights/flights.service.ts"], to: ["src/list.tpl/x.ts"], why: "outside layout" }], conventions: [{ text: "Name helper files after the domain concept", why: "helper2.ts" }] } };
-			return { json: { id: "tidy", question: "Rename helper2.ts to flight-slots.ts?", options: [{ value: "apply", label: "Rename", hint: "" }, { value: "skip", label: "Keep", hint: "" }], recommended: "apply", opinion: "Clearer." } };
+			if (sys.includes("tidiness")) return { json: { changes: [{ op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flights-slots.service.ts"], why: "name says nothing" }, { op: "move", from: ["src/features/flights/flights.service.ts"], to: ["src/list.tpl/x.ts"], why: "outside layout" }, { op: "move", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/utils/slots.ts"], why: "the layout check refuses utils/" }], conventions: [{ text: "Name helper files after the domain concept", why: "helper2.ts" }] } };
+			return { json: { id: "tidy", question: "Rename helper2.ts to flights-slots.service.ts?", options: [{ value: "apply", label: "Rename", hint: "" }, { value: "skip", label: "Keep", hint: "" }], recommended: "apply", opinion: "Clearer." } };
 		} });
 		const d = { ledger, config, root, client };
 		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights", every: 2 })).reviewed).toBe(false);
 		const r = await maybeTidyReview(d, { stackId: "nestjs", area: "flights", every: 2 });
-		expect(r).toMatchObject({ reviewed: true, asked: 1, proposals: 1 }); // the out-of-layout move is refused by code
+		expect(r).toMatchObject({ reviewed: true, asked: 1, proposals: 1 }); // the out-of-layout moves (outside the area, a path the layout check refuses) are refused by code
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
 		const q = ledger.openQuestions().find((x) => x.point === "tidy")!;
 		ledger.answerQuestion(q.id, "apply — Rename");
-		expect(tidyTaskCard(ledger, "nestjs", "flights")).toMatch(/rename: .*helper2.ts → .*flight-slots.ts/);
+		expect(tidyTaskCard(ledger, "nestjs", "flights")).toMatch(/rename: .*helper2.ts → .*flights-slots.service.ts/);
 		expect(completeTidyTasks(ledger, proj, "nestjs", "flights")).toEqual([]);
-		writeFileSync(join(proj, "src/features/flights/flight-slots.ts"), "export const x = 1;\n");
+		writeFileSync(join(proj, "src/features/flights/flights-slots.service.ts"), "export const x = 1;\n");
 		(await import("node:fs")).rmSync(join(proj, "src/features/flights/helper2.ts"));
 		expect(completeTidyTasks(ledger, proj, "nestjs", "flights")).toHaveLength(1);
 		expect(tidyTaskCard(ledger, "nestjs", "flights")).toBe("");
@@ -297,6 +297,86 @@ describe("tidy review", () => {
 		const r = await maybeTidyReview({ ledger, config, root, client }, { stackId: "nestjs", area: "money", shared: true, force: true });
 		expect(r.reviewed).toBe(true);
 		expect(seen).toContain("src/shared/money/amount.ts");
+	});
+});
+
+describe("tidy review: a source folder outside the layout", () => {
+	it("every review of the stack sees the stray folder and may move it into the shared dir; a second review does not ask again", async () => {
+		const { root, config, ledger } = setup();
+		const { maybeTidyReview, tidyTasks } = await import("../src/run/tidy.ts");
+		const { projectDir } = await import("../src/init/init.ts");
+		const proj = projectDir(config, "nestjs");
+		mkdirSync(join(proj, "src/shared/http"), { recursive: true });
+		mkdirSync(join(proj, "src/api"), { recursive: true });
+		mkdirSync(join(proj, "src/features/flights"), { recursive: true });
+		writeFileSync(join(proj, "src/shared/http/retry.ts"), "export const retry = 1;\n");
+		writeFileSync(join(proj, "src/api/client.ts"), "export const apiFetch = 1;\n");
+		writeFileSync(join(proj, "src/features/flights/flights.service.ts"), "export class FlightsService {}\n");
+		ledger.setMeta("drift:nestjs", "src/api/: outside the feature root, the shared dirs and the scaffold");
+		const prompts: string[] = [];
+		const move = { op: "move", from: ["src/api/client.ts"], to: ["src/shared/http/api-client.ts"], why: "shared client belongs in the shared dir" };
+		const client = new FakeModelClient({ chat: (req) => {
+			const text = req.messages.map((m) => m.content).join("\n");
+			if (req.messages[0]!.content.includes("tidiness")) return (prompts.push(text), { json: { changes: [move], conventions: [] } });
+			return { json: { id: "tidy", question: "Move the client?", options: [{ value: "apply", label: "Move", hint: "" }, { value: "skip", label: "Keep", hint: "" }], recommended: "apply", opinion: "Yes." } };
+		} });
+		const d = { ledger, config, root, client };
+		// a feature's review too: an area that reviews often gets src/api moved even when no shared topic is reviewed again
+		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights", force: true })).asked).toBe(1);
+		expect(prompts[0]).toContain("src/api/client.ts");
+		expect(tidyTasks(ledger, "nestjs", "flights")[0]).toMatchObject({ from: ["src/api/client.ts"], to: ["src/shared/http/api-client.ts"] });
+		// another shared topic proposes the same files elsewhere: already pending, not asked again
+		mkdirSync(join(proj, "src/shared/dates"), { recursive: true });
+		writeFileSync(join(proj, "src/shared/dates/format.ts"), "export const f = 1;\n");
+		move.to = ["src/shared/dates/api-client.ts"];
+		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "dates", shared: true, force: true })).asked).toBe(0);
+	});
+});
+
+describe("tidy review: what it may propose", () => {
+	const answer = { json: { id: "tidy", question: "Do it?", options: [{ value: "apply", label: "Do it", hint: "" }, { value: "skip", label: "Keep", hint: "" }], recommended: "apply", opinion: "Yes." } };
+	it("a valid rename is still asked when the area's folder misses a required file (that finding is not the rename's)", async () => {
+		const { root, config, ledger } = setup();
+		const { saveLayoutRules, normalize } = await import("../src/rules/layout-rules.ts");
+		saveLayoutRules(root, "nestjs", normalize({ moduleDir: "src/features/{area}", files: [{ path: "{area}.module.ts", doc: "module" }, { path: "{area}.service.ts", doc: "service" }, { path: "{area}-{name}.service.ts", doc: "second service" }, { path: "{name}.ts", doc: "other" }], require: ["{area}.module.ts"] }));
+		const was = process.env["BR_WORKSPACE"];
+		process.env["BR_WORKSPACE"] = root;
+		try {
+			const { maybeTidyReview } = await import("../src/run/tidy.ts");
+			const { projectDir } = await import("../src/init/init.ts");
+			const proj = projectDir(config, "nestjs");
+			mkdirSync(join(proj, "src/features/flights"), { recursive: true });
+			writeFileSync(join(proj, "src/features/flights/flights.service.ts"), "export class FlightsService {}\n");
+			writeFileSync(join(proj, "src/features/flights/helper2.ts"), "export const x = 1;\n");
+			const rename = { op: "rename", from: ["src/features/flights/helper2.ts"], to: ["src/features/flights/flights-slots.service.ts"], why: "name says nothing" };
+			const client = new FakeModelClient({ chat: (req) => (req.messages[0]!.content.includes("tidiness") ? { json: { changes: [rename], conventions: [] } } : answer) });
+			expect((await maybeTidyReview({ ledger, config, root, client }, { stackId: "nestjs", area: "flights", force: true })).asked).toBe(1);
+		} finally {
+			if (was === undefined) delete process.env["BR_WORKSPACE"];
+			else process.env["BR_WORKSPACE"] = was;
+		}
+	});
+	it("a note nothing uses may be deleted, code never; new drift in an area brings its review at the next accept, the same drift does not", async () => {
+		const { root, config, ledger } = setup();
+		const { maybeTidyReview, tidyTasks, tidyMissing } = await import("../src/run/tidy.ts");
+		const { projectDir } = await import("../src/init/init.ts");
+		const proj = projectDir(config, "nestjs");
+		mkdirSync(join(proj, "src/features/flights"), { recursive: true });
+		writeFileSync(join(proj, "src/features/flights/flights.service.ts"), "export class FlightsService {}\n");
+		writeFileSync(join(proj, "src/features/flights/README.md"), "notes for other units\n");
+		ledger.setMeta("drift:nestjs", "src/features/flights/README.md: not an allowed file in the feature folder");
+		const changes = [
+			{ op: "delete", from: ["src/features/flights/README.md"], to: [], why: "a handoff note, not code" },
+			{ op: "delete", from: ["src/features/flights/flights.service.ts"], to: [], why: "code is never deleted" },
+		];
+		let reviews = 0;
+		const client = new FakeModelClient({ chat: (req) => (req.messages[0]!.content.includes("tidiness") ? (reviews++, { json: { changes, conventions: [] } }) : answer) });
+		const d = { ledger, config, root, client };
+		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights" })).asked).toBe(1); // first accept, but drift it has not seen
+		expect(tidyTasks(ledger, "nestjs", "flights")[0]).toMatchObject({ op: "delete", from: ["src/features/flights/README.md"], to: [] });
+		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights" })).reviewed).toBe(false);
+		expect(reviews).toBe(1);
+		expect(tidyMissing(proj, tidyTasks(ledger, "nestjs", "flights")[0]!)).toEqual(["src/features/flights/README.md still exists"]);
 	});
 });
 

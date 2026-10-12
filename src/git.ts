@@ -81,11 +81,12 @@ export function isRepoRoot(path: string): boolean {
 	}
 }
 
-export function commitAll(path: string, message: string, opts: { allowEmpty?: boolean } = {}): string | undefined {
+/** `exclude`: repo-relative folders left out of the commit (another stack's project). */
+export function commitAll(path: string, message: string, opts: { allowEmpty?: boolean; exclude?: string[] } = {}): string | undefined {
 	// never commit a parent repo's files: a target folder inside another checkout is not ours to commit
 	if (!isRepoRoot(path)) throw new Error(`${path} is not the top of its own git repo; refusing to commit there`);
-	git(path, ["add", "-A"]);
-	if (!opts.allowEmpty && !isDirty(path) && git(path, ["diff", "--cached", "--name-only"]).length === 0) return undefined;
+	git(path, ["add", "-A", ...(opts.exclude?.length ? ["--", ".", ...opts.exclude.map((d) => `:(exclude)${d}`)] : [])]);
+	if (!opts.allowEmpty && (opts.exclude?.length || !isDirty(path)) && git(path, ["diff", "--cached", "--name-only"]).length === 0) return undefined;
 	git(path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message, ...(opts.allowEmpty ? ["--allow-empty"] : [])]);
 	return headOf(path);
 }

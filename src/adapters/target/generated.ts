@@ -575,6 +575,9 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 			return `scaffold failed (${m.scaffold.cmd} ${m.scaffold.args.join(" ")}):\n${String(e?.message ?? e)}`;
 		}
 		if (!a.toolchain.isProjectReady(dir)) return `scaffold ran but ${m.scaffold.readyFile} is missing in the generated project (files: ${existsSync(dir) ? readdirSync(dir).join(", ") : "none"})`;
+		// the run counts a shared dir the generator made as the framework's (layout-rules generatorDirs): never shared app code
+		const made = (m.layout.sharedDirs ?? []).filter((d) => existsSync(join(dir, d)));
+		if (made.length) return `layout.sharedDirs ${made.join(", ")}: the generator already made ${made.length > 1 ? "these folders" : "this folder"}, so ${made.length > 1 ? "they are" : "it is"} the framework's own, not shared app code. Give one folder for app code that several feature areas use, next to the feature folders (e.g. src/Shared/).`;
 		const probe = m.probeTest;
 		mkdirSync(dirname(join(dir, probe.path)), { recursive: true });
 		writeFileSync(join(dir, probe.path), probe.content);
