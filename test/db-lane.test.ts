@@ -201,6 +201,19 @@ describe("DB lane", () => {
 		expect(offline.dropped).toBe(0);
 	});
 
+	it("a model reply that judged no table is used once but not saved: the next plan asks again", async () => {
+		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
+		const ledger = new Ledger(":memory:");
+		let calls = 0;
+		const client = new FakeModelClient({ chat: (req) => (JSON.stringify(req.schema ?? {}).includes('"databases"') ? (calls++, { json: { databases: [], tables: [] } }) : undefined) });
+		const r = await planDbLane(ledger, config, { client, root: ws });
+		expect(calls).toBe(1);
+		expect(r.tables).toBe(4); // grouped by name, as without a model
+		expect(ledger.getMeta("db_tables_judged")).toBeUndefined();
+		await planDbLane(ledger, config, { client, root: ws });
+		expect(calls).toBe(2);
+	});
+
 	it("migration lane: schema units + data unit, code units wait on their tables, data slice right after foundation; survives re-inventory", async () => {
 		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
 		const ledger = new Ledger(":memory:");

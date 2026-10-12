@@ -1,5 +1,39 @@
-import { describe, expect, it } from "vitest";
-import { isCapacityError, isTransientError, promptWithRecovery } from "../src/sessions/spawn.ts";
+import { describe, expect, it, vi } from "vitest";
+import { ConfigSchema } from "../src/config.ts";
+import { isCapacityError, isTransientError, promptWithRecovery, spawnLeaf } from "../src/sessions/spawn.ts";
+
+// A fake Pi session for spawnLeaf: each prompt() plays the next scripted list of assistant messages to the subscriber.
+const pi = vi.hoisted(() => ({ turns: [] as Array<Array<Record<string, unknown>>>, models: [] as string[], prompts: [] as string[] }));
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+	DefaultResourceLoader: class {
+		async reload() {}
+	},
+	getAgentDir: () => "/nonexistent-agent-dir",
+	SessionManager: { inMemory: () => ({}) },
+	createAgentSession: async () => {
+		let listener: ((ev: unknown) => void) | undefined;
+		return {
+			session: {
+				subscribe: (fn: (ev: unknown) => void) => ((listener = fn), () => (listener = undefined)),
+				prompt: async (p: string) => {
+					pi.prompts.push(p);
+					for (const m of pi.turns.shift() ?? []) listener?.({ type: "message_end", message: { role: "assistant", content: [], ...m } });
+				},
+				setModel: async (m: { provider: string }) => void pi.models.push(m.provider),
+				abort() {},
+				dispose() {},
+			},
+		};
+	},
+}));
+// Codex serves the role first (so a provider switch is possible); the role's flex tier makes a tier switch possible
+vi.mock("../src/models/codex.ts", () => ({
+	CODEX_PROVIDER: "openai-codex",
+	modelRuntime: async () => ({ getModel: (provider: string, id: string) => ({ provider, id, samplingParams: {} }) }),
+	resolveCodexModel: async (id: string) => ({ provider: "openai-codex", id }),
+	openRouterCost: async () => undefined,
+	priceAt: () => undefined,
+}));
 
 /** Scripted Pi session: each send() ends with the next scripted assistant error (undefined = clean turn). */
 function scripted(errors: Array<string | undefined>) {
@@ -103,5 +137,43 @@ describe("session error recovery", () => {
 		expect(providerSwitches).toBe(0);
 		expect(s.tierSwitches()).toBe(0);
 		expect(s.sent).toEqual(["TASK"]);
+	});
+});
+
+describe("spawnLeaf: only the last assistant message's error counts", () => {
+	const config = ConfigSchema.parse({ source: { path: "/nonexistent-legacy", stack: "php" }, target: { path: "/nonexistent-new", stacks: ["nestjs"] }, models: {} });
+	const run = async (turns: Array<Array<Record<string, unknown>>>) => {
+		pi.turns = turns;
+		pi.models = [];
+		pi.prompts = [];
+		const off = process.env["BR_NO_LLM"];
+		delete process.env["BR_NO_LLM"];
+		try {
+			const s = await spawnLeaf({ role: "implement", cwd: "/nonexistent-cwd", config, writeGlobs: [], systemPrompt: "x" });
+			try {
+				return await s.run("TASK");
+			} finally {
+				s.dispose();
+			}
+		} finally {
+			if (off !== undefined) process.env["BR_NO_LLM"] = off;
+		}
+	};
+	const rateLimited = { stopReason: "error", errorMessage: "429 Too Many Requests: rate limit exceeded" };
+	const done = { stopReason: "stop", content: [{ type: "text", text: "done" }] };
+
+	it("a 429 that Pi's own retry gets past (a later good message) switches no provider and no tier", async () => {
+		const r = await run([[rateLimited, done]]);
+		expect(r.error).toBeUndefined();
+		expect(r.text).toBe("done");
+		expect(pi.models).toEqual([]);
+		expect(pi.prompts).toEqual(["TASK"]);
+	});
+
+	it("a 429 that stays the last message still moves to the fallback provider", async () => {
+		const r = await run([[done, rateLimited], [done]]);
+		expect(r.error).toBeUndefined();
+		expect(pi.models).toEqual(["openrouter"]);
+		expect(pi.prompts).toEqual(["TASK", "TASK"]);
 	});
 });

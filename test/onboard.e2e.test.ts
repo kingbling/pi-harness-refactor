@@ -1,8 +1,17 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { AdapterGaveUpError } from "../src/adapters/target/generated.ts";
 import type { InitPrompter, PromptOption } from "../src/init/init.ts";
 import { onboard } from "../src/init/onboard.ts";
+import { MissingToolsError } from "../src/init/toolchain-install.ts";
+
+// the trial build of a generated adapter, scripted per test (default: the real one)
+const verify = vi.hoisted(() => ({ fail: undefined as (() => Error) | undefined }));
+vi.mock("../src/adapters/target/generated.ts", async (importOriginal) => {
+	const real = await importOriginal<typeof import("../src/adapters/target/generated.ts")>();
+	return { ...real, verifyPendingAdapters: async (...a: Parameters<typeof real.verifyPendingAdapters>) => (verify.fail ? Promise.reject(verify.fail()) : real.verifyPendingAdapters(...a)) };
+});
 import { Ledger } from "../src/ledger/db.ts";
 import { ensureRepo, commitAll } from "../src/git.ts";
 
@@ -104,4 +113,69 @@ describe("br onboard (e2e, offline)", () => {
 		const d = JSON.parse(readFileSync(join(ws, ".bigrefactor", "decisions.json"), "utf8"));
 		expect(Object.keys(d.answers).length).toBeGreaterThan(0);
 	}, 120_000);
+
+	it("an error outside any step (here: a config that does not load) ends onboarding as failed, never as done", async () => {
+		const ws = join(here, ".sim", "onboard-outside-step");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(ws, { recursive: true });
+		writeFileSync(join(ws, "bigrefactor.config.json"), "{ not json");
+		const lines: string[] = [];
+		const r = await onboard({ root: ws, args: ["--yes", "--no-llm"], log: (l) => lines.push(l) });
+		expect(r.ok).toBe(false);
+		expect(r.steps.map((s) => `${s.name}:${s.status}`)).toEqual(["init:skipped", "onboarding:failed"]);
+		expect(lines.at(-1)).toMatch(/onboarding stopped at "onboarding"/);
+	});
+
+	describe("a generated adapter that cannot be made to work", () => {
+		// a stack picked during the questions: its adapter was written, its trial build runs after the last question
+		const pickGenerated = (ws: string) => {
+			const cmd = { cmd: "true", args: [] };
+			const m = {
+				id: "go-x", role: "server", subdir: "api", aliases: [], docs: [], scaffold: { ...cmd, readyFile: "go.mod" }, postScaffold: [], build: cmd, lint: cmd, test: cmd, verified: false,
+				toolchain: { ecosystem: "go", packageName: "^[\\w./-]+", packageExamples: [], manifestFiles: ["go.mod"], installed: { file: "", keys: [] }, add: cmd, worktreeLinks: [], ignoredPaths: [] },
+				layout: { moduleDir: "internal/{area}", structureDoc: "-", sharedDirs: ["internal/shared/"], testFileGlobs: ["{moduleDir}/*_test.go"], testFileRegex: "_test\\.go$", sourceExtensions: [".go"], langByExtension: {}, skipMarker: "t\\.Skip", interfaceHint: "-", testHint: "-", legacyMarker: "// LEGACY: {why}", dataAccessHint: "", ignoreDirs: [], wiringFiles: [] },
+				platform: {}, stackChoices: [], protectedGlobs: [], patternKinds: ["handler"], probeTest: { path: "x_test.go", content: "" }, detect: { file: "go.mod", contains: "module" },
+			};
+			mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+			writeFileSync(join(ws, ".bigrefactor", "adapters", "go-x.json"), JSON.stringify(m));
+			const cfgPath = join(ws, "bigrefactor.config.json");
+			const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+			cfg.target.stacks = ["go-x"];
+			cfg.target.choices = { "go-x": {} };
+			writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+			const decPath = join(ws, ".bigrefactor", "decisions.json");
+			const d = JSON.parse(readFileSync(decPath, "utf8"));
+			d.answers["target:server"] = { answer: "go-x", by: "human (onboard)", at: new Date().toISOString() };
+			writeFileSync(decPath, JSON.stringify(d, null, 2));
+		};
+		const read = (ws: string) => ({ config: JSON.parse(readFileSync(join(ws, "bigrefactor.config.json"), "utf8")), answers: JSON.parse(readFileSync(join(ws, ".bigrefactor", "decisions.json"), "utf8")).answers });
+
+		it("repairs that gave up: the stack question opens again and the stack leaves the config; missing tools keep the choice", async () => {
+			const { ws } = workspace("onboard-adapter-gave-up");
+			expect((await onboard({ root: ws, args: [...baseArgs(ws), "--yes"], log: () => {} })).ok).toBe(true);
+			pickGenerated(ws);
+			try {
+				// nothing left to decide: setup proves the pending adapter first. Tools missing on this machine: the owner installs them and resumes, the choice stands
+				verify.fail = () => new MissingToolsError("go-x", ["go"]);
+				const tools = await onboard({ root: ws, args: [...baseArgs(ws), "--yes"], log: () => {} });
+				expect(tools.ok).toBe(false);
+				expect(tools.steps.find((s) => s.status === "failed")).toMatchObject({ name: "setup", note: expect.stringMatching(/needs go/) });
+				expect(read(ws).answers["target:server"].answer).toBe("go-x");
+				expect(read(ws).config.target.stacks).toEqual(["go-x"]);
+
+				// the model's repairs failed too: forgotten, so a resume asks the stack question again
+				verify.fail = () => new AdapterGaveUpError("go-x", "server", "the build still fails");
+				const gaveUp = await onboard({ root: ws, args: [...baseArgs(ws), "--yes"], log: () => {} });
+				expect(gaveUp.ok).toBe(false);
+				expect(gaveUp.steps.find((s) => s.status === "failed")).toMatchObject({ name: "setup", note: expect.stringMatching(/no working go-x adapter/) });
+				const after = read(ws);
+				expect(after.answers["target:server"]).toBeUndefined();
+				expect(after.config.target.stacks).not.toContain("go-x");
+				expect(after.config.target.stacks).toHaveLength(1);
+				expect(after.config.target.choices["go-x"]).toBeUndefined();
+			} finally {
+				verify.fail = undefined;
+			}
+		}, 120_000);
+	});
 });

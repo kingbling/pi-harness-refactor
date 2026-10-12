@@ -1,3 +1,7 @@
+import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { Ledger, LedgerError } from "../src/ledger/db.ts";
 
@@ -102,5 +106,25 @@ describe("ledger invariants", () => {
 		const why = l.why("src/Dead.php::Dead::run");
 		expect(why?.kind).toBe("symbol");
 		expect(why && why.kind === "symbol" ? why.transitions.at(-1)?.reason : "").toMatch(/dead code/);
+	});
+});
+
+describe("ledger shared between processes", () => {
+	it("a write while another process holds the lock waits for it instead of failing at once", async () => {
+		const path = join(mkdtempSync(join(tmpdir(), "br-ledger-")), "ledger.sqlite");
+		new Ledger(path).close();
+		const l = new Ledger(path);
+		expect(l.db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 10_000 });
+		// another process takes the write lock, says so, and lets go after a moment
+		const holder = spawn(process.execPath, ["-e", `const { DatabaseSync } = require("node:sqlite"); const db = new DatabaseSync(${JSON.stringify(path)}); db.exec("BEGIN IMMEDIATE"); db.exec("INSERT INTO meta(key, value) VALUES ('held', '1')"); console.log("locked"); setTimeout(() => { db.exec("COMMIT"); db.close(); }, 400);`]);
+		const exited = new Promise((r) => holder.on("exit", r));
+		await new Promise<void>((r) => holder.stdout.on("data", (d) => String(d).includes("locked") && r()));
+		const t0 = Date.now();
+		l.setMeta("mine", "2");
+		expect(Date.now() - t0).toBeGreaterThan(100);
+		expect(l.getMeta("held")).toBe("1");
+		expect(l.getMeta("mine")).toBe("2");
+		l.close();
+		await exited;
 	});
 });
