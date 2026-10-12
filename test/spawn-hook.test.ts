@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { bashDeletesOutside, bashTouchesReadOnly, thinkingLevelOf } from "../src/sessions/spawn.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { bashDeletesOutside, bashTouchesReadOnly, sessionLimits, thinkingLevelOf } from "../src/sessions/spawn.ts";
 
 /**
  * The inline tool_call guard is what keeps the source repo read-only for roles that have bash.
@@ -60,5 +60,47 @@ describe("bash deletes stay inside the session's folder", () => {
 		expect(bashDeletesOutside("find . -name '*.tmp' -delete", cwd)).toBeUndefined();
 		expect(bashDeletesOutside("rm /work/.bigrefactor/truth/u7/cases.php", cwd, (abs) => abs.startsWith("/work/.bigrefactor/truth/u7/"))).toBeUndefined();
 		expect(bashDeletesOutside("ls ../../ && cat ../x", cwd)).toBeUndefined();
+	});
+});
+
+describe("runaway control inside a model session (run.maxUnitTokens, run.idleMs)", () => {
+	afterEach(() => vi.useRealTimers());
+	const limits = (maxTokens = 250_000, idleMs = 600_000) => {
+		const stops: string[] = [];
+		return { stops, l: sessionLimits({ maxTokens, idleMs, onStop: (why) => stops.push(why) }) };
+	};
+
+	it("stops once when the fresh tokens go over the limit", () => {
+		vi.useFakeTimers();
+		const { stops, l } = limits(1000);
+		l.used(900);
+		expect(l.stopped()).toBeUndefined();
+		l.used(1200);
+		l.used(5000); // the abort takes a moment: further usage does not stop it again
+		expect(stops).toEqual(["budget: the session used 1200 tokens, over run.maxUnitTokens (1000)"]);
+		expect(l.stopped()).toMatch(/^budget/);
+		l.end();
+	});
+
+	it("stops after idleMs without activity; any session event starts the clock over", () => {
+		vi.useFakeTimers();
+		const { stops, l } = limits(250_000, 60_000);
+		vi.advanceTimersByTime(59_000);
+		l.active(); // a streamed token, a tool start or end
+		vi.advanceTimersByTime(59_000);
+		expect(stops).toEqual([]);
+		vi.advanceTimersByTime(2_000);
+		expect(stops).toEqual(["idle_timeout: no model or tool activity for 60s"]);
+		l.active(); // late events after the stop do not start a new clock
+		vi.advanceTimersByTime(120_000);
+		expect(stops).toHaveLength(1);
+	});
+
+	it("a session that ended never stops later", () => {
+		vi.useFakeTimers();
+		const { stops, l } = limits(250_000, 1_000);
+		l.end();
+		vi.advanceTimersByTime(10_000);
+		expect(stops).toEqual([]);
 	});
 });

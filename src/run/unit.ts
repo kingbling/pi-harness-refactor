@@ -97,6 +97,19 @@ export interface UnitRunResult {
 	costUsd: number;
 }
 
+/**
+ * Ported tests that pass before any code for the unit exists do not call its code (an `expect(true)` with the case id
+ * in its name): the tester gets one go at them (`retest`). Still green, the returned note goes to the reviewer; behaviour
+ * an earlier unit of the area already wrote can make them legitimately green, so it never fails the unit by itself.
+ */
+export async function testsGreenBefore(o: { files: () => string[]; pass: (files: string[]) => Promise<boolean>; retest: (why: string) => Promise<void> }): Promise<string | undefined> {
+	const why = () => `These ported test files pass before any code for this unit exists, so they do not call the code in interface.md: ${o.files().join(", ")}.`;
+	if (!(await o.pass(o.files()))) return undefined;
+	await o.retest(`${why()} Make each test call the code in interface.md and assert the case's expected value, so it fails until that code exists.`);
+	if (!(await o.pass(o.files()))) return undefined;
+	return `${why()} The tester was asked once to fix them and they still pass: check in weakTests that each one really calls this unit's code.`;
+}
+
 export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const unit = o.ledger.getUnit(o.unitId);
@@ -460,17 +473,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
 		}
 	}
-	// tests that pass before any code for this unit exists do not call its code (an `expect(true)` with the case id in
-	// its name): the tester gets one go at them. Still green, the reviewer is told; behaviour an earlier unit of the
-	// area already wrote can make it legitimately green, so it never fails the unit by itself
-	let greenBefore: string | undefined;
-	const implementedBefore = o.ledger.db.prepare("SELECT 1 FROM attempts WHERE unit_id = ? AND role IN ('implement', 'escalate') LIMIT 1").get(o.unitId);
-	if (testFiles.length && !o.gate && !implementedBefore && (await testsPass(targetProjectDir, adapter, testFiles.map((t) => t.path)))) {
-		const why = `These ported test files pass before any code for this unit exists, so they do not call the code in interface.md: ${testFiles.map((t) => t.path).join(", ")}.`;
-		log(pc.yellow("  ported tests pass before any code exists: the tester makes them call the unit's code"));
-		if (await runTruth(`${why} Make each test call the code in interface.md and assert the case's expected value, so it fails until that code exists.`, true)) testFiles = loadTests();
-		if (await testsPass(targetProjectDir, adapter, testFiles.map((t) => t.path))) greenBefore = `${why} The tester was asked once to fix them and they still pass: check in weakTests that each one really calls this unit's code.`;
-	}
+	const implementedBefore = !!o.ledger.db.prepare("SELECT 1 FROM attempts WHERE unit_id = ? AND role IN ('implement', 'escalate') LIMIT 1").get(o.unitId);
+	const greenBefore =
+		testFiles.length && !o.gate && !implementedBefore
+			? await testsGreenBefore({
+					files: () => testFiles.map((t) => t.path),
+					pass: (files) => testsPass(targetProjectDir, adapter, files),
+					retest: async (why) => {
+						log(pc.yellow("  ported tests pass before any code exists: the tester makes them call the unit's code"));
+						if (await runTruth(why, true)) testFiles = loadTests();
+					},
+				})
+			: undefined;
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");
 
 	// ---- implement → gate → triage loop ----------------------------------------------------------

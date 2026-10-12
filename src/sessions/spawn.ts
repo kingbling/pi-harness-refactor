@@ -241,6 +241,35 @@ export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "gl
 	return `${reason}. ${where} Otherwise ${report}.`;
 }
 
+/**
+ * Runaway control inside one model session: fresh tokens (input + output, cache reads excluded) over `maxTokens`, or
+ * no model or tool activity for `idleMs`, stops it once (`onStop` with the reason). What it wrote still goes to the gate.
+ */
+export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (why: string) => void }) {
+	let stopped: string | undefined;
+	const stop = (why: string) => {
+		if (stopped) return;
+		stopped = why;
+		o.onStop(why);
+	};
+	let idle: ReturnType<typeof setTimeout> | undefined;
+	const active = () => {
+		clearTimeout(idle);
+		if (!stopped) idle = setTimeout(() => stop(`idle_timeout: no model or tool activity for ${Math.round(o.idleMs / 1000)}s`), o.idleMs);
+	};
+	active();
+	return {
+		/** Any session event: the idle clock starts over. */
+		active,
+		/** The session's fresh tokens so far. */
+		used: (tokens: number) => {
+			if (tokens > o.maxTokens) stop(`budget: the session used ${tokens} tokens, over run.maxUnitTokens (${o.maxTokens})`);
+		},
+		stopped: () => stopped,
+		end: () => clearTimeout(idle),
+	};
+}
+
 export interface LeafSession {
 	run(prompt: string): Promise<{ text: string; toolCalls: number; blocked: number; usage: { input: number; output: number; cost: number }; error?: string }>;
 	dispose(): void;
@@ -340,23 +369,13 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 			let text = "";
 			let error: string | undefined;
 			const usage = { input: 0, output: 0, cost: 0 };
-			// runaway control inside a session: fresh tokens (cache reads excluded) above run.maxUnitTokens, or no
-			// model or tool activity for run.idleMs, ends it; what it wrote still goes to the gate as an attempt
-			let stopped: string | undefined;
-			const stop = (why: string) => {
-				if (stopped) return;
-				stopped = why;
-				record({ type: "session_stopped", why });
-				session.abort();
-			};
-			let idle: ReturnType<typeof setTimeout> | undefined;
-			const stillActive = () => {
-				clearTimeout(idle);
-				idle = setTimeout(() => stop(`idle_timeout: no model or tool activity for ${Math.round(opts.config.run.idleMs / 1000)}s`), opts.config.run.idleMs);
-			};
-			stillActive();
+			const limits = sessionLimits({
+				maxTokens: opts.config.run.maxUnitTokens,
+				idleMs: opts.config.run.idleMs,
+				onStop: (why) => (record({ type: "session_stopped", why }), session.abort()),
+			});
 			const unsub = session.subscribe((ev: any) => {
-				stillActive();
+				limits.active();
 				if (ev.type === "message_end" && ev.message?.role === "assistant") {
 					const m = ev.message;
 					text = (m.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
@@ -367,7 +386,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 						const codex = m.provider === CODEX_PROVIDER;
 						const usd = (codex ? priceAt(orCost, m.usage) : undefined) ?? m.usage.cost?.total ?? 0;
 						usage.cost += usd;
-						if (usage.input + usage.output > opts.config.run.maxUnitTokens) stop(`budget: the session used ${usage.input + usage.output} tokens, over run.maxUnitTokens (${opts.config.run.maxUnitTokens})`);
+						limits.used(usage.input + usage.output);
 						progress.agentUsage(agentId, { costUsd: usd, tokensIn: m.usage.input ?? 0, tokensOut: m.usage.output ?? 0 });
 						recordSpend(usd, `session: ${roleName} ${agentLabel}`, `${m.provider ?? "openrouter"}/${m.model ?? role.id}`, { subscription: codex });
 					}
@@ -396,17 +415,17 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 					toDefaultTier: role.tier !== "default" ? async () => session.setModel(await resolveRoleModel({ ...role, tier: "default" })) : undefined,
 					tier: role.tier,
 					record,
-					aborting: () => progress.aborting || !!stopped,
+					aborting: () => progress.aborting || !!limits.stopped(),
 				});
 			} catch (e: any) {
 				error = e?.message ?? String(e);
 				record({ type: "prompt_error", error });
 			} finally {
-				clearTimeout(idle);
+				limits.end();
 				unsub();
 				progress.agentEnd(agentId);
 			}
-			if (stopped) error = stopped;
+			if (limits.stopped()) error = limits.stopped();
 			if (progress.aborting && !error) error = "stopped by the user";
 			record({ type: "run_end", toolCalls, blocked, usage, error });
 			return { text, toolCalls, blocked, usage, error };
