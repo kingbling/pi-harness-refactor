@@ -25,13 +25,20 @@ export function pushRemote(repo: string, preferred?: string): string | undefined
 	return remotes.includes("origin") ? "origin" : remotes.length === 1 ? remotes[0] : undefined;
 }
 
+/** git without a password prompt: a remote that needs one fails instead of hanging. */
+const noPrompt = () => ({ ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: process.env["GIT_SSH_COMMAND"] ?? "ssh -o BatchMode=yes" });
+
 function pushOnce(repo: string, remote: string, branch: string): Promise<string | undefined> {
 	return new Promise((res) => {
-		execFile("git", ["-C", repo, "push", "--quiet", remote, `${branch}:${branch}`], { timeout: 120_000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: process.env["GIT_SSH_COMMAND"] ?? "ssh -o BatchMode=yes" } }, (err, _out, stderr) =>
-			res(err ? String(stderr || err.message).trim().split("\n").slice(-2).join(" ") : undefined),
+		execFile("git", ["-C", repo, "push", "--quiet", remote, `${branch}:${branch}`], { timeout: 120_000, env: noPrompt() }, (err, _out, stderr) =>
+			// git's own "hint:" lines are advice for a person at a terminal, not the error
+			res(err ? String(stderr || err.message).trim().split("\n").filter((l) => !/^hint:/.test(l)).slice(-2).join(" ") : undefined),
 		);
 	});
 }
+
+/** git refused because the remote branch has commits this repo does not have (another history, or someone pushed). */
+const rejected = (err: string) => /\[rejected\]|non-fast-forward|fetch first/.test(err);
 
 export interface Pusher {
 	afterMerge(): void;
@@ -75,7 +82,14 @@ export function createPusher(o: { config: Config; root: string; log: (l: string)
 					return;
 				}
 				dirty = true; // try again with the next merge
-				if (err !== lastError) o.log(pc.yellow(`push to ${remote} failed: ${err}`));
+				if (err !== lastError)
+					o.log(
+						pc.yellow(
+							rejected(err)
+								? `push to ${remote} refused: its ${branch} has commits this repo does not have. br push replace overwrites it with this repo's ${branch}; br push off stops pushing`
+								: `push to ${remote} failed: ${err}`,
+						),
+					);
 				lastError = err;
 			})
 			.finally(() => {
@@ -105,20 +119,41 @@ export function createPusher(o: { config: Config; root: string; log: (l: string)
 	};
 }
 
-/** `br push [on|off] [remote]`: show or change the setting. */
+/** `br push [on|off] [remote]`: show or change the setting. `br push replace`: overwrite the remote branch once. */
 export function pushSetting(configPath: string, args: string[]): string {
 	const { config, root } = loadConfig(configPath);
 	const [mode, remote] = args;
+	if (mode === "replace") return replaceRemote(config);
 	if (mode === "on" || mode === "off") {
 		config.target.git.push = mode;
 		// a URL becomes a remote of the target repo (as onboarding does), so git and the owner see it
 		if (remote) config.target.git.remote = isUrl(remote) ? addRemote(config.target.path, remote) : remote;
 		config.target.git.pushAskedAt = new Date().toISOString(); // the owner decided: onboarding never asks (or overwrites) again
 		saveConfig(root, config);
-	} else if (mode) throw new Error("usage: br push [on|off] [remote]");
+	} else if (mode) throw new Error("usage: br push [on|off] [remote] | br push replace");
 	const g = config.target.git;
 	const found = pushRemote(config.target.path, g.remote);
 	return `push ${g.push}: ${mainBranch(config.target.path, g.branch)} → ${found ?? (g.remote ? `${g.remote} (no such remote in ${config.target.path})` : `no remote in ${config.target.path}`)}${g.push === "on" ? " (after merges, at most once a minute, and when a run ends)" : ""}\nchange: br push on|off [remote]  ·  in Pi: /br push on|off [remote]`;
+}
+
+/**
+ * The owner's call when the remote branch has another history: this repo's branch replaces it. Only what was
+ * there a moment ago is overwritten (--force-with-lease): a push that lands in between is refused, not lost.
+ */
+function replaceRemote(config: Config): string {
+	const repo = config.target.path;
+	const g = config.target.git;
+	const remote = pushRemote(repo, g.remote);
+	if (!remote) throw new Error(`no remote in ${repo}; br push on <url> first`);
+	const branch = mainBranch(repo, g.branch);
+	const run = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"], env: noPrompt() }).trim();
+	try {
+		const there = run(["ls-remote", "--heads", remote, branch]).split(/\s/)[0] ?? "";
+		run(["push", "--quiet", `--force-with-lease=refs/heads/${branch}:${there}`, remote, `${branch}:${branch}`]);
+		return `replaced ${branch} on ${remote}${there ? ` (was ${there.slice(0, 8)})` : ""} with this repo's ${branch} (${run(["rev-parse", "--short", branch])})`;
+	} catch (e: any) {
+		throw new Error(String(e?.stderr || e?.message || e).trim().split("\n").filter((l) => !/^hint:/.test(l)).slice(-2).join(" "));
+	}
 }
 
 /** Adds (or points) a remote at `url`: origin, unless origin goes elsewhere; returns its name. */

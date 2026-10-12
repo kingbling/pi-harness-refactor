@@ -51,6 +51,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br status                    ledger dashboard
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
   br push [on|off] [remote]    push the migration branch to the target repo's remote after merges
+  br push replace              overwrite the remote's migration branch with this repo's (when push says it has another history)
   br forecast                  how far the migration is: done, open, spend and time left (with range)
   br questions | answer <id> <text>   open human questions (nothing unrelated waits on them)
   br why <symbol|path>         full history of one symbol or file

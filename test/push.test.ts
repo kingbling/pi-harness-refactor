@@ -76,6 +76,25 @@ describe("pushing to the target's remote", () => {
 		expect(() => pushSetting(cfgPath, ["maybe"])).toThrow(/usage/);
 	});
 
+	it("a remote branch with another history: the log says so and how to fix it; br push replace overwrites it", async () => {
+		const { root, target, bare, config, cfgPath } = setup(true);
+		// another repo pushed its own migration/main there first
+		const other = join(root, "other");
+		mkdirSync(other);
+		ensureRepo(other, "migration/main", []);
+		writeFileSync(join(other, "b.txt"), "x\n");
+		commitAll(other, "other history");
+		git(other, ["push", "-q", bare, "migration/main"]);
+		pushSetting(cfgPath, ["on"]);
+		const logs: string[] = [];
+		const p = createPusher({ config, root, log: (l) => logs.push(l), everyMs: 0 });
+		p.afterMerge();
+		await p.finish();
+		expect(logs.join("\n")).toMatch(/refused: .*br push replace/);
+		expect(pushSetting(cfgPath, ["replace"])).toMatch(/replaced migration\/main on origin \(was \w{8}\)/);
+		expect(git(bare, ["rev-parse", "migration/main"])).toBe(git(target, ["rev-parse", "HEAD"]));
+	});
+
 	it("a URL as the remote: an existing config pushes to it as it is; br push on <url> adds it as origin", async () => {
 		const { root, target, bare, config, cfgPath } = setup(false);
 		git(root, ["init", "-q", "--bare", bare]);

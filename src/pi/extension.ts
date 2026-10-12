@@ -45,7 +45,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	check: "what bigrefactor needs here (Pi packages, logins, the stacks' tools) and what is missing",
 	forecast: "how far the migration is: done, open, spend and time left",
 	lanes: "lanes [n] [gates m]: show/change parallel units live (running units finish)",
-	push: "push [on|off] [remote]: push the migration branch to the target repo's remote after merges",
+	push: "push [on|off] [remote] | replace: push the migration branch to the target repo's remote after merges; replace overwrites a remote branch with another history",
 	why: "why <id|path>: full history of a symbol or file",
 	unaccounted: "symbols not yet in a terminal state",
 	questions: "open questions waiting for you (list)",
