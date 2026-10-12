@@ -189,3 +189,30 @@ describe("/br answer: many questions summed up in one card", () => {
 		}
 	});
 });
+
+describe("a card answers only what is still open", () => {
+	it("a question the run answered while its card was open is left alone; the rest get the owner's answer", async () => {
+		const root = mkdtempSync(join(tmpdir(), "br-race-"));
+		const ledger = new Ledger(join(root, "ledger.sqlite"));
+		const ask = () => ledger.askQuestion({ point: "gate_env", question: "The database is down. What now?", options: ["retry — Retry", "leave — Leave it"], context: {}, blocks: "none", askedBy: "t" });
+		const [a, b] = [ask(), ask()];
+		const ctx = {
+			ui: {
+				custom: (factory: any) =>
+					new Promise((resolve) => {
+						factory({ requestRender() {}, terminal: { rows: 40 } }, {}, {}, resolve);
+						// the env came back while the owner was reading: the run settles one of them itself
+						ledger.answerQuestion(a, "retry — Retry", "run");
+						resolve("leave — Leave it");
+					}),
+			},
+		};
+		const { answerGroup } = await import("../src/pi/extension.ts");
+		const done: string[] = [];
+		expect(await answerGroup(ctx as any, ledger, [ledger.getQuestion(a)!, ledger.getQuestion(b)!], "q", "human", done)).toBe("answered");
+		expect(ledger.getQuestion(a)!.answer).toBe("retry — Retry");
+		expect(ledger.getQuestion(b)!.answer).toBe("leave — Leave it");
+		expect(done).toEqual([`#${b} = leave — Leave it`]);
+		ledger.close();
+	});
+});

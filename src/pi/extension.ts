@@ -112,8 +112,11 @@ export async function answerGroup(ctx: ExtensionContext, ledger: Ledger, qs: Que
 	}
 	const answer = pick === TYPE ? (await askCard(ctx, { message: q.question, text: { initial: "" } }))?.trim() : pick;
 	if (!answer) return "skipped";
-	for (const x of qs) ledger.answerQuestion(x.id, pick === TYPE ? answer : optionFor(x, answer), by);
-	done.push(`#${qs.map((x) => x.id).join(", #")} = ${answer}`);
+	// the run may have answered some while the card was open (e.g. an env change settles a gate_env question): leave those
+	const still = qs.filter((x) => ["open", "auto"].includes(ledger.getQuestion(x.id)?.status ?? ""));
+	if (!still.length) return "skipped";
+	for (const x of still) ledger.answerQuestion(x.id, pick === TYPE ? answer : optionFor(x, answer), by);
+	done.push(`#${still.map((x) => x.id).join(", #")} = ${answer}`);
 	return "answered";
 }
 
@@ -534,19 +537,25 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			const askOnTheSide = async () => {
 				if (!ctx.hasUI) return;
 				const asked = new Set<string>();
-				for (;;) {
-					const now = decisionGate(ledger, loadConfig(cp).config, source, targets, root);
-					// blocking decisions first, biggest block first
-					const next = [...now.scoped.sort((a, b) => b.units.length - a.units.length).map((x) => x.decision), ...now.free].find((d) => !asked.has(d.id));
-					if (!next || progress.stopping) return;
-					asked.add(next.id);
-					const ui = piPrompter(ctx, []);
-					const v = await ui.select(`decision while the run continues — ${decisionPrompt(next)}`, next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), next.recommended);
-					if (v === undefined) {
-						progress.log(`decision ${next.id} skipped: its units stay blocked (/br decide later)`);
-						continue;
+				// its own handle: a dialog still open when the run ends (and closes the run's ledger) must still be able to save
+				const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+				try {
+					for (;;) {
+						const now = decisionGate(ledger, loadConfig(cp).config, source, targets, root);
+						// blocking decisions first, biggest block first
+						const next = [...now.scoped.sort((a, b) => b.units.length - a.units.length).map((x) => x.decision), ...now.free].find((d) => !asked.has(d.id));
+						if (!next || runDone || progress.stopping) return;
+						asked.add(next.id);
+						const ui = piPrompter(ctx, []);
+						const v = await ui.select(`decision while the run continues — ${decisionPrompt(next)}`, next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), next.recommended);
+						if (v === undefined) {
+							progress.log(`decision ${next.id} skipped: its units stay blocked (/br decide later)`);
+							continue;
+						}
+						progress.log(`decided ${next.id} = ${v}  ${applyDecision(ledger, loadConfig(cp).config, root, next.id, v, "human (pi, during run)")}`);
 					}
-					progress.log(`decided ${next.id} = ${v}  ${applyDecision(ledger, loadConfig(cp).config, root, next.id, v, "human (pi, during run)")}`);
+				} finally {
+					ledger.close();
 				}
 			};
 			// Questions the resolver model could not settle (context.forOwner) come up as cards while the run goes on;
@@ -567,7 +576,12 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 						}
 						for (const q of qs) shown.add(q.id);
 						const why = JSON.parse(qs[0]!.context!).forOwner as string;
-						if ((await answerGroup(ctx, ledger, qs, `question while the run continues (${why})`, "human (pi, during run)", done)) === "quit") {
+						// one group failing must not end the cards for the rest of the run
+						const r = await answerGroup(ctx, ledger, qs, `question while the run continues (${why})`, "human (pi, during run)", done).catch((e) => {
+							progress.log(`question #${qs.map((x) => x.id).join(", #")} not saved: ${e?.message ?? e}`);
+							return "skipped" as const;
+						});
+						if (r === "quit") {
 							progress.log("question cards off for this run: /br answer answers the rest");
 							return;
 						}

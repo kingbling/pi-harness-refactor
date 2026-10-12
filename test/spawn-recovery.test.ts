@@ -95,4 +95,13 @@ describe("session error recovery", () => {
 		expect(await promptWithRecovery({ prompt: "TASK", ...b.opts, aborting: () => true })).toBe("terminated");
 		expect(b.sent).toHaveLength(1);
 	});
+
+	it("a user stop on Codex never moves the prompt to OpenRouter or the default tier", async () => {
+		const s = scripted(["Request was aborted"]);
+		let providerSwitches = 0;
+		expect(await promptWithRecovery({ prompt: "TASK", ...s.opts, toFallbackProvider: async () => void providerSwitches++, aborting: () => true })).toBe("Request was aborted");
+		expect(providerSwitches).toBe(0);
+		expect(s.tierSwitches()).toBe(0);
+		expect(s.sent).toEqual(["TASK"]);
+	});
 });

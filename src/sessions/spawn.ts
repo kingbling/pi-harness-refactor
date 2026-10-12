@@ -130,6 +130,8 @@ export async function promptWithRecovery(o: {
 	const backoff = o.backoffMs ?? [15_000, 60_000];
 	await o.send(o.prompt);
 	let error = o.takeError();
+	// the user stopped it: no other provider or tier, never the prompt again
+	if (o.aborting?.()) return error;
 	// Codex failed for any reason but a network drop (usage limit, auth, capacity, model missing): OpenRouter takes
 	// over in the same session, same prompt — with its own tier recovery below.
 	if (error && o.toFallbackProvider && !isTransientError(error)) {
@@ -137,6 +139,7 @@ export async function promptWithRecovery(o: {
 		await o.toFallbackProvider();
 		await o.send(o.prompt);
 		error = o.takeError();
+		if (o.aborting?.()) return error;
 	}
 	// Flex capacity errors surface as an assistant error message, not an exception. The provider never
 	// falls back on its own, so the orchestrator does: same session, same prompt, standard tier, once.
@@ -298,6 +301,9 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 
 	return {
 		async run(prompt) {
+			// counts are per prompt: blocked calls from an earlier run() never terminate this one
+			toolCalls = 0;
+			blocked = 0;
 			let text = "";
 			let error: string | undefined;
 			const usage = { input: 0, output: 0, cost: 0 };
@@ -315,7 +321,8 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 						progress.agentUsage(agentId, { costUsd: usd, tokensIn: m.usage.input ?? 0, tokensOut: m.usage.output ?? 0 });
 						recordSpend(usd, `session: ${roleName} ${agentLabel}`, `${m.provider ?? "openrouter"}/${m.model ?? role.id}`, { subscription: codex });
 					}
-					if (m.stopReason === "error" || m.errorMessage) error = m.errorMessage ?? "assistant message ended with error";
+					// a later good message (Pi's own retry got through) clears an earlier error: only the last one counts
+					error = m.stopReason === "error" || m.errorMessage ? (m.errorMessage ?? "assistant message ended with error") : undefined;
 					record({ type: "assistant", text, stopReason: m.stopReason, error: m.errorMessage, usage: m.usage, toolCalls: (m.content ?? []).filter((c: any) => c.type === "toolCall").map((c: any) => ({ name: c.name, args: c.arguments })) });
 				} else if (ev.type === "tool_execution_end") {
 					record({ type: "tool_result", toolCallId: ev.toolCallId, name: ev.toolName, isError: ev.isError, text: ev.result?.content?.map((c: any) => c.text).join("\n").slice(0, 2000) });

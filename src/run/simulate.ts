@@ -251,7 +251,9 @@ function fakeGate(plan: Script[string], attemptsSeen: Map<string, number>) {
 		const n = attemptsSeen.get(`${g.unitId}:implement`) ?? 0;
 		const esc = attemptsSeen.get(`${g.unitId}:escalate`) ?? 0;
 		const fail = (name: GateReport["steps"][number]["name"], output: string): GateReport => {
-			const steps = real.steps.filter((s) => !["build_ok", "lint_ok", "rules_ok", "ported_tests_green"].includes(s.name) || s.name < name);
+			// scripted steps in gate order: keep the ones before the failed step (by position, not by name)
+			const order: string[] = ["build_ok", "lint_ok", "rules_ok", "ported_tests_green"];
+			const steps = real.steps.filter((s) => !order.includes(s.name) || order.indexOf(s.name) < order.indexOf(name));
 			// remove evidence the real gate recorded for scripted-failed steps and later ones
 			g.ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('build_ok','lint_ok','rules_ok','ported_tests_green')").run(g.unitId);
 			for (const s of steps) if (s.ok && ["build_ok", "lint_ok", "rules_ok"].includes(s.name) && s.name !== name) g.ledger.addEvidence(g.unitId, s.name, { simulated: true });
