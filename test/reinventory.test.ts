@@ -68,4 +68,21 @@ describe("re-inventory", () => {
 		expect(ledger.checkInvariants().ok).toBe(true);
 		ledger.close();
 	}, 60_000);
+
+	it("keeps the dep of a unit that waits for a bug fix in another unit", async () => {
+		const ws = join(here, ".sim", "reinv-waits");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await inventory(config, ws, ledger);
+		const [waiter, owner] = ledger.listUnits({ state: "planned" }).map((u) => u.id);
+		// as the run does when the waiter reports a bug in the owner's code
+		ledger.addEvidence(owner!, "bug_reported", { by: waiter, reports: [] });
+		ledger.db.prepare("UPDATE units SET deps = json_insert(deps, '$[#]', ?) WHERE id = ?").run(owner!, waiter!);
+		await inventory(config, ws, ledger);
+		expect(JSON.parse(ledger.getUnit(waiter!)!.deps)).toContain(owner);
+		ledger.close();
+	}, 60_000);
 });

@@ -29,7 +29,7 @@ import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDir
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals } from "../jev/ask.ts";
-import { RESOLVER, resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
+import { MODEL_ANSWERERS, resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
 import { findTests } from "./ported.ts";
@@ -1336,7 +1336,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		}
 		if (meta.healQuestion) {
 			// the owner's answer: retry (with any hint they typed) gives the unit a fresh set of tries; leave keeps it.
-			// The resolver model's retry is one more try, not a fresh set: its answers on the same failure would
+			// A model's retry (resolver, fix, code or layout job) is one more try, not a fresh set: its answers on the same failure would
 			// otherwise put a unit back forever
 			const q = ledger.getQuestion(meta.healQuestion);
 			if (!q || (q.status !== "answered" && q.status !== "auto")) continue;
@@ -1345,7 +1345,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
 				continue;
 			}
-			const byModel = q.answered_by === RESOLVER;
+			const byModel = MODEL_ANSWERERS.includes(q.answered_by ?? "");
 			backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? "the resolver model" : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "resolver's" : "owner's"} hint: ${a.hint}` : ""}`, failure);
 			back.push(r.id);
 			continue;

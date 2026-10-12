@@ -49,6 +49,29 @@ describe("ledger invariants", () => {
 		expect(l.getSymbol("src/A.php::A::calc")!.state).toBe("tested");
 	});
 
+	it("a symbol re-proved with another outcome moves through in_progress; a refused prove keeps the earlier move", () => {
+		const l = seed();
+		l.createUnit({ id: "U1", tier: "T1", symbolIds: ["src/A.php::A::calc"] });
+		l.prove({ unitId: "U1", srcSymbol: "src/A.php::A::calc", op: "moved", targetSymbols: ["src/a.ts::calc"], why: "port" });
+		l.prove({ unitId: "U1", srcSymbol: "src/A.php::A::calc", op: "dropped", why: "the view does it now" });
+		expect(l.getSymbol("src/A.php::A::calc")!.state).toBe("dropped");
+		l.prove({ unitId: "U1", srcSymbol: "src/A.php::A::calc", op: "moved", targetSymbols: ["src/a.ts::calc"], why: "needed after all" });
+		expect(l.getSymbol("src/A.php::A::calc")!.state).toBe("mapped");
+		l.transitionSymbol("src/A.php::A::calc", "quarantined", "test");
+		expect(() => l.prove({ unitId: "U1", srcSymbol: "src/A.php::A::calc", op: "dropped", why: "x" })).toThrow(/illegal/);
+		expect(l.movesOf("src/A.php::A::calc").map((m) => m.op)).toEqual(["moved"]);
+	});
+
+	it("first-pass accepted counts units with one implementer attempt (tester and reviewer attempts aside)", () => {
+		const l = seed();
+		l.createUnit({ id: "U1", tier: "T1", symbolIds: [] });
+		for (const role of ["test", "implement", "review"]) l.startAttempt("U1", role);
+		l.db.prepare("UPDATE units SET state = 'accepted'").run();
+		expect(l.status().firstPassAccepted).toBe(1);
+		l.startAttempt("U1", "escalate");
+		expect(l.status().firstPassAccepted).toBe(0);
+	});
+
 	it("unit acceptance requires all gate evidence and proof for every symbol", () => {
 		const l = seed();
 		l.createUnit({ id: "U1", tier: "T1", symbolIds: ["src/A.php::A::calc", "src/A.php::A::fmt"] });

@@ -42,7 +42,9 @@ export function decisionGate(ledger: Ledger, config: Config, source: SourceAdapt
 				)
 				.all(`${path}::${cls}`, `${path}::${cls}::%`, `${path}::${cls}`, `${path}::${cls}::%`) as Array<{ u: string }>
 		).map((r) => r.u);
-	const unitsWhere = (sql: string): string[] => (ledger.db.prepare(`SELECT id FROM units WHERE state = 'planned' AND ${sql}`).all() as Array<{ id: string }>).map((r) => r.id);
+	// every unit, not only planned ones: the blocks are cached until decisions.json changes, and a unit re-opened
+	// meanwhile must still wait (the scheduler only starts planned units anyway)
+	const unitsWhere = (sql: string): string[] => (ledger.db.prepare(`SELECT id FROM units WHERE ${sql}`).all() as Array<{ id: string }>).map((r) => r.id);
 
 	for (const d of open) {
 		if (GLOBAL.test(d.id)) {
@@ -90,10 +92,16 @@ export function liveBlocks(ledger: Ledger, config: Config, source: SourceAdapter
 			/* no decisions file yet */
 		}
 		if (m !== seen) {
-			seen = m;
-			const g = decisionGate(ledger, config, source, targets, root);
-			current = g.blocked;
-			onChange?.(g);
+			// the file counts as read only once the blocks are recomputed: a slip (the ledger busy while `br decide`
+			// writes) keeps the last blocks and tries again on the next loop
+			try {
+				const g = decisionGate(ledger, config, source, targets, root);
+				current = g.blocked;
+				seen = m;
+				onChange?.(g);
+			} catch {
+				/* tried again next loop */
+			}
 		}
 		return current;
 	};

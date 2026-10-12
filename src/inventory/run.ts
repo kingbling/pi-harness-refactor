@@ -347,6 +347,9 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		unitIds.push(id);
 		const symbolIds = comp.flatMap((p) => fileOf.get(p)!.symbols.map((s) => s.id));
 		const deps = [...(cond.deps.get(ci) ?? [])].map((d) => compUnit.get(d)).filter((x): x is string => !!x);
+		// a unit that reported a bug in another unit's code waits for that fix (a dep the run added): kept
+		for (const r of ledger.db.prepare("SELECT DISTINCT e.unit_id u FROM evidence e JOIN units o ON o.id = e.unit_id WHERE e.type = 'bug_reported' AND json_extract(e.payload, '$.by') = ?").all(id) as Array<{ u: string }>)
+			if (r.u !== id && !deps.includes(r.u)) deps.push(r.u);
 		const dyn = comp.flatMap((p) => fileOf.get(p)!.dynamicMarkers);
 		const existing = ledger.getUnit(id);
 		const unitMeta = { files: comp, loc: comp.reduce((a, p) => a + fileOf.get(p)!.loc, 0), dynamic_markers: dyn, queries: comp.reduce((a, p) => a + fileOf.get(p)!.queries.length, 0), cutDeps: [...new Set(comp.flatMap((p) => cutFrom.get(p) ?? []))].filter((t) => !comp.includes(t)).sort(), ambiguous: Object.fromEntries(comp.flatMap((p) => [...(ambiguousOf.get(p) ?? [])]).slice(0, 20).map(([n, fs]) => [n, fs.slice(0, 8)])) };

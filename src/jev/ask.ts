@@ -164,6 +164,8 @@ export async function repoBrief(d: AskDeps, opts: { force?: boolean } = {}): Pro
 		brief = res.text.trim();
 		costUsd += res.usage.costUsd;
 	}
+	// an empty reply (refusal, cut-off) is not saved: the next call writes the brief again instead of reusing nothing
+	if (!brief) return { brief, costUsd };
 	mkdirSync(dirname(p), { recursive: true });
 	writeFileSync(p, BRIEF_MARK + brief + "\n");
 	return { brief, costUsd };

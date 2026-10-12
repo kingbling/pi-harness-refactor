@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { RESOLVER, resolveOpenQuestions, type Resolver } from "../src/jev/resolve.ts";
@@ -107,6 +107,53 @@ describe("resolver model before the owner", () => {
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, pluginChangedAt: later });
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, pluginChangedAt: later });
 		expect(calls).toBe(1);
+	});
+});
+
+describe("resolver failures and shared problems", () => {
+	const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+
+	it("a failed resolver call leaves the question open and tries again later; the owner gets it only after a few failures", async () => {
+		const { MAX_RESOLVER_FAILURES } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const q = ledger.askQuestion({ point: "budget", question: "cap", options: ["retry — retry"], askedBy: "orchestrator" });
+		let calls = 0;
+		const resolver: Resolver = async () => (calls++, Promise.reject(new Error("429 rate limited")));
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			for (let i = 1; i <= MAX_RESOLVER_FAILURES; i++) {
+				await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+				await resolveOpenQuestions({ ledger, config, root: "/r", resolver }); // waits: no second call right away
+				expect(calls).toBe(i);
+				vi.setSystemTime(Date.now() + i * 5 * 60_000 + 1);
+			}
+		} finally {
+			vi.useRealTimers();
+		}
+		const ctx = JSON.parse(ledger.getQuestion(q)!.context!);
+		expect(ctx.forOwner).toMatch(/429 rate limited \(3 times\)/);
+	});
+
+	it("tries on a problem several units share are counted per problem, not per unit", async () => {
+		const { MAX_RESOLVER_TRIES } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const resolver: Resolver = async () => ({ answer: "retry", why: "w" });
+		let last = 0;
+		for (let i = 0; i <= MAX_RESOLVER_TRIES; i++) {
+			ledger.createUnit({ id: `u${i}`, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+			last = ledger.askQuestion({ unitId: `u${i}`, point: "gate_env", question: "lint fails", options: ["retry — retry"], context: { sameAs: "lint:missing-config" }, askedBy: "orchestrator" });
+			await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+		}
+		expect(JSON.parse(ledger.getQuestion(last)!.context!).forOwner).toMatch(/came back/);
+	});
+
+	it("a key that names its own unit never joins another unit's question", async () => {
+		const { sameQuestion } = await import("../src/jev/same.ts");
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		ledger.askQuestion({ unitId: "u1", point: "parity", question: "differs", context: { sameAs: "parity:u1" }, askedBy: "parity" });
+		const client = { chat: async () => { throw new Error("no model call expected"); } } as never;
+		expect(await sameQuestion({ ledger, config, client }, ["parity"], "parity:u2", "differs", "u2")).toEqual({ costUsd: 0 });
 	});
 });
 

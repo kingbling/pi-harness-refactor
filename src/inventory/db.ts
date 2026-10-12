@@ -361,6 +361,7 @@ export async function findTablesByModel(config: Config, root: string, o: { spawn
 		},
 	} as unknown as ToolDefinition;
 	let cost = 0;
+	let failed = false;
 	let session: Awaited<ReturnType<typeof spawnLeaf>> | undefined;
 	try {
 		session = await (o.spawn ?? spawnLeaf)({
@@ -374,12 +375,21 @@ export async function findTablesByModel(config: Config, root: string, o: { spawn
 		});
 		const r = await session.run(`Schema inputs the owner gave: ${config.db.schemaFiles.join(", ") || "none"}.\nList every table with record_tables, then end with one line.`);
 		cost += r.usage.cost;
-		if (r.error) o.log?.(`  db tables: the session ended with an error (${r.error})`);
+		if (r.error) {
+			failed = true;
+			o.log?.(`  db tables: the session ended with an error (${r.error})`);
+		}
 	} catch (e) {
 		o.log?.(`  db tables: no session (${(e as Error).message.split("\n")[0]}); the units get the raw schema files`);
 		return { tables: 0, costUsd: cost };
 	} finally {
 		session?.dispose();
+	}
+	// a failed or empty session is not saved: a saved list is reused while the inputs stay the same, and an empty
+	// one would plan a single unit for the whole schema
+	if (failed || !got.size) {
+		o.log?.(`  db tables: the model found no tables${failed ? " (the session failed)" : ""}; asked again next time`);
+		return { tables: 0, costUsd: cost };
 	}
 	const data: FoundTables = { at: new Date().toISOString(), inputs: config.db.schemaFiles, tables: [...got.values()].sort((a, b) => a.name.localeCompare(b.name)) };
 	writeFileSync(foundTablesPath(root), JSON.stringify(data, null, 2) + "\n");
@@ -432,15 +442,27 @@ const DDL_START = new RegExp(String.raw`^\s*(?:create\s+(?:temporary\s+)?table\s
 /** `USE dbname;`: a dump of several databases switches with it (mysqldump --all-databases / --databases). */
 const USE_DB = /^\s*use\s+[\x60"\[]?(\w+)[\x60"\]]?\s*;/i;
 
+/** A batch separator line of SQL Server scripts (SSMS ends statements with it, not with `;`). */
+const GO_LINE = /^\s*go(?:\s+\d+)?\s*$/i;
+/** No table definition is this long: a statement still open past it never closed, and is cut there. */
+const MAX_STATEMENT = 256 * 1024;
+
 type Emit = (table: string, ddl: string, db: string | undefined) => void;
 
-/** Lines of SQL in order → DDL statements emitted whole, with the database they are in. `inStatement`: a statement is open. */
-function ddlLines(emit: Emit): { line: (line: string) => void; inStatement: () => boolean } {
+/** Lines of SQL in order → DDL statements emitted whole, with the database they are in. `inStatement`: a statement is open; `end` emits one still open at the end of the input. */
+function ddlLines(emit: Emit): { line: (line: string) => void; inStatement: () => boolean; end: () => void } {
 	let buf: string | undefined;
 	let table = "";
 	let db: string | undefined; // from the last USE line
 	let stmtDb: string | undefined;
+	const close = () => {
+		if (buf?.trim()) emit(table, buf.trimEnd(), stmtDb);
+		buf = undefined;
+	};
 	const line = (line: string) => {
+		// a statement without a trailing `;` ends at a GO line or where the next one starts
+		if (buf !== undefined && GO_LINE.test(line)) return close();
+		if (buf !== undefined && DDL_START.test(line)) close();
 		if (buf === undefined) {
 			const u = USE_DB.exec(line);
 			if (u) {
@@ -454,17 +476,15 @@ function ddlLines(emit: Emit): { line: (line: string) => void; inStatement: () =
 			stmtDb = m[1] ?? db;
 		}
 		buf += `${line}\n`;
-		if (/;\s*$/.test(line)) {
-			emit(table, buf.trimEnd(), stmtDb);
-			buf = undefined;
-		}
+		if (/;\s*$/.test(line) || buf.length > MAX_STATEMENT) close();
 	};
-	return { line, inStatement: () => buf !== undefined };
+	return { line, inStatement: () => buf !== undefined, end: close };
 }
 
 async function scanSqlText(text: string, emit: Emit): Promise<void> {
-	const { line } = ddlLines(emit);
+	const { line, end } = ddlLines(emit);
 	for (const l of text.split("\n")) line(l);
+	end();
 }
 
 /**
@@ -479,7 +499,7 @@ async function scanSqlDdl(f: string, size: number, emit: Emit, onProgress: (pct:
 	let head = ""; // start of the current line (capped) while it is not known to be DDL
 	let skipping = false; // current line is long and not DDL: ignore until its newline
 	let lastPct = 0;
-	const { line: endLine, inStatement } = ddlLines(emit);
+	const { line: endLine, inStatement, end } = ddlLines(emit);
 	try {
 		for (;;) {
 			const { bytesRead } = await fh.read(chunk, 0, chunk.length, pos);
@@ -511,6 +531,7 @@ async function scanSqlDdl(f: string, size: number, emit: Emit, onProgress: (pct:
 			}
 		}
 		if (head && !skipping) endLine(head);
+		end();
 	} finally {
 		await fh.close();
 	}
@@ -657,6 +678,8 @@ async function judgeTables(ledger: Ledger, config: Config, client: ModelClient, 
 	});
 	const j = (res.json ?? {}) as Partial<TableJudgement>;
 	const judged: TableJudgement = { databases: j.databases ?? [], tables: j.tables ?? [] };
+	// a reply with no judgement (cut off, refused) is used this once but not saved: the next inventory asks again
+	if (!judged.tables.length) return { judged, costUsd: res.usage.costUsd };
 	ledger.setMeta(JUDGED_KEY, JSON.stringify({ key, judged, by: res.usage.model, at: new Date().toISOString() }));
 	return { judged, costUsd: res.usage.costUsd };
 }

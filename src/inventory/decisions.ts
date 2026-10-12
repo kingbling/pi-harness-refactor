@@ -213,6 +213,8 @@ export function toPoint(d: Decision): DecisionPoint {
 
 
 export function applyDecision(ledger: Ledger, config: Config, root: string, id: string, answer: string, by = "human"): string {
+	// "set the real path now" without a path sets nothing: the decision stays open until the path comes with it
+	if (id === "target-location" && answer.trim() === "set-now") return "not recorded: give the path, answer target-location=set:<absolute path>";
 	const d = loadDecisions(root);
 	d.answers[id] = { answer, by, at: new Date().toISOString() };
 	let note = "";
