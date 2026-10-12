@@ -60,6 +60,8 @@ export interface AdapterManifest {
 		sourceExtensions: string[];
 		langByExtension: Record<string, string>;
 		skipMarker: string;
+		/** Older manifests have none. */
+		suppressMarker?: string;
 		interfaceHint: string;
 		testHint: string;
 		/** `{why}` expands. */
@@ -141,6 +143,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 			sourceExtensions: m.layout.sourceExtensions,
 			lang: (p) => Object.entries(m.layout.langByExtension).find(([ext]) => p.endsWith(ext))?.[1],
 			skipMarker: new RegExp(m.layout.skipMarker),
+			...(m.layout.suppressMarker ? { suppressMarker: new RegExp(m.layout.suppressMarker) } : {}),
 			interfaceHint: m.layout.interfaceHint,
 			testHint: m.layout.testHint,
 			legacyMarker: (why) => m.layout.legacyMarker.replace(/\{why\}/g, why),
@@ -221,7 +224,7 @@ export function validateManifest(m: AdapterManifest): string[] {
 		if (SHELLS.has(basename(c.cmd).toLowerCase())) out.push(`${k}.cmd "${c.cmd}" is a shell/launcher; name the tool itself`);
 		if (c.args.some((a) => typeof a !== "string" || /[;&|`$<>\n]/.test(a))) out.push(`${k}.args contain shell syntax; give plain arguments`);
 	}
-	for (const [k, re] of [["toolchain.packageName", m.toolchain?.packageName], ["layout.testFileRegex", m.layout?.testFileRegex], ["layout.skipMarker", m.layout?.skipMarker], ["toolchain.installed.listPattern", m.toolchain?.installed?.listPattern]] as const) {
+	for (const [k, re] of [["toolchain.packageName", m.toolchain?.packageName], ["layout.testFileRegex", m.layout?.testFileRegex], ["layout.skipMarker", m.layout?.skipMarker], ["layout.suppressMarker", m.layout?.suppressMarker], ["toolchain.installed.listPattern", m.toolchain?.installed?.listPattern]] as const) {
 		try {
 			new RegExp(re ?? "");
 		} catch {
@@ -335,7 +338,7 @@ export const MANIFEST_SCHEMA = obj({
 	test: CMD,
 	migrateFresh: CMD,
 	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA, list: CMD, listPattern: S }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
-	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
+	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, suppressMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
 	platform: MAP,
 	stackChoices: { type: "array", items: obj({ key: S, question: S, default: S, options: { type: "array", items: OPTION } }) },
 	protectedGlobs: SA,
@@ -357,6 +360,7 @@ const SYSTEM = [
 	"- layout.dataDirs: the folders (project-relative, trailing slash) where this stack's official docs keep database code: schema/models/entities, migrations, seed scripts (e.g. a Spring project with Flyway: src/main/resources/db/migration/ plus the entity package folder). Database work may write only there. layout.dataAccessHint: one line on how data access is written in this stack (ORM entities, query builder, SQL with generated code, …).",
 	"- layout.wiringFiles: the files (project-relative paths or globs) where this stack registers a new feature by hand (router/route table, main module, URL config), from the official docs; [] when the framework finds handlers on its own (annotations, file-system routing). A file layout.rules.require names is registered somewhere: that file belongs here. Units edit these files to wire what they add.",
 	"- layout.skipMarker: a regex matching a test that is skipped, focused or left incomplete in this stack: every skip, only and incomplete call or annotation its test runner has (from its docs), so a placeholder test is caught.",
+	"- layout.suppressMarker: a regex matching a comment or annotation that silences this stack's type checker, compiler warnings or linter for a line or a file (every such form the tools have, from their docs), so code that hides an error instead of fixing it is caught.",
 	"- migrateFresh: one command that applies every migration of the project, in order, to a NEW EMPTY throwaway database (in-memory, or a temporary one the command itself points at; never the dev, legacy or production database), and fails when a migration cannot be applied. {cmd: \"\", args: []} when the stack has no migrations.",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",

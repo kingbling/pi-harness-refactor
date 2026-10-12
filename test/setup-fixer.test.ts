@@ -250,3 +250,44 @@ describe("worktree dependency dirs: link or (learned) copy", () => {
 		expect(loadCommandOverrides(root, "s").worktreeCopy).toEqual(["vendor"]);
 	});
 });
+
+describe("setup fixes during the run: the test command must still be able to fail", () => {
+	it("a fix after which a failing probe test passes is put back whole: files and command override", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { overridesPath } = await import("../src/adapters/command-overrides.ts");
+		const { existsSync } = await import("node:fs");
+		const { execFileSync } = await import("node:child_process");
+		const { root, target, adapter, config } = stack({ id: "nofail" } as never);
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "runner.sh"), "exit 0\n");
+			saveCommandOverride(o.root, o.adapter.id, "test", { cmd: "sh", args: ["runner.sh"] }, "a wrapper that swallows the exit code");
+			return "wrapped the runner";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "runner flaky", fixer })).toBeUndefined();
+		expect(existsSync(join(target, "runner.sh"))).toBe(false);
+		expect(existsSync(overridesPath(root, "nofail"))).toBe(false);
+		expect(execFileSync("git", ["-C", target, "log", "-1", "--format=%s"], { encoding: "utf8" })).toMatch(/init/);
+	});
+});
+
+describe("the gate commands file belongs to the setup fixer", () => {
+	it("a session's own change to it is put back; the fixer's change made meanwhile stays", async () => {
+		const { keepOverrides, overridesPath, loadCommandOverrides } = await import("../src/adapters/command-overrides.ts");
+		const { existsSync } = await import("node:fs");
+		const { root } = stack();
+		// a tester rewrites it through bash: put back (the file did not exist, so it is gone again)
+		let kept = keepOverrides(root, "s1");
+		mkdirSync(join(root, ".bigrefactor", "commands"), { recursive: true });
+		writeFileSync(overridesPath(root, "s1"), JSON.stringify({ lint: { cmd: "true", args: [] } }));
+		expect(kept.restore()).toBe(true);
+		expect(existsSync(overridesPath(root, "s1"))).toBe(false);
+		// the setup fixer's tool writes it while the session runs: kept
+		kept = keepOverrides(root, "s1");
+		saveCommandOverride(root, "s1", "test", grep, "flag gone");
+		expect(kept.restore()).toBe(false);
+		expect(loadCommandOverrides(root, "s1").test).toEqual(grep);
+	});
+});

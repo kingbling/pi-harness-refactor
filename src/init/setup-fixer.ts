@@ -4,13 +4,14 @@ import { join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
-import { loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy } from "../adapters/command-overrides.ts";
+import { keepOverrides, loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy, withCommandOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { commitAll, isRepoRoot, whitespaceOnly } from "../git.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
+import { testCannotFail } from "./init.ts";
 
 /**
  * When a setup check fails (gate build/test on a fresh project, stack choices not installed), a model with tools
@@ -229,6 +230,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 	const wasted = () => fixes.set(key, (fixes.get(key) ?? 0) + 1);
 	const p = (async () => {
 		const before = JSON.stringify(loadCommandOverrides(o.root, key));
+		const overrides = keepOverrides(o.root, key);
 		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
 		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000) } });
@@ -243,13 +245,22 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 			wasted();
 			return undefined;
 		}
-		const { sha, undone, changed } = await lock(async () => {
+		const { sha, undone, changed, cannotFail } = await lock(async () => {
 			try {
 				const migrated = o.ledger ? new Set((o.ledger.db.prepare("SELECT target_symbols FROM moves WHERE op != 'dropped'").all() as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!))) : undefined;
 				const undone = undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
+				// a fix may change the test command or its config so that nothing can fail any more: the probe test with a
+				// wrong expected value must still fail, else the whole fix is put back (it would turn every gate green)
+				const cannotFail = await testCannotFail(o.config, withCommandOverrides(o.adapter, o.root)).catch((e) => (console.log(pc.yellow(`  setup fix: could not check that the test command can still fail (${e?.message ?? e})`)), undefined));
+				if (cannotFail) {
+					overrides.restore(true);
+					execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", o.projectDir], { stdio: "pipe" });
+					execFileSync("git", ["-C", repo, "clean", "-fdq", "--", o.projectDir], { stdio: "pipe" }); // ignored dirs (installs) stay
+					return { sha: undefined, undone, changed: [], cannotFail };
+				}
 				const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`);
 				const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
-				return { sha, undone, changed };
+				return { sha, undone, changed, cannotFail: undefined };
 			} catch (e: any) {
 				// a failed put-back or commit (a hook) must not leave the fixer's edits on main for the next commit to sweep up
 				try {
@@ -263,6 +274,12 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 				throw e;
 			}
 		});
+		if (cannotFail) {
+			console.log(pc.red(`  setup fix put back: ${cannotFail}`));
+			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "probe_failed", gateReport: { said, error: cannotFail, problem: o.problem.slice(0, 2000) } });
+			wasted();
+			return undefined;
+		}
 		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} test or migrated-code file(s) it changed: ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
 		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
 		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });

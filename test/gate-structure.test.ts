@@ -294,3 +294,27 @@ describe("accepted behaviour stays proven", () => {
 		expect(step(await gate("agency", { sanctioned: ["src/features/agency/agency.service.spec.ts"] }), "antigaming_ok")!.output).not.toMatch(/earlier unit/);
 	});
 });
+
+describe("silenced checks in production code", () => {
+	it("finds only the lines this unit added, and the TS stacks' marker catches the usual forms", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const { mkdtempSync, writeFileSync: write } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join: j } = await import("node:path");
+		const { addedLines } = await import("../src/run/gate.ts");
+		const { getTargetAdapter } = await import("../src/adapters/registry.ts");
+		const dir = mkdtempSync(j(tmpdir(), "br-silence-"));
+		const git = (...a: string[]) => execFileSync("git", a, { cwd: dir, stdio: "pipe" });
+		git("init", "-q");
+		write(j(dir, "a.ts"), "// eslint-disable-next-line\nconst a = 1;\n");
+		git("add", ".");
+		git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init");
+		write(j(dir, "a.ts"), "// eslint-disable-next-line\nconst a = 1;\n// @ts-ignore\nconst b: number = 'x';\n");
+		write(j(dir, "b.ts"), "/* eslint-disable */\nexport {};\n");
+		const silence = (await getTargetAdapter("nestjs")).layout.suppressMarker!;
+		expect(addedLines(dir, "a.ts", true).filter((l) => silence.test(l.text))).toEqual([{ line: 3, text: "// @ts-ignore" }]); // the old disable is not this unit's
+		expect(addedLines(dir, "b.ts", false).filter((l) => silence.test(l.text)).map((l) => l.line)).toEqual([1]);
+		for (const ok of ["// a note on eslint rules", "const ignore = true;"]) expect(silence.test(ok)).toBe(false);
+		for (const bad of ["// @ts-nocheck", "// @ts-expect-error", "// oxlint-disable-next-line no-unused-vars"]) expect(silence.test(bad)).toBe(true);
+	});
+});

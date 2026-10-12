@@ -44,6 +44,8 @@ export interface ReviewInput {
 	writeGlobs?: string[];
 	/** The owner's / orchestrator's note for this run of the unit (e.g. the answer to an earlier out-of-scope question). */
 	ownerNote?: string;
+	/** The ported tests already passed before the implementer wrote any code (and still did after one retest). */
+	greenBefore?: string;
 	/** The ported tests (the tester's): weak ones go back to the tester, not the implementer. */
 	testFiles?: string[];
 	transcriptPath?: string;
@@ -126,6 +128,7 @@ function facts(o: ReviewInput): string {
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
 		`Ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
 		...(o.writeGlobs?.length ? [`The implementer may write only: ${o.writeGlobs.join(", ")}. A fix anywhere else is an outOfScope item, not a finding.`] : []),
+		...(o.greenBefore ? [o.greenBefore] : []),
 		...(o.ownerNote ? [`Note from the orchestrator for this run (only an answer by the owner, a person, counts as decided; a model's hint is context to check against the legacy code): ${o.ownerNote}`] : []),
 		...legacyFacts(o),
 		...(none ? [`The tester found no runtime behaviour to pin in this unit, so it has no truth cases and no ported tests. Its reason: ${none}. Check that against the legacy code: if the unit does compute or decide something, name it in weakTests (the tester then writes cases for it).`] : []),

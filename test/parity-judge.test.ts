@@ -138,4 +138,14 @@ describe("judging parity differences", () => {
 		ledger.db.prepare("UPDATE parity_diffs SET status = 'bug', quirk_id = ? WHERE id = ?").run(quirk, ids(r2)[0]!);
 		expect(parityAgain(ledger).again.has("invoices")).toBe(false);
 	});
+
+	it("at run start: a slice compared on an older main is compared again; the same main or an unknown one is not", () => {
+		const { ledger } = workspace();
+		const add = (slice: string, sha: string | null) => ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at, commit_sha) VALUES (?, 'same', datetime('now'), ?)").run(slice, sha);
+		add("invoices", "aaa");
+		add("users", "bbb");
+		add("auth", null); // from before commits were recorded
+		expect(parityAgain(ledger, "bbb").again).toEqual(new Set(["invoices"]));
+		expect(parityAgain(ledger).again).toEqual(new Set());
+	});
 });

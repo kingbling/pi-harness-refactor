@@ -112,10 +112,10 @@ export const ConfigSchema = z.object({
 			/** Quarantined units go back into the queue every this many minutes (sooner when a fix landed), up to maxAutoHeals times; then the owner is asked. */
 			healEveryMinutes: z.number().min(1).default(60),
 			maxAutoHeals: z.number().int().min(0).default(5),
-			/** Packed task-card context above this triggers a pre-split; a session exceeding it in total usage is aborted. */
+			/** A model session whose fresh tokens (input + output, cache reads excluded) go over this is stopped; what it wrote goes to the gate. */
 			maxUnitTokens: z.number().int().default(250_000),
-			/** A leaf session with no model/tool activity for this long is aborted (outcome idle_timeout). */
-			idleMs: z.number().int().default(300_000),
+			/** A model session with no model or tool activity for this long is stopped (idle_timeout). */
+			idleMs: z.number().int().default(600_000),
 			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
 			sampleSize: z.number().int().min(0).default(10),
 			/** "unsure": the run decides routine questions itself when the model and the code agree (your goals guide both); "all": ask every one. */

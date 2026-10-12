@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { TargetAdapter } from "./types.ts";
 
@@ -45,7 +45,34 @@ export function saveCommandOverride(root: string, stackId: string, step: "build"
 	const cur = loadCommandOverrides(root, stackId);
 	const p = overridesPath(root, stackId);
 	mkdirSync(dirname(p), { recursive: true });
-	writeFileSync(p, JSON.stringify({ ...cur, [step]: c, why: [cur.why, `${step}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+	writeFile(p, JSON.stringify({ ...cur, [step]: c, why: [cur.why, `${step}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+}
+
+/** What the setup fixer's own tools last wrote per overrides file: a session running meanwhile does not undo it. */
+const written = new Map<string, string>();
+function writeFile(p: string, text: string): void {
+	writeFileSync(p, text);
+	written.set(p, text);
+}
+
+/**
+ * Holds the stack's overrides file as it is now; `restore()` puts it back and says whether anything had changed.
+ * The file decides what every later gate runs, and sessions with bash (tester, builder, tidy) could rewrite it:
+ * only the setup fixer may change it (through its tools, which may run meanwhile).
+ */
+export function keepOverrides(root: string, stackId: string): { restore: (evenTheFixers?: boolean) => boolean } {
+	const p = overridesPath(root, stackId);
+	const read = () => (existsSync(p) ? readFileSync(p, "utf8") : undefined);
+	const before = read();
+	return {
+		restore: (evenTheFixers = false) => {
+			const now = read();
+			if (now === before || (!evenTheFixers && now !== undefined && now === written.get(p))) return false; // unchanged, or the setup fixer's change
+			if (before === undefined) rmSync(p, { force: true });
+			else (mkdirSync(dirname(p), { recursive: true }), writeFileSync(p, before));
+			return true;
+		},
+	};
 }
 
 const expand = (c: Cmd, files: string[]): Cmd => ({ cmd: c.cmd, args: c.args.flatMap((a) => (a === "{files}" ? files : [a])) });
@@ -67,5 +94,5 @@ export function saveWorktreeCopy(root: string, stackId: string, dir: string, why
 	const cur = loadCommandOverrides(root, stackId);
 	const p = overridesPath(root, stackId);
 	mkdirSync(dirname(p), { recursive: true });
-	writeFileSync(p, JSON.stringify({ ...cur, worktreeCopy: [...new Set([...(cur.worktreeCopy ?? []), dir])], why: [cur.why, `worktree copy of ${dir}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+	writeFile(p, JSON.stringify({ ...cur, worktreeCopy: [...new Set([...(cur.worktreeCopy ?? []), dir])], why: [cur.why, `worktree copy of ${dir}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
 }

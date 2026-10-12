@@ -70,6 +70,8 @@ export class Ledger {
 		this.db.exec(DDL);
 		// ledgers from before decisions.state
 		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = 'state'").get())) this.db.exec("ALTER TABLE decisions ADD COLUMN state TEXT");
+		// ledgers from before parity_runs.commit_sha
+		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('parity_runs') WHERE name = 'commit_sha'").get())) this.db.exec("ALTER TABLE parity_runs ADD COLUMN commit_sha TEXT");
 	}
 
 	close(): void {

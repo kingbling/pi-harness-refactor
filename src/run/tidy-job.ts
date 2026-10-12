@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
+import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { addWorktree, commitAll, headOf, mainBranch, removeWorktree } from "../git.ts";
@@ -98,7 +99,8 @@ export function createTidyJobs(o: {
 			addWorktree(o.config.target.path, wt, branch);
 			o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, t.stack)));
-			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t })) || "";
+			const overrides = keepOverrides(o.root, t.stack); // the gate commands are the setup fixer's, never a tidy job's
+			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t }).finally(() => overrides.restore() && o.log(pc.yellow(`tidy ${t.id}: the job changed the gate commands file; put back`)))) || "";
 			const changed = changedFiles(dir, adapter.toolchain.ignoredPaths);
 			const message = `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`;
 			let problem = await check(adapter, dir, t, changed);

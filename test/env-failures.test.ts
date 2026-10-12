@@ -263,3 +263,27 @@ describe("br lanes", () => {
 		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([unit]);
 	});
 });
+
+describe("a hint carried to the next attempt says who gave it", () => {
+	it("a model's hint is not labelled as the owner's (the reviewer treats only the owner's answer as decided)", async () => {
+		const { ConfigSchema } = await import("../src/config.ts");
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { resubmitParkedUnits } = await import("../src/run/run.ts");
+		const { RESOLVER } = await import("../src/jev/resolve.ts");
+		const { mkdtempSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const ws = mkdtempSync(join(tmpdir(), "br-hint-"));
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		for (const [id, by] of [["byModel", RESOLVER], ["byOwner", "human"]] as const) {
+			ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+			ledger.transitionUnit(id, "truth", "test");
+			ledger.transitionUnit(id, "implementing", "test");
+			const q = ledger.askQuestion({ unitId: id, point: "gate_env", question: "q", options: ["retry — run again", "leave — leave it"], askedBy: "orchestrator" });
+			ledger.answerQuestion(q, "retry: the reviewer is wrong, X is not needed", by);
+		}
+		resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, new Map());
+		expect(JSON.parse(ledger.getUnit("byModel")!.meta).retryNote).toMatch(/^A model's hint \(not the owner's\): the reviewer is wrong/);
+		expect(JSON.parse(ledger.getUnit("byOwner")!.meta).retryNote).toMatch(/^The owner's hint: the reviewer is wrong/);
+	});
+});

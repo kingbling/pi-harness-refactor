@@ -9,6 +9,7 @@ import type { Config } from "../config.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
+import { differences } from "./differences.ts";
 
 /**
  * Truth runs on the OLD code. Out of the box it runs in the legacy repo with this machine's tools; when that is
@@ -128,6 +129,10 @@ export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: So
 		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
 		const invented = legacyFiles ? notFromOldCode(readFileSync(script, "utf8"), cases, legacyFiles) : undefined;
 		if (invented) return { ok: false, cases: [], error: invented };
+		// a value that changes from run to run (a timestamp, a random id, hash order) is no truth: no new code can match it
+		const again = lastJsonArray(execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }));
+		const unstable = differences(cases.map((c) => c.expected), (again as TruthCase[] | undefined)?.map((c) => c?.expected) ?? []);
+		if (unstable.length) return { ok: false, cases: [], error: `expected values differ between two runs of the old code, so no new code can match them: ${unstable.slice(0, 3).map((d) => `case ${d.path.replace(/^\[(\d+)\]/, (_, n) => `#${Number(n) + 1}`)}: ${JSON.stringify(d.a)} then ${JSON.stringify(d.b)}`).join("; ")}. Give the code a fixed input (clock, seed, sorted order), or leave that value out of expected.` };
 		return { ok: true, cases };
 	} catch (e: any) {
 		// stderr carries the runtime's own message ("Failed opening required …"); it is captured, never printed into the UI

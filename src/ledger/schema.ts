@@ -350,7 +350,8 @@ CREATE TABLE IF NOT EXISTS parity_runs (
   steps INTEGER NOT NULL DEFAULT 0,
   compared INTEGER NOT NULL DEFAULT 0,
   note TEXT,
-  started_at TEXT NOT NULL, ended_at TEXT
+  started_at TEXT NOT NULL, ended_at TEXT,
+  commit_sha TEXT                     -- the target's main the new app ran from: compared again once main moves
 );
 CREATE TABLE IF NOT EXISTS parity_diffs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

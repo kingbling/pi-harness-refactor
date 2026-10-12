@@ -2,6 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
+import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { addWorktree, removeWorktree, whitespaceOnly } from "../git.ts";
@@ -10,7 +11,9 @@ import { askViaModel } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
-import { spawnLeaf } from "../sessions/spawn.ts";
+import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
+import { mentionsCase } from "./ported.ts";
+import { reopenUnit } from "./recheck.ts";
 import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 
 /**
@@ -24,6 +27,24 @@ import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 export type Repairer = (o: { config: Config; root: string; adapter: TargetAdapter; dir: string; problem: string; attempt: number }) => Promise<string | void>;
 
 const MAX_REPAIRS = 2;
+/** How often the builder may send one accepted unit back for its own failing tests before it asks instead. */
+export const MAX_BUILD_REOPENS = 2;
+
+/** Accepted units whose ported tests (named by their case id) fail in `problem`: back to planned, code kept. */
+export function reopenBroken(ledger: Ledger, problem: string): string[] {
+	const cases = ledger.db.prepare("SELECT tc.id, tc.unit_id, u.meta FROM truth_cases tc JOIN units u ON u.id = tc.unit_id WHERE u.state = 'accepted'").all() as Array<{ id: string; unit_id: string; meta: string }>;
+	const failing = new Map<string, string[]>();
+	for (const c of cases) if (mentionsCase(problem, c.id)) failing.set(c.unit_id, [...(failing.get(c.unit_id) ?? []), c.id]);
+	const out: string[] = [];
+	for (const [unitId, ids] of failing) {
+		const n = (JSON.parse(ledger.getUnit(unitId)!.meta) as { buildReopens?: number }).buildReopens ?? 0;
+		if (n >= MAX_BUILD_REOPENS) continue;
+		reopenUnit(ledger, unitId, `This unit was accepted, and its code stays on the branch. After later merges the whole-project tests fail on main, and your tests ${ids.join(", ")} are among them:\n${problem.slice(-2000)}\nFix your code. If the cause is in another unit's code, call report_migrated_bug.`, `builder: tests ${ids.slice(0, 3).join(", ")} fail on main after later merges`);
+		ledger.updateUnit(unitId, { meta: { buildReopens: n + 1 } });
+		out.push(unitId);
+	}
+	return out;
+}
 
 export const repairWithModel: Repairer = async (o) => {
 	const session = await spawnLeaf({
@@ -133,23 +154,28 @@ export function createBuilder(o: {
 			// a problem already with the owner (open, or answered "leave it"), or already repaired in vain: no more paid repairs
 			const skip = o.ledger.openQuestionFor("build", sig) !== undefined || ignored(sig) || (tried.get(sig) ?? 0) >= MAX_REPAIRS;
 			const repair = o.repair === false || skip ? undefined : (o.repair ?? repairWithModel);
+			const protectedRes = adapter.protectedGlobs.map(globToRegExp);
+			const isProtected = (rel: string) => protectedRes.some((r) => r.test(rel));
 			let said = "";
 			for (let i = 1; problem && repair && i <= MAX_REPAIRS; i++) {
 				tried.set(sig, i);
 				o.log(pc.cyan(`builder ${stackId}: whole-project check fails; the big model fixes it (try ${i})`));
-				said = (await repair({ config: o.config, root: o.root, adapter, dir, problem, attempt: i })) || "";
-				// tests are the truth: a repair never changes them
-				const touched = execFileSync("git", ["-C", wt, "status", "--porcelain", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
-					.split("\n")
-					.filter((l) => l.trim())
-					.map((l) => ({ added: l.startsWith("??"), f: l.slice(3).trim() }));
+				const overrides = keepOverrides(o.root, stackId);
+				said = (await repair({ config: o.config, root: o.root, adapter, dir, problem, attempt: i }).finally(() => overrides.restore() && o.log(pc.yellow(`builder ${stackId}: the repair changed the gate commands file; put back`)))) || "";
+				// tests are the truth and protected config (tsconfig, test and lint config, manifests) holds the checks:
+				// a repair never changes them, also not through bash, which the write gate does not see
+				const status = execFileSync("git", ["-C", wt, "status", "--porcelain", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean).map((l) => ({ added: l.startsWith("??"), f: l.slice(3).trim() }));
 				const proj = relative(o.config.target.path, projectDir(o.config, stackId));
+				const inProj = (f: string) => (proj && f.startsWith(`${proj}/`) ? f.slice(proj.length + 1) : f);
 				// a formatter's whitespace fix in a test stays (it cannot change what the test checks)
-				const tests = touched.filter((t) => adapter.layout.isTestFile(proj && t.f.startsWith(`${proj}/`) ? t.f.slice(proj.length + 1) : t.f) && (t.added || !whitespaceOnly(wt, t.f)));
-				// a new test file is not in git, so checkout cannot undo it: it is deleted
-				for (const t of tests) if (t.added) rmSync(join(wt, t.f), { force: true });
-				const changed = tests.filter((t) => !t.added).map((t) => t.f);
-				if (changed.length) execFileSync("git", ["-C", wt, "checkout", "--", ...changed], { stdio: "pipe" });
+				const tests = status.filter((t) => adapter.layout.isTestFile(inProj(t.f)) && (t.added || !whitespaceOnly(wt, t.f)));
+				const configFiles = status.filter(({ f }) => !tests.some((t) => t.f === f) && isProtected(inProj(f)));
+				const undo = [...tests, ...configFiles];
+				const tracked = undo.filter((u) => !u.added).map((u) => u.f);
+				if (tracked.length) execFileSync("git", ["-C", wt, "checkout", "--", ...tracked], { stdio: "pipe" });
+				// a new file is not in git, so checkout cannot undo it: it is deleted
+				for (const u of undo.filter((u) => u.added)) rmSync(join(wt, u.f), { recursive: true, force: true });
+				if (configFiles.length) o.log(pc.yellow(`builder ${stackId}: the repair changed protected config; undone: ${configFiles.map((u) => u.f).slice(0, 5).join(", ")}`));
 				problem = await check();
 			}
 			if (!problem) {
@@ -157,6 +183,11 @@ export function createBuilder(o: {
 				o.log(pc.green(`builder ${stackId}: fixed and merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said}`));
 				return;
 			}
+			// a failing test names its case id: that accepted unit's behaviour broke on main, so it goes back to work
+			// (its code stays) instead of a vague question. Capped per unit: its own gate runs only its area's tests
+			const reopened = reopenBroken(o.ledger, problem);
+			if (reopened.length) o.log(pc.yellow(`builder ${stackId}: re-opened ${reopened.join(", ")}, whose tests fail on main`));
+			if (reopened.length) return;
 			// one question for this problem, blocking nothing: units keep running
 			await askViaModel(
 				{ ledger: o.ledger, config: o.config, root: o.root, client: o.client },

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bashTouchesReadOnly, thinkingLevelOf } from "../src/sessions/spawn.ts";
+import { bashDeletesOutside, bashTouchesReadOnly, thinkingLevelOf } from "../src/sessions/spawn.ts";
 
 /**
  * The inline tool_call guard is what keeps the source repo read-only for roles that have bash.
@@ -38,5 +38,27 @@ describe("reasoning effort → Pi thinking level (single knob)", () => {
 		expect(thinkingLevelOf("high")).toBe("high");
 		expect(thinkingLevelOf("max")).toBe("xhigh");
 		expect(thinkingLevelOf("none")).toBe("off");
+	});
+});
+
+describe("bash deletes stay inside the session's folder", () => {
+	const cwd = "/work/.bigrefactor/worktrees/u7/app";
+	it("refuses deletes and moves that reach other lanes, the ledger or home", () => {
+		expect(bashDeletesOutside("rm -rf ../../*", cwd)).toMatch(/inside your working directory/);
+		expect(bashDeletesOutside("cd /x && rm ../../../ledger.sqlite", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("rm -rf ~/.cache/*", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("rm -rf $HOME", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("rm -rf /", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("rm -rf /tmp", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("mv src ../other", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("find .. -name '*.js' -delete", cwd)).toMatch(/inside/);
+		expect(bashDeletesOutside("rm -rf $DIR/x", cwd)).toMatch(/inside/);
+	});
+	it("allows deletes inside the folder, in temp, and where the session may write", () => {
+		expect(bashDeletesOutside("rm -rf ./build dist/x.js", cwd)).toBeUndefined();
+		expect(bashDeletesOutside("rm /tmp/x && rm -f node_modules/.cache/a", cwd)).toBeUndefined();
+		expect(bashDeletesOutside("find . -name '*.tmp' -delete", cwd)).toBeUndefined();
+		expect(bashDeletesOutside("rm /work/.bigrefactor/truth/u7/cases.php", cwd, (abs) => abs.startsWith("/work/.bigrefactor/truth/u7/"))).toBeUndefined();
+		expect(bashDeletesOutside("ls ../../ && cat ../x", cwd)).toBeUndefined();
 	});
 });

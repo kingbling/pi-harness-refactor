@@ -66,6 +66,12 @@ export function checkTests(targetProjectDir: string, adapter: TargetAdapter, nam
 	);
 }
 
+/** Runs the stack's test command on `files`; true when it exits 0 (all given tests pass). */
+export function testsPass(targetProjectDir: string, adapter: TargetAdapter, files: string[]): Promise<boolean> {
+	const c = adapter.test(targetProjectDir, files);
+	return new Promise((res) => execFile(c.cmd, c.args, { cwd: targetProjectDir, env: { ...process.env, CI: "1", FORCE_COLOR: "0" }, maxBuffer: 20 * 1024 * 1024, timeout: 5 * 60_000 }, (e) => res(!e)));
+}
+
 /**
  * Keeps a session to its own paths in the project. Call it before the session; the function it returns, called after
  * the session, puts back every file the session changed outside `allowed` (globs relative to `dir`): to its content

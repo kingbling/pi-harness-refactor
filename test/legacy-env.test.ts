@@ -126,3 +126,17 @@ describe("the old code's environment", () => {
 		expect(loadLegacyEnv(root, config).probeQuestion).toBeUndefined();
 	});
 });
+
+describe("truth that changes from run to run", () => {
+	it("an expected value that differs between two runs of the old code is refused, with the case and what to do", () => {
+		const { root, legacy, truthDir, config, source } = workspace();
+		// a counter file stands in for a clock: each run prints a different created_at
+		writeFileSync(join(legacy, "app.sh"), `n=$(cat n 2>/dev/null || echo 0); n=$((n+1)); echo $n > n\necho '[{"symbol":"a::b","inputs":[],"expected":{"total":5,"created_at":'$n'}}]'\n`);
+		const r = verifyTruthOnOld(truthDir, config, source, root);
+		expect(r.ok).toBe(false);
+		expect(r.error).toMatch(/differ between two runs[\s\S]*case #1\.created_at: \d+ then \d+[\s\S]*fixed input/);
+		expect(r.error).not.toMatch(/total/);
+		writeFileSync(join(legacy, "app.sh"), `echo '[{"symbol":"a::b","inputs":[],"expected":{"total":5}}]'\n`);
+		expect(verifyTruthOnOld(truthDir, config, source, root).ok).toBe(true);
+	});
+});

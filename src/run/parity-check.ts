@@ -4,10 +4,11 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
 import type { Config } from "../config.ts";
-import { removeWorktree } from "../git.ts";
+import { headOf, removeWorktree } from "../git.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
+import { differences } from "./differences.ts";
 import { appRoot, bootApp, dumpData, LEGACY, loadApps, prepareTargetCopy, type AppRecipe } from "./parity.ts";
 
 /**
@@ -199,23 +200,7 @@ export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; ba
 
 // ---- comparing -------------------------------------------------------------------------------------------
 
-type Found = { path: string; a: unknown; b: unknown };
-
-/** Every place two JSON values differ: object keys by name, arrays by position. */
-export function differences(a: unknown, b: unknown, path = ""): Found[] {
-	const obj = (v: unknown) => v !== null && typeof v === "object" && !Array.isArray(v);
-	if (obj(a) && obj(b)) {
-		const x = a as Record<string, unknown>;
-		const y = b as Record<string, unknown>;
-		return [...new Set([...Object.keys(x), ...Object.keys(y)])].flatMap((k) => differences(x[k], y[k], path ? `${path}.${k}` : k));
-	}
-	if (Array.isArray(a) && Array.isArray(b)) {
-		const out: Found[] = [];
-		for (let i = 0; i < Math.max(a.length, b.length); i++) out.push(...differences(a[i], b[i], `${path}[${i}]`));
-		return out;
-	}
-	return JSON.stringify(a) === JSON.stringify(b) ? [] : [{ path, a, b }];
-}
+export { differences } from "./differences.ts";
 
 /** What a step's `compare` says is compared. */
 function view(s: Step, r: StepResult, withData: boolean): Record<string, unknown> | undefined {
@@ -337,8 +322,9 @@ export interface SliceCheck {
 export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const startedAt = new Date().toISOString();
+	const mainAt = headOf(o.config.target.path);
 	const record = (c: Omit<SliceCheck, "runId">, steps = 0): SliceCheck => {
-		const runId = Number(o.ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, steps, compared, note, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))").run(o.slice, c.outcome, steps, c.compared, c.note, startedAt).lastInsertRowid);
+		const runId = Number(o.ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, steps, compared, note, started_at, ended_at, commit_sha) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)").run(o.slice, c.outcome, steps, c.compared, c.note, startedAt, mainAt ?? null).lastInsertRowid);
 		const ins = o.ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 		for (const d of c.diffs) ins.run(runId, o.slice, d.step, d.route, d.kind, d.path, JSON.stringify(d.legacy ?? null), JSON.stringify(d.target ?? null));
 		return { ...c, runId };

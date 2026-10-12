@@ -126,4 +126,47 @@ describe("the builder", () => {
 		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
 		expect(existsSync(join(target, "src", "new", "b.test.txt"))).toBe(false);
 	});
+
+	it("a repair that changes protected config through bash has it undone", async () => {
+		const { root, target, config, adapter, ledger, mergeFix } = setup();
+		writeFileSync(join(target, "lint.cfg"), "strict\n");
+		commitAll(target, "cfg");
+		const guarded = { ...adapter, protectedGlobs: ["lint.cfg", "*.ignore"] } as TargetAdapter;
+		const logs: string[] = [];
+		const repair: Repairer = async (o) => {
+			writeFileSync(join(o.dir, "src", "a.txt"), "ok\n");
+			writeFileSync(join(o.dir, "lint.cfg"), "loose\n"); // weakens the checks
+			writeFileSync(join(o.dir, "src.ignore"), "src\n"); // a new file that hides errors
+			return "fixed";
+		};
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", guarded]]), log: (l) => logs.push(l), linkAll: () => {}, mergeFix, repair, every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await b.finish();
+		expect(logs.join("\n")).toMatch(/protected config; undone: .*lint\.cfg/);
+		expect(readFileSync(join(target, "lint.cfg"), "utf8")).toBe("strict\n");
+		expect(git(target, ["ls-files", "src.ignore"])).toBe("");
+		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
+	});
+
+	it("an accepted unit whose own test fails on main goes back to work instead of a question, at most twice", async () => {
+		const { root, config, adapter, ledger, mergeFix } = setup();
+		const failing = { ...adapter, build: () => ({ cmd: "true", args: [] }), test: () => ({ cmd: "sh", args: ["-c", "echo 'FAIL invoices u1#2 total'; exit 1"] }) } as TargetAdapter;
+		ledger.createUnit({ id: "u1", tier: "leaf", symbolIds: [] });
+		ledger.createUnit({ id: "u2", tier: "leaf", symbolIds: [] });
+		ledger.db.prepare("UPDATE units SET state = 'accepted'").run();
+		const ins = ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES (?, ?, 's', '[]', '1', 1, '')");
+		ins.run("u1#2", "u1");
+		ins.run("u2#1", "u2");
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", failing]]), log: () => {}, linkAll: () => {}, mergeFix, repair: false, every: { units: 1, minutes: 60 } });
+		for (let i = 0; i < 3; i++) {
+			ledger.db.prepare("UPDATE units SET state = 'accepted'").run();
+			b.afterMerge("fake");
+			await b.finish();
+			expect(ledger.getUnit("u2")!.state).toBe("accepted");
+		}
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).buildReopens).toBe(2);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).retryNote).toMatch(/u1#2/);
+		// after the cap the builder asks again
+		expect(ledger.openQuestions()).toHaveLength(1);
+	});
 });

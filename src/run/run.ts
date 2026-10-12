@@ -381,7 +381,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 	if (parityProbe) {
 		// at the start: finished slices never compared, and slices whose last comparison needs another look
-		const { checked, again } = parityAgain(ledger);
+		const { checked, again } = parityAgain(ledger, headOf(config.target.path));
 		const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((x): x is string => !!x));
 		// and slices of units the owner said to retry after they ran out of parity re-opens: a fresh set, used once per answer
 		const answered: Array<string | undefined> = [];
@@ -1106,7 +1106,7 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 			continue;
 		}
 		// what the run learned before parking (diagnosis) and the hint go to the next attempt, labelled by who gave it
-		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `${q?.answered_by === RESOLVER ? "The resolver model's hint (a model, not the owner)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
+		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `${MODEL_ANSWERERS.includes(q?.answered_by ?? "") ? "A model's hint (not the owner's)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
 		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
 		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, datetime('now'))").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`);
 		removeWorktree(config.target.path, worktreeDir(root, u.id));
@@ -1265,21 +1265,23 @@ export const MAX_PARITY_ERRORS = 3;
 
 /**
  * Slices compared before (`checked`), and those whose last comparison needs another look at run start (`again`): it
- * ended in an error (a few times in a row at most), left differences nobody judged, or holds quirks the owner has
- * decided since. Only the last run counts: once a later run judged a decided quirk, the slice is not queued again.
+ * ended in an error (a few times in a row at most), left differences nobody judged, holds quirks the owner has
+ * decided since, or ran on an older main than `head` (later units, tidy jobs and repairs change shared code). Only the last run counts: once a later run judged a decided quirk, the slice is not queued again.
  */
-export function parityAgain(ledger: Ledger): { checked: Set<string>; again: Set<string> } {
+export function parityAgain(ledger: Ledger, head?: string): { checked: Set<string>; again: Set<string> } {
 	const rows = ledger.db
 		.prepare(
-			`SELECT r.slice, r.outcome,
+			`SELECT r.slice, r.outcome, r.commit_sha,
 			   (SELECT COUNT(*) FROM parity_runs e WHERE e.slice = r.slice AND e.outcome = 'error'
 			      AND e.id > COALESCE((SELECT MAX(g.id) FROM parity_runs g WHERE g.slice = r.slice AND g.outcome != 'error'), 0)) AS errors,
 			   EXISTS (SELECT 1 FROM parity_diffs d WHERE d.run_id = r.id AND d.status = 'open') AS unjudged,
 			   EXISTS (SELECT 1 FROM parity_diffs d JOIN quirks q ON q.id = d.quirk_id WHERE d.run_id = r.id AND d.status = 'quirk' AND q.status IN ('kept', 'dropped')) AS decided
 			 FROM parity_runs r WHERE r.id = (SELECT MAX(id) FROM parity_runs WHERE slice = r.slice)`,
 		)
-		.all() as Array<{ slice: string; outcome: string; errors: number; unjudged: number; decided: number }>;
-	const again = rows.filter((r) => (r.outcome === "error" ? r.errors < MAX_PARITY_ERRORS : r.unjudged || r.decided)).map((r) => r.slice);
+		.all() as Array<{ slice: string; outcome: string; commit_sha: string | null; errors: number; unjudged: number; decided: number }>;
+	// a run from before commits were recorded has none: it is not compared again just for that
+	const moved = (r: (typeof rows)[number]) => !!head && !!r.commit_sha && r.commit_sha !== head;
+	const again = rows.filter((r) => (r.outcome === "error" ? r.errors < MAX_PARITY_ERRORS : r.unjudged || r.decided || moved(r))).map((r) => r.slice);
 	return { checked: new Set(rows.map((r) => r.slice)), again: new Set(again) };
 }
 

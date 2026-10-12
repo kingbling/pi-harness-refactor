@@ -450,11 +450,27 @@ async function toolchainProblem(config: Config, adapter: TargetAdapter): Promise
 			const err = await runChecked(c, dir);
 			if (err !== undefined) return `${adapter.id}: the gate's ${step} command fails on a fresh project (${c.cmd} ${c.args.join(" ")}):\n${err}`;
 		}
-		// a test command that cannot fail proves nothing: the same probe with a wrong expected value must fail
-		if (!probe.failing) {
-			console.log(pc.yellow(`  ${adapter.id}: not checked that the gate's test command can fail (the adapter's probe test has no failing variant; regenerate the adapter to get one)`));
-			return undefined;
-		}
+	} finally {
+		rmSync(probePath, { force: true });
+	}
+	return testCannotFail(config, adapter);
+}
+
+/**
+ * A test command that cannot fail proves nothing: the adapter's probe test with a wrong expected value must fail.
+ * Checked at setup, and again after every setup fix during the run (a fix may change the command or its config).
+ */
+export async function testCannotFail(config: Config, adapter: TargetAdapter): Promise<string | undefined> {
+	const dir = projectDir(config, adapter.id);
+	const probe = adapter.probeTest?.(dir);
+	if (!probe) return undefined;
+	if (!probe.failing) {
+		console.log(pc.yellow(`  ${adapter.id}: not checked that the gate's test command can fail (the adapter's probe test has no failing variant; regenerate the adapter to get one)`));
+		return undefined;
+	}
+	const probePath = join(dir, probe.path);
+	try {
+		mkdirSync(dirname(probePath), { recursive: true });
 		writeFileSync(probePath, probe.failing);
 		const c = adapter.test(dir, [probe.path]);
 		if ((await runChecked(c, dir)) === undefined) return `${adapter.id}: the gate's test command passes a failing test (${c.cmd} ${c.args.join(" ")}): it does not run the given test files`;

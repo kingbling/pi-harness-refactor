@@ -317,6 +317,8 @@ export interface TargetLayout {
 	lang(path: string): string | undefined;
 	/** Anti-gaming: a test marked skipped/only/todo. */
 	skipMarker: RegExp;
+	/** Anti-gaming: a comment that silences the type check or the linter (added lines of production code fail the gate). Absent in older generated manifests. */
+	suppressMarker?: RegExp;
 	/** One line for the tester on how to write the interface draft (type system, DTO idiom). */
 	interfaceHint: string;
 	/** ast-grep `language` ids this stack's source files need; rules written for one are copied for the others. */

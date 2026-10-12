@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import pc from "picocolors";
-import { overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
+import { keepOverrides, overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 // static on purpose: Pi loads plugins without a module cache, and units starting together that each import a
 // module the first time get half-loaded copies of what it imports ("Cannot read properties of undefined")
@@ -36,7 +36,7 @@ import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
-import { caseCoverage, checkTests, findTests, scopeGuard } from "./ported.ts";
+import { caseCoverage, checkTests, findTests, scopeGuard, testsPass } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
 /**
@@ -191,6 +191,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// its test paths and the approved tidy paths; the plugin's own folder (ledger, truth) when it sits in the project is not the tester's write
 		const ownDir = relative(targetProjectDir, join(o.root, ".bigrefactor"));
 		const putBack = scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
+		const overrides = keepOverrides(o.root, stackId); // the gate's commands are the setup fixer's, never the tester's
+		let overridesChanged = false;
 		const tester = await spawn({
 			role: "test",
 			// the shell and relative paths start in the project (reviewer findings and test paths are project paths);
@@ -219,6 +221,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			);
 		} finally {
 			tester.dispose();
+			overridesChanged = overrides.restore();
 		}
 		cost += res.usage.cost;
 		lastTesterText = res.text;
@@ -228,6 +231,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			execFileSync("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir, stdio: "pipe" });
 			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
 			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. If one is wrong, say which and why in your final answer.)` };
+			lastTesterText = res.text;
+		}
+		if (overridesChanged) {
+			log(pc.yellow(`  tester changed the gate commands file; put back`));
+			res = { ...res, text: `${res.text}\n(Your change to the gate commands file was put back: the gate's commands are not yours to change. A command that does not fit goes in your final answer.)` };
 			lastTesterText = res.text;
 		}
 		// the tester writes tests only: anything else it changed (a formatter run over the project) is put back
@@ -452,6 +460,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
 		}
 	}
+	// tests that pass before any code for this unit exists do not call its code (an `expect(true)` with the case id in
+	// its name): the tester gets one go at them. Still green, the reviewer is told; behaviour an earlier unit of the
+	// area already wrote can make it legitimately green, so it never fails the unit by itself
+	let greenBefore: string | undefined;
+	const implementedBefore = o.ledger.db.prepare("SELECT 1 FROM attempts WHERE unit_id = ? AND role IN ('implement', 'escalate') LIMIT 1").get(o.unitId);
+	if (testFiles.length && !o.gate && !implementedBefore && (await testsPass(targetProjectDir, adapter, testFiles.map((t) => t.path)))) {
+		const why = `These ported test files pass before any code for this unit exists, so they do not call the code in interface.md: ${testFiles.map((t) => t.path).join(", ")}.`;
+		log(pc.yellow("  ported tests pass before any code exists: the tester makes them call the unit's code"));
+		if (await runTruth(`${why} Make each test call the code in interface.md and assert the case's expected value, so it fails until that code exists.`, true)) testFiles = loadTests();
+		if (await testsPass(targetProjectDir, adapter, testFiles.map((t) => t.path))) greenBefore = `${why} The tester was asked once to fix them and they still pass: check in weakTests that each one really calls this unit's code.`;
+	}
 	const loadIface = () => (existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "(tester did not write interface.md)");
 
 	// ---- implement → gate → triage loop ----------------------------------------------------------
@@ -611,7 +630,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const review = reviewer
 			? async (changedFiles: string[], nearDuplicates?: string[]) => {
 					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
 					cost += r.costUsd ?? 0;
 					reviewWeak = r.weakTests;
 					reviewOutOfScope = r.outOfScope;

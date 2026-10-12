@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
+import { saveCommandOverride } from "../src/adapters/command-overrides.ts";
 import { exampleProfileJson } from "../src/adapters/source/php.ts";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
@@ -296,6 +297,8 @@ describe("runUnit wiring", () => {
 
 		it("a setup fix parks the unit for a fresh run without asking anyone", async () => {
 			execFileSync("git", ["init", "-q"], { cwd: join(ws, "migrated") });
+			// after a fix code checks that the test command can still fail on a wrong probe test: a stand-in runner that does
+			saveCommandOverride(ws, "nestjs", "test", { cmd: "sh", args: ["-c", "exit 1"] }, "fixture runner");
 			const setupFixer = async () => (write(join(ws, "migrated", "autoload.json"), "{}\n"), "added the autoload mapping");
 			const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, setupFixer, log: () => {} });
 			expect(r.attempts).toBe(1);

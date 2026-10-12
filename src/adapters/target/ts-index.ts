@@ -157,6 +157,7 @@ export function tsLayoutBase() {
 		isTestFile: (p: string) => /\.(spec|test|e2e-spec)\.[cm]?[jt]sx?$/.test(p) || /\.d\.ts$/.test(p),
 		lang: (p: string) => (/\.tsx$/.test(p) ? "tsx" : /\.[cm]?ts$/.test(p) ? "typescript" : /\.[cm]?jsx?$/.test(p) ? "javascript" : undefined),
 		skipMarker: /\.(skip|only|todo)\s*\(/,
+		suppressMarker: /@ts-(nocheck|ignore|expect-error)\b|\b(eslint|oxlint)-disable/,
 		interfaceHint: "TypeScript signatures; DTOs/classes where the legacy code used arrays",
 		legacyMarker: (why: string) => `// LEGACY: ${why}`,
 		ignoreDirs: ["node_modules", "dist", "build", "coverage", ".git", "test", "tests", "__tests__"],

@@ -80,7 +80,7 @@ export function bashDeletesOutside(command: string, cwd: string, mayWrite: (abs:
 		if (/\$(?!HOME\b|\{HOME\})/.test(arg)) return false; // a variable code cannot resolve: not provably inside
 		const p = arg.replace(/^["']|["']$/g, "").replace(/^~(?=\/|$)/, home).replace(/\$\{?HOME\}?/g, home);
 		const abs = resolve(cwd, p);
-		return [resolve(cwd), resolve(tmpdir()), "/tmp", "/private/tmp"].some((r) => abs !== r && abs.startsWith(r + sep)) || mayWrite(abs);
+		return abs === resolve(cwd) || [resolve(cwd), resolve(tmpdir()), "/tmp", "/private/tmp"].some((r) => abs.startsWith(r + sep)) || mayWrite(abs);
 	};
 	for (const seg of command.split(/&&|\|\||[;|\n]/)) {
 		const words = seg.trim().split(/\s+/).filter(Boolean);
@@ -88,7 +88,10 @@ export function bashDeletesOutside(command: string, cwd: string, mayWrite: (abs:
 		const verb = words[0] ?? "";
 		let paths: string[] = [];
 		if (DELETES.test(verb)) paths = words.slice(1).filter((w) => !w.startsWith("-"));
-		else if (verb === "find" && words.some((w) => w === "-delete" || /^rm$/.test(w))) paths = words.slice(1, words.findIndex((w, i) => i > 0 && w.startsWith("-")) >>> 0 || undefined);
+		else if (verb === "find" && words.some((w) => w === "-delete" || w === "rm")) {
+			const firstFlag = words.findIndex((w, i) => i > 0 && w.startsWith("-"));
+			paths = words.slice(1, firstFlag < 0 ? undefined : firstFlag); // the folders find starts in
+		}
 		const outside = paths.find((p) => !inside(p));
 		if (outside !== undefined) return `only files inside your working directory (${cwd}) may be deleted or moved; "${outside}" is not`;
 	}
@@ -337,7 +340,23 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 			let text = "";
 			let error: string | undefined;
 			const usage = { input: 0, output: 0, cost: 0 };
+			// runaway control inside a session: fresh tokens (cache reads excluded) above run.maxUnitTokens, or no
+			// model or tool activity for run.idleMs, ends it; what it wrote still goes to the gate as an attempt
+			let stopped: string | undefined;
+			const stop = (why: string) => {
+				if (stopped) return;
+				stopped = why;
+				record({ type: "session_stopped", why });
+				session.abort();
+			};
+			let idle: ReturnType<typeof setTimeout> | undefined;
+			const stillActive = () => {
+				clearTimeout(idle);
+				idle = setTimeout(() => stop(`idle_timeout: no model or tool activity for ${Math.round(opts.config.run.idleMs / 1000)}s`), opts.config.run.idleMs);
+			};
+			stillActive();
 			const unsub = session.subscribe((ev: any) => {
+				stillActive();
 				if (ev.type === "message_end" && ev.message?.role === "assistant") {
 					const m = ev.message;
 					text = (m.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
@@ -348,6 +367,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 						const codex = m.provider === CODEX_PROVIDER;
 						const usd = (codex ? priceAt(orCost, m.usage) : undefined) ?? m.usage.cost?.total ?? 0;
 						usage.cost += usd;
+						if (usage.input + usage.output > opts.config.run.maxUnitTokens) stop(`budget: the session used ${usage.input + usage.output} tokens, over run.maxUnitTokens (${opts.config.run.maxUnitTokens})`);
 						progress.agentUsage(agentId, { costUsd: usd, tokensIn: m.usage.input ?? 0, tokensOut: m.usage.output ?? 0 });
 						recordSpend(usd, `session: ${roleName} ${agentLabel}`, `${m.provider ?? "openrouter"}/${m.model ?? role.id}`, { subscription: codex });
 					}
@@ -376,15 +396,17 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 					toDefaultTier: role.tier !== "default" ? async () => session.setModel(await resolveRoleModel({ ...role, tier: "default" })) : undefined,
 					tier: role.tier,
 					record,
-					aborting: () => progress.aborting,
+					aborting: () => progress.aborting || !!stopped,
 				});
 			} catch (e: any) {
 				error = e?.message ?? String(e);
 				record({ type: "prompt_error", error });
 			} finally {
+				clearTimeout(idle);
 				unsub();
 				progress.agentEnd(agentId);
 			}
+			if (stopped) error = stopped;
 			if (progress.aborting && !error) error = "stopped by the user";
 			record({ type: "run_end", toolCalls, blocked, usage, error });
 			return { text, toolCalls, blocked, usage, error };
