@@ -95,7 +95,8 @@ describe("checkTree", () => {
 });
 
 describe("structure_ok and drift", () => {
-	const gate = (writeGlobs = ["src/features/agency/**"]) => runGate({ ledger, unitId: "u1", adapter, targetProjectDir: project, writeGlobs, appendOnlyGlobs: ["src/shared/**"], testFiles: [], moduleDir: "src/features/agency", area: "agency", root: ws, stackId: "nestjs" });
+	// no ported tests: the tester said there is nothing to pin (else the gate fails the unit)
+	const gate = (writeGlobs = ["src/features/agency/**"]) => (ledger.addEvidence("u1", "truth_none", { reason: "a contract only" }), runGate({ ledger, unitId: "u1", adapter, targetProjectDir: project, writeGlobs, appendOnlyGlobs: ["src/shared/**"], testFiles: [], moduleDir: "src/features/agency", area: "agency", root: ws, stackId: "nestjs" }));
 
 	it("fails a touched file with two service classes; pre-existing drift elsewhere does not fail the unit", async () => {
 		write("src/features/campaign/campaign.service.ts", `export class CampaignService {\n${"\t// line\n".repeat(420)}}\n`);

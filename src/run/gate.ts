@@ -151,7 +151,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const cases = (g.ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ?").get(g.unitId) as { n: number }).n;
 	// a unit the tester found without runtime behaviour (a pure contract, constants) has nothing to pin: no tests to run
 	const none = !cases && !g.testFiles.length ? noBehaviour(g.ledger, g.unitId) : undefined;
-	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : cases && !g.testFiles.length ? Promise.resolve({ ok: false, output: `${cases} truth case(s) but no ported test file: nothing proves the behaviour` }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
+	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
 
 	return done();
 
@@ -303,18 +303,15 @@ export function run(cmd: string, args: string[], cwd: string, timeoutMs: number)
 /** Files changed in the working tree under `dir` (git status), relative to `dir`. */
 /** Files changed in the project, without generated paths (`ignored`: dependencies, build output; symlinked in worktrees). */
 export function changedFiles(dir: string, ignored: string[] = []): string[] {
-	try {
-		const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-		const out = execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-		return out
-			.split("\n")
-			.filter(Boolean)
-			.map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
-			.map((p) => relative(realpathSync(dir), join(top, p))) // top is the real path (/var → /private/var on macOS)
-			.filter((p) => !p.startsWith("..") && !ignored.some((i) => p === i || p.startsWith(`${i}/`))); // a symlinked dependency dir is not matched by a "dir/" ignore line
-	} catch {
-		return [];
-	}
+	// a git failure throws: read as "nothing written" it would be blamed on the implementer, not the environment
+	const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	const out = execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	return out
+		.split("\n")
+		.filter(Boolean)
+		.map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
+		.map((p) => relative(realpathSync(dir), join(top, p))) // top is the real path (/var → /private/var on macOS)
+		.filter((p) => !p.startsWith("..") && !ignored.some((i) => p === i || p.startsWith(`${i}/`))); // a symlinked dependency dir is not matched by a "dir/" ignore line
 }
 
 /**

@@ -46,8 +46,11 @@ const write = (rel: string, body: string) => {
 	mkdirSync(dirname(join(project, rel)), { recursive: true });
 	writeFileSync(join(project, rel), body);
 };
-const gate = (area: string, extra: Partial<Parameters<typeof runGate>[0]> = {}) =>
-	runGate({ ledger, unitId: "u1", adapter, targetProjectDir: project, writeGlobs: ["src/**"], testFiles: [], moduleDir: `src/features/${area}`, area, root: ws, stackId: "nestjs", ...extra });
+// no ported tests: the tester said there is nothing to pin (else the gate fails the unit)
+const gate = (area: string, extra: Partial<Parameters<typeof runGate>[0]> = {}) => (
+	ledger.addEvidence("u1", "truth_none", { reason: "a contract only" }),
+	runGate({ ledger, unitId: "u1", adapter, targetProjectDir: project, writeGlobs: ["src/**"], testFiles: [], moduleDir: `src/features/${area}`, area, root: ws, stackId: "nestjs", ...extra })
+);
 const step = (r: GateReport, name: string) => r.steps.find((s) => s.name === name);
 const commit = () => {
 	execFileSync("git", ["add", "-A"], { cwd: project });

@@ -131,6 +131,15 @@ describe("wired_ok: the reviewer model", () => {
 		const spawn = (async () => ({ run: async () => Promise.reject(new Error("provider down")), dispose() {} })) as never;
 		const r = await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
 		expect(r).toMatchObject({ ok: false, judged: false });
+		// a session that cannot even start is "not judged" too, never a crash of the unit
+		const noStart = (async () => Promise.reject(new Error("no model"))) as never;
+		expect(await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn: noStart })).toMatchObject({ ok: false, judged: false, output: expect.stringMatching(/not judged: no model/) });
+	});
+
+	it("a unit with no truth cases, no ported tests and no reason from the tester fails ported_tests_green", async () => {
+		const { dir, ledger } = project();
+		const g = await runGate({ ledger, unitId: "u1", adapter, targetProjectDir: dir, writeGlobs: ["src/features/campaign/**"], testFiles: [], review: async () => ({ ok: true, output: "fine", judged: true }) });
+		expect(g.failedStep).toBe("ported_tests_green");
 	});
 
 	it("tells the reviewer that a stub left for this unit (TODO(br:<this unit>)) is a finding", async () => {
@@ -148,6 +157,7 @@ describe("wired_ok: the reviewer model", () => {
 		const slotted: boolean[] = [];
 		const slot = async <T,>(fn: () => Promise<T>) => ((inSlot = true), await fn().finally(() => (inSlot = false)));
 		const review = async () => (slotted.push(inSlot), { ok: true, output: "fine", judged: true });
+		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });
 		const g = await runGate({ ledger, unitId: "u1", adapter, targetProjectDir: dir, writeGlobs: ["src/features/campaign/**"], testFiles: [], review, slot });
 		expect(g.ok).toBe(true);
 		expect(slotted).toEqual([false]);

@@ -274,6 +274,16 @@ describe("runUnit wiring", () => {
 			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
 		});
 
+		it("a reviewer that cannot judge burns no attempt: three in a row become one provider question, never quarantine", async () => {
+			const down = async () => ({ ok: false, judged: false, output: "not judged: provider down" });
+			const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer: down, setupFixer: false, log: () => {} });
+			expect(r.attempts).toBe(0);
+			expect(r.state).not.toBe("quarantined");
+			expect(ledger.db.prepare("SELECT point FROM questions WHERE unit_id = 'u1'").all()).toEqual([{ point: "env" }]);
+			// truth was kept, so the tester was skipped: the unit still ran as implementing, not planned
+			expect(ledger.transitionsOf("unit", "u1")[0]).toMatchObject({ from_state: "planned", to_state: "implementing", reason: "truth ready" });
+		});
+
 		it("a setup fix parks the unit for a fresh run without asking anyone", async () => {
 			execFileSync("git", ["init", "-q"], { cwd: join(ws, "migrated") });
 			const setupFixer = async () => (write(join(ws, "migrated", "autoload.json"), "{}\n"), "added the autoload mapping");

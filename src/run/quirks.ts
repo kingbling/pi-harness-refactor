@@ -146,16 +146,23 @@ export function syncQuirkAnswers(d: Pick<AskDeps, "ledger"> & { root: string }):
 	return [...rework];
 }
 
+/** Decided quirks whose decision the unit's tests do not follow yet. */
+const offQuirks = (d: Pick<AskDeps, "ledger">, unitId: string) => quirksOf(d, unitId).filter((q) => (q.status === "kept" && q.applied !== "keep") || (q.status === "dropped" && q.applied !== "drop"));
+
 /**
  * Instruction for the tester when decided quirks differ from what the unit's tests follow; undefined = tests are
- * current. Marks the quirks applied, so the note is produced once.
+ * current. Call `markQuirksApplied` once the retest went through, so a failed or stopped one is asked again.
  */
 export function quirkRetestNote(d: Pick<AskDeps, "ledger"> & { root: string }, unitId: string): string | undefined {
 	syncQuirkAnswers(d);
-	const off = quirksOf(d, unitId).filter((q) => (q.status === "kept" && q.applied !== "keep") || (q.status === "dropped" && q.applied !== "drop"));
+	const off = offQuirks(d, unitId);
 	if (!off.length) return undefined;
-	for (const q of off) d.ledger.db.prepare("UPDATE quirks SET applied = ? WHERE id = ?").run(q.status === "kept" ? "keep" : "drop", q.id);
 	return `The owner decided on quirks you recorded. Rewrite the affected tests and interface.md:\n${off.map((q) => `- ${q.symbol_id}: ${q.behaviour} → ${q.status === "kept" ? "KEEP it (pin it, mark LEGACY)" : "DROP it (test the intended behaviour, do not pin the quirk)"}`).join("\n")}`;
+}
+
+/** The unit's tests follow the decided quirks now (the retest from `quirkRetestNote` passed). */
+export function markQuirksApplied(d: Pick<AskDeps, "ledger">, unitId: string): void {
+	for (const q of offQuirks(d, unitId)) d.ledger.db.prepare("UPDATE quirks SET applied = ? WHERE id = ?").run(q.status === "kept" ? "keep" : "drop", q.id);
 }
 
 /** Decided quirks of a unit, for the implementer's task. */

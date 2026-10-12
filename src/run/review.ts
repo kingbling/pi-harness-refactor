@@ -67,21 +67,23 @@ export const reviewWithModel: Reviewer = async (o) => {
 		},
 	} as unknown as ToolDefinition;
 	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir: o.targetProjectDir, adapter: o.adapter, moduleDir: o.moduleDir };
-	const session = await (o.spawn ?? spawnLeaf)({
-		role: "review",
-		cwd: o.targetProjectDir,
-		config: o.config,
-		writeGlobs: [],
-		customTools: [verdictTool, sourceSymbolBody(deps), readFunctionTool(deps), whoCalls(deps), targetLookup(deps), docsLookup(deps)],
-		transcriptPath: o.transcriptPath,
-		systemPrompt: `You review ONE unit of an automated migration (${o.config.source.stack} → ${o.config.target.stacks.join(" + ")}) before it is accepted. Build, lint and the layout checks already passed; the tests from the old behaviour run after you. You judge what tests and compilers cannot see:
+	// a spawn that throws (the model is down) is "not judged" too, never a crash of the unit
+	let session: Awaited<ReturnType<typeof spawnLeaf>> | undefined;
+	try {
+		session = await (o.spawn ?? spawnLeaf)({
+			role: "review",
+			cwd: o.targetProjectDir,
+			config: o.config,
+			writeGlobs: [],
+			customTools: [verdictTool, sourceSymbolBody(deps), readFunctionTool(deps), whoCalls(deps), targetLookup(deps), docsLookup(deps)],
+			transcriptPath: o.transcriptPath,
+			systemPrompt: `You review ONE unit of an automated migration (${o.config.source.stack} → ${o.config.target.stacks.join(" + ")}) before it is accepted. Build, lint and the layout checks already passed; the tests from the old behaviour run after you. You judge what tests and compilers cannot see:
 1. Real: the unit's legacy behaviour is really ported. No stubs or placeholders (TODO, "not implemented", a fixed empty result where the legacy code computes something, an interface or port nothing implements, an endpoint that only answers "not implemented"). Compare with the legacy code (source_symbol_body, read_function).
 2. Connected: the new code can be reached the way the legacy callers (listed below) reached the old code — an HTTP handler has its route/page registered the way this stack does it; code the legacy callers reached through a factory or another class is reached that way, not turned into an entry point nobody calls — and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet. Code owned by planned units (listed below) is expected as a minimal stub marked TODO(br:<the owning unit>): that is not a finding. A stub marked TODO(br:${o.unitId}) (grep for it) that stands in for this unit's own legacy code was left by an earlier unit for this one: one still there, not replaced by the real code or pointed at it, is a finding.
 3. On the chosen stack: the owner's stack choices below are used where they apply (data access, rendering, data fetching, routing, forms, styling …), not gone around.
 4. The tests: the ported tests (listed below) really check the legacy behaviour — they assert the expected values, not only that something renders or exists. Weak tests go in weakTests (the tester rewrites them), never in findings.
 Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and few: only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
-	});
-	try {
+		});
 		const r = await session.run(facts(o));
 		// no verdict: ask once more in the same session; still none is red, never a pass
 		if (!verdict) {
@@ -103,7 +105,7 @@ Judge only what this unit added or changed, against the facts below: the behavio
 	} catch (e: any) {
 		return { ok: false, judged: false, output: `not judged: ${e?.message ?? e}` };
 	} finally {
-		session.dispose();
+		session?.dispose();
 	}
 };
 
