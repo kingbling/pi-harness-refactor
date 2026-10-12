@@ -42,6 +42,12 @@ describe("comparing the old and the new app", () => {
 		expect(c.diffs).toMatchObject([{ step: "b", kind: "error", target: "ECONNREFUSED" }]);
 	});
 
+	it("a second old run that failed is not compared: its missing answer must not count as noise and hide differences", () => {
+		const c = compareRuns([step("a")], [{ status: 200, body: { total: 10 } }], [{ error: "ECONNRESET" }], [{ status: 404, body: "" }], false);
+		expect(c.notCompared).toEqual(["a (the old app's second run: ECONNRESET)"]);
+		expect(c.compared).toBe(0);
+	});
+
 	it("what a step wrote is compared as rows added and removed", () => {
 		expect(dataChanges({ t: [{ id: 1 }] }, { t: [{ id: 1 }, { id: 2 }], u: [] })).toEqual({ t: { added: [{ id: 2 }], removed: [] } });
 		const s = [{ ...step("p", "redirect"), method: "POST" }];

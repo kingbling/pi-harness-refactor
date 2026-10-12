@@ -232,7 +232,7 @@ const covers = (noise: string, path: string) => path === noise || path.startsWit
 
 /**
  * The real differences between the old app (two runs) and the new app. Only what differs between the two old runs
- * is ignored. A step the old app itself fails on (no answer, 5xx) proves nothing and is listed as not compared.
+ * is ignored. A step the old app itself fails on (no answer, 5xx, in either run) proves nothing and is listed as not compared.
  */
 export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[], neu: StepResult[], withData: boolean): { diffs: Diff[]; compared: number; notCompared: string[] } {
 	const diffs: Diff[] = [];
@@ -242,10 +242,13 @@ export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[
 		const a = old1[i]!;
 		if (s.compare === "none") return;
 		if (a.error || (a.status ?? 0) >= 500) return void notCompared.push(`${s.id} (the old app: ${a.error ?? `status ${a.status}`})`);
+		// a failed second old run would make everything look like noise and hide every real difference
+		const a2 = old2[i]!;
+		if (a2.error || (a2.status ?? 0) >= 500) return void notCompared.push(`${s.id} (the old app's second run: ${a2.error ?? `status ${a2.status}`})`);
 		compared++;
 		const b = neu[i]!;
 		if (b.error && b.status === undefined) return void diffs.push({ step: s.id, route: s.route, kind: "error", path: "", legacy: view(s, a, withData), target: b.error });
-		const noise = differences(view(s, a, withData), view(s, old2[i]!, withData)).map((d) => d.path);
+		const noise = differences(view(s, a, withData), view(s, a2, withData)).map((d) => d.path);
 		for (const d of differences(view(s, a, withData), view(s, b, withData))) {
 			if (noise.some((n) => covers(n, d.path))) continue;
 			const top = d.path.split(/[.[]/)[0]!;

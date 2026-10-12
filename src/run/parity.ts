@@ -5,7 +5,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
 import type { Config } from "../config.ts";
-import { addWorktree, removeWorktree } from "../git.ts";
+import { addWorktree, headOf, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
@@ -45,6 +45,9 @@ export interface AppState {
 	said?: string;
 	/** The owner question asked once after a red probe (blocks nothing): "retry" makes the next probe try again. */
 	probeQuestion?: number;
+	/** The new app only: the main commit the last probe ran at, and how many probes in a row were red. */
+	commit?: string;
+	redProbes?: number;
 	at?: string;
 }
 
@@ -115,6 +118,27 @@ async function answers(url: string): Promise<boolean> {
 	}
 }
 
+/** True while any process of the group still runs (signal 0 only checks). */
+const groupAlive = (pid: number) => {
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (e: any) {
+		return e?.code === "EPERM";
+	}
+};
+
+/** App servers started and not stopped yet: killed when the harness exits (a double Ctrl-C skips every stop()). */
+const liveGroups = new Set<number>();
+process.on("exit", () => {
+	for (const pid of liveGroups)
+		try {
+			process.kill(-pid, "SIGKILL");
+		} catch {
+			/* already gone */
+		}
+});
+
 /**
  * Start the app, wait until the ready URL answers, hand back how to stop it. A start command that exits 0 (a
  * container started in the background) is fine; one that exits non-zero before the app answers is a failure.
@@ -142,20 +166,27 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 	let spawnError: string | undefined;
 	child.on("exit", (c) => (exit = c));
 	child.on("error", (e) => (spawnError = e.message));
+	if (child.pid) liveGroups.add(child.pid);
 	const stop = async () => {
-		if (child.pid && exit === undefined) {
-			try {
-				process.kill(-child.pid, "SIGTERM");
-			} catch {
-				/* already gone */
-			}
-			for (let i = 0; i < 50 && exit === undefined; i++) await new Promise((r) => setTimeout(r, 100));
-			if (exit === undefined)
+		// the whole group, even when the start command already exited: a wrapper that ran `server &` and exited 0
+		// leaves the server in the group, and it would refuse every later boot ("something already answers")
+		if (child.pid) {
+			const pid = child.pid;
+			if (groupAlive(pid)) {
 				try {
-					process.kill(-child.pid, "SIGKILL");
+					process.kill(-pid, "SIGTERM");
 				} catch {
 					/* already gone */
 				}
+				for (let i = 0; i < 50 && groupAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+				if (groupAlive(pid))
+					try {
+						process.kill(-pid, "SIGKILL");
+					} catch {
+						/* already gone */
+					}
+			}
+			liveGroups.delete(pid);
 		}
 		if (recipe.stop)
 			try {
@@ -318,16 +349,22 @@ function problemFor(config: Config, root: string, side: string): string {
 	return `Find out whether this app can be started here as a local server that answers HTTP requests on this machine. ${where}${db}${ports.length ? ` Both apps run at the same time: ${ports.join(", ")}; use another port.` : ""} The app does not have to be complete: any answer on the ready URL (a login page, a redirect, a 404 from the framework) proves it runs. When the app is no HTTP server at all (a command-line tool, a library), say so and stop. Try more than one way before giving up.`;
 }
 
+/** A red new app is probed again once main has moved on, at most this many probes in a row. */
+const MAX_RED_PROBES = 3;
+
 /**
  * Once per workspace and side: can this app be started here? The setup model writes a recipe; code starts the
  * app with it and gets an answer, or it is red. Red asks the owner once (blocks nothing); "retry" probes again.
+ * A red new app is also probed again once main has new commits (the first probe often runs before it can start).
  * `again` probes regardless of an earlier result.
  */
 export async function probeApp(o: { config: Config; root: string; side: string; fixer?: AppFixer; log?: (l: string) => void; ask?: ProbeAsker; answer?: ProbeAnswer; again?: boolean }): Promise<boolean> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const cur = loadApps(o.root)[o.side] ?? {};
 	const retry = cur.up === false && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
-	if (cur.up !== undefined && !retry && !o.again) return cur.up;
+	const commit = o.side === LEGACY ? undefined : headOf(o.config.target.path);
+	const moved = cur.up === false && commit !== undefined && commit !== cur.commit && (cur.redProbes ?? 0) < MAX_RED_PROBES;
+	if (cur.up !== undefined && !retry && !moved && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
 	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem: problemFor(o.config, o.root, o.side) }).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	const recipe = loadApps(o.root)[o.side]?.recipe;
@@ -335,7 +372,7 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const bad = recipe ? recipeProblem(o.config, o.root, o.side, recipe) : "no recipe saved";
 	const res = bad || !recipe ? { ok: false, error: bad } : await checkRecipe(recipe, appRoot(o.config, o.root, o.side));
 	const why = res.ok ? said || "it starts" : [said, res.error].filter(Boolean).join(" — ");
-	saveApp(o.root, o.side, { up: res.ok, said: why, probeQuestion: undefined });
+	saveApp(o.root, o.side, { up: res.ok, said: why, probeQuestion: undefined, commit, redProbes: res.ok ? 0 : (cur.redProbes ?? 0) + 1 });
 	mkdirSync(parityDir(o.root), { recursive: true });
 	appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → ${res.ok ? "up" : "down"}: ${String(why).replace(/\s+/g, " ").slice(0, 600)}\n`);
 	const name = o.side === LEGACY ? "the old app" : `the new ${o.side} app`;
@@ -344,6 +381,8 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		return true;
 	}
 	log(pc.yellow(`parity: ${name} could not be started here (${String(said || res.error).split("\n")[0]}) — parity checks stay off until it does`));
+	// probed again only because main moved: the owner's open question still stands, no second one
+	if (moved && !retry && !o.again && cur.probeQuestion !== undefined) return (saveApp(o.root, o.side, { probeQuestion: cur.probeQuestion }), false);
 	const qid = await o
 		.ask?.({
 			facts: `To compare the old and the new app on the same requests, both must run here as local servers. A setup model tried to start ${name} and could not. What it said: ${said || "nothing"}. ${res.error ? `Code's check: ${String(res.error).slice(0, 600)}` : ""} The migration goes on without these checks.`,

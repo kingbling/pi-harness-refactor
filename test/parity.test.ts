@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { commitAll, ensureRepo } from "../src/git.ts";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -78,6 +79,35 @@ describe("starting the apps for parity", () => {
 		answers.set(7, "retry");
 		const fixed: AppFixer = async (o) => (await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "installed node");
 		expect(await probeApp({ ...opts, fixer: fixed })).toBe(true);
+	});
+
+	it("a red new app is probed again once main has moved on, a few times at most, without asking the owner again", async () => {
+		const { root, config } = workspace();
+		mkdirSync(config.target.path, { recursive: true });
+		ensureRepo(config.target.path);
+		commitAll(config.target.path, "scaffold", { allowEmpty: true });
+		let calls = 0;
+		const red: AppFixer = async () => (calls++, "nothing to start yet");
+		let asked = 0;
+		const opts = { config, root, side: "nestjs", fixer: red, log: () => {}, ask: async () => (asked++, 1) };
+		expect(await probeApp(opts)).toBe(false);
+		expect(await probeApp(opts)).toBe(false);
+		expect(calls).toBe(1);
+		for (let i = 0; i < 4; i++) {
+			commitAll(config.target.path, `unit ${i}`, { allowEmpty: true });
+			await probeApp(opts);
+		}
+		expect(calls).toBe(3);
+		expect(asked).toBe(1);
+	});
+
+	it("stop() takes down a server the start command left running in the background", async () => {
+		const { legacy } = workspace();
+		const port = await freePort();
+		const r = await bootApp({ dir: ".", start: { cmd: "sh", args: ["-c", `${JSON.stringify(process.execPath)} server.js ${port} & exit 0`] }, ready: `http://localhost:${port}/` }, legacy);
+		expect(r.ok).toBe(true);
+		if (r.ok) await r.stop();
+		await expect(fetch(`http://localhost:${port}/`)).rejects.toThrow();
 	});
 
 	it("both apps run at once: the new app may not take the old app's port", async () => {
