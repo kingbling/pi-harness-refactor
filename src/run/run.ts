@@ -397,7 +397,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		for (const sl of slices) if (!checked.has(sl) || again.has(sl) || answered.includes(sl)) queueParity(sl);
 	}
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
-	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
+	// an area is busy while a unit of it runs; a truth-ahead lane (only tests, in its own worktree) never holds a tidy job back
+	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { if (aheadRunning.has(id)) return false; const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
 	const curate = new Semaphore(1);
 	const ran: UnitRunResult[] = [];
 	const running = new Map<string, Promise<void>>();
