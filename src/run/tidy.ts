@@ -64,8 +64,10 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const drift = (d.ledger.getMeta(`drift:${o.stackId}`) ?? "").split("\n").filter((l) => l.startsWith(`${areaDir}/`)).slice(0, 40).join("\n");
 	const open = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "asked" || t.status === "approved");
 	const rejected = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "rejected");
+	// a change whose job failed its check is not proposed again every review (its failure stays on the task)
+	const failed = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "failed");
 	const sig = (op: string, from: string[], to: string[]) => `${op}|${[...from].sort().join(",")}|${[...to].sort().join(",")}`;
-	const seen = new Set([...open, ...rejected].map((t) => sig(t.op, t.from, t.to)));
+	const seen = new Set([...open, ...rejected, ...failed].map((t) => sig(t.op, t.from, t.to)));
 
 	const role = d.config.models.escalate;
 	const res = await d.client.chat({
@@ -91,7 +93,7 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 		},
 		messages: [
 			{ role: "system", content: `You review one feature module of a codebase under migration for tidiness: a new developer must find things by name, every file has one clear job, names are professional and consistent, nothing reads like a legacy artifact. Propose only changes worth their cost (at most 6; never a new layer or abstraction the module does not need), all paths relative to the project and inside ${areaDir}/ or the shared dirs (${adapter.layout.sharedDirs.join(", ")}); never break the binding layout below. Conventions = patterns the whole stack should follow from now on.\n\nBinding layout:\n${adapter.layout.structureDoc}` },
-			{ role: "user", content: `${loadBrief(d.root) ? `Repo brief:\n${loadBrief(d.root).slice(0, 2500)}\n\n` : ""}Area "${o.area}" (${o.stackId}):\n${tree}\n\nExports:\n${exports.map((e) => `${e.path}: ${e.kind} ${e.name}`).join("\n")}\n\nWhat the code does:\n${cards.map((c) => `${c.path} ${c.name}: ${c.summary}`).join("\n") || "(no cards)"}\n${drift ? `\nCode checks flagged:\n${drift}\n` : ""}${open.length ? `\nAlready pending (do not repeat):\n${open.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}${rejected.length ? `\nRejected by the owner (never propose these again, nor variants of them):\n${rejected.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}` },
+			{ role: "user", content: `${loadBrief(d.root) ? `Repo brief:\n${loadBrief(d.root).slice(0, 2500)}\n\n` : ""}Area "${o.area}" (${o.stackId}):\n${tree}\n\nExports:\n${exports.map((e) => `${e.path}: ${e.kind} ${e.name}`).join("\n")}\n\nWhat the code does:\n${cards.map((c) => `${c.path} ${c.name}: ${c.summary}`).join("\n") || "(no cards)"}\n${drift ? `\nCode checks flagged:\n${drift}\n` : ""}${open.length ? `\nAlready pending (do not repeat):\n${open.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}${rejected.length ? `\nRejected by the owner (never propose these again, nor variants of them):\n${rejected.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}${failed.length ? `\nTried and failed the build or tests (do not propose again):\n${failed.map((t) => `${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`).join("\n")}` : ""}` },
 		],
 	});
 	let cost = res.usage.costUsd;
@@ -179,15 +181,21 @@ export function onlyCase(t: Pick<TidyTask, "op" | "from" | "to">): boolean {
 }
 
 export function syncTidyAnswers(ledger: Ledger): void {
-	const tasks = loadTasks(ledger);
+	const all = loadTasks(ledger);
 	let changed = false;
-	for (const t of tasks) {
-		if (t.status !== "asked") continue;
+	const tasks = all.filter((t) => {
+		if (t.status !== "asked") return true;
 		const q = ledger.getQuestion(t.questionId);
-		if (!q || (q.status !== "answered" && q.status !== "auto")) continue;
+		// a withdrawn question was never answered: its task is dropped (a later review may propose it again), not left asked forever
+		if (q?.status === "withdrawn") {
+			changed = true;
+			return false;
+		}
+		if (!q || (q.status !== "answered" && q.status !== "auto")) return true;
 		t.status = answerValue(q.answer) === "apply" ? "approved" : "rejected";
 		changed = true;
-	}
+		return true;
+	});
 	if (changed) saveTasks(ledger, tasks);
 }
 

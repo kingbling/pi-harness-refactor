@@ -10,7 +10,7 @@ import { JEV_ACT as ACT, noulConfidence, type Battery } from "../jev/questions.t
 import type { Ledger, UnitRow } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { folderArea, kebab, SHARED_AREA } from "./areas.ts";
-import { areasPath, curateAreas, excludeUnit, recordTopic, syncTaxonomyAnswers, taxonomyHold } from "./taxonomy.ts";
+import { areasPath, curateAreas, excludeUnit, recordArea, syncTaxonomyAnswers, taxonomyHold } from "./taxonomy.ts";
 
 /**
  * Where a unit lands in the target: which stack, which legacy area (one area = one feature module per stack),
@@ -215,7 +215,8 @@ export function planPlacements(config: Config, units: Array<Pick<UnitRow, "id" |
 	for (const u of units) {
 		const meta = JSON.parse(u.meta) as UnitMeta;
 		// a placement on a stack that is no target any more (target.stacks changed) counts as none: the unit is placed again
-		if (meta.place && config.target.stacks.includes(meta.place.stack) && (!force || KEPT.has(meta.place.source))) out.set(u.id, { place: placeUnit(config, u.meta, root), surfaceKnown: true, stored: true });
+		// a DB unit has no files to place by: the DB lane's own placement is kept, even when forced
+		if (meta.place && config.target.stacks.includes(meta.place.stack) && (!force || KEPT.has(meta.place.source) || meta.lane === "db")) out.set(u.id, { place: placeUnit(config, u.meta, root), surfaceKnown: true, stored: true });
 		else out.set(u.id, { ...codePlace(config, meta, root), stored: false });
 	}
 	// shared: dependents in the same stack span ≥ 2 feature areas other than the unit's own, and its own area is
@@ -633,7 +634,7 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 		}
 		const shared = !!m?.[2] || area === SHARED_AREA;
 		ledger.updateUnit(r.id, { meta: { place: { stack, area, shared, source: "answer" } satisfies StoredPlace } });
-		if (shared && area !== SHARED_AREA) recordTopic(root, stack, area, `named in answer to placement question #${qid}`); // the curated set knows it from now on
+		if (area !== SHARED_AREA) recordArea(root, stack, area, `named in answer to placement question #${qid}`, shared); // the curated set knows it from now on
 		// similar files (same dir + stem) follow the answer's area; its stack only where the adapter cannot tell the surface
 		const source = getSourceAdapter(config.source.stack);
 		addRules(root, ((JSON.parse(r.meta) as UnitMeta).files ?? []).map((f) => ({ prefix: similarPrefix(f), area, ...(source.placeFile?.(f, config.source.path)?.surface ? {} : { stack }), ...(shared ? { shared } : {}) })));

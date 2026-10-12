@@ -78,3 +78,31 @@ describe("run start: a profile without notApp", () => {
 		await healStackKnowledge({ ledger, config, root: ws, spawn: (async () => { throw new Error("not again"); }) as never, log: () => {} });
 	});
 });
+
+describe("run start: a notApp heal that did not finish", () => {
+	it("the profile already has notApp, but the inventory after it never ran: the next run start redoes it", async () => {
+		const ws = join(here, ".sim", "heal-not-app-pending");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
+		process.env["BR_WORKSPACE"] = ws;
+		mkdirSync(join(ws, "legacy", "tools"), { recursive: true });
+		writeFileSync(join(ws, "legacy", "tools", "Lint.php"), "<?php\nclass Lint { function run() { return 1; } }\n");
+		writeFileSync(join(ws, "legacy", "index.php"), "<?php\n$l = new Lint(); $l->run();\n");
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		const profile = { ...exampleProfileJson(), frameworkDirs: [] } as Record<string, unknown>;
+		delete profile["notApp"];
+		writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify(profile));
+		getSourceAdapter("php").reloadProfile?.();
+		await inventory(config, ws, ledger);
+		const lint = ledger.listUnits().find((u) => (JSON.parse(u.meta).files ?? []).includes("tools/Lint.php"))?.id;
+		expect(lint).toBeTruthy();
+		// the session's list was saved, then the run was stopped before the inventory
+		writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify({ ...profile, notApp: [{ path: "tools/", kind: "tooling", why: "lint scripts" }] }));
+		ledger.setMeta("not_app_heal_pending", "1");
+		await healStackKnowledge({ ledger, config, root: ws, spawn: (async () => { throw new Error("not again"); }) as never, log: () => {} });
+		expect(ledger.getUnit(lint!)).toBeUndefined();
+		expect(ledger.getMeta("not_app_heal_pending")).toBe("0");
+	});
+});

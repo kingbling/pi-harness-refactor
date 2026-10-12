@@ -3,7 +3,7 @@ import { getSourceAdapter, registerGeneratedTargets } from "../adapters/registry
 import { healWiringFiles } from "../adapters/target/generated.ts";
 import type { Config } from "../config.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
-import { healNotApp, leftOut } from "../inventory/not-app.ts";
+import { healNotApp, leftOut, loadNotApp } from "../inventory/not-app.ts";
 import { inventory } from "../inventory/run.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
@@ -17,10 +17,16 @@ import { requeueUnits } from "./run.ts";
  *   started there that merged nothing go back to planned first, so they drop out too.
  * - A generated adapter without wiringFiles: one question to the model (healWiringFiles); the rest stays.
  */
+const NOT_APP_PENDING = "not_app_heal_pending";
+
 export async function healStackKnowledge(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; spawn?: typeof spawnLeaf; log: (l: string) => void }): Promise<void> {
 	const { ledger, config } = o;
-	const notApp = await healNotApp({ config, root: o.root, ledger, spawn: o.spawn, log: o.log });
+	// the profile keeps notApp as soon as the session wrote it; a requeue + inventory that did not finish (stopped,
+	// threw) is redone from that list on the next run start
+	const pending = ledger.getMeta(NOT_APP_PENDING) === "1";
+	const notApp = (await healNotApp({ config, root: o.root, ledger, spawn: o.spawn, log: o.log })) ?? (pending ? loadNotApp(o.root) : undefined);
 	if (notApp) {
+		ledger.setMeta(NOT_APP_PENDING, "1");
 		o.log(pc.cyan(`↻ the framework profile now names ${notApp.length} folder(s) that are not app code: ${notApp.map((f) => f.path).join(", ") || "none"}`));
 		const source = getSourceAdapter(config.source.stack);
 		source.reloadProfile?.();
@@ -42,6 +48,7 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		o.log(pc.cyan(`  ${gone.size} unit(s) dropped from the plan: their files are not app code`));
 		const accepted = units.filter((u) => u.state === "accepted").map((u) => u.id);
 		if (accepted.length) o.log(pc.yellow(`  ${accepted.length} accepted unit(s) hold code that is not the app's: ${accepted.slice(0, 20).join(", ")}${accepted.length > 20 ? ", …" : ""} (left as they are)`));
+		ledger.setMeta(NOT_APP_PENDING, "0");
 	}
 	if (o.client) {
 		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, log: (l) => o.log(pc.dim(l)) });

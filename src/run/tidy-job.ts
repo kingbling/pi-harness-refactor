@@ -4,7 +4,7 @@ import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, removeWorktree } from "../git.ts";
+import { addWorktree, commitAll, headOf, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -90,21 +90,35 @@ export function createTidyJobs(o: {
 				/* no branch */
 			}
 		};
-		reset();
-		addWorktree(o.config.target.path, wt, branch);
 		o.log(pc.cyan(`tidy ${t.id}: ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`));
+		// inside the try: a worktree that cannot be made fails the task, it does not stay approved and hold its area
 		try {
+			reset();
+			const base = headOf(o.config.target.path);
+			addWorktree(o.config.target.path, wt, branch);
 			o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, t.stack)));
 			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t })) || "";
 			const changed = changedFiles(dir, adapter.toolchain.ignoredPaths);
-			const problem = await check(adapter, dir, t, changed);
+			const message = `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`;
+			let problem = await check(adapter, dir, t, changed);
+			// main moved while the job ran: a unit merged since may use the old names, so the check runs again on top of it
+			if (!problem && headOf(o.config.target.path) !== base) {
+				commitAll(wt, message);
+				try {
+					execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", mainBranch(o.config.target.path, o.config.target.git.branch)], { stdio: "pipe" });
+				} catch (e: any) {
+					// the half-done rebase goes with the worktree below; the task fails with git's reason
+					throw new Error(`could not rebase onto main: ${String(e?.stderr ?? e?.message).trim().slice(0, 400)}`);
+				}
+				problem = await check(adapter, dir, t, changed);
+			}
 			if (problem) {
 				endTidyTask(o.ledger, t.id, "failed", problem);
 				o.log(pc.yellow(`tidy ${t.id}: failed, nothing changed on main — ${problem.split("\n")[0]}`));
 				return;
 			}
-			const sha = await o.mergeFix(wt, branch, `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`);
+			const sha = await o.mergeFix(wt, branch, message);
 			endTidyTask(o.ledger, t.id, "done");
 			// the moved code is found under its new name (reuse hints, the copy check)
 			await indexTarget(o.ledger, adapter, projectDir(o.config, t.stack), changed).catch(() => 0);
@@ -123,7 +137,10 @@ export function createTidyJobs(o: {
 			if (running || !worker) return;
 			const t = tidyTasks(o.ledger).find((x) => todo(x) && !o.areaBusy(x.stack, x.area));
 			if (!t) return;
-			running = run(t, worker).finally(() => (running = undefined));
+			// run() ends the task itself on any error; this catch only keeps a stray one from crashing the process
+			running = run(t, worker)
+				.catch((e) => o.log(pc.yellow(`tidy ${t.id}: ${e?.message ?? e}`)))
+				.finally(() => (running = undefined));
 		},
 		get busy() {
 			return running;

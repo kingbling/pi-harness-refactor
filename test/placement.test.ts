@@ -6,6 +6,7 @@ import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { draftedOutside, runUnit } from "../src/run/unit.ts";
 import { getTargetAdapter, knownTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdFor } from "../src/adapters/registry.ts";
+import { curateAreas } from "../src/run/taxonomy.ts";
 import { applyPlacementAnswers, codePlace, placeUnit, pruneRules, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
@@ -262,6 +263,12 @@ describe("placement + taxonomy", () => {
 		expect(plan.get("agency_cmd")).toMatchObject({ stored: true, place: { area: "accounts", source: "taxonomy" } });
 	});
 
+	it("forced re-placement keeps a DB unit's placement: it has no files to place by", () => {
+		ledger.updateUnit("agency_cmd", { meta: { lane: "db", files: [], place: { stack: "nestjs", area: "accounts", shared: false, source: "code" } } });
+		const plan = planPlacements(config, ledger.listUnits(), ws, true);
+		expect(plan.get("agency_cmd")).toMatchObject({ stored: true, place: { stackId: "nestjs", area: "accounts" } });
+	});
+
 	it("onboarding: the area model writes the rules from the folder tree, code applies them, Jev places the rest", async () => {
 		writeFileSync(rulesPath(), JSON.stringify({ rules: [{ prefix: "app/lib/components/uuid.", area: "ids", shared: true }] })); // an answer's rule
 		const client = new FakeModelClient({
@@ -468,6 +475,26 @@ describe("placement: what no area holds, siblings, re-placement, overlaps", () =
 		const areas = JSON.parse(readFileSync(join(ws, ".bigrefactor", "areas.json"), "utf8"));
 		expect(areas.stacks[0].topics).toEqual([]);
 		expect(ledger.openQuestions().filter((q) => q.point === "area_overlap")).toHaveLength(0);
+
+		// a later curation that splits them again does not undo the owner's merge, and does not ask again
+		ledger.updateUnit("money", { meta: { place: { stack: "nestjs", area: "billing", shared: false, source: "model" } } });
+		const again = { ...curation, rules: [{ prefix: "app/lib/components/fpdf.", to: "shared", stack: "nestjs", area: "file-storage", confidence: 0.9, why: "files" }] };
+		const client2 = new FakeModelClient({ chat: (req) => (req.messages[0]!.content.includes("feature-module structure") ? { json: again } : undefined) });
+		await curateAreas({ ledger, config, root: ws, client: client2 });
+		expect(JSON.stringify(client2.calls)).toContain("The owner merged these");
+		expect(JSON.parse(readFileSync(rulesPath(), "utf8")).rules).toContainEqual({ prefix: "app/lib/components/fpdf.", area: "documents", by: "taxonomy" });
+		expect(JSON.parse(readFileSync(join(ws, ".bigrefactor", "areas.json"), "utf8")).stacks[0].topics).toEqual([]);
+		expect(ledger.openQuestions().filter((q) => q.point === "area_overlap")).toHaveLength(0);
+	});
+
+	it("an area named in a placement answer joins the curated set", () => {
+		writeFileSync(join(ws, ".bigrefactor", "areas.json"), JSON.stringify({ stacks: [{ stack: "nestjs", areas: [{ name: "agency", purpose: "" }], topics: [] }] }));
+		const q = ledger.askQuestion({ point: "placement", unitId: "money", question: "q", blocks: "unit", askedBy: "placement", context: { defaultStack: "nestjs" } });
+		ledger.updateUnit("money", { meta: { placeQuestion: q } });
+		ledger.answerQuestion(q, "nestjs:billing", "human");
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["money"]);
+		const areas = JSON.parse(readFileSync(join(ws, ".bigrefactor", "areas.json"), "utf8"));
+		expect(areas.stacks[0].areas.map((a: { name: string }) => a.name)).toEqual(["agency", "billing"]);
 	});
 
 	it("DB table groups are mapped onto the curated areas", async () => {

@@ -62,6 +62,8 @@ interface AreasFile {
 	overlapDone?: number;
 	/** Overlaps the owner keeps apart: never raised again. */
 	overlapsKept?: Overlap[];
+	/** Overlaps the owner merged: every later curation keeps them merged. */
+	merged?: Overlap[];
 	at?: string;
 	by?: string;
 }
@@ -118,6 +120,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 	const role = d.config.models.escalate;
 	const dbUnits = (d.ledger.db.prepare("SELECT id, state, meta FROM units").all() as Array<{ id: string; state: string; meta: string }>).map((u) => ({ ...u, m: JSON.parse(u.meta) as Meta })).filter((u) => u.m.lane === "db" && u.m.group);
 	const kept = prev?.overlapsKept ?? [];
+	const merged = prev?.merged ?? [];
 	const res = await d.client.chat({
 		model: role.id,
 		tier: role.tier as "default" | "flex" | "priority",
@@ -164,7 +167,7 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 - Map each database table group onto one of your areas in db (by what its tables hold).
 - Areas placed so far are listed with their units; FIXED areas stay as they are (keep their files there), others may be renamed or merged. confidence = how sure you are (0–1).`,
 			},
-			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nLegacy folder tree (folder, files, ui/server fact; then each file name up to its first dot, ← used from folder ×n):\n${treeFacts(units, surfaceOf)}\n\nAreas placed so far (key, units, sample files):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n") || "none yet"}${dbUnits.length ? `\n\nDatabase table groups (group, business area the table model named, tables):\n${dbUnits.map((u) => `${u.m.group}  ${u.m.businessArea ?? "-"}  ${(u.m.tables ?? []).slice(0, 6).join(", ")}`).join("\n")}` : ""}${kept.length ? `\n\nThe owner keeps these apart: ${kept.map((o) => `${o.stack}: ${o.names.join(" + ")}`).join("; ")}` : ""}` },
+			{ role: "user", content: `Repo brief:\n${brief.brief.slice(0, 6000)}\n\nLegacy folder tree (folder, files, ui/server fact; then each file name up to its first dot, ← used from folder ×n):\n${treeFacts(units, surfaceOf)}\n\nAreas placed so far (key, units, sample files):\n${areas.map((a) => `${a.key}  ${a.units}  ${a.files.join(", ")}${a.fixed ? `  FIXED (${a.fixed})` : ""}`).join("\n") || "none yet"}${dbUnits.length ? `\n\nDatabase table groups (group, business area the table model named, tables):\n${dbUnits.map((u) => `${u.m.group}  ${u.m.businessArea ?? "-"}  ${(u.m.tables ?? []).slice(0, 6).join(", ")}`).join("\n")}` : ""}${kept.length ? `\n\nThe owner keeps these apart: ${kept.map((o) => `${o.stack}: ${o.names.join(" + ")}`).join("; ")}` : ""}${merged.length ? `\n\nThe owner merged these (use only the kept name): ${merged.map((o) => `${o.stack}: ${o.names.join(" + ")} → ${o.into}`).join("; ")}` : ""}` },
 		],
 	});
 	let cost = brief.costUsd + res.usage.costUsd;
@@ -172,9 +175,66 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 	const files = units.flatMap((u) => u.m.files!);
 	// guards: a rule must cover a real file of the inventory and name a target stack
 	const rules = (j.rules ?? []).map((r) => ({ ...r, prefix: r.prefix.replace(/^\.\//, ""), area: kebab(r.area) })).filter((r) => r.prefix && (r.area || r.to === "exclude") && d.config.target.stacks.includes(r.stack) && files.some((f) => covers(r.prefix, f)));
-	const out: AreasFile = { stacks: j.stacks ?? [], rules, at: new Date().toISOString(), by: res.usage.model, ...(kept.length ? { overlapsKept: kept } : {}) };
+	// the owner's merges hold even when the model splits them again: their names and rules go to the kept name
+	for (const o of merged) {
+		const gone = o.names.filter((n) => n !== o.into);
+		const into = o.into.startsWith("shared/") ? { to: "shared" as const, area: o.into.slice(7) } : { to: "area" as const, area: o.into };
+		for (const r of rules) if (r.stack === o.stack && r.to !== "exclude" && gone.includes(r.to === "shared" ? `shared/${r.area}` : r.area)) Object.assign(r, into);
+		const s = j.stacks?.find((x) => x.stack === o.stack);
+		if (s) {
+			s.areas = s.areas.filter((a) => !gone.includes(kebab(a.name)));
+			s.topics = (s.topics ?? []).filter((t) => !gone.includes(`shared/${kebab(t.name)}`));
+		}
+	}
+	const out: AreasFile = { stacks: j.stacks ?? [], rules, at: new Date().toISOString(), by: res.usage.model, ...(kept.length ? { overlapsKept: kept } : {}), ...(merged.length ? { merged } : {}) };
 	const changed = !prev || [...namesOf(prev)].sort().join() !== [...namesOf(out)].sort().join();
 
+	// exclusions are the owner's call: one question per rule; its units wait for the answer
+	let asked = 0;
+	for (const r of rules.filter((x) => x.to === "exclude")) {
+		const hit = units.filter((u) => u.state === "planned" && !u.m.taxonomyKeep && !u.m.taxonomyQuestion && u.m.files!.every((f) => covers(r.prefix, f)));
+		if (!hit.length) continue;
+		const sample = hit.flatMap((u) => u.m.files!).slice(0, 4);
+		const options = [{ value: "exclude", facts: "do not migrate these units" }, { value: "keep", facts: "migrate them like the rest" }];
+		const q = await askViaModel(d, {
+			point: "area_taxonomy",
+			facts: `Area review of the new codebase: ${r.prefix} (${hit.length} unit(s), e.g. ${sample.join(", ")}) should not be migrated. Reason: ${r.why}. Model confidence ${r.confidence.toFixed(2)}.`,
+			options,
+			recommended: "exclude",
+			agentOpinion: r.why,
+			blocks: "none",
+			askedBy: "taxonomy",
+			context: { mapping: { ...r, from: r.prefix } },
+		});
+		cost += q.costUsd;
+		asked++;
+		// the units wait for the answer: placement treats a unit with an open taxonomy question as unplaced
+		for (const u of hit) d.ledger.updateUnit(u.id, { meta: { taxonomyQuestion: q.id } });
+	}
+	// overlaps the model could not merge: one owner question for all of them (not while an earlier one is open)
+	const overlaps = (j.overlaps ?? [])
+		.map((o) => ({ ...o, names: [...new Set(o.names.map(areaName).filter(Boolean))], into: areaName(o.into) }))
+		.filter((o) => d.config.target.stacks.includes(o.stack) && o.names.length > 1 && o.names.includes(o.into) && ![...kept, ...merged].some((k) => overlapKey(k) === overlapKey(o)));
+	const openBefore = prev?.overlapQuestion && d.ledger.getQuestion(prev.overlapQuestion)?.status === "open" ? prev.overlapQuestion : undefined;
+	if (openBefore) Object.assign(out, { overlaps: prev!.overlaps, overlapQuestion: openBefore });
+	else if (overlaps.length) {
+		const q = await askViaModel(d, {
+			point: "area_overlap",
+			facts: `Area review of the new codebase: these areas/topics look like one domain each, but the area model could not merge them on its own:\n${overlaps.map((o) => `- ${o.stack}: ${o.names.join(" + ")} → keep ${o.into} (${o.why})`).join("\n")}\nmerge = their planned units and rules move to the kept name (units already migrated stay where they are); keep = they stay apart and are not raised again.`,
+			options: [{ value: "merge", facts: "one home per domain: merge as listed" }, { value: "keep", facts: "keep them apart" }],
+			recommended: "merge",
+			blocks: "none",
+			askedBy: "taxonomy",
+			context: { overlaps },
+		});
+		cost += q.costUsd;
+		asked++;
+		Object.assign(out, { overlaps, overlapQuestion: q.id });
+	} else if (prev?.overlapQuestion) Object.assign(out, { overlaps: prev.overlaps, overlapQuestion: prev.overlapQuestion });
+	if (prev?.overlapDone) out.overlapDone = prev.overlapDone;
+	// both files at once, after every question (an await) above: a stop in between never leaves the rules of one set
+	// in placement.json and another set in areas.json
+	writeAreas(d.root, out);
 	// confident rules: code applies them; the stack only where the adapter knows no surface for the covered files
 	const write: PlacementRule[] = rules
 		.filter((r) => r.to !== "exclude" && r.confidence >= ACT)
@@ -206,51 +266,6 @@ export async function curateAreas(d: Deps, opts: { log?: (s: string) => void } =
 		d.ledger.updateUnit(u.id, { meta: { place: { stack: u.m.place?.stack ?? d.config.target.stacks[0]!, area, shared: false, source: "taxonomy" } } });
 		moved++;
 	}
-
-	// exclusions are the owner's call: one question per rule; its units wait for the answer
-	let asked = 0;
-	for (const r of rules.filter((x) => x.to === "exclude")) {
-		const hit = units.filter((u) => u.state === "planned" && !u.m.taxonomyKeep && !u.m.taxonomyQuestion && u.m.files!.every((f) => covers(r.prefix, f)));
-		if (!hit.length) continue;
-		const sample = hit.flatMap((u) => u.m.files!).slice(0, 4);
-		const options = [{ value: "exclude", facts: "do not migrate these units" }, { value: "keep", facts: "migrate them like the rest" }];
-		const q = await askViaModel(d, {
-			point: "area_taxonomy",
-			facts: `Area review of the new codebase: ${r.prefix} (${hit.length} unit(s), e.g. ${sample.join(", ")}) should not be migrated. Reason: ${r.why}. Model confidence ${r.confidence.toFixed(2)}.`,
-			options,
-			recommended: "exclude",
-			agentOpinion: r.why,
-			blocks: "none",
-			askedBy: "taxonomy",
-			context: { mapping: { ...r, from: r.prefix } },
-		});
-		cost += q.costUsd;
-		asked++;
-		// the units wait for the answer: placement treats a unit with an open taxonomy question as unplaced
-		for (const u of hit) d.ledger.updateUnit(u.id, { meta: { taxonomyQuestion: q.id } });
-	}
-	// overlaps the model could not merge: one owner question for all of them (not while an earlier one is open)
-	const overlaps = (j.overlaps ?? [])
-		.map((o) => ({ ...o, names: [...new Set(o.names.map(areaName).filter(Boolean))], into: areaName(o.into) }))
-		.filter((o) => d.config.target.stacks.includes(o.stack) && o.names.length > 1 && o.names.includes(o.into) && !kept.some((k) => overlapKey(k) === overlapKey(o)));
-	const openBefore = prev?.overlapQuestion && d.ledger.getQuestion(prev.overlapQuestion)?.status === "open" ? prev.overlapQuestion : undefined;
-	if (openBefore) Object.assign(out, { overlaps: prev!.overlaps, overlapQuestion: openBefore });
-	else if (overlaps.length) {
-		const q = await askViaModel(d, {
-			point: "area_overlap",
-			facts: `Area review of the new codebase: these areas/topics look like one domain each, but the area model could not merge them on its own:\n${overlaps.map((o) => `- ${o.stack}: ${o.names.join(" + ")} → keep ${o.into} (${o.why})`).join("\n")}\nmerge = their planned units and rules move to the kept name (units already migrated stay where they are); keep = they stay apart and are not raised again.`,
-			options: [{ value: "merge", facts: "one home per domain: merge as listed" }, { value: "keep", facts: "keep them apart" }],
-			recommended: "merge",
-			blocks: "none",
-			askedBy: "taxonomy",
-			context: { overlaps },
-		});
-		cost += q.costUsd;
-		asked++;
-		Object.assign(out, { overlaps, overlapQuestion: q.id });
-	} else if (prev?.overlapQuestion) Object.assign(out, { overlaps: prev.overlaps, overlapQuestion: prev.overlapQuestion });
-	if (prev?.overlapDone) out.overlapDone = prev.overlapDone;
-	writeAreas(d.root, out);
 	syncOverlapAnswer(d);
 	log(`areas: ${rules.length} rules from the folder tree, ${write.length} applied, ${moved} unit(s) moved, ${cleared.length} Jev pick(s) to redo, ${asked} asked; ${(j.stacks ?? []).map((s) => `${s.stack} ${s.areas.length} areas`).join(", ")}`);
 	return { applied: write.length, moved, asked, cleared, areas: Object.fromEntries((j.stacks ?? []).map((s) => [s.stack, s.areas.map((a) => a.name)])), costUsd: cost };
@@ -291,20 +306,26 @@ export function syncOverlapAnswer(d: Pick<Deps, "ledger" | "root">): boolean {
 			}
 		}
 		if (rules.length) writeFileSync(file, JSON.stringify({ rules }, null, 2) + "\n");
+		f.merged = [...(f.merged ?? []), ...overlaps];
 	} else f.overlapsKept = [...(f.overlapsKept ?? []), ...overlaps];
 	f.overlapDone = f.overlapQuestion;
 	writeAreas(d.root, f);
 	return true;
 }
 
-/** A shared topic named in an answer joins the curated set, so the next units can be placed there too. */
-export function recordTopic(root: string, stack: string, name: string, purpose: string): void {
+/**
+ * An area or shared topic named in an answer joins the curated set, so the next units can be placed there too and
+ * the next curation does not run again only because the set lacks it.
+ */
+export function recordArea(root: string, stack: string, name: string, purpose: string, shared: boolean): void {
 	const f = readAreas(root);
-	if (!f?.stacks) return; // nothing curated yet: the first curation sees the topic among the placed areas
+	if (!f?.stacks) return; // nothing curated yet: the first curation sees the area among the placed areas
 	let s = f.stacks.find((x) => x.stack === stack);
 	if (!s) f.stacks.push((s = { stack, areas: [], topics: [] }));
-	if ((s.topics ?? []).some((t) => kebab(t.name) === name)) return;
-	s.topics = [...(s.topics ?? []), { name, purpose }];
+	const list = shared ? (s.topics ?? []) : s.areas;
+	if (list.some((t) => kebab(t.name) === name)) return;
+	if (shared) s.topics = [...list, { name, purpose }];
+	else s.areas = [...list, { name, purpose }];
 	writeAreas(root, f);
 }
 

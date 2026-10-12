@@ -1,4 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
+import { rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
@@ -71,6 +72,10 @@ export function createBuilder(o: {
 }): Builder {
 	const every = o.every ?? { units: o.config.run.buildEveryUnits, minutes: o.config.run.buildEveryMinutes };
 	const merged = new Map<string, number>();
+	// repairs paid per problem: the same problem is not repaired again on every build cycle
+	const tried = new Map<string, number>();
+	const ignored = (sig: string) =>
+		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND json_extract(context, '$.sameAs') = ? AND status IN ('answered', 'auto') ORDER BY id DESC LIMIT 1").get(sig) as { answer: string } | undefined)?.answer === "ignore";
 	let last = Date.now();
 	let running: Promise<void> | undefined;
 
@@ -124,17 +129,27 @@ export function createBuilder(o: {
 			o.log(pc.dim(`builder ${stackId}: whole-project ${steps.map((s) => s.step).join(" + ")} on main`));
 			let problem = await check();
 			if (!problem) return o.log(pc.green(`builder ${stackId}: whole project ok`));
-			const repair = o.repair === false ? undefined : (o.repair ?? repairWithModel);
+			const sig = errorSignature(`build:${stackId}`, problem);
+			// a problem already with the owner (open, or answered "leave it"), or already repaired in vain: no more paid repairs
+			const skip = o.ledger.openQuestionFor("build", sig) !== undefined || ignored(sig) || (tried.get(sig) ?? 0) >= MAX_REPAIRS;
+			const repair = o.repair === false || skip ? undefined : (o.repair ?? repairWithModel);
 			let said = "";
 			for (let i = 1; problem && repair && i <= MAX_REPAIRS; i++) {
+				tried.set(sig, i);
 				o.log(pc.cyan(`builder ${stackId}: whole-project check fails; the big model fixes it (try ${i})`));
 				said = (await repair({ config: o.config, root: o.root, adapter, dir, problem, attempt: i })) || "";
 				// tests are the truth: a repair never changes them
-				const touched = execFileSync("git", ["-C", wt, "status", "--porcelain"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").map((l) => l.slice(3).trim()).filter(Boolean);
+				const touched = execFileSync("git", ["-C", wt, "status", "--porcelain", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+					.split("\n")
+					.filter((l) => l.trim())
+					.map((l) => ({ added: l.startsWith("??"), f: l.slice(3).trim() }));
 				const proj = relative(o.config.target.path, projectDir(o.config, stackId));
 				// a formatter's whitespace fix in a test stays (it cannot change what the test checks)
-				const tests = touched.filter((f) => adapter.layout.isTestFile(proj && f.startsWith(`${proj}/`) ? f.slice(proj.length + 1) : f) && !whitespaceOnly(wt, f));
-				if (tests.length) execFileSync("git", ["-C", wt, "checkout", "--", ...tests], { stdio: "pipe" });
+				const tests = touched.filter((t) => adapter.layout.isTestFile(proj && t.f.startsWith(`${proj}/`) ? t.f.slice(proj.length + 1) : t.f) && (t.added || !whitespaceOnly(wt, t.f)));
+				// a new test file is not in git, so checkout cannot undo it: it is deleted
+				for (const t of tests) if (t.added) rmSync(join(wt, t.f), { force: true });
+				const changed = tests.filter((t) => !t.added).map((t) => t.f);
+				if (changed.length) execFileSync("git", ["-C", wt, "checkout", "--", ...changed], { stdio: "pipe" });
 				problem = await check();
 			}
 			if (!problem) {
@@ -151,7 +166,7 @@ export function createBuilder(o: {
 					options: [{ value: "fixed", facts: "I fixed it on main" }, { value: "ignore", facts: "leave it for now" }],
 					blocks: "none",
 					askedBy: "builder",
-					sameAs: errorSignature(`build:${stackId}`, problem),
+					sameAs: sig,
 				},
 			).catch(() => undefined);
 			o.log(pc.yellow(`builder ${stackId}: whole project still fails; asked once (blocks nothing)`));
