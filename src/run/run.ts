@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
-import { loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
+import { linkedDirs, loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { createBuilder, createMergeCheck, filesNamed, type Repairer } from "./builder.ts";
@@ -811,7 +811,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const dx = await diagnoseFailure({ config, adapter, projectDir: dir, failedStep: first.step ?? "", output, client: o.client }).catch(() => undefined);
 			if (dx) log(pc.dim(`  diagnosis (${dx.by}): ${dx.action} — ${dx.summary}`));
 			if (!dx || dx.action === "fix" || dx.action === "unknown")
-				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, ledger, lock: (fn) => merge.run(fn), signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nFailure output of ${first.unit} (${first.step}):\n${output.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+				fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: dir, fixer: setupFixer, ledger, lock: (fn) => merge.run(fn), signature: first.sig, problem: `${units.length} units failed the same way (${what}).${dx ? ` Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}.` : ""}\nEach unit works in its own git worktree of the target repo (${join(o.root, ".bigrefactor", "worktrees", "<unit>")}); these dependency dirs are linked into it from the main project: ${linkedDirs(adapter, o.root).join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nFailure output of ${first.unit} (${first.step}):\n${output.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 		}
 		recent.length = 0;
 		if (fixed) {

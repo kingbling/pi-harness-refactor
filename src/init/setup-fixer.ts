@@ -4,7 +4,7 @@ import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
-import { type CommandStep, keepOverrides, loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy, withCommandOverrides } from "../adapters/command-overrides.ts";
+import { type CommandStep, keepOverrides, linkedDirs, loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy, withCommandOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -43,16 +43,17 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 /** Learned per workspace: a dependency dir every later unit worktree gets as a copy instead of a link. */
 export function worktreeCopyTool(root: string, adapter: TargetAdapter): ToolDefinition {
 	const dirs = adapter.toolchain.worktreeLinks;
+	const copied = loadCommandOverrides(root, adapter.id).worktreeCopy ?? [];
 	return {
 		name: "set_worktree_copy",
 		label: "Copy into worktrees",
-		description: `Each migration unit works in its own git worktree; these dependency dirs are linked into it from the main project: ${dirs.join(", ") || "none"}. When a tool resolves the link to its real path (an autoloader, module resolution) and so loads the main project's code instead of the worktree's, give the dir as a copy (copy-on-write clone) to every later worktree.`,
+		description: `Each migration unit works in its own git worktree; these dependency dirs are linked into it from the main project: ${linkedDirs(adapter, root).join(", ") || "none"}${copied.length ? ` (already a copy: ${copied.join(", ")})` : ""}. When a tool resolves the link to its real path (an autoloader, module resolution) and so loads the main project's code instead of the worktree's, give the dir as a copy (copy-on-write clone) to every later worktree.`,
 		promptSnippet: "set_worktree_copy: a linked dependency dir becomes a copy in every later unit worktree",
 		parameters: Type.Object({ dir: Type.String(), why: Type.String() }),
 		execute: async (_id: string, p: { dir: string; why: string }) => {
 			const out = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 			if (!dirs.includes(p.dir)) return out(`refused: ${p.dir} is not a linked dir (${dirs.join(", ") || "none"})`);
-			saveWorktreeCopy(root, adapter.id, p.dir, p.why);
+			if (!saveWorktreeCopy(root, adapter.id, p.dir, p.why)) return out(`${p.dir} is a copy in every unit worktree already: this changes nothing, the cause is elsewhere`);
 			return out(`${p.dir} is copied into every unit worktree from now on`);
 		},
 	} as unknown as ToolDefinition;
@@ -259,7 +260,9 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 	fixes.set(problemKey, (fixes.get(problemKey) ?? 0) + 1);
 	const wasted = () => fixes.set(key, (fixes.get(key) ?? 0) + 1);
 	const p = (async () => {
-		const before = JSON.stringify(loadCommandOverrides(o.root, key));
+		// the why text is only a note: a fix that adds to it alone changed nothing
+		const settings = () => JSON.stringify({ ...loadCommandOverrides(o.root, key), why: undefined });
+		const before = settings();
 		const overrides = keepOverrides(o.root, key);
 		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
 		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
@@ -305,6 +308,11 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 				}
 				const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`, { exclude: others.map((x) => x.dir) });
 				const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
+				// a commit of notes only (.md) fixes nothing a gate runs: it is taken back, the units are not retried for it
+				if (changed.length && changed.every((f) => f.endsWith(".md"))) {
+					execFileSync("git", ["-C", repo, "reset", "-q", "--keep", "HEAD~1"], { stdio: "pipe" });
+					return { sha: undefined, undone: [...undone, ...changed], changed: [], cannotFail: undefined };
+				}
 				return { sha, undone, changed, cannotFail: undefined };
 			} catch (e: any) {
 				// a failed put-back or commit (a hook) must not leave the fixer's edits on main for the next commit to sweep up
@@ -326,7 +334,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 			return undefined;
 		}
 		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} file(s) it changed (tests, migrated code, another stack's project): ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
-		const override = JSON.stringify(loadCommandOverrides(o.root, key)) !== before;
+		const override = settings() !== before;
 		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });
 		if (!sha && !override) return (wasted(), undefined);
 		const what = said || "the setup was changed";

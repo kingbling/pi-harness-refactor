@@ -193,6 +193,25 @@ describe("setup fixes during the run: a folder the fix made holds no app code", 
 	});
 });
 
+describe("setup fixes during the run: a note is no fix", () => {
+	it("a commit that changes only .md files is taken back and counts as no change", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll, headOf } = await import("../src/git.ts");
+		const { existsSync } = await import("node:fs");
+		const { root, target, adapter, config } = stack({ id: "notes" } as never);
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		const head = headOf(target);
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "SETUP-NOTES.md"), "nothing to fix: the unit's own code is wrong\n");
+			return "wrote down why nothing was fixed";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "a test fails", fixer })).toBeUndefined();
+		expect(headOf(target)).toBe(head);
+		expect(existsSync(join(target, "SETUP-NOTES.md"))).toBe(false);
+	});
+});
+
 describe("setup fixes during the run: tries per problem", () => {
 	it("fixes that worked do not count toward the run's cap; only sessions that changed nothing do", async () => {
 		const { fixRunSetup, MAX_RUN_FIXES } = await import("../src/init/setup-fixer.ts");
@@ -304,6 +323,25 @@ describe("worktree dependency dirs: link or (learned) copy", () => {
 		expect((await tool.execute("1", { dir: "src", why: "x" })).content[0]!.text).toMatch(/refused/);
 		await tool.execute("2", { dir: "vendor", why: "the autoloader resolves the link to the main project" });
 		expect(loadCommandOverrides(root, "s").worktreeCopy).toEqual(["vendor"]);
+	});
+
+	it("copying a dir that is a copy already changes nothing: no fix, and the problem no longer calls it linked", async () => {
+		const { fixRunSetup, worktreeCopyTool } = await import("../src/init/setup-fixer.ts");
+		const { linkedDirs, loadCommandOverrides } = await import("../src/adapters/command-overrides.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { root, target, adapter, config } = stack({ id: "copied", toolchain: { isProjectReady: () => true, worktreeLinks: ["vendor", "node_modules"] } } as never);
+		ensureRepo(target, "migration/main", []);
+		commitAll(target, "init");
+		type Tool = { execute: (id: string, p: { dir: string; why: string }) => Promise<{ content: Array<{ text: string }> }> };
+		await (worktreeCopyTool(root, adapter) as unknown as Tool).execute("1", { dir: "vendor", why: "autoloader" });
+		expect(linkedDirs(adapter, root)).toEqual(["node_modules"]);
+		const fixer: SetupFixer = async (o) => {
+			const said = await (worktreeCopyTool(o.root, o.adapter) as unknown as Tool).execute("2", { dir: "vendor", why: "autoloader again" });
+			expect(said.content[0]!.text).toMatch(/already/);
+			return "vendor is copied now";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "class not found", fixer })).toBeUndefined();
+		expect(loadCommandOverrides(root, "copied").why).not.toMatch(/again/);
 	});
 });
 
