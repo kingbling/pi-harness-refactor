@@ -9,6 +9,7 @@ import { judgeRun, MAX_PARITY_REOPENS, type ParityJudge } from "../src/run/parit
 import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain } from "../src/run/run.ts";
 import { RESOLVER } from "../src/jev/resolve.ts";
 import { routeOwners } from "../src/run/parity-check.ts";
+import { LEGACY, loadApps, saveApp } from "../src/run/parity.ts";
 
 /**
  * The judge sorts each difference into a bug of the new app (the unit is re-opened with it) or a quirk of the old
@@ -97,6 +98,19 @@ describe("judging parity differences", () => {
 		const line = renderStatus(ledger, { color: false }).split("\n").find((l) => l.startsWith("parity"))!;
 		expect(line).toMatch(/same 0 +differ 1 +not compared 1 +differences: bugs 1 +quirks 0/);
 		expect(line).toMatch(/not compared: auth/);
+	});
+
+	it("a difference only the test setup causes re-opens no unit: it goes to that app's parity setup, and the judge sees how each app runs", async () => {
+		const { root, config, ledger, run, ids, status } = workspace();
+		saveApp(root, LEGACY, { up: true, said: "starts with docker at http://localhost:18080/login" });
+		saveApp(root, "nestjs", { up: true, said: "no database snapshot could be loaded" });
+		const r = run([{ step: "one", path: "body.total", legacy: 10, target: null }]);
+		const judge: ParityJudge = async (o) => (expect(o.facts).toMatch(/nestjs: ready at \?; no database snapshot/), [{ diffs: ids(r), verdict: "setup", unit: "", app: "nestjs", problem: "the new app runs without the snapshot data" }]);
+		const res = await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge, log: () => {} });
+		expect(res).toMatchObject({ setup: 1, bugs: 0, reopened: [] });
+		expect(status(r)).toEqual(["setup"]);
+		expect(ledger.getUnit("U1")!.state).toBe("accepted");
+		expect(loadApps(root)["nestjs"]!.setupProblem).toMatch(/body\.total[\s\S]*without the snapshot data/);
 	});
 
 	it("a verdict naming an unknown unit or another run's differences changes nothing; what is not judged stays open", async () => {

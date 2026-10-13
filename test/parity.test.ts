@@ -132,6 +132,24 @@ describe("starting the apps for parity", () => {
 		expect(problems).toHaveLength(1);
 	});
 
+	it("a setup problem the parity judge found is sent to that app's setup once; a working new recipe clears it", async () => {
+		const { root, config } = workspace();
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		saveApp(root, LEGACY, { setupProblem: "step s1 redirects to localhost — the app's base URL is set to another port" });
+		const problems: string[] = [];
+		const fix: AppFixer = async (o) => (problems.push(o.problem), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), env: { BASE_URL: "x" } }), "set the base URL");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: fix, log: () => {} })).toBe(true);
+		expect(problems[0]).toMatch(/only its setup here causes \(step s1 redirects to localhost/);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, setupProbed: true, recipe: { env: { BASE_URL: "x" } } });
+		expect(loadApps(root)[LEGACY]!.setupProblem).toBeUndefined();
+		// once only
+		saveApp(root, LEGACY, { setupProblem: "again" });
+		expect(await probeApp({ config, root, side: LEGACY, fixer: fix, log: () => {} })).toBe(true);
+		expect(problems).toHaveLength(1);
+	});
+
 	it("a red new app is probed again once main has moved on, a few times at most, without asking the owner again", async () => {
 		const { root, config } = workspace();
 		mkdirSync(config.target.path, { recursive: true });
