@@ -330,6 +330,10 @@ describe("tidy review: a source folder outside the layout", () => {
 		writeFileSync(join(proj, "src/shared/dates/format.ts"), "export const f = 1;\n");
 		move.to = ["src/shared/dates/api-client.ts"];
 		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "dates", shared: true, force: true })).asked).toBe(0);
+		// the job failed it: the same files moved to another name are not asked again
+		ledger.setMeta("tidy_tasks", JSON.stringify(tidyTasks(ledger).map((t) => ({ ...t, status: "failed", failure: "build red" }))));
+		move.to = ["src/shared/http/client.ts"];
+		expect((await maybeTidyReview(d, { stackId: "nestjs", area: "flights", force: true })).asked).toBe(0);
 	});
 });
 

@@ -11,7 +11,7 @@ import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { runCmd } from "./builder.ts";
+import { FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
 import { changedFiles, wholeProjectSteps } from "./gate.ts";
 import { checkTree } from "./layout-check.ts";
 import { endTidyTask, onlyCase, tidyMissing, tidyTasks, type TidyTask } from "./tidy.ts";
@@ -20,7 +20,8 @@ import { endTidyTask, onlyCase, tidyMissing, tidyTasks, type TidyTask } from "./
  * The tidy job: each approved tidy task runs once, on its own, in a worktree of main. A model does the move and
  * finds every file that uses the moved names (it searches; code does not guess), tests included, and changes
  * only their imports and namespaces; it also deletes shims an earlier attempt left (deprecated copies, aliases).
- * Code then checks: the tree shows the task done, the moved files follow the layout, the build passes, the tests of the changed files pass.
+ * Code then checks: the tree shows the task done, the moved files follow the layout, the build passes, the tests of the changed files pass
+ * (an error main already has does not count).
  * Green: merged into main, the task is done. Red: thrown away, the task is failed with the output; units go on.
  * Units never do tidy work: while a task of their area is approved, the scheduler holds them back (`holds`).
  */
@@ -106,7 +107,7 @@ export function createTidyJobs(o: {
 			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t }).finally(() => overrides.restore() && o.log(pc.yellow(`tidy ${t.id}: the job changed the gate commands file; put back`)))) || "";
 			const changed = changedFiles(dir, adapter.toolchain.ignoredPaths);
 			const message = `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`;
-			let problem = await check(adapter, dir, t, changed);
+			let problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
 			// main moved while the job ran: a unit merged since may use the old names, so the check runs again on top of it
 			if (!problem && headOf(o.config.target.path) !== base) {
 				commitAll(wt, message);
@@ -116,7 +117,7 @@ export function createTidyJobs(o: {
 					// the half-done rebase goes with the worktree below; the task fails with git's reason
 					throw new Error(`could not rebase onto main: ${String(e?.stderr ?? e?.message).trim().slice(0, 400)}`);
 				}
-				problem = await check(adapter, dir, t, changed);
+				problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
 			}
 			if (problem) {
 				endTidyTask(o.ledger, t.id, "failed", problem);
@@ -157,8 +158,9 @@ export function createTidyJobs(o: {
 /**
  * Code's check of a tidy job: the task is done in the tree, the moved files follow the layout, the build passes (the whole project when the build
  * cannot take files, else the changed code files) and the tests among the changed files pass. Undefined = green.
+ * A failing step runs again on main (`mainDir`), like a code job's: it fails only when green on main or with error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[]): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[], mainDir: string): Promise<string | undefined> {
 	const missing = tidyMissing(dir, t);
 	if (missing.length) return `the change is not complete: ${missing.join("; ")}`;
 	// a delete removes only the files it names
@@ -171,13 +173,23 @@ async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: 
 	if (drift.length) return `the layout check failed: ${drift.slice(0, 10).join("\n")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
-	const whole = wholeProjectSteps(adapter, dir).filter((s) => s.step === "build");
+	const whole = wholeProjectSteps(adapter, dir).some((s) => s.step === "build");
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
-	const steps = [...(whole.length ? whole : code.length ? [{ step: "build", ...adapter.build(dir, code) }] : []), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
-	const out: string[] = [];
+	// each step with the files it checks (none: the whole project), so the same step can run on main
+	const steps: Array<{ step: string; files?: string[] }> = [...(whole ? [{ step: "build" }] : code.length ? [{ step: "build", files: code }] : []), ...(tests.length ? [{ step: "test", files: tests }] : [])];
+	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === "build")!);
+	const added: string[] = [];
 	for (const s of steps) {
-		const err = await runCmd(s.cmd, s.args, dir);
-		if (err !== undefined) out.push(`$ ${[s.cmd, ...s.args].join(" ")}   (${s.step})\n${err}`);
+		const c = cmd(dir, s);
+		const err = await runCmd(c.cmd, c.args, dir, FULL_OUTPUT);
+		if (err === undefined) continue;
+		// main may be red too (a big project's type check): an error main already has is not this task's.
+		// Files new here (the moved ones) keep their names: a build that ignores its file list still shows main's errors
+		const there = s.files?.filter((f) => existsSync(join(mainDir, f)));
+		const m = cmd(mainDir, { ...s, files: there?.length ? there : s.files });
+		const was = await runCmd(m.cmd, m.args, mainDir, FULL_OUTPUT);
+		if (was === undefined) return `$ ${[c.cmd, ...c.args].join(" ")}   (${s.step})\n${err.slice(-8000)}`; // red here, green on main
+		added.push(...newErrorLines(err, dir, was, mainDir));
 	}
-	return out.length ? out.join("\n\n") : undefined;
+	return added.length ? `the checks fail with ${added.length} error line(s) main does not have:\n${added.join("\n").slice(-6000)}` : undefined;
 }
