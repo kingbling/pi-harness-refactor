@@ -26,6 +26,7 @@ import { implementerTools, portedLayout, testerTools, type ToolDeps } from "../s
 import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
+import { isWiringFile } from "../rules/layout-rules.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
@@ -90,6 +91,24 @@ export interface UnitRunOptions {
 	legacyFixer?: LegacyFixer | false;
 	/** Judges wired_ok (real, connected, on the chosen stack); default: the reviewer model (none when `spawn` is faked). */
 	reviewer?: Reviewer | false;
+	/**
+	 * Kept by the scheduler across merge rounds: the last approved review (set here) and the files that clashed with
+	 * main since (repo-relative). A later round reuses that approval when only those files and wiring files changed.
+	 */
+	approved?: { review?: ApprovedReview; clash: string[] };
+}
+
+/** What an approved review saw: each changed file's hash, and the tests with the tester's answers as one hash. */
+export interface ApprovedReview {
+	files: Record<string, string>;
+	tests: string;
+	r: Awaited<ReturnType<Reviewer>>;
+}
+
+/** An approval still holds when the tests are the same and every file that changed since may change (clash, wiring). */
+export function approvalStands(a: ApprovedReview, now: { files: Record<string, string>; tests: string }, mayChange: (f: string) => boolean): boolean {
+	if (a.tests !== now.tests) return false;
+	return [...new Set([...Object.keys(a.files), ...Object.keys(now.files)])].every((f) => a.files[f] === now.files[f] || mayChange(f));
 }
 
 export interface UnitRunResult {
@@ -821,17 +840,23 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					// (a tester that kept every test and only answered gets a fresh review that reads them)
 					const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
 					const key = sha1(JSON.stringify([[...changedFiles].sort().map((f) => [f, read(f)]).concat(testFiles.map((t) => [t.path, read(t.path)])), unitMeta().testerKept ?? ""]));
+					const seen = { files: Object.fromEntries(changedFiles.map((f) => [f, sha1(read(f))])), tests: sha1(JSON.stringify([testFiles.map((t) => [t.path, read(t.path)]), unitMeta().testerKept ?? ""])) };
 					const disputed = findingDisputes;
 					const changedTruth = truthChangedAfterCode();
 					const truthChanged = changedTruth.lines;
 					findingDisputes = [];
+					// a merge round: only the clashing files (resolved) and wiring files changed since an approval, it stands
+					const clash = (o.approved?.clash ?? []).map((c) => relative(targetProjectDir, join(o.workDir ?? o.config.target.path, c)));
+					const approvedBefore = !disputed.length && !truthChanged.length && lastReview?.key !== key && !!o.approved?.review && approvalStands(o.approved.review, seen, (f) => clash.includes(f) || isWiringFile(f, wiring));
+					if (approvedBefore) lastReview = { key, r: o.approved!.review!.r };
 					const reuse = !disputed.length && !truthChanged.length && lastReview?.key === key;
-					if (reuse) log(pc.dim("  code and tests unchanged since the last review: its verdict stands (no new review)"));
+					if (reuse) log(pc.dim(approvedBefore ? "  only clashing or wiring files changed since the approved review: its verdict stands (no new review)" : "  code and tests unchanged since the last review: its verdict stands (no new review)"));
 					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
 					let r = reuse
 						? { ...lastReview!.r, costUsd: 0 }
 						: await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), implementerNote, findingDisputes: disputed, testerKept: unitMeta().testerKept, truthChanged, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra!) });
 					if (!reuse && r.judged) lastReview = { key, r };
+					if (!reuse && r.judged && r.ok && o.approved) o.approved.review = { ...seen, r };
 					// a review that judged them has seen the changed truth: a wrong one is in its findings now
 					if (!reuse && r.judged && changedTruth.last) o.ledger.updateUnit(o.unitId, { meta: { truthChangeSeen: changedTruth.last } });
 					cost += r.costUsd ?? 0;

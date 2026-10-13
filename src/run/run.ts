@@ -38,7 +38,10 @@ import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
 import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
-import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
+import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
+import { conflictMarkers } from "./gate.ts";
+import { isWiringFile } from "../rules/layout-rules.ts";
+import { spawnLeaf } from "../sessions/spawn.ts";
 
 /**
  * The scheduler: many agent sessions, few gate workers, one merge at a time.
@@ -580,6 +583,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			let wholeStack: string | undefined;
 			let carried: string | undefined;
 			let crash: string | undefined;
+			// the last approved review and the files that clashed since: it stands across merge rounds while only those changed
+			const approved: { review?: ApprovedReview; clash: string[] } = { clash: [] };
+			// a clash only in wiring files is resolved without a new implement pass: no round used, so a cap of its own
+			let wiringRounds = 0;
+			let mergeOnly = false;
 			try {
 				// inside the try: a worktree that cannot be made (disk full, git lock) counts as a crash, so the unit is
 				// quarantined after the second one instead of being picked first again on every restart
@@ -590,7 +598,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				carried = [takeRetryNote(ledger, unitId), restored && "The worktree already holds your code from the earlier try, put on top of the current main: fix what failed instead of starting over.", restored?.length && conflictFilesNote(restored)].filter(Boolean).join("\n\n") || undefined;
 				// Playbook: run → (merge conflict → fresh worktree on current main with the unit's commit put back on top, one more implement pass to resolve the clashing files) ×2 → accept or quarantine.
 				for (let round = 1; round <= 3; round++) {
-					res = await runUnit({
+					if (!mergeOnly) res = await runUnit({
 						ledger,
 						config,
 						root: o.root,
@@ -610,10 +618,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						log: (l) => log(`  ${l}`),
 						spawn: o.spawn,
 						gate: o.gate,
+						approved,
 					});
-					cost += res.costUsd;
+					if (!mergeOnly) cost += res!.costUsd;
+					mergeOnly = false;
 					testsNote = undefined;
-					if (res.state !== "review") break;
+					if (res!.state !== "review") break;
 					try {
 						await merge.run(async () => {
 							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);
@@ -663,7 +673,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							}
 						});
 						acceptedNow++;
-						log(pc.green(`✓ ${unitId} accepted ($${res.costUsd.toFixed(4)})`));
+						log(pc.green(`✓ ${unitId} accepted ($${res!.costUsd.toFixed(4)})`));
 						if (!o.dry) {
 							builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							pusher.afterMerge();
@@ -683,7 +693,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						break;
 					} catch (e: any) {
 						const breaks = e instanceof BreaksMain;
-						if ((!breaks && !/merge conflict/.test(String(e?.message))) || round === 3) {
+						if ((!breaks && !/merge conflict/.test(String(e?.message))) || (breaks && round === 3)) {
 							ledger.transitionUnit(unitId, "quarantined", `could not merge: ${String(e?.message).slice(0, 300)}`);
 							log(pc.red(`■ ${unitId}: quarantined (${String(e?.message).split("\n")[0]})${blocksNote(unitId)}`));
 							break;
@@ -691,7 +701,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						if (breaks) {
 							// the worktree keeps the code on top of the current main: the next pass fixes it there
 							wholeStack = e.stackId;
-							const tests = res.gate?.testFiles ?? [];
+							approved.clash = [];
+							const tests = res!.gate?.testFiles ?? [];
 							const named = filesNamed(e.output, join(wt, relative(config.target.path, projectDir(config, e.stackId))), adapters.get(e.stackId)?.layout.sourceExtensions ?? []);
 							// errors only in the unit's own tests: the implementer may not edit them, the tester fixes them first
 							if (named.length && named.every((f) => tests.includes(f))) testsNote = `The unit passed its own checks but was not merged: with it, the whole ${e.stackId} project check has errors main does not have, all in your test files (${named.join(", ")}). Fix them in the test files, behaviour unchanged; check_ported_tests runs that check.\n${e.output.slice(-4000)}`;
@@ -704,6 +715,30 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						const sha = headOf(wt);
 						fresh();
 						const clash = sha ? restoreUnitWork(wt, sha) : undefined;
+						approved.clash = clash ?? [];
+						// only wiring files clash (route table, main module: every unit adds its entry there): one short session
+						// keeps both sides' entries, then the merge (with its stack check) is tried again, no new implement pass or review
+						const { stackId: cStack } = placementOf(ledger.getUnit(unitId)!.meta);
+						const cAdapter = adapters.get(cStack)!;
+						const wiring = cAdapter.generateRegistration ? [] : cAdapter.layout.wiringFiles;
+						const projRel = relative(config.target.path, projectDir(config, cStack));
+						if (clash?.length && wiringRounds < MAX_WIRING_ROUNDS && clash.every((f) => isWiringFile(relative(projRel, f), wiring))) {
+							wiringRounds++;
+							log(pc.yellow(`  merge conflict only in wiring files (${clash.join(", ")}) → keeping both sides' entries`));
+							if (await resolveWiringClash({ config, root: o.root, unitId, wt, files: clash, spawn: o.spawn })) {
+								round--;
+								mergeOnly = true;
+								continue;
+							}
+							log(pc.yellow("  the wiring files still hold conflict markers"));
+						}
+						if (round === 3) {
+							// back to the unit's commit as it was before the restore: what a quarantine keeps
+							if (sha) gitIn(wt, ["reset", "-q", "--hard", sha]);
+							ledger.transitionUnit(unitId, "quarantined", `could not merge: ${String(e?.message).slice(0, 300)}`);
+							log(pc.red(`■ ${unitId}: quarantined (${String(e?.message).split("\n")[0]})${blocksNote(unitId)}`));
+							break;
+						}
 						conflictNote = clash
 							? `Your previous pass passed its checks and the review but could not be merged: the main branch has moved (another unit landed). Your code is back in the worktree on top of the current main. ${clash.length ? conflictFilesNote(clash) : "It applied cleanly this time."} Change nothing else unless a check asks for it.`
 							: `Your previous pass could not be merged: ${String(e?.message).split("\n")[0]}. The main branch has moved (another unit of the same module landed). The worktree now starts from the current main; re-apply the migration of this unit on top of the existing code (extend files, do not overwrite other units' work).`;
@@ -1639,6 +1674,31 @@ export function restoreUnitWork(wt: string, sha: string): string[] | undefined {
 		}
 		return undefined;
 	}
+}
+
+/** Clashes only in wiring files resolved without an implement pass, per unit run (main can keep moving). */
+export const MAX_WIRING_ROUNDS = 5;
+
+/**
+ * Wiring files (repo-relative) that clashed with main hold both sides: one short session keeps every entry of both
+ * and removes the markers, changing nothing else. True when no marker is left.
+ */
+export async function resolveWiringClash(o: { config: Config; root: string; unitId: string; wt: string; files: string[]; spawn?: typeof spawnLeaf }): Promise<boolean> {
+	mkdirSync(join(o.root, ".bigrefactor", "sessions"), { recursive: true });
+	const session = await (o.spawn ?? spawnLeaf)({
+		role: "implement",
+		cwd: o.wt,
+		config: o.config,
+		writeGlobs: o.files,
+		transcriptPath: join(o.root, ".bigrefactor", "sessions", `${o.unitId}.wiring.jsonl`),
+		systemPrompt: `You resolve git merge conflicts in wiring files (route tables, the main module) where every migrated unit registers what it adds. Keep every entry of both sides (imports, routes, registrations), each once, and remove every conflict marker. Change nothing else and edit no other file. Never interactive prompts or servers; do not commit.`,
+	});
+	try {
+		await session.run(`${conflictFilesNote(o.files)}\nPaths are relative to ${o.wt}.`);
+	} finally {
+		session.dispose();
+	}
+	return o.files.every((f) => existsSync(join(o.wt, f))) && !conflictMarkers(o.wt, o.files).length;
 }
 
 /** What the implementer is told about files that clashed with main when its code was put back on top of it. */
