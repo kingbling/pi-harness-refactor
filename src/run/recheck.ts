@@ -266,7 +266,9 @@ function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: 
 }
 
 /** The old code's environment as a short hash: work tried on it is tried again only once it changes. */
-const envHash = (root: string, config: Config) => createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(root, config), why: undefined })).digest("hex").slice(0, 12);
+/** Bump when how scripts are run changes (2: absolute legacy-repo paths made relative), so scripts tried before are tried again. */
+const RUN_RULES = 2;
+const envHash = (root: string, config: Config) => createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(root, config), why: undefined, rules: RUN_RULES })).digest("hex").slice(0, 12);
 
 /** Writes the unit's cases script into `truthDir` (the recorded cases' symbols and inputs, never their expected values); returns its last sentence. */
 export type TruthScriptWriter = (o: { config: Config; root: string; source: SourceAdapter; unitId: string; truthDir: string; legacyFiles: string[]; cases: Array<{ symbol: string; inputs: unknown }> }) => Promise<string | void>;
@@ -280,7 +282,7 @@ export const writeTruthScriptWithModel: TruthScriptWriter = async (o) => {
 		writeGlobs: [o.source.truth.scriptName],
 		protectedGlobs: [],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `${o.unitId}.truth-script.${Date.now()}.jsonl`),
-		systemPrompt: `You write a characterization script that runs the OLD ${o.source.id} code, so a migration tool can check expected values that were so far only read from that code. Write ${script} only: ${o.source.truth.instructions} Load the unit's real legacy files (paths relative to the legacy root ${o.config.source.path}) and call the real code with exactly the inputs you are given; print one case per input, with the same symbol and inputs and the value the old code returns as expected: [{"symbol": <as given>, "inputs": <as given>, "expected": <what the old code returned>}]. Never write a result into the script yourself and never fake the code: when it cannot run, say what is missing and stop. Never change the legacy repo. Run it the way the tool will: ${describeTruthRun(o.root, o.config, o.source, script)}. End with one sentence.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You write a characterization script that runs the OLD ${o.source.id} code, so a migration tool can check expected values that were so far only read from that code. Write ${script} only: ${o.source.truth.instructions} Load the unit's real legacy files by paths relative to the folder the script runs in (the old code's folder; the legacy repo is ${o.config.source.path}, but the old code may run from a copy or a container, so never write that absolute path) and call the real code with exactly the inputs you are given; print one case per input, with the same symbol and inputs and the value the old code returns as expected: [{"symbol": <as given>, "inputs": <as given>, "expected": <what the old code returned>}]. Never write a result into the script yourself and never fake the code: when it cannot run, say what is missing and stop. Never change the legacy repo. Run it the way the tool will: ${describeTruthRun(o.root, o.config, o.source, script)}. End with one sentence.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const r = await session.run(`Unit ${o.unitId}. Its legacy files: ${o.legacyFiles.join(", ") || "none recorded"}. The cases to run (symbol and inputs; JSON):\n${JSON.stringify(o.cases, null, 1).slice(0, 12_000)}`);

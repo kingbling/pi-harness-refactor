@@ -63,8 +63,25 @@ function saveLegacyEnv(root: string, config: Config, change: Partial<LegacyEnv>,
 	return next;
 }
 
-/** The command the orchestrator runs a truth script with (and the tester should too). */
-export function truthCommand(env: LegacyEnv, source: SourceAdapter, script: string): { cmd: string; args: string[]; cwd: string } {
+/**
+ * A script that loads the old code by its absolute path in the legacy repo (`sourcePath`) cannot find it where the
+ * old code really runs (a copy, or a container that mounts it elsewhere). Scripts run with cwd = the old code's
+ * folder, so such paths are made relative: a copy next to the script (same folder, so the script's own folder and
+ * mounts still hold) is run instead. The script itself is left as the tester wrote it.
+ */
+export function portableScript(script: string, sourcePath: string): string {
+	if (!existsSync(script)) return script;
+	const text = readFileSync(script, "utf8");
+	const abs = `${resolve(sourcePath)}/`;
+	if (!text.includes(abs)) return script;
+	const copy = join(dirname(script), `.portable.${basename(script)}`);
+	writeFileSync(copy, text.replaceAll(abs, ""));
+	return copy;
+}
+
+/** The command the orchestrator runs a truth script with (and the tester should too). With `sourcePath`, see portableScript. */
+export function truthCommand(env: LegacyEnv, source: SourceAdapter, script: string, sourcePath?: string): { cmd: string; args: string[]; cwd: string } {
+	if (sourcePath) script = portableScript(script, sourcePath);
 	const fill = (a: string) => a.replaceAll("{script}", script).replaceAll("{root}", env.root);
 	const c = env.run ? { cmd: fill(env.run.cmd), args: env.run.args.map(fill) } : source.truth.run(env.root, script);
 	return { ...c, cwd: env.root };
@@ -124,7 +141,7 @@ export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: So
 	const none = noBehaviourReason(truthDirAbs);
 	if (!existsSync(script)) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
 	try {
-		const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script);
+		const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script, config.source.path);
 		const out = execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 		const cases = lastJsonArray(out) as TruthCase[] | undefined;
 		if (!cases) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no JSON array of cases at its end; its output ends with:\n${out.trim().slice(-800) || "(nothing)"}` };
@@ -322,8 +339,8 @@ export function legacyCopyTool(root: string, config: Config): ToolDefinition {
 }
 
 /** Runs `script` with `env`'s command: undefined when it exits 0, else what it printed. */
-function runError(env: LegacyEnv, source: SourceAdapter, script: string): string | undefined {
-	const { cmd, args, cwd } = truthCommand(env, source, script);
+function runError(env: LegacyEnv, source: SourceAdapter, script: string, sourcePath: string): string | undefined {
+	const { cmd, args, cwd } = truthCommand(env, source, script, sourcePath);
 	try {
 		execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 		return undefined;
@@ -340,13 +357,13 @@ function reachesTruthScripts(root: string, config: Config, source: SourceAdapter
 	const probe = join(root, ".bigrefactor", "legacy-env", "probe", source.truth.scriptName);
 	if (!existsSync(probe)) return undefined;
 	const env = run ? { ...loadLegacyEnv(root, config), run } : loadLegacyEnv(root, config);
-	if (runError(env, source, probe)) return undefined; // the probe itself does not run: nothing to compare
+	if (runError(env, source, probe, config.source.path)) return undefined; // the probe itself does not run: nothing to compare
 	const dir = join(root, ".bigrefactor", "truth", "__runcheck__");
 	mkdirSync(dir, { recursive: true });
 	const copy = join(dir, source.truth.scriptName);
 	cpSync(probe, copy);
 	try {
-		const err = runError(env, source, copy);
+		const err = runError(env, source, copy, config.source.path);
 		return err ? `the probe runs from ${dirname(probe)}, but not from the units' truth folders (${join(root, ".bigrefactor", "truth")}/<unit>/), where every truth script lives:\n${err}` : undefined;
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

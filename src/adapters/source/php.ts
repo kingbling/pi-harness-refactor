@@ -690,7 +690,7 @@ export const phpAdapter: SourceAdapter = {
 	truth: {
 		scriptName: "cases.php",
 		run: (_sourceRoot, scriptPath) => ({ cmd: "php", args: [scriptPath] }),
-		instructions: "a PHP script that require()s the legacy files (paths relative to the legacy root; it is executed from there), executes each case and prints ONE JSON array via echo json_encode(...). Run it with bash (php <script>) and iterate until it exits 0 and prints valid JSON.",
+		instructions: "a PHP script that require()s the legacy files (paths relative to the legacy root, never absolute: it is executed from there, which may be a copy or a container), executes each case and prints ONE JSON array via echo json_encode(...). Run it with bash (php <script>) and iterate until it exits 0 and prints valid JSON.",
 	},
 
 	oldTestCommand(root) {

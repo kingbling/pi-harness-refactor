@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { SourceAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
@@ -159,6 +159,22 @@ describe("the old code's environment", () => {
 		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(root, ".bigrefactor", "legacy-env.json"), "utf8")), run: { ...onlyProbe, args: [...onlyProbe.args, "x"] } }));
 		const fixed: LegacyFixer = async (o) => (await call(legacyRunTool(o.root, o.config, o.source), { cmd: "sh", args: ["{script}"], why: "mount it all" }), "set a run that reaches every script");
 		expect(await probeLegacyEnv({ ...opts, fixer: fixed })).toBe("run");
+	});
+
+
+	it("a truth script that loads the old code by its absolute legacy-repo path still runs where the old code really is", () => {
+		const { root, config, source } = workspace();
+		const elsewhere = join(root, "old-copy");
+		mkdirSync(join(elsewhere, "lib"), { recursive: true });
+		writeFileSync(join(elsewhere, "lib", "value.sh"), "V=7\n");
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: elsewhere, mode: "run" }));
+		const dir = join(root, ".bigrefactor", "truth", "U1");
+		mkdirSync(dir, { recursive: true });
+		const script = join(dir, "cases.sh");
+		writeFileSync(script, `. ${resolve(config.source.path)}/lib/value.sh\necho "[{\\"symbol\\":\\"s\\",\\"inputs\\":[],\\"expected\\":$V}]"\n`);
+		const r = verifyTruthOnOld(dir, config, source, root);
+		expect(r).toMatchObject({ ok: true, cases: [{ expected: 7 }] });
+		expect(readFileSync(script, "utf8")).toContain(resolve(config.source.path)); // the tester's script is untouched
 	});
 
 	it("a red probe nobody was asked about is probed once more (the machine may have changed), then decided", async () => {
