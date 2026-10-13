@@ -68,6 +68,10 @@ export const EVIDENCE_TYPES = [
 	"structure_ok",
 	// another model said the tests are wrong (implementer dispute, reviewer: weak tests): the tester re-checked them
 	"test_disputed",
+	// the reviewer called the ported tests too weak: the tester re-checked them
+	"tests_weak",
+	// a retest changed an expected value read from the old code after the implementer's code existed: {case, old, new, why}
+	"truth_changed_after_code",
 	// a later unit found a bug in this unit's accepted code: it was re-opened with the report
 	"bug_reported",
 	// the new code is real and connected: no stubs, entry point for HTTP units, uses its migrated deps, chosen stack used

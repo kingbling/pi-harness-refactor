@@ -111,21 +111,33 @@ describe("the builder", () => {
 		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt[\s\S]*run these commands yourself/i);
 	});
 
-	it("a code job that made progress is followed by the next one in the same cycle, until main is green", async () => {
+	it("a code job that made progress is followed by the next one in the same cycle, until main is green or one makes none", async () => {
 		const { root, target, config, adapter, ledger } = setup();
+		// the "type check" prints one line per error left in src/errors.txt
+		writeFileSync(join(target, "src", "errors.txt"), "src/a.txt(1,1): error one\nsrc/a.txt(2,1): error two\n");
+		commitAll(target, "errors");
+		const typed = { ...adapter, build: () => ({ cmd: "sh", args: ["-c", "cat src/errors.txt; test ! -s src/errors.txt"] }), test: () => ({ cmd: "true", args: [] }) } as TargetAdapter;
 		const jobs: string[] = [];
+		const fixTo = (left: string) => (writeFileSync(join(target, "src", "errors.txt"), left), commitAll(target, "fix"));
 		const codeJob = async () => {
 			jobs.push("job");
-			// the first job fixes part of it (merged, main still red); the second makes main green
-			if (jobs.length === 2) (writeFileSync(join(target, "src", "a.txt"), "ok\n"), commitAll(target, "fix"));
-			return jobs.length === 1 ? "fixed half of the errors" : "fixed the rest";
+			// the first job fixes one of the two errors (merged, main still red); the second fixes the other
+			fixTo(jobs.length === 1 ? "src/a.txt(2,1): error two\n" : "");
+			return jobs.length === 1 ? "fixed one error" : "fixed the rest";
 		};
 		const logs: string[] = [];
-		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: (l) => logs.push(l), linkAll: () => {}, mergeFix: async () => undefined, codeJob, every: { units: 1, minutes: 60 } });
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", typed]]), log: (l) => logs.push(l), linkAll: () => {}, mergeFix: async () => undefined, codeJob, every: { units: 1, minutes: 60 } });
 		b.afterMerge("fake");
 		await b.finish();
 		expect(jobs).toHaveLength(2);
 		expect(logs.join("\n")).toMatch(/whole project ok/);
+		// a job that says it helped but leaves main as it was: no second job in that cycle
+		fixTo("src/a.txt(1,1): error one\n");
+		const said: string[] = [];
+		const b2 = createBuilder({ config, root, ledger, adapters: new Map([["fake", typed]]), log: () => {}, linkAll: () => {}, mergeFix: async () => undefined, codeJob: async () => (said.push("job"), "fewer errors"), every: { units: 1, minutes: 60 } });
+		b2.afterMerge("fake");
+		await b2.finish();
+		expect(said).toHaveLength(1);
 	});
 
 	it("a test file the repair adds is deleted, not checked out, and the fix is merged", async () => {

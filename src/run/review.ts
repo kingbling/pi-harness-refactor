@@ -55,6 +55,8 @@ export interface ReviewInput {
 	findingDisputes?: Array<{ finding: string; why: string; evidence: string }>;
 	/** The tester's answer after re-checking tests the reviewer called weak: the ones it kept, with its reasons. */
 	testerKept?: string;
+	/** Expected values read from the old code (not run) that a retest changed after the code existed: the reviewer confirms each against the legacy code. */
+	truthChanged?: string[];
 	transcriptPath?: string;
 	spawn?: typeof spawnLeaf;
 }
@@ -150,6 +152,7 @@ function facts(o: ReviewInput): string {
 		...(o.openFindings?.length ? [`\nYour earlier reviews of this unit found these, still open as far as the ledger knows. Check each against the code now: a fixed one goes in fixed, one still open goes in findings again (with any new ones), so findings is the whole open list. Raise a new one only when it is a real blocker, not a change of mind:\n${o.openFindings.join("\n")}`] : []),
 		...(o.findingDisputes?.length ? [`\nThe implementer disputes these findings. Check each against the legacy code and the code now, then answer each in disputeAnswers: kept (it stays in findings) with the reason the dispute is wrong, or dropped (it leaves findings) with the reason it is right:\n${o.findingDisputes.map((d) => `- ${d.finding}: ${d.why}\n  evidence: ${d.evidence}`).join("\n")}`] : []),
 		...(o.implementerNote ? [`\nThe implementer's final message (its claims, not facts: check them against the code):\n${o.implementerNote}`] : []),
+		...(o.truthChanged?.length ? [`\nThe tester changed these expected values after the implementer's code existed. They were read from the old code, never run on it, so nothing but the tester checked the change. Read the legacy code for each: where the old value was right, it is a finding ("truth case <id>: the old code gives <old value>; put it back in the test and the case"):\n${o.truthChanged.map((t) => `- ${t}`).join("\n")}`] : []),
 		...(o.testerKept ? [`\nThe tester re-checked the tests you called weak against the legacy code and kept these, with its reasons. Call a kept test weak again only when its reason is wrong, and say why:\n${o.testerKept}`] : []),
 		...(o.ownerNote ? [`Note from the orchestrator for this run (only an answer by the owner, a person, counts as decided; a model's hint is context to check against the legacy code): ${o.ownerNote}`] : []),
 		...legacyFacts(o),
@@ -159,7 +162,9 @@ function facts(o: ReviewInput): string {
 		...(o.nearDuplicates?.length ? [`\nLook-alike class names the reuse check found (a guess from the names, not proof). For each, read both classes: when they are the same record or class, it is a finding (reuse the existing one); when they hold different things, it is fine:\n${o.nearDuplicates.map((n) => `- ${n}`).join("\n")}`] : []),
 		o.recheck
 			? `\nThis unit was accepted earlier; later units, tidy and repairs may have changed its code since. Judge its files as they are now:\n${current(o.targetProjectDir, o.changedFiles)}${o.commit ? `\n\nIts original commit (context only, may be outdated): ${summary(o.config.target.path, o.commit)}` : ""}`
-			: `\nWhat the unit changed:\n${diff(o.targetProjectDir, o.changedFiles)}`,
+			: o.changedFiles.length
+				? `\nWhat the unit changed:\n${diff(o.targetProjectDir, o.changedFiles)}`
+				: `\nThe unit changed no file: the implementer says existing code already does this (reuse). Find that code (the ported tests' imports, the legacy symbols' names) and judge whether it really does what the legacy code does, wired where it is used; if it does not, that is a finding.`,
 	].join("\n");
 }
 

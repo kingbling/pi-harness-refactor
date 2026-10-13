@@ -161,6 +161,8 @@ export function createBuilder(o: {
 	const tried = new Map<string, number>();
 	// code jobs per stack since main was last green
 	const jobs = new Map<string, number>();
+	// how many error lines main had when the stack's last code job started: the next job in the same cycle needs fewer
+	const jobFrom = new Map<string, number>();
 	const ignored = (sig: string) =>
 		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND json_extract(context, '$.sameAs') = ? AND status IN ('answered', 'auto') ORDER BY id DESC LIMIT 1").get(sig) as { answer: string } | undefined)?.answer === "ignore";
 	let last = Date.now();
@@ -174,7 +176,7 @@ export function createBuilder(o: {
 		merged.clear();
 		running = (async () => {
 			// a code job that made progress is followed by the next one at once, until main is green or a job makes none
-			for (const s of stacks) for (let i = 0; i < MAX_JOBS_PER_CYCLE && (await buildStack(s).catch((e) => (o.log(pc.yellow(`builder ${s}: ${e?.message ?? e}`)), false))); i++);
+			for (const s of stacks) for (let i = 0; i < MAX_JOBS_PER_CYCLE && (await buildStack(s, i > 0).catch((e) => (o.log(pc.yellow(`builder ${s}: ${e?.message ?? e}`)), false))); i++);
 		})().finally(() => {
 			running = undefined;
 			last = Date.now();
@@ -182,7 +184,7 @@ export function createBuilder(o: {
 	};
 
 	/** True when a code job made main better and the stack should be checked again right away. */
-	const buildStack = async (stackId: string): Promise<boolean> => {
+	const buildStack = async (stackId: string, again = false): Promise<boolean> => {
 		const adapter = o.adapters.get(stackId);
 		if (!adapter) return false;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__builder__${stackId}`);
@@ -222,6 +224,8 @@ export function createBuilder(o: {
 				o.ledger.setMeta(buildParkedKey(stackId), "");
 			};
 			if (!problem) return green(), o.log(pc.green(`builder ${stackId}: whole project ok`)), false;
+			const errors = errorKeys(problem, dir).length;
+			if (again && errors >= (jobFrom.get(stackId) ?? Infinity)) return o.log(pc.yellow(`builder ${stackId}: main has no fewer errors after the last code job (${errors}); the next one after the next merges`)), false;
 			const sig = errorSignature(`build:${stackId}`, problem);
 			const parked = (jobs.get(stackId) ?? 0) >= MAX_BUILD_CODE_JOBS;
 			// a problem already with the owner (open, or answered "leave it"), parked, or already repaired in vain: no more paid repairs
@@ -268,6 +272,7 @@ export function createBuilder(o: {
 			// "fix or ignore": after MAX_BUILD_CODE_JOBS jobs in a row main stays red quietly, br status says so
 			const n = (jobs.get(stackId) ?? 0) + 1;
 			jobs.set(stackId, n);
+			jobFrom.set(stackId, errors);
 			const changedMain = o.codeJob
 				? await o.codeJob(stackId, `The whole ${stackId} project fails its checks on main after merges of units that each passed their own checks. Fix the code so these commands pass: types, imports, signatures and calls between modules, also in test files (type errors there), without changing what a test checks. Never weaken the checks (no excluded paths, ignore comments, config changes). Fixing part of the errors is fine: it is merged when main has fewer errors and no new ones, and the next job goes on from there. Run the failing commands again before you stop.\n${brief(problem)}`).catch((e) => (o.log(pc.yellow(`builder ${stackId}: code job failed: ${e?.message ?? e}`)), undefined))
 				: undefined;

@@ -87,6 +87,33 @@ describe("models fix each other's work", () => {
 		expect(ledger.db.prepare("SELECT role FROM attempts WHERE unit_id = 'u1' AND role != 'review' ORDER BY id").all()).toEqual([{ role: "implement" }, { role: "test" }, { role: "gate" }]);
 	});
 
+	it("a retest that changes an expected value read from the old code after the code exists is recorded and shown to the next review", async () => {
+		writeFileSync(join(ws, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read" }));
+		ledger.db.prepare("DELETE FROM evidence").run();
+		ledger.addEvidence("u1", "truth_read", {});
+		ledger.db.prepare("UPDATE truth_cases SET symbol_id = 's', inputs = '[]', expected = '1', verified_on_old = 0").run();
+		write(join(ws, ".bigrefactor", "truth", "u1", "cases.json"), '[{"symbol":"s","inputs":[],"expected":1}]');
+		const calls: Call[] = [];
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => {
+			const inner = await (sessions(calls) as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts);
+			return { ...inner, run: async (task: string) => (opts.role === "test" && write(join(ws, ".bigrefactor", "truth", "u1", "cases.json"), '[{"symbol":"s","inputs":[],"expected":2}]'), inner.run(task)) } as LeafSession;
+		}) as never;
+		const seen: Array<string[] | undefined> = [];
+		let reviews = 0;
+		const reviewer = async (i: { truthChanged?: string[] }) => (seen.push(i.truthChanged), ++reviews === 1 ? { ok: false, judged: true, output: "weak tests:\n- spec: weak", weakTests: "- spec: weak" } : { ok: true, judged: true, output: "fine" });
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!([]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer: reviewer as never, log: () => {} });
+		expect(seen[0]).toEqual([]);
+		expect(seen[1]).toEqual([expect.stringMatching(/^u1#1 \(s, inputs \[\]\): was 1, the tester made it 2/)]);
+		expect(ledger.hasEvidence("u1", "truth_changed_after_code")).toBe(true);
+		// a weak-tests round is counted as such, not as a dispute
+		expect(ledger.hasEvidence("u1", "tests_weak")).toBe(true);
+		expect(ledger.hasEvidence("u1", "test_disputed")).toBe(false);
+	});
+
 	it("tests still called weak after 2 tester rounds: the code passes with a note on the unit, no owner question", async () => {
 		const calls: Call[] = [];
 		const weak = "- agency.service.spec.ts: only checks it renders";

@@ -137,8 +137,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		if (silence) for (const f of prodFiles) for (const l of addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
 		// a merge conflict restored into the worktree: no marker line may reach main (build and tests do not read every file)
 		for (const f of conflictMarkers(g.targetProjectDir, changed)) problems.push(`unresolved merge conflict in ${f}: keep the changes of both sides and remove the <<<<<<< ======= >>>>>>> lines`);
-		if (prodFiles.length === 0 && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
-		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
+		// no code written but ported tests to run: existing code may already do it (reuse); the tests and the reviewer decide
+		const reuse = prodFiles.length === 0 && g.testFiles.length > 0;
+		if (prodFiles.length === 0 && !reuse && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
+		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : reuse ? "no production file changed (reuse): the ported tests and the reviewer decide" : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 	});
 	if (!agOk) return done();
 

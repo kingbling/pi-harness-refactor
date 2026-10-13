@@ -71,6 +71,15 @@ describe("gate: own scope", () => {
 		expect(JSON.parse(ev!.payload)).toMatchObject({ judged: false, note: expect.stringMatching(/whole-project build: the builder runs it/) });
 	});
 
+	it("no production file changed but ported tests to run: reuse passes anti-gaming, the tests and the reviewer decide", async () => {
+		commit();
+		const testFiles = [{ path: "src/shared/agency/agency.spec.ts", sha1: sha1("src/shared/agency/agency.spec.ts") }];
+		const r = await gate({ testFiles });
+		expect(step(r, "antigaming_ok")).toMatchObject({ ok: true, output: expect.stringMatching(/reuse/) });
+		// without tests, writing nothing is still a failure
+		expect(step(await gate(), "antigaming_ok")).toMatchObject({ ok: false, output: expect.stringMatching(/no production files were written/) });
+	});
+
 	it("a file that still holds a merge conflict marker fails antigaming_ok, in any file type", async () => {
 		write("src/features/agency/agency.module.yaml", "routes:\n<<<<<<< HEAD\n  - a\n=======\n  - b\n>>>>>>> unit\n");
 		const r = await gate();

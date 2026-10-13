@@ -322,7 +322,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			log(pc.red(`  truth (${truthMode}) failed: ${verified.error}`));
 			return false;
 		}
-		recordTruth(verified.cases, verified.madeBy, "none" in verified ? verified.none : undefined);
+		recordTruth(verified.cases, verified.madeBy, "none" in verified ? verified.none : undefined, more.codeWritten);
 		// once the cases were linked to their tests, every later truth run links them again: a new case gets its test now
 		if (linkedOnce) await coverTruth(false);
 		return true;
@@ -332,7 +332,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastRunError: string | undefined;
 	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks).
 	// The same cases as recorded stay untouched (ids, links to their tests): a retest never makes them drift.
-	const recordTruth = (cases: TruthCase[], mode: TruthMode, none?: string) => {
+	const recordTruth = (cases: TruthCase[], mode: TruthMode, none?: string, codeWritten = false) => {
 		if (none !== undefined && !cases.length) {
 			o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
 			if (noBehaviour(o.ledger, o.unitId) !== none) o.ledger.addEvidence(o.unitId, "truth_none", { reason: none, file: `${truthDirRel}/${NO_BEHAVIOUR_FILE}` });
@@ -350,6 +350,15 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		// a case already recorded keeps its id and its link to its test; a new one gets the next free number
 		const ids = caseIds(o.unitId, old, cases);
+		// read truth whose expected value a retest changed once the code existed: nobody but the tester checked it, so the
+		// reviewer confirms it against the legacy code (new cases stay allowed)
+		if (codeWritten && mode === "read") {
+			const was = new Map(old.map((c) => [c.id, c]));
+			cases.forEach((c, i) => {
+				const before = was.get(ids[i]!);
+				if (before && before.verified_on_old === 0 && before.expected !== JSON.stringify(c.expected)) o.ledger.addEvidence(o.unitId, "truth_changed_after_code", { case: ids[i], symbol: c.symbol, inputs: before.inputs.slice(0, 300), old: before.expected.slice(0, 500), new: JSON.stringify(c.expected).slice(0, 500), why: lastTesterText.slice(-600) });
+			});
+		}
 		const linked = new Map(old.map((c) => [c.id, c.ported_test_path]));
 		o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
 		const ins = o.ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, ported_test_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -618,7 +627,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let disputeRounds = 0;
 	// tester rounds the reviewer's weak-tests verdict drove (disputes do not count): the waiver below needs 2 of them.
 	// Kept in unit meta with the tester's "kept" answers, so a later run of the unit goes on counting
-	const unitMeta = () => JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { weakRounds?: number; testerKept?: string };
+	const unitMeta = () => JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { weakRounds?: number; testerKept?: string; truthChangeSeen?: number };
+	// read truth a retest changed after the code existed, not yet shown to a review that judged (a finding then keeps it open)
+	const truthChangedAfterCode = (): { lines: string[]; last: number } => {
+		const rows = o.ledger.db.prepare("SELECT id, payload FROM evidence WHERE unit_id = ? AND type = 'truth_changed_after_code' AND id > ? ORDER BY id").all(o.unitId, unitMeta().truthChangeSeen ?? 0) as Array<{ id: number; payload: string }>;
+		const lines = rows.map((r) => {
+			const p = JSON.parse(r.payload) as { case: string; symbol: string; inputs: string; old: string; new: string; why?: string };
+			return `${p.case} (${p.symbol}, inputs ${p.inputs}): was ${p.old}, the tester made it ${p.new}${p.why ? `. The tester's last words: ${p.why.replace(/\s+/g, " ").slice(-300)}` : ""}`;
+		});
+		return { lines, last: rows.at(-1)?.id ?? 0 };
+	};
 	let weakRounds = unitMeta().weakRounds ?? 0;
 	// the reviewer found only weak tests (the code is fine): after the tester's retest the gate runs again on the same
 	// code, with no new implementer session and no new attempt
@@ -785,14 +803,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
 					const key = sha1(JSON.stringify([[...changedFiles].sort().map((f) => [f, read(f)]).concat(testFiles.map((t) => [t.path, read(t.path)])), unitMeta().testerKept ?? ""]));
 					const disputed = findingDisputes;
+					const changedTruth = truthChangedAfterCode();
+					const truthChanged = changedTruth.lines;
 					findingDisputes = [];
-					const reuse = !disputed.length && lastReview?.key === key;
+					const reuse = !disputed.length && !truthChanged.length && lastReview?.key === key;
 					if (reuse) log(pc.dim("  code and tests unchanged since the last review: its verdict stands (no new review)"));
 					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
 					let r = reuse
 						? { ...lastReview!.r, costUsd: 0 }
-						: await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), implementerNote, findingDisputes: disputed, testerKept: unitMeta().testerKept, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra!) });
+						: await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), implementerNote, findingDisputes: disputed, testerKept: unitMeta().testerKept, truthChanged, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra!) });
 					if (!reuse && r.judged) lastReview = { key, r };
+					// a review that judged them has seen the changed truth: a wrong one is in its findings now
+					if (!reuse && r.judged && changedTruth.last) o.ledger.updateUnit(o.unitId, { meta: { truthChangeSeen: changedTruth.last } });
 					cost += r.costUsd ?? 0;
 					reviewWeakOnly = r.judged && !r.ok && !!r.weakTests && !r.findings?.length && !r.outOfScope;
 					// the tester had 2 weak-tests rounds and only the tests are still called weak: the code passes, the doubt is noted
@@ -872,7 +894,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				testRounds++;
 				o.ledger.updateUnit(o.unitId, { meta: { weakRounds: ++weakRounds } });
 			}
-			o.ledger.addEvidence(o.unitId, "test_disputed", { note: testsNote.slice(0, 2000) });
+			// a dispute and a weak-tests round are counted apart: the weak-tests rounds are most of them
+			if (disputeNote) o.ledger.addEvidence(o.unitId, "test_disputed", { note: disputeNote.slice(0, 2000) });
+			if (weakDrove) o.ledger.addEvidence(o.unitId, "tests_weak", { note: testsNote.slice(0, 2000) });
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
 			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`, { disputeText: disputeNote || undefined });
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
