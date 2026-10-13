@@ -6,7 +6,9 @@ import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { renderStatus } from "../src/dashboard/status.ts";
 import { judgeRun, MAX_PARITY_REOPENS, type ParityJudge } from "../src/run/parity-judge.ts";
-import { MAX_PARITY_ERRORS, parityAgain } from "../src/run/run.ts";
+import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain } from "../src/run/run.ts";
+import { RESOLVER } from "../src/jev/resolve.ts";
+import { routeOwners } from "../src/run/parity-check.ts";
 
 /**
  * The judge sorts each difference into a bug of the new app (the unit is re-opened with it) or a quirk of the old
@@ -117,6 +119,27 @@ describe("judging parity differences", () => {
 		const res = await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge: async () => [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "tax" }], log: () => {} });
 		expect(res.reopened).toEqual([]);
 		expect(ledger.openQuestions().filter((q) => q.point === "parity")).toHaveLength(0);
+	});
+
+	it("a model's retry gives a unit one more parity re-open; the owner's retry a fresh set", () => {
+		const { ledger } = workspace();
+		for (const [unit, by] of [["U1", RESOLVER], ["U2", "human"]] as const) {
+			ledger.updateUnit(unit, { meta: { parityReopens: MAX_PARITY_REOPENS } });
+			const q = ledger.askQuestion({ unitId: unit, point: "parity", question: "still differs", options: ["retry", "leave"], blocks: "none", askedBy: "parity" });
+			ledger.answerQuestion(q, "retry", by);
+		}
+		expect(applyParityAnswers(ledger)).toEqual(["invoices", "invoices"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta).parityReopens).toBe(MAX_PARITY_REOPENS - 1);
+		expect(JSON.parse(ledger.getUnit("U2")!.meta).parityReopens).toBe(0);
+		// used once per answer
+		expect(applyParityAnswers(ledger)).toEqual([]);
+	});
+
+	it("a slice's route owners are the units holding its routes' handlers, not its pages", () => {
+		const { ledger } = workspace();
+		ledger.db.prepare("INSERT INTO index_routes(side, method, path, handler_symbol) VALUES ('source', 'GET', '/invoices', 'src/U1.php::f')").run();
+		ledger.db.prepare("UPDATE units SET state = 'planned' WHERE id = 'U2'").run();
+		expect(routeOwners(ledger, "invoices")).toEqual([{ id: "U1", state: "accepted" }]);
 	});
 
 	it("at run start: an error is compared again a few times, unjudged differences again, a decided quirk once", () => {

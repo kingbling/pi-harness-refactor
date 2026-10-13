@@ -9,7 +9,7 @@ import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { checkSlice, compareRuns, dataChanges, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
+import { checkSlice, compareRuns, dataChanges, runSteps, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
@@ -54,6 +54,31 @@ describe("comparing the old and the new app", () => {
 		const w = (n: number): StepResult => ({ status: 302, location: "/x", data: { t: { added: [{ id: 2, total: n }], removed: [] } } });
 		expect(compareRuns(s, [w(5)], [w(5)], [w(6)], true).diffs).toMatchObject([{ kind: "data", path: "data.t.added[0].total" }]);
 		expect(compareRuns(s, [w(5)], [w(5)], [w(6)], false).diffs).toEqual([]);
+	});
+
+	it("an http → https redirect to the app itself matches the other app doing the same on its own port", async () => {
+		const serve = (to: (host: string) => string) =>
+			new Promise<{ base: string; close: () => void }>((res) => {
+				const s = createServer((q, r) => r.writeHead(301, { location: to(q.headers.host!) }).end()).listen(0, () => {
+					res({ base: `http://localhost:${(s.address() as { port: number }).port}/`, close: () => s.close() });
+				});
+			});
+		const [a, b, c] = [await serve((h) => `https://${h}/x?y=1`), await serve((h) => `https://${h}/x?y=1`), await serve(() => "https://elsewhere.example/x?y=1")];
+		try {
+			const s = [step("r", "redirect")];
+			const [ra, rb, rc] = await Promise.all([a, b, c].map((app) => runSteps(s, { side: "legacy", base: () => app.base })));
+			expect(ra![0]!.location).toBe("https://(this app)/x?y=1");
+			expect(compareRuns(s, ra!, ra!, rb!, false).diffs).toEqual([]);
+			expect(compareRuns(s, ra!, ra!, rc!, false).diffs).toMatchObject([{ kind: "redirect" }]);
+		} finally {
+			for (const app of [a, b, c]) app.close();
+		}
+	});
+
+	it("a page step compares its status, so a page the new app does not have is a difference", () => {
+		const s = [step("p", "page")];
+		const c = compareRuns(s, [{ status: 200, body: "<html>" }], [{ status: 200, body: "<html>!" }], [{ status: 404, body: "" }], false);
+		expect(c.diffs).toMatchObject([{ step: "p", kind: "status", legacy: 200, target: 404 }]);
 	});
 
 	it("every slice route needs a compared step or a reason it has none", () => {

@@ -36,6 +36,8 @@ import { findTests } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
+import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
+import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 
 /**
@@ -351,9 +353,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let parityLast: string | undefined;
 	const showParity = (what?: string) => progress.setParity({ now: what ? { what, since: Date.now() } : undefined, queued: parityQueue.length, last: parityLast });
 	const sliceOf = (unitId: string) => (JSON.parse(ledger.getUnit(unitId)?.meta ?? "{}") as { slice?: string }).slice;
+	// a slice can be compared once the units that answer its routes are accepted: its pages and helpers may still be open
 	const sliceDone = (slice: string) => {
-		const us = ledger.listUnits().filter((u) => (JSON.parse(u.meta) as { slice?: string }).slice === slice);
-		return us.length > 0 && us.every((u) => u.state === "accepted");
+		const owners = routeOwners(ledger, slice);
+		return owners.length > 0 && owners.every((u) => u.state === "accepted");
 	};
 	const pumpParity = () => {
 		if (parityRunning || parityStopped || !parityQueue.length) return;
@@ -393,17 +396,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		// at the start: finished slices never compared, and slices whose last comparison needs another look
 		const { checked, again } = parityAgain(ledger, headOf(config.target.path));
 		const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((x): x is string => !!x));
-		// and slices of units the owner said to retry after they ran out of parity re-opens: a fresh set, used once per answer
-		const answered: Array<string | undefined> = [];
-		for (const q of ledger.db.prepare("SELECT unit_id, MAX(id) AS id FROM questions WHERE point = 'parity' AND answer IS NOT NULL AND unit_id IS NOT NULL GROUP BY unit_id").all() as Array<{ unit_id: string; id: number }>) {
-			const meta = JSON.parse(ledger.getUnit(q.unit_id)?.meta ?? "{}") as { parityRetried?: number };
-			if (meta.parityRetried === q.id) continue;
-			const value = answerValue(ledger.getQuestion(q.id)?.answer);
-			const retry = value === "retry";
-			// "leave" is remembered, so the judge does not ask about this unit again at the next comparison
-			ledger.updateUnit(q.unit_id, { meta: { parityRetried: q.id, ...(retry ? { parityReopens: 0, parityLeft: undefined } : value === "leave" ? { parityLeft: q.id } : {}) } });
-			if (retry) answered.push(sliceOf(q.unit_id));
-		}
+		// and slices of units the owner said to retry after they ran out of parity re-opens
+		const answered = applyParityAnswers(ledger);
 		for (const sl of slices) if (!checked.has(sl) || again.has(sl) || answered.includes(sl)) queueParity(sl);
 	}
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
@@ -663,7 +657,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						if (!o.dry) {
 							builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							pusher.afterMerge();
-							queueParity(sliceOf(unitId));
+							// only a route owner's accept changes what is compared; a slice never compared is queued once
+							const sl = sliceOf(unitId);
+							if (sl && (routeOwners(ledger, sl).some((u) => u.id === unitId) || !parityAgain(ledger).checked.has(sl))) queueParity(sl);
 						}
 						// living rules: proposals from units are curated into a new rules version once enough piled up
 						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => {
@@ -1346,6 +1342,27 @@ function capText(t: string, max: number): string {
  * joined at all, so it never blocks.
  */
 const OPEN_DEP = "du.state != 'accepted' AND json_extract(du.meta, '$.exclude') IS NULL";
+
+/**
+ * Parity questions answered since the last run ("retry" or "leave" after a unit ran out of parity re-opens), applied
+ * once per answer. Returns the slices of the units to compare again. The owner's retry is a fresh set of re-opens; a
+ * model's retry is one more, so a model cannot loop a unit forever.
+ */
+export function applyParityAnswers(ledger: Ledger): string[] {
+	const slices: string[] = [];
+	for (const q of ledger.db.prepare("SELECT unit_id, MAX(id) AS id FROM questions WHERE point = 'parity' AND answer IS NOT NULL AND unit_id IS NOT NULL GROUP BY unit_id").all() as Array<{ unit_id: string; id: number }>) {
+		const meta = JSON.parse(ledger.getUnit(q.unit_id)?.meta ?? "{}") as { parityRetried?: number; slice?: string };
+		if (meta.parityRetried === q.id) continue;
+		const question = ledger.getQuestion(q.id);
+		const value = answerValue(question?.answer);
+		const retry = value === "retry";
+		const reopens = MODEL_ANSWERERS.includes(question?.answered_by ?? "") ? MAX_PARITY_REOPENS - 1 : 0;
+		// "leave" is remembered, so the judge does not ask about this unit again at the next comparison
+		ledger.updateUnit(q.unit_id, { meta: { parityRetried: q.id, ...(retry ? { parityReopens: reopens, parityLeft: undefined } : value === "leave" ? { parityLeft: q.id } : {}) } });
+		if (retry && meta.slice) slices.push(meta.slice);
+	}
+	return slices;
+}
 
 /** Parity comparisons that failed with an error in a row before a slice is left alone (until a unit of it lands again). */
 export const MAX_PARITY_ERRORS = 3;

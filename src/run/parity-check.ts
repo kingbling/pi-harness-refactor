@@ -23,7 +23,7 @@ export interface Step {
 	id: string;
 	/** The slice route it exercises ("GET /invoices/{id}"), or "setup" for login and other preparation. */
 	route: string;
-	/** What is compared: data = status, redirect, body and written data; redirect = status, redirect and written data; page = written data only (pages are compared later); none = nothing. */
+	/** What is compared: data = status, redirect, body and written data; redirect = status, redirect and written data; page = status and written data (the HTML is compared later); none = nothing. */
 	compare: "data" | "redirect" | "page" | "none";
 	method: string;
 	path: string;
@@ -74,6 +74,14 @@ export function sliceFacts(ledger: Ledger, slice: string): { routes: string[]; f
 	const rows = ledger.db.prepare("SELECT method, path, handler_symbol FROM index_routes WHERE side = 'source'").all() as Array<{ method: string | null; path: string; handler_symbol: string | null }>;
 	const routes = [...new Set(rows.filter((r) => r.handler_symbol && own.has(r.handler_symbol.split("::")[0]!)).map((r) => `${r.method ?? "ANY"} ${r.path}`))];
 	return { routes, files, units: units.map((u) => ({ id: u.id, state: u.state })) };
+}
+
+/** The slice's units that hold one of its routes' handlers: once these are accepted, the slice can be compared. */
+export function routeOwners(ledger: Ledger, slice: string): Array<{ id: string; state: string }> {
+	const units = ledger.listUnits().filter((u) => (JSON.parse(u.meta) as { slice?: string }).slice === slice);
+	const rows = ledger.db.prepare("SELECT handler_symbol FROM index_routes WHERE side = 'source' AND handler_symbol IS NOT NULL").all() as Array<{ handler_symbol: string }>;
+	const handlers = new Set(rows.map((r) => r.handler_symbol.split("::")[0]!));
+	return units.filter((u) => ((JSON.parse(u.meta) as { files?: string[] }).files ?? []).some((f) => handlers.has(f))).map((u) => ({ id: u.id, state: u.state }));
 }
 
 /** Why these steps cannot be used, or undefined. Every slice route needs a step or a reason it has none. */
@@ -167,8 +175,11 @@ export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; ba
 			r.status = res.status;
 			const loc = res.headers.get("location");
 			if (loc) {
+				// the app's own address is dropped: the two apps run on different ports. An http → https redirect to
+				// itself keeps only the scheme, so it still matches the other app doing the same.
 				const u = new URL(loc, base);
-				r.location = u.origin === new URL(base).origin ? `${u.pathname}${u.search}` : u.href;
+				const b = new URL(base);
+				r.location = u.host !== b.host ? u.href : u.protocol === b.protocol ? `${u.pathname}${u.search}` : `${u.protocol}//(this app)${u.pathname}${u.search}`;
 			}
 			const text = await res.text();
 			try {
@@ -206,7 +217,7 @@ export { differences } from "./differences.ts";
 function view(s: Step, r: StepResult, withData: boolean): Record<string, unknown> | undefined {
 	if (s.compare === "none") return undefined;
 	const v: Record<string, unknown> = {};
-	if (s.compare !== "page") v["status"] = r.status;
+	v["status"] = r.status;
 	if (s.compare === "redirect" || s.compare === "data") v["redirect"] = r.location ?? null;
 	if (s.compare === "data") v["body"] = r.body;
 	if (withData && r.data) v["data"] = r.data;
@@ -268,7 +279,7 @@ function tryOnOldTool(config: Config, root: string, slice: string): ToolDefiniti
 	return {
 		name: "try_on_old_app",
 		label: "Try the steps on the old app",
-		description: "Start the old app (its data reset first), send the steps in steps.json in order, stop it. Shows each step's answer: status, redirect, the start of the body, what it wrote.",
+		description: "Start the old app (its data reset first, when it has a reset), send the steps in steps.json in order, stop it. Shows each step's answer: status, redirect, the start of the body, what it wrote.",
 		promptSnippet: "try_on_old_app: send steps.json to the old app and see its answers",
 		parameters: Type.Object({}),
 		execute: async () => {
@@ -293,7 +304,7 @@ export const writeStepsWithModel: StepWriter = async (o) => {
 		protectedGlobs: [],
 		customTools: [tryOnOldTool(o.config, o.root, o.slice)],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__parity__.${o.slice}.steps.${Date.now()}.jsonl`),
-		systemPrompt: `You write the HTTP requests a migration tool sends to the OLD app and to the NEW app, to compare their answers. Write them to steps.json in your folder. You try them on the old app with try_on_old_app; you never see the new app's answers, and you never shape a request to make the apps look alike. Read the old handlers to know what each route expects (parameters, form fields, login, tokens) and the new project to know where each route went.\n\nsteps.json: {"steps": [Step, …], "skipped": {"<route>": "why it has no step"}}. A Step: {"id": "s1", "route": "<one of the slice routes, or setup>", "compare": "data" | "redirect" | "page" | "none", "method": "GET", "path": "/…", "headers"?: {}, "body"?: <JSON>, "form"?: {field: value}, "save"?: {"name": "regex with one group"}, "target"?: {"method"?, "path"?, "headers"?, "body"?, "form"?, "stack"?}, "why"?: "…"}.\n- compare: data = an answer with data (JSON or text) where status, redirect and body must match; redirect = status and where it sends to; page = an HTML page (only what it writes is compared for now); none = preparation such as a login.\n- Steps run in order with one cookie jar, so a login step holds for the steps after it. "{{name}}" in a later step is replaced by a value saved earlier (a CSRF token, a new id).\n- target: only what the new app needs differently (the route moved, it takes JSON instead of a form, another target stack answers it: ${o.config.target.stacks.join(", ")}).\n- Every slice route gets at least one compared step, or a reason in skipped. Steps that write data are fine: the data is reset before every run.\nEnd with one sentence.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You write the HTTP requests a migration tool sends to the OLD app and to the NEW app, to compare their answers. Write them to steps.json in your folder. You try them on the old app with try_on_old_app; you never see the new app's answers, and you never shape a request to make the apps look alike. Read the old handlers to know what each route expects (parameters, form fields, login, tokens) and the new project to know where each route went.\n\nsteps.json: {"steps": [Step, …], "skipped": {"<route>": "why it has no step"}}. A Step: {"id": "s1", "route": "<one of the slice routes, or setup>", "compare": "data" | "redirect" | "page" | "none", "method": "GET", "path": "/…", "headers"?: {}, "body"?: <JSON>, "form"?: {field: value}, "save"?: {"name": "regex with one group"}, "target"?: {"method"?, "path"?, "headers"?, "body"?, "form"?, "stack"?}, "why"?: "…"}.\n- compare: data = an answer with data (JSON or text) where status, redirect and body must match; redirect = status and where it sends to; page = an HTML page (its status and what it writes are compared, not its HTML); none = preparation such as a login.\n- Steps run in order with one cookie jar, so a login step holds for the steps after it. "{{name}}" in a later step is replaced by a value saved earlier (a CSRF token, a new id).\n- target: only what the new app needs differently (the route moved, it takes JSON instead of a form, another target stack answers it: ${o.config.target.stacks.join(", ")}).\n- Every slice route gets at least one compared step, or a reason in skipped. ${loadApps(o.root)[LEGACY]?.recipe?.reset ? "Steps that write data are fine: the data is reset before every run." : "The data is NOT reset between runs: a step that writes must still work when it runs again (use new names, or save the id it creates)."}\nEnd with one sentence.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const r = await session.run(o.problem);

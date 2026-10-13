@@ -48,6 +48,8 @@ export interface AppState {
 	/** The new app only: the main commit the last probe ran at, and how many probes in a row were red. */
 	commit?: string;
 	redProbes?: number;
+	/** Set once an app that was up was probed again to add a data reset and dump (asked once, whatever came of it). */
+	dataProbed?: boolean;
 	at?: string;
 }
 
@@ -364,13 +366,24 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const retry = cur.up === false && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
 	const commit = o.side === LEGACY ? undefined : headOf(o.config.target.path);
 	const moved = cur.up === false && commit !== undefined && commit !== cur.commit && (cur.redProbes ?? 0) < MAX_RED_PROBES;
-	if (cur.up !== undefined && !retry && !moved && !o.again) return cur.up;
+	// an app that starts but cannot reset or dump its data: written data is never compared, so it is asked once to add them
+	const noData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump) && !cur.dataProbed;
+	if (cur.up !== undefined && !retry && !moved && !noData && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
-	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem: problemFor(o.config, o.root, o.side) }).catch((e) => `setup model failed: ${e?.message ?? e}`);
+	const problem = noData ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared. Keep how it starts; add what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
+	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem }).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	const recipe = loadApps(o.root)[o.side]?.recipe;
 	// the copy may have been made during the session: the root is read again
 	const bad = recipe ? recipeProblem(o.config, o.root, o.side, recipe) : "no recipe saved";
 	const res = bad || !recipe ? { ok: false, error: bad } : await checkRecipe(recipe, appRoot(o.config, o.root, o.side));
+	if (noData) {
+		// the app started before: a new recipe that does not work is dropped, the old one stays
+		const kept = res.ok ? recipe! : cur.recipe!;
+		saveApp(o.root, o.side, { up: true, recipe: kept, dataProbed: true });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${res.ok ? "" : ` (the new recipe did not start: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
+		return true;
+	}
 	const why = res.ok ? said || "it starts" : [said, res.error].filter(Boolean).join(" — ");
 	saveApp(o.root, o.side, { up: res.ok, said: why, probeQuestion: undefined, commit, redProbes: res.ok ? 0 : (cur.redProbes ?? 0) + 1 });
 	mkdirSync(parityDir(o.root), { recursive: true });

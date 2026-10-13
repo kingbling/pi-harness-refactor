@@ -81,6 +81,23 @@ describe("starting the apps for parity", () => {
 		expect(await probeApp({ ...opts, fixer: fixed })).toBe(true);
 	});
 
+	it("a keep-schema app that is up but cannot dump its data is asked once to add a reset and a dump; a broken new recipe is dropped", async () => {
+		const { root, config: base } = workspace();
+		const config = ConfigSchema.parse({ ...base, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" } });
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		const problems: string[] = [];
+		// the second try breaks the start command: the app was up before, so the old recipe stays
+		const broken: AppFixer = async (o) => (problems.push(o.problem), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), args: ["-e", "process.exit(3)"], dumpCmd: "echo", dumpArgs: ["{}"] }), "added a dump");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: broken, log: () => {} })).toBe(true);
+		expect(problems[0]).toMatch(/no data reset and no data dump/);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, dataProbed: true, recipe: { start: { args: ["server.js", String(port)] } } });
+		// asked once only
+		expect(await probeApp({ config, root, side: LEGACY, fixer: broken, log: () => {} })).toBe(true);
+		expect(problems).toHaveLength(1);
+	});
+
 	it("a red new app is probed again once main has moved on, a few times at most, without asking the owner again", async () => {
 		const { root, config } = workspace();
 		mkdirSync(config.target.path, { recursive: true });
