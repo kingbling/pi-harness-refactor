@@ -201,6 +201,60 @@ describe("truth read from the old code, run once it can", () => {
 	});
 });
 
+describe("truth read from the old code, run once it can: values compared where both sides have them", () => {
+	it("a key only one side has proves nothing, so the unit stays; a value both sides hold that differs redoes it", async () => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		const print = (expected: string) => `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":${expected}}]'\n`;
+		// recorded, then what the old code prints when run
+		for (const [id, recorded, ran] of [["fine", '{"net":1,"tax":2}', '{"net":1}'], ["stub", '{"net":1}', '{"net":1,"due":3}'], ["typed", '{"net":1}', '{"net":2}']] as const) {
+			ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ?").run(id);
+			ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 0, expected = ? WHERE unit_id = ?").run(recorded, id);
+			ledger.addEvidence(id, "truth_read", {});
+			writeFileSync(join(root, ".bigrefactor", "truth", id, "cases.sh"), print(ran));
+		}
+		const r = upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		expect(r).toMatchObject({ upgraded: [], redone: ["typed"], red: 0 });
+		for (const id of ["fine", "stub"]) {
+			expect(ledger.getUnit(id)!.state).toBe("accepted");
+			expect(ledger.hasEvidence(id, "truth_green_on_old")).toBe(false);
+			expect(ledger.hasEvidence(id, "truth_read")).toBe(true);
+		}
+		expect(JSON.parse(ledger.getUnit("typed")!.meta).retryNote).toMatch(/the old code returns \{"net":2\}/);
+	});
+});
+
+describe("a script for truth that was only read, already there but red here", () => {
+	it("goes to the tester with the error it gave; a script not run here yet is left to the truth upgrade", async () => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth, writeTruthScripts } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "run" }));
+		for (const id of ["fine", "stub", "typed"]) {
+			ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ?").run(id);
+			ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 0 WHERE unit_id = ?").run(id);
+			ledger.addEvidence(id, "truth_read", {});
+		}
+		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), "echo 'Class Money not found' >&2; exit 1\n");
+		upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		// a red script on a unit the upgrade has not run yet waits for it
+		writeFileSync(join(root, ".bigrefactor", "truth", "stub", "cases.sh"), "exit 1\n");
+		const told = new Map<string, string | undefined>();
+		const writer = async (o: { unitId: string; truthDir: string; failed?: string }) => {
+			told.set(o.unitId, o.failed);
+			writeFileSync(join(o.truthDir, "cases.sh"), `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"$(printf %s.%s 123 45)"'}]'\n`);
+		};
+		const r = await writeTruthScripts({ ledger, config, root, source, cap: 5, writer, log: () => {} });
+		expect([...told.keys()].sort()).toEqual(["fine", "typed"]);
+		expect(told.get("fine")).toMatch(/Class Money not found/);
+		expect(told.get("typed")).toBeUndefined();
+		expect(r.upgraded.sort()).toEqual(["fine", "typed"]);
+	});
+});
+
 describe("a script for truth that was only read", () => {
 	it("once the old code runs: the tester writes scripts for a few accepted units per run, never sees the expected values, code judges what they print", async () => {
 		const { root, config, ledger } = workspace();
