@@ -1,4 +1,5 @@
 import { forecast, renderForecast, type Forecast } from "../run/forecast.ts";
+import { PLUGIN_VERSION } from "../version.ts";
 import { totalSpend } from "../spend.ts";
 import { lanes, parseLanesArgs, runLanesArg } from "../run/lanes.ts";
 /**
@@ -240,7 +241,7 @@ export function statusLine(ledger: Ledger, root: string): string {
 	const f = d.forecast;
 	const open = d.questions;
 	const left = f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}), ${f.remaining.hours[1] < 48 ? `${f.remaining.hours[1].toFixed(1)} h` : `${(f.remaining.hours[1] / 24).toFixed(1)} days`} [${f.confidence}]` : "";
-	return `br ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
+	return `br ${PLUGIN_VERSION} · ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
 }
 
 /** Warnings: a toast with a UI, the console without one (print mode swallows notify). */
@@ -273,7 +274,7 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 	const now = Date.now();
 	const L: string[] = [];
 	const state = s.stopping ? pc.yellow(`${spinner(now)} stopping…`) : s.running ? pc.cyan(`${spinner(now)} running`) : s.error ? pc.red("stopped") : pc.green("finished");
-	L.push(`${pc.bold("bigrefactor")} ${s.job ?? ""} · ${state} · ${ELAPSED(now - (s.startedAt ?? now))} · ${fmtUsage(s, 3)}${s.running ? pc.dim("   /br stop · /br progress · chat works meanwhile") : ""}`);
+	L.push(`${pc.bold("bigrefactor")} ${pc.dim(PLUGIN_VERSION)} ${s.job ?? ""} · ${state} · ${ELAPSED(now - (s.startedAt ?? now))} · ${fmtUsage(s, 3)}${s.running ? pc.dim("   /br stop · /br progress · chat works meanwhile") : ""}`);
 	const names = [...s.plan, ...s.steps.map((x) => x.name).filter((n) => !s.plan.includes(n))];
 	const icon = (n: string) => {
 		const st = [...s.steps].reverse().find((x) => x.name === n);
