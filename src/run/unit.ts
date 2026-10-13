@@ -467,9 +467,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	if (hasTruth && existsSync(portedDir)) {
 		// truth was captured ahead: put its ported tests into this worktree (never over newer files)
 		const walk = (d: string): string[] => readdirSync(d).flatMap((n) => (statSync(join(d, n)).isDirectory() ? walk(join(d, n)) : [join(d, n)]));
-		for (const abs of walk(portedDir)) {
-			const dest = join(targetProjectDir, relative(portedDir, abs));
-			if (existsSync(dest)) continue;
+		const saved = walk(portedDir).map((abs) => relative(portedDir, abs));
+		// a path main ever had is not this unit's unmerged test: another unit's, or one tidy moved or removed since
+		const onMainOnce = everOnMain(targetProjectDir, saved);
+		for (const f of saved) {
+			const abs = join(portedDir, f);
+			const dest = join(targetProjectDir, f);
+			if (existsSync(dest) || onMainOnce.has(f)) continue;
 			mkdirSync(dirname(dest), { recursive: true });
 			copyFileSync(abs, dest);
 		}
@@ -1010,4 +1014,15 @@ function truthCounts(ledger: Ledger, unitId: string): { truthCases: number; trut
 export function legacyWordsFor(words: string[] | undefined, target: TargetAdapter): string[] | undefined {
 	const own = new Set(target.layout.sourceExtensions.map((e) => e.replace(/^\./, "").toLowerCase()));
 	return words?.filter((w) => !own.has(w));
+}
+
+/** Which of `paths` (relative to `dir`) main's history ever held; none when `dir` is not in a git checkout. */
+export function everOnMain(dir: string, paths: string[]): Set<string> {
+	if (!paths.length) return new Set();
+	try {
+		const out = execFileSync("git", ["log", "--format=", "--name-only", "--no-renames", "--relative", "HEAD", "--", ...paths], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 << 20 });
+		return new Set(out.split("\n").filter(Boolean));
+	} catch {
+		return new Set();
+	}
 }
