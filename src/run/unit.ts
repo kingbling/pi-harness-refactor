@@ -117,6 +117,9 @@ export async function testsGreenBefore(o: { files: () => string[]; pass: (files:
 /** One check_my_code result (see ToolDeps.onCheck). */
 type CheckResult = Parameters<NonNullable<ToolDeps["onCheck"]>>[0];
 
+/** Review rounds per run that give their try back because fewer findings are open than at the review before. */
+export const MAX_PROGRESS_ROUNDS = 5;
+
 export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const unit = o.ledger.getUnit(o.unitId);
@@ -638,6 +641,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return { lines, last: rows.at(-1)?.id ?? 0 };
 	};
 	let weakRounds = unitMeta().weakRounds ?? 0;
+	// open findings at the last judged review (a later run of the unit starts from those it carries): fewer open after
+	// the next one is progress, and that round gives its try back, a few times per run
+	let openBefore: number | undefined = openFindings().length || undefined;
+	let progressRounds = 0;
 	// the reviewer found only weak tests (the code is fine): after the tester's retest the gate runs again on the same
 	// code, with no new implementer session and no new attempt
 	let reviewWeakOnly = false;
@@ -865,6 +872,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			continue;
 		}
 		reviewErrors = 0;
+
+		if (gate.failedStep === "wired_ok" && !reviewWeakOnly) {
+			const openNow = openFindings().length;
+			if (!regateOnly && openBefore !== undefined && openNow < openBefore && progressRounds < MAX_PROGRESS_ROUNDS) {
+				progressRounds++;
+				attemptNo--;
+				log(pc.dim(`  the reviewer's open findings went from ${openBefore} to ${openNow}: getting there, this round uses no try (${progressRounds}/${MAX_PROGRESS_ROUNDS})`));
+			}
+			openBefore = openNow;
+		}
 
 		// the reviewer found something that must change outside the unit's files: another attempt cannot fix it.
 		// Like a setup problem: the setup model first, then one owner question; only this unit waits.

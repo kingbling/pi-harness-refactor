@@ -114,6 +114,33 @@ describe("models fix each other's work", () => {
 		expect(ledger.hasEvidence("u1", "test_disputed")).toBe(false);
 	});
 
+	it("a review round with fewer open findings than the one before uses no try; one with as many does", async () => {
+		const calls: Call[] = [];
+		const open = [4, 3, 2, 1, 1, 1, 1, 1, 1, 1];
+		let reviews = 0;
+		const reviewer = async () => {
+			const n = open[reviews++] ?? 1;
+			const findings = Array.from({ length: n }, (_, i) => `- src/features/agency/agency.service.ts:${i + 1}: still missing → port it`);
+			return { ok: false, judged: true, output: `reviewer findings:\n${findings.join("\n")}`, findings };
+		};
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!(["src/features/agency/agency.service.ts"]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		// each try changes the code (an unchanged tree would reuse the last review)
+		let edits = 0;
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => {
+			const inner = await (sessions(calls) as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts);
+			return { ...inner, run: async (task: string) => (opts.role !== "test" && write(join(ws, "migrated", "src/features/agency/agency.service.ts"), `export const v = ${++edits};\n`), inner.run(task)) } as LeafSession;
+		}) as never;
+		const lines: string[] = [];
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, log: (l) => lines.push(l) });
+		// 5 tries, plus the 3 rounds that went 4 → 3 → 2 → 1; then 1 → 1 counts again
+		expect(asked(calls).filter((c) => c.role !== "test")).toHaveLength(8);
+		expect(r).toMatchObject({ state: "quarantined", attempts: 5 });
+		expect(lines.join("\n")).toMatch(/open findings went from 4 to 3: getting there, this round uses no try \(1\/5\)/);
+	});
+
 	it("tests still called weak after 2 tester rounds: the code passes with a note on the unit, no owner question", async () => {
 		const calls: Call[] = [];
 		const weak = "- agency.service.spec.ts: only checks it renders";
