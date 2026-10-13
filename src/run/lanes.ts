@@ -39,6 +39,12 @@ export function parseLanesArgs(args: string[]): { lanes?: number; gates?: number
 	return { lanes: n !== undefined ? Number(n) : undefined, gates };
 }
 
+/** `br run 24 --limit 5` → 24: a bare number on run is the lane count (not the value of --limit/--slice/--units). */
+export function runLanesArg(args: string[]): number | undefined {
+	const n = args.find((a, i) => /^\d+$/.test(a) && !["--limit", "--slice", "--units"].includes(args[i - 1] ?? ""));
+	return n !== undefined ? Number(n) : undefined;
+}
+
 function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimited: number } | undefined {
 	if (!existsSync(ledgerPath) || !existsSync(dirname(ledgerPath))) return undefined;
 	const db = new DatabaseSync(ledgerPath, { readOnly: true });

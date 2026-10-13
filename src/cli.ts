@@ -40,7 +40,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br rule [<stack>:] <words>   change how the new code is organised, in plain words (checked by code, shown before it applies); no words: show the layouts
   br layout                    layout preflight: units per stack, top areas, shared units, target tree, problems (br run refuses on problems)
   br order [--no-llm]          database units from the schema, then vertical slices (foundation → auth → features) as scheduling priority; .bigrefactor/slices.json overrides
-  br run [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
+  br run [lanes] [--dry] [--slice s] [--units a,b] [--limit n] [--force]   scheduler: agent pool + gate pool, worktree per unit, merge per accepted unit;
                                refuses on layout problems (--force starts anyway); pauses after the first units for a layout review question
   br requeue <unit...>|--all [--fresh]   put quarantined or parked (waiting on an answered question) units back into the queue;
                                --fresh: the tester drafts the interface and tests again (truth cases stay)
@@ -217,6 +217,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!args.includes("--dry")) await assertNoGlobalDecisions();
 		const { run } = await import("./run/run.ts");
 		const limit = flag(args, "--limit");
+		// `br run 24`: run with 24 lanes (saved, same as `br lanes 24`)
+		const { lanes, runLanesArg } = await import("./run/lanes.ts");
+		const n = runLanesArg(args);
+		if (n !== undefined) console.log(lanes(loadConfig().path, { lanes: n }).split("\n")[0]);
 		// one run per workspace: a second one would clean up the first one's live worktrees
 		const { acquireRunLock } = await import("./run/run-lock.ts");
 		const release = args.includes("--dry") ? () => {} : acquireRunLock(loadConfig().root);

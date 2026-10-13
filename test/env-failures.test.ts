@@ -216,6 +216,13 @@ describe("br lanes", () => {
 		expect(parseLanesArgs(["gates", "3"])).toEqual({ lanes: undefined, gates: 3 });
 		expect(parseLanesArgs([])).toEqual({ lanes: undefined, gates: undefined });
 	});
+	it("br run 24 means 24 lanes, not the value of --limit", async () => {
+		const { runLanesArg } = await import("../src/run/lanes.ts");
+		expect(runLanesArg(["24"])).toBe(24);
+		expect(runLanesArg(["--limit", "5", "24"])).toBe(24);
+		expect(runLanesArg(["--limit", "5"])).toBeUndefined();
+		expect(runLanesArg([])).toBeUndefined();
+	});
 	it("writes the config", async () => {
 		const { mkdtempSync } = await import("node:fs");
 		const { ConfigSchema, loadConfig } = await import("../src/config.ts");

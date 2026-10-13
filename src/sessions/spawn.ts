@@ -2,7 +2,8 @@ import { findSourceAdapter } from "../adapters/registry.ts";
 import { CODEX_PROVIDER, modelRuntime, openRouterCost, priceAt, resolveCodexModel } from "../models/codex.ts";
 import { recordSpend } from "../spend.ts";
 import { describeArgs, progress } from "../progress.ts";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, lstatSync, realpathSync, renameSync, unlinkSync } from "node:fs";
+import { Type, type TSchema } from "typebox";
 import { basename, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -230,6 +231,61 @@ export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot
 	};
 }
 
+/** File-only mutations use the same scope as writes, and reject symlink traversal and directory removal. */
+export function scopedFileTools(opts: Pick<SpawnOptions, "cwd" | "globRoot" | "writeGlobs" | "protectedGlobs" | "appendOnlyGlobs"> & { sourceRoot: string }): ToolDefinition[] {
+	const gate = makeWriteGate({ ...opts, protectedGlobs: opts.protectedGlobs ?? [] });
+	// Built on first use: the session's folder may not exist yet when its tools are made.
+	let physicalGate: ReturnType<typeof makeWriteGate> | undefined;
+	const physical = () => (physicalGate ??= makeWriteGate({ ...opts, cwd: realpathSync(opts.cwd), globRoot: opts.globRoot ? realpathSync(opts.globRoot) : undefined, sourceRoot: existsSync(opts.sourceRoot) ? realpathSync(opts.sourceRoot) : opts.sourceRoot, protectedGlobs: opts.protectedGlobs ?? [] }));
+	const checked = (path: string, existing: boolean): string => {
+		if (!path.trim()) throw new Error("a file path is required");
+		const abs = resolve(opts.cwd, path);
+		const reason = gate(abs);
+		if (reason) throw new Error(reason);
+		// Check the real parent too: a writable-looking path must not escape through a symlink.
+		const parent = realpathSync(dirname(abs));
+		const realPath = resolve(parent, basename(abs));
+		const physicalReason = physical()(realPath);
+		if (physicalReason) throw new Error(physicalReason);
+		if (existing) {
+			if (!lstatSync(abs).isFile()) throw new Error("only regular files may be removed or renamed");
+		} else {
+			try {
+				lstatSync(abs);
+			} catch (e: any) {
+				if (e.code === "ENOENT") return abs;
+				throw e;
+			}
+			throw new Error("rename destination already exists; remove the obsolete source instead of overwriting it");
+		}
+		return abs;
+	};
+	const result = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
+	const define = <T extends TSchema>(tool: ToolDefinition<T>): ToolDefinition => tool as unknown as ToolDefinition;
+	return [
+		define({
+			name: "remove_file", label: "Remove file",
+			description: "Delete an obsolete regular file inside your write scope. No directories, protected tests, existing shared files or legacy files. Deletions are kept in the change and checked for scope; do not leave compatibility shims with rejected filenames.",
+			parameters: Type.Object({ path: Type.String() }),
+			execute: async (_id, p) => {
+				unlinkSync(checked(p.path, true));
+				return result(`Removed ${p.path}`);
+			},
+		}),
+		define({
+			name: "rename_file", label: "Rename file",
+			description: "Move a regular file within your write scope to a new filename. Both paths are checked; the destination must not exist. Update imports afterwards. If the replacement already exists, use remove_file on the obsolete file, not a compatibility shim.",
+			parameters: Type.Object({ path: Type.String(), destination: Type.String() }),
+			execute: async (_id, p) => {
+				const source = checked(p.path, true);
+				const destination = checked(p.destination, false);
+				renameSync(source, destination);
+				return result(`Renamed ${p.path} to ${p.destination}`);
+			},
+		}),
+	];
+}
+
 /**
  * What a blocked session is told: why, where it may write instead (this session's own globs, as absolute paths),
  * and how to report what it cannot do — only with tools this session really has.
@@ -294,9 +350,10 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 			toolCalls++;
 			const input = event.input as Record<string, unknown>;
 			let reason: string | undefined;
-			if (event.toolName === "write" || event.toolName === "edit") {
+			if (["write", "edit", "remove_file", "rename_file"].includes(event.toolName)) {
 				const path = String(input["path"] ?? "");
 				reason = gate(path);
+				if (!reason && event.toolName === "rename_file") reason = gate(String(input["destination"] ?? ""));
 				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""));
 			} else if (event.toolName === "bash") {
 				const command = String(input["command"] ?? "");
@@ -345,13 +402,14 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	});
 	await resourceLoader.reload();
 
+	const customTools = [...(opts.customTools ?? []), ...(["implement", "escalate"].includes(opts.role) ? scopedFileTools({ ...opts, sourceRoot: opts.config.source.path }) : [])];
 	const { session } = await createAgentSession({
 		cwd: opts.cwd,
 		model,
 		thinkingLevel: thinkingLevelOf(role.effort),
 		modelRuntime: await modelRuntime(),
-		tools: [...ROLE_TOOLS[opts.role], ...(opts.tools ?? []), ...(opts.customTools?.map((t) => t.name) ?? [])],
-		customTools: opts.customTools,
+		tools: [...ROLE_TOOLS[opts.role], ...(opts.tools ?? []), ...customTools.map((t) => t.name)],
+		customTools,
 		resourceLoader,
 		sessionManager: SessionManager.inMemory(),
 	});

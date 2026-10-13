@@ -1,6 +1,6 @@
 import { forecast, renderForecast, type Forecast } from "../run/forecast.ts";
 import { totalSpend } from "../spend.ts";
-import { lanes, parseLanesArgs } from "../run/lanes.ts";
+import { lanes, parseLanesArgs, runLanesArg } from "../run/lanes.ts";
 /**
  * Thin Pi shell for bigrefactor. The heavy lifting (sessions, gates, scheduler) runs in the `br`
  * CLI; this extension makes the ledger visible and queryable from inside any Pi session:
@@ -58,7 +58,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	resume: "resume: continue onboarding where it stopped, then the migration if it already started",
 	progress: "progress: what the running onboarding is doing right now (full activity log)",
 	stop: "stop: stop the running job (a run lets running units finish; stop twice to abort them)",
-	run: "run [--limit N] [--slice S] [--units a,b] [--dry] [--force]: migrate units in the background (live panel, /br stop); --force starts despite layout problems",
+	run: "run [lanes] [--limit N] [--slice S] [--units a,b] [--dry] [--force]: migrate units in the background (live panel, /br stop); --force starts despite layout problems",
 	onboard: "onboard [init flags] [--yes] [--no-llm]: whole onboarding, resumable (init → setup → docs → inventory → profile → frameworks → decide → rules → order)",
 	decide: "decide [id=value ...]: open decisions the inventory could not make; run/L3 wait for them",
 	frameworks: "frameworks: legacy framework & library mapping (platform | port | drop)",
@@ -512,6 +512,10 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 		return i >= 0 ? flags[i + 1] : undefined;
 	};
 	const limit = flag("--limit") ? Number(flag("--limit")) : undefined;
+	// `/br run 24`: run with 24 lanes (saved, same as `/br lanes 24`)
+	const n = runLanesArg(flags);
+	const cp = findConfigPath(ctx.cwd);
+	if (n !== undefined && cp) pi.appendEntry<BrEntry>("br", { title: "lanes", text: lanes(cp, { lanes: n }).split("\n")[0] ?? "" });
 	startJob(pi, ctx, limit ? `pilot run (${limit} units)` : "migration run", async () => {
 		const cp = findConfigPath(ctx.cwd);
 		if (!cp) return { error: "no bigrefactor.config.json here: run /br onboard first" };
