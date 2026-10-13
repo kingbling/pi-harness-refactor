@@ -126,14 +126,50 @@ describe("the old code's environment", () => {
 		expect(problems[1]).toMatch(/refused it:[\s\S]*without a symbol id/);
 	});
 
+	it("a run command that reaches the probe but not the units' truth folders is refused", async () => {
+		const { root, config, source } = workspace();
+		const probeDir = join(root, ".bigrefactor", "legacy-env", "probe");
+		mkdirSync(probeDir, { recursive: true });
+		writeFileSync(join(probeDir, "cases.sh"), "echo '[]'\n");
+		const tool = legacyRunTool(root, config, source);
+		// like a container that mounts only the legacy-env folder
+		const onlyProbe = { cmd: "sh", args: ["-c", 'case "$0" in */legacy-env/*) sh "$0";; *) echo "Could not open input file: $0" >&2; exit 1;; esac', "{script}"], why: "docker" };
+		expect((await call(tool, onlyProbe)).content[0]!.text).toMatch(/^refused: the probe runs from[\s\S]*truth folders[\s\S]*Could not open input file/);
+		expect(loadLegacyEnv(root, config).run).toBeUndefined();
+		expect((await call(tool, { cmd: "sh", args: ["{script}"], why: "plain sh" })).content[0]!.text).toMatch(/^truth scripts run with/);
+		expect(existsSync(join(root, ".bigrefactor", "truth", "__runcheck__"))).toBe(false);
+	});
+
+	it("a saved run command that reaches the probe but no truth script is probed again (once per command), even with the owner's question open", async () => {
+		const { root, config, source } = workspace();
+		const probeDir = join(root, ".bigrefactor", "legacy-env", "probe");
+		mkdirSync(probeDir, { recursive: true });
+		writeFileSync(join(probeDir, "cases.sh"), `echo '[{"symbol":"probe","inputs":[],"expected":1}]'\n`);
+		const onlyProbe = { cmd: "sh", args: ["-c", 'case "$0" in */legacy-env/*) sh "$0";; *) echo "Could not open input file: $0" >&2; exit 1;; esac', "{script}"] };
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read", probeQuestion: 7, run: onlyProbe }));
+		const problems: string[] = [];
+		const stuck: LegacyFixer = async (o) => (problems.push(o.problem), "could not change it");
+		const opts = { config, root, source, log: () => {}, answer: () => undefined };
+		expect(await probeLegacyEnv({ ...opts, fixer: stuck })).toBe("read");
+		expect(problems[0]).toMatch(/runs the probe but no unit's truth script[\s\S]*Could not open input file/);
+		// the same command: not probed again
+		expect(await probeLegacyEnv({ ...opts, fixer: stuck })).toBe("read");
+		expect(problems).toHaveLength(1);
+		// a new command (set by a unit's setup fix, say) that also fails is checked again; this fixer sets one that reaches both
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ ...JSON.parse(readFileSync(join(root, ".bigrefactor", "legacy-env.json"), "utf8")), run: { ...onlyProbe, args: [...onlyProbe.args, "x"] } }));
+		const fixed: LegacyFixer = async (o) => (await call(legacyRunTool(o.root, o.config, o.source), { cmd: "sh", args: ["{script}"], why: "mount it all" }), "set a run that reaches every script");
+		expect(await probeLegacyEnv({ ...opts, fixer: fixed })).toBe("run");
+	});
+
 	it("a red probe nobody was asked about is probed once more (the machine may have changed), then decided", async () => {
 		const { root, config, source } = workspace();
 		let calls = 0;
 		const red: LegacyFixer = async () => (calls++, "docker is not installed");
+		// decided red before probes asked anything (an old legacy-env.json)
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read" }));
 		expect(await probeLegacyEnv({ config, root, source, fixer: red, log: () => {} })).toBe("read");
 		expect(await probeLegacyEnv({ config, root, source, fixer: red, log: () => {} })).toBe("read");
-		expect(await probeLegacyEnv({ config, root, source, fixer: red, log: () => {} })).toBe("read");
-		expect(calls).toBe(2);
+		expect(calls).toBe(1);
 		expect(loadLegacyEnv(root, config).probedAgain).toBe(true);
 	});
 

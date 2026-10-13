@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, relative, resolve } from "node:path";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
@@ -34,6 +34,8 @@ export interface LegacyEnv {
 	probeQuestion?: number;
 	/** A red probe with no question on it (made before probes asked, or the ask failed) is probed once more: set then. */
 	probedAgain?: boolean;
+	/** The run command last found unable to reach the units' truth scripts: probed again once per such command. */
+	unreachableRun?: string;
 }
 
 /** run = expected values recorded by running the old code; read = written from reading it (not run). */
@@ -243,7 +245,9 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 	const retry = cur.mode === "read" && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
 	// a red probe nobody was asked about: the machine may have changed since (docker installed), so it is probed once more
 	const unasked = cur.mode === "read" && cur.probeQuestion === undefined && !cur.probedAgain;
-	if (cur.mode && !retry && !unasked) return cur.mode;
+	// a saved run command that cannot reach the units' truth scripts (a container mounting only the probe's folder)
+	const unreachable = cur.run && cur.unreachableRun !== JSON.stringify(cur.run) ? reachesTruthScripts(o.root, o.config, o.source, cur.run) : undefined;
+	if (cur.mode && !retry && !unasked && !unreachable) return cur.mode;
 	const dir = join(o.root, ".bigrefactor", "legacy-env", "probe");
 	mkdirSync(dir, { recursive: true });
 	const script = join(dir, o.source.truth.scriptName);
@@ -255,7 +259,7 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 		source: o.source,
 		script,
 		probe: true,
-		problem: `Nothing has run on the old code yet. Find out whether single units of the old code can be loaded and called with what this machine has (any installed runtime or tool; check which ones and their versions). The whole app does not need to boot: loading one real file of the old code (and what it needs) and calling one of its functions is enough. Install dependencies in a copy only if that unit needs them.${db} Then write the probe ${script}: it loads that file, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} The array must have exactly this shape: [{"symbol": "probe", "inputs": <the arguments, JSON>, "expected": <what the function returned, JSON>}]. Try more than one way before giving up; if nothing works, say exactly what is missing.`,
+		problem: `${unreachable ? `The saved run command (${[cur.run!.cmd, ...cur.run!.args].join(" ")}) runs the probe but no unit's truth script: ${unreachable}\nSet a run command that reaches both (set_legacy_run checks it), then confirm the probe.\n\n` : ""}Nothing has run on the old code yet. Find out whether single units of the old code can be loaded and called with what this machine has (any installed runtime or tool; check which ones and their versions). The whole app does not need to boot: loading one real file of the old code (and what it needs) and calling one of its functions is enough. Install dependencies in a copy only if that unit needs them.${db} Then write the probe ${script}: it loads that file, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} The array must have exactly this shape: [{"symbol": "probe", "inputs": <the arguments, JSON>, "expected": <what the function returned, JSON>}]. Try more than one way before giving up; if nothing works, say exactly what is missing.`,
 	}).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	let probe = verifyTruthOnOld(dir, o.config, o.source, o.root);
 	// the probe ran but code refused what it printed (a wrong shape, a typo): one more turn with code's own error
@@ -263,9 +267,12 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 		said = await fixer({ config: o.config, root: o.root, source: o.source, script, probe: true, problem: `The tool ran your probe ${script} itself and refused it:\n${String(probe.error).slice(-1500)}\nFix the probe (or the run command) so the tool's own run passes. The array must have exactly this shape: [{"symbol": "probe", "inputs": <JSON>, "expected": <JSON>}].` }).catch((e) => `setup model failed: ${e?.message ?? e}`);
 		probe = verifyTruthOnOld(dir, o.config, o.source, o.root);
 	}
-	const ok = probe.ok;
+	const blocked = probe.ok ? reachesTruthScripts(o.root, o.config, o.source) : undefined;
+	const ok = probe.ok && !blocked;
+	if (blocked) said = `${said || ""} — ${blocked}`;
 	const mode: TruthMode = ok ? "run" : "read";
-	saveLegacyEnv(o.root, o.config, { mode, probeQuestion: undefined, ...(unasked ? { probedAgain: true } : {}) }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
+	const runNow = loadLegacyEnv(o.root, o.config).run;
+	saveLegacyEnv(o.root, o.config, { mode, probeQuestion: undefined, probedAgain: true, ...(blocked || unreachable ? { unreachableRun: JSON.stringify(blocked ? runNow : cur.run) } : {}) }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
 	appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} probe → ${mode}: ${String(said || "").replace(/\s+/g, " ")}\n`);
 	if (ok) {
 		log(pc.green(`truth: the old code runs here — expected values come from running it`));
@@ -314,7 +321,39 @@ export function legacyCopyTool(root: string, config: Config): ToolDefinition {
 	} as unknown as ToolDefinition;
 }
 
-export function legacyRunTool(root: string, config: Config): ToolDefinition {
+/** Runs `script` with `env`'s command: undefined when it exits 0, else what it printed. */
+function runError(env: LegacyEnv, source: SourceAdapter, script: string): string | undefined {
+	const { cmd, args, cwd } = truthCommand(env, source, script);
+	try {
+		execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+		return undefined;
+	} catch (e: any) {
+		return [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-600) || String(e?.message ?? e);
+	}
+}
+
+/**
+ * Why a run command reaches the probe but not the units' truth scripts (a container that mounts only the probe's
+ * folder), or undefined. The probe that runs green is copied into the truth folder and run from there.
+ */
+function reachesTruthScripts(root: string, config: Config, source: SourceAdapter, run?: { cmd: string; args: string[] }): string | undefined {
+	const probe = join(root, ".bigrefactor", "legacy-env", "probe", source.truth.scriptName);
+	if (!existsSync(probe)) return undefined;
+	const env = run ? { ...loadLegacyEnv(root, config), run } : loadLegacyEnv(root, config);
+	if (runError(env, source, probe)) return undefined; // the probe itself does not run: nothing to compare
+	const dir = join(root, ".bigrefactor", "truth", "__runcheck__");
+	mkdirSync(dir, { recursive: true });
+	const copy = join(dir, source.truth.scriptName);
+	cpSync(probe, copy);
+	try {
+		const err = runError(env, source, copy);
+		return err ? `the probe runs from ${dirname(probe)}, but not from the units' truth folders (${join(root, ".bigrefactor", "truth")}/<unit>/), where every truth script lives:\n${err}` : undefined;
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+export function legacyRunTool(root: string, config: Config, source?: SourceAdapter): ToolDefinition {
 	return {
 		name: "set_legacy_run",
 		label: "Set the truth run command",
@@ -323,6 +362,8 @@ export function legacyRunTool(root: string, config: Config): ToolDefinition {
 		parameters: Type.Object({ cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
 		execute: async (_id: string, p: { cmd: string; args: string[]; why: string }) => {
 			if (![p.cmd, ...p.args].some((a) => a.includes("{script}"))) return out('refused: one arg must contain "{script}"');
+			const unreachable = source ? reachesTruthScripts(root, config, source, { cmd: p.cmd, args: p.args }) : undefined;
+			if (unreachable) return out(`refused: ${unreachable}`);
 			saveLegacyEnv(root, config, { run: { cmd: p.cmd, args: p.args } }, p.why);
 			return out(`truth scripts run with: ${[p.cmd, ...p.args].join(" ")}`);
 		},
@@ -344,9 +385,9 @@ export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
 		config: o.config,
 		writeGlobs: ["**"],
 		protectedGlobs: [],
-		customTools: [legacyCopyTool(o.root, o.config), legacyRunTool(o.root, o.config)],
+		customTools: [legacyCopyTool(o.root, o.config), legacyRunTool(o.root, o.config, o.source)],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.legacy.${Date.now()}.jsonl`),
-		systemPrompt: `You make the OLD ${o.source.id} code runnable on this machine, so a migration tool can run characterization scripts against it. The legacy repo (${o.config.source.path}) is read-only: never write into it. Use make_legacy_copy for a copy you may change (install the dependencies with the project's own package manager, as its manifest and docs say), and set_legacy_run when the run command itself must change. Check which tools this machine really has (versions, docker) before choosing a way. ${o.probe ? "You also write the probe script you are asked for; keep it tiny." : "Do not edit the script: it belongs to the tester; when it is the script itself that is wrong (not the environment), say so and stop. What any script needs before the old code can load (the framework's bootstrap, an autoloader, constants the app defines at start) is environment: provide it with set_legacy_run (e.g. a file the runtime loads first)."} Never interactive prompts, never servers left running (a database container the old code needs may stay up). End with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You make the OLD ${o.source.id} code runnable on this machine, so a migration tool can run characterization scripts against it. The legacy repo (${o.config.source.path}) is read-only: never write into it. Use make_legacy_copy for a copy you may change (install the dependencies with the project's own package manager, as its manifest and docs say), and set_legacy_run when the run command itself must change. Check which tools this machine really has (versions, docker) before choosing a way. The run command must reach every truth script: they live in ${join(o.root, ".bigrefactor", "truth")}/<unit>/ (the probe in ${work}/probe/), so a container must mount a folder that holds both (e.g. ${join(o.root, ".bigrefactor")}). ${o.probe ? "You also write the probe script you are asked for; keep it tiny." : "Do not edit the script: it belongs to the tester; when it is the script itself that is wrong (not the environment), say so and stop. What any script needs before the old code can load (the framework's bootstrap, an autoloader, constants the app defines at start) is environment: provide it with set_legacy_run (e.g. a file the runtime loads first)."} Never interactive prompts, never servers left running (a database container the old code needs may stay up). End with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const now = truthCommand(env, o.source, o.script);
