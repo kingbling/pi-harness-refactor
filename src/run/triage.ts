@@ -122,9 +122,14 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		const action: TriageAction = attemptNo >= maxTotal ? "quarantine" : attemptNo >= maxImpl ? "escalate" : "retry";
 		return deterministic(d, unitId, "other", action, `decision model unavailable (${String((e as Error)?.message ?? e).slice(0, 120)}); playbook by attempt count`);
 	}
-	const cause = choiceOf(dec.answers["cause"]) ?? "other";
+	// Jev was unsure and the stronger model, on the same evidence, named another cause: act on the stronger model's
+	// (a retest on Jev's guess while it says impl_bug sends the tester where the implementer was needed)
+	const strong = dec.secondOpinion === "disagreed" ? dec.second?.answers["cause"] : undefined;
+	const answers: Record<string, DecisionAnswer> = typeof strong === "string" ? { ...dec.answers, cause: { type: "choice", choice: strong, probabilities: {}, confidence: 0 } } : dec.answers;
+	const cause = choiceOf(answers["cause"]) ?? "other";
 	const sure = dec.confidence >= JEV_ACT;
-	let { action, reason } = playbook(dec.answers);
+	let { action, reason } = playbook(answers);
+	if (typeof strong === "string") reason = `${reason} (stronger model's cause; the decision model said ${choiceOf(dec.answers["cause"]) ?? "other"})`;
 	// Unsure between code causes (test or code, interface): act on the best guess, nobody is asked. The owner cannot
 	// tell a test fault from a code fault better than a model; the next attempt's outcome is the label, the attempt
 	// cap bounds the cost. Only an environment cause goes the asking route (doctor and setup model first).
