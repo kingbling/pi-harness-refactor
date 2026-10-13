@@ -65,6 +65,12 @@ describe("gate: own scope", () => {
 		expect(step(other, "antigaming_ok")?.output).toContain("edited an existing shared file (add-only zone): src/shared/agency/agency.spec.ts");
 	});
 
+	it("a whole-project build skipped in the unit's gate is stored as not judged, not as a green build", async () => {
+		await gate();
+		const ev = ledger.evidenceOf("u1").find((e) => e.type === "build_ok");
+		expect(JSON.parse(ev!.payload)).toMatchObject({ judged: false, note: expect.stringMatching(/whole-project build: the builder runs it/) });
+	});
+
 	it("a file that still holds a merge conflict marker fails antigaming_ok, in any file type", async () => {
 		write("src/features/agency/agency.module.yaml", "routes:\n<<<<<<< HEAD\n  - a\n=======\n  - b\n>>>>>>> unit\n");
 		const r = await gate();

@@ -167,7 +167,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const unitFiles = buildFiles(g.targetProjectDir, g.adapter, changed);
 	const scopedStep = (name: "build" | "lint") => () => {
 		const c = scopedCheck(g.adapter, g.targetProjectDir, name, unitFiles);
-		return "skip" in c ? Promise.resolve({ ok: true, output: c.skip }) : cpu(() => run(c.cmd, c.args, g.targetProjectDir, timeout));
+		// skipped is not a pass: it is stored as not judged, so nobody reads a 0 ms build_ok as a green build
+		return "skip" in c ? Promise.resolve({ ok: true, output: c.skip, judged: false }) : cpu(() => run(c.cmd, c.args, g.targetProjectDir, timeout));
 	};
 	if (!(await step("build_ok", scopedStep("build")))) return done();
 	if (!(await step("lint_ok", scopedStep("lint")))) return done();

@@ -193,6 +193,9 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 		const c = files?.length === 0 ? undefined : cmd(mainDir, { ...s, files });
 		const was = c && (await runCmd(c.cmd, c.args, mainDir, FULL_OUTPUT));
 		if (err !== undefined && was === undefined) return out.join("\n\n"); // red here, green on main
+		// the builder's job is measured by the type check and the linter: a test run's output (timings, a flaky line)
+		// would read as new errors. Tests red on main too are not its job
+		if (whole && s.step === "test") continue;
 		if (err !== undefined) added.push(...newErrorLines(err, dir, was!, mainDir));
 		mine += err === undefined ? 0 : errorKeys(err, dir).length;
 		theirs += was === undefined ? 0 : errorKeys(was, mainDir).length;

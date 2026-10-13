@@ -29,6 +29,17 @@ import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 export type Repairer = (o: { config: Config; root: string; adapter: TargetAdapter; dir: string; problem: string; attempt: number }) => Promise<string | void>;
 
 const MAX_REPAIRS = 2;
+/** Code jobs one build cycle runs in a row on one stack while each makes progress (a backstop, not a budget). */
+const MAX_JOBS_PER_CYCLE = 25;
+
+/**
+ * What a model is told about a red main: each failing command with the start of its output (a tail would be mostly
+ * the test runner's summary), and to run the commands itself for the full output.
+ */
+export function brief(problem: string, perStep = 1500): string {
+	const parts = problem.split(/\n(?=\$ )/).filter((p) => p.trim());
+	return `${parts.map((p) => (p.length > perStep ? `${p.slice(0, perStep)}\n… (more: run the command)` : p)).join("\n\n")}\n\nRun these commands yourself and read their full output: what is shown here is only the start.`;
+}
 /** How often the builder may send one accepted unit back for its own failing tests before it asks instead. */
 export const MAX_BUILD_REOPENS = 2;
 /** Code jobs without progress a red main gets in a row before the builder stops paying for it (until it is green again or the run restarts). */
@@ -63,7 +74,7 @@ export const repairWithModel: Repairer = async (o) => {
 		systemPrompt: `You are the BUILDER of an automated migration to ${o.adapter.id}. Many units were migrated separately and each passed its own checks; the whole-project checks now fail. Fix the CODE so they pass: imports, types, signatures and calls between modules, missing exports. A failing test is behaviour of an accepted unit that a later change broke: find that change and fix the code, not the test. Keep behaviour. Never edit tests (test changes are thrown away), never weaken the checks (no excluded paths, lower levels, ignore comments, baseline files, config changes that hide errors). Never interactive prompts or servers. Run the failing commands yourself to confirm. End with one sentence saying what you fixed.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
-		const r = await session.run(`The whole-project checks fail:\n${o.problem.slice(-6000)}\n\nFix the code, then run the commands again.`);
+		const r = await session.run(`The whole-project checks fail:\n${brief(o.problem)}\n\nFix the code, then run the commands again.`);
 		return r.text.trim().split("\n").at(-1) ?? "";
 	} finally {
 		session.dispose();
@@ -162,16 +173,18 @@ export function createBuilder(o: {
 		const stacks = [...merged.keys()];
 		merged.clear();
 		running = (async () => {
-			for (const s of stacks) await buildStack(s).catch((e) => o.log(pc.yellow(`builder ${s}: ${e?.message ?? e}`)));
+			// a code job that made progress is followed by the next one at once, until main is green or a job makes none
+			for (const s of stacks) for (let i = 0; i < MAX_JOBS_PER_CYCLE && (await buildStack(s).catch((e) => (o.log(pc.yellow(`builder ${s}: ${e?.message ?? e}`)), false))); i++);
 		})().finally(() => {
 			running = undefined;
 			last = Date.now();
 		});
 	};
 
-	const buildStack = async (stackId: string) => {
+	/** True when a code job made main better and the stack should be checked again right away. */
+	const buildStack = async (stackId: string): Promise<boolean> => {
 		const adapter = o.adapters.get(stackId);
-		if (!adapter) return;
+		if (!adapter) return false;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__builder__${stackId}`);
 		const branch = `builder/${stackId}`;
 		const reset = () => {
@@ -193,7 +206,7 @@ export function createBuilder(o: {
 			// list, and "no tests ran" would pass
 			const tests = trackedFiles(dir).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
-			if (!steps.length) return;
+			if (!steps.length) return false;
 			const check = async () => {
 				const out: string[] = [];
 				for (const s of steps) {
@@ -208,12 +221,13 @@ export function createBuilder(o: {
 				jobs.delete(stackId);
 				o.ledger.setMeta(buildParkedKey(stackId), "");
 			};
-			if (!problem) return green(), o.log(pc.green(`builder ${stackId}: whole project ok`));
+			if (!problem) return green(), o.log(pc.green(`builder ${stackId}: whole project ok`)), false;
 			const sig = errorSignature(`build:${stackId}`, problem);
 			const parked = (jobs.get(stackId) ?? 0) >= MAX_BUILD_CODE_JOBS;
 			// a problem already with the owner (open, or answered "leave it"), parked, or already repaired in vain: no more paid repairs
 			const skip = parked || o.ledger.openQuestionFor("build", sig) !== undefined || ignored(sig) || (tried.get(sig) ?? 0) >= MAX_REPAIRS;
-			const repair = o.repair === false || skip ? undefined : (o.repair ?? repairWithModel);
+			// with a code job the repair is skipped: it may not touch tests, and errors in test files are most of a red main
+			const repair = o.repair === false || skip || o.codeJob ? undefined : (o.repair ?? repairWithModel);
 			const protectedRes = adapter.protectedGlobs.map(globToRegExp);
 			const isProtected = (rel: string) => protectedRes.some((r) => r.test(rel));
 			let said = "";
@@ -242,29 +256,30 @@ export function createBuilder(o: {
 				green();
 				const sha = await o.mergeFix(wt, branch, `fix(${stackId}): whole-project check after merges\n\n${said || "builder"}`);
 				o.log(pc.green(`builder ${stackId}: fixed and merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said}`));
-				return;
+				return false;
 			}
 			// a failing test names its case id: that accepted unit's behaviour broke on main, so it goes back to work
 			// (its code stays) instead of a vague question. Capped per unit: its own gate runs only its area's tests
 			const reopened = reopenBroken(o.ledger, problem);
 			if (reopened.length) o.log(pc.yellow(`builder ${stackId}: re-opened ${reopened.join(", ")}, whose tests fail on main`));
-			if (reopened.length) return;
-			if (parked) return;
+			if (reopened.length) return false;
+			if (parked) return false;
 			// a code job fixes it on main (it may change test code, the repair may not); the owner is never asked
 			// "fix or ignore": after MAX_BUILD_CODE_JOBS jobs in a row main stays red quietly, br status says so
 			const n = (jobs.get(stackId) ?? 0) + 1;
 			jobs.set(stackId, n);
 			const changedMain = o.codeJob
-				? await o.codeJob(stackId, `The whole ${stackId} project fails its checks on main after merges of units that each passed their own checks. Fix the code so these commands pass: types, imports, signatures and calls between modules, also in test files (type errors there), without changing what a test checks. Never weaken the checks (no excluded paths, ignore comments, config changes). Run the failing commands again before you stop.\n${problem.slice(-6000)}`).catch((e) => (o.log(pc.yellow(`builder ${stackId}: code job failed: ${e?.message ?? e}`)), undefined))
+				? await o.codeJob(stackId, `The whole ${stackId} project fails its checks on main after merges of units that each passed their own checks. Fix the code so these commands pass: types, imports, signatures and calls between modules, also in test files (type errors there), without changing what a test checks. Never weaken the checks (no excluded paths, ignore comments, config changes). Fixing part of the errors is fine: it is merged when main has fewer errors and no new ones, and the next job goes on from there. Run the failing commands again before you stop.\n${brief(problem)}`).catch((e) => (o.log(pc.yellow(`builder ${stackId}: code job failed: ${e?.message ?? e}`)), undefined))
 				: undefined;
 			// a merged job made main better (green, or fewer errors and none new): only jobs in a row without progress lead to the park
-			if (changedMain) return jobs.delete(stackId), o.log(pc.cyan(`builder ${stackId}: a code job changed main: ${changedMain.split("\n")[0]!.slice(0, 160)}; checked again after the next merges`));
+			if (changedMain) return jobs.delete(stackId), o.log(pc.cyan(`builder ${stackId}: a code job changed main: ${changedMain.split("\n")[0]!.slice(0, 160)}; checked again now`)), true;
 			if (o.codeJob) o.log(pc.yellow(`builder ${stackId}: code job ${n}/${MAX_BUILD_CODE_JOBS} merged nothing; tried again after the next merges`));
-			if (n < MAX_BUILD_CODE_JOBS && o.codeJob) return;
+			if (n < MAX_BUILD_CODE_JOBS && o.codeJob) return false;
 			jobs.set(stackId, MAX_BUILD_CODE_JOBS);
 			const first = problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? problem.split("\n")[0]!;
 			o.ledger.setMeta(buildParkedKey(stackId), `${new Date().toISOString()} main fails its whole-project checks; ${o.codeJob ? `${n} code job(s) did not make it green` : "no code job to fix it"}, the builder stops until it is green or the run restarts: ${first.slice(0, 200)}`);
 			o.log(pc.yellow(`builder ${stackId}: whole project still fails; parked, no question (br status)`));
+			return false;
 		} finally {
 			reset();
 		}

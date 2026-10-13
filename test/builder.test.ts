@@ -92,7 +92,7 @@ describe("the builder", () => {
 		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
 	});
 
-	it("what the model cannot fix goes to a code job with the errors, no question, and is not repaired again", async () => {
+	it("with a code job a red main goes straight to it with the failing commands, no repair, no question", async () => {
 		const { root, config, adapter, ledger, mergeFix } = setup();
 		let calls = 0;
 		const repair: Repairer = async () => {
@@ -106,9 +106,26 @@ describe("the builder", () => {
 		b.afterMerge("fake");
 		await b.finish();
 		expect(ledger.openQuestions()).toEqual([]);
-		expect(calls).toBe(2); // the first cycle's two tries only
+		expect(calls).toBe(0); // the repair may not touch tests; the code job may
+		expect(jobs).toHaveLength(2); // one per cycle: a job that merged nothing ends the cycle
+		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt[\s\S]*run these commands yourself/i);
+	});
+
+	it("a code job that made progress is followed by the next one in the same cycle, until main is green", async () => {
+		const { root, target, config, adapter, ledger } = setup();
+		const jobs: string[] = [];
+		const codeJob = async () => {
+			jobs.push("job");
+			// the first job fixes part of it (merged, main still red); the second makes main green
+			if (jobs.length === 2) (writeFileSync(join(target, "src", "a.txt"), "ok\n"), commitAll(target, "fix"));
+			return jobs.length === 1 ? "fixed half of the errors" : "fixed the rest";
+		};
+		const logs: string[] = [];
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: (l) => logs.push(l), linkAll: () => {}, mergeFix: async () => undefined, codeJob, every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await b.finish();
 		expect(jobs).toHaveLength(2);
-		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt/);
+		expect(logs.join("\n")).toMatch(/whole project ok/);
 	});
 
 	it("a test file the repair adds is deleted, not checked out, and the fix is merged", async () => {
