@@ -22,7 +22,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
-import { implementerTools, testerTools, type ToolDeps } from "../sessions/tools.ts";
+import { implementerTools, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
 import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
@@ -529,6 +529,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (lint.error) {
 			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
 			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
+		}
+	}
+	// kept tests and interface.md may name paths the layout does not allow (written before a layout change, the
+	// tester skipped): the implementer cannot rename them, so the tester moves them now (once)
+	if (testFiles.length && !o.gate) {
+		const iface = existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "";
+		const bad = portedLayout(checkLayout, ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths), interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir));
+		if (bad.length) {
+			log(pc.dim("  ported tests or interface.md name paths the layout does not allow: the tester moves them before implementing"));
+			if (await runTruth(`The ported tests or interface.md name files the stack's layout does not allow (the gate's structure_ok). The implementer cannot change a test's file name or imports, so it could never pass: rename or move the test files, change their imports and interface.md to paths the layout below allows, behaviour unchanged. check_ported_tests with code_files checks the new paths.\n${bad.join("\n")}\n\n${adapter.layout.structureDoc}`, true)) testFiles = loadTests();
 		}
 	}
 	const implementedBefore = !!o.ledger.db.prepare("SELECT 1 FROM attempts WHERE unit_id = ? AND role IN ('implement', 'escalate') LIMIT 1").get(o.unitId);
@@ -1080,4 +1090,15 @@ export function everOnMain(dir: string, paths: string[]): Set<string> {
 	} catch {
 		return new Set();
 	}
+}
+
+/** Files interface.md names in the unit's own folder that do not exist yet: the paths the implementer must create. */
+export function interfaceCodeFiles(md: string, targetRel: string, moduleDir: string, dir: string): string[] {
+	const out = new Set<string>();
+	for (const m of md.matchAll(/(?:^|[\s`'"(\[])((?:\.\/)?(?:[\w@.-]+\/)+[\w.-]+\.[A-Za-z]{1,5})(?=$|[\s`'"),:\]#]|\.(?:\s|$))/gm)) {
+		let p = m[1]!.replace(/^\.\//, "");
+		if (targetRel && p.startsWith(`${targetRel}/`)) p = p.slice(targetRel.length + 1);
+		if (p.startsWith(`${moduleDir}/`) && !existsSync(join(dir, p))) out.add(p);
+	}
+	return [...out];
 }
