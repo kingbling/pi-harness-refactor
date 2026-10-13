@@ -207,6 +207,24 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).parkedWhy).toBeUndefined();
 	});
 
+	it("a unit a model parked gets one more try when the plugin changed after the park", async () => {
+		const { root, config, ledger, mk } = workspace();
+		const { healQuarantined } = await import("../src/run/run.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "a code job wrote it but was not merged: protected config was changed");
+		const parkedAt = Date.now() - 60_000;
+		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "protected config was changed", parkedAt } });
+		const heal = (pluginChangedAt: number) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: 0, pluginChangedAt });
+		expect(await heal(parkedAt - 1000)).toEqual([]); // the plugin is older than the park
+		expect(await heal(parkedAt + 1000)).toEqual(["U1"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ retryNote: expect.stringMatching(/^This unit was parked \(protected config was changed\); the migration tool changed since/) });
+		// parked again after that try: the same plugin does not bring it back
+		ledger.transitionUnit("U1", "implementing", "x");
+		ledger.transitionUnit("U1", "quarantined", "still red");
+		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "still red", parkedAt: Date.now() } });
+		expect(await heal(parkedAt + 1000)).toEqual([]);
+	});
+
 	it("a model's leave on a waiting unit's question parks it with the model's reason; the owner's leave does not", async () => {
 		const { root, config, ledger, mk } = workspace();
 		const { RESOLVER } = await import("../src/jev/resolve.ts");

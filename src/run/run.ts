@@ -1487,7 +1487,8 @@ async function changeTouches(d: { ledger: Ledger; config: Config; client: ModelC
  * with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model tries first, one
  * question per kind of failure), and the answer is applied here. A requeue here keeps the unit's code (keepUnitWork).
  */
-export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient } = {}): Promise<string[]> {
+export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient; pluginChangedAt?: number } = {}): Promise<string[]> {
+	const pluginAt = o.pluginChangedAt ?? PLUGIN_TIME;
 	// one change time per stack per pass
 	const sinces = new Map<string, number>();
 	const sinceOf = (stackId: string) => o.since ?? (sinces.get(stackId) ?? sinces.set(stackId, lastFixAt(config, root, manifests, stackId)).get(stackId)!);
@@ -1513,6 +1514,13 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// a unit a model parked waits for a change on main after the park, past its automatic tries (the owner's leave stands)
 		const parked = meta.healQuestion === 0 && !!meta.parkedWhy && since > (meta.parkedAt ?? 0);
 		const mayRun = (meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && (meta.stuck || !meta.healQuestion)) || parked;
+		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change), so one
+		// more try, once per park (a park after the try is newer than the plugin)
+		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0)) {
+			backInQueue(ledger, config, root, r.id, heals, `This unit was parked (${meta.parkedWhy}); the migration tool changed since, so it runs again. Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
+			back.push(r.id);
+			continue;
+		}
 		if (changed && mayRun) {
 			// a change the decide model already said does not touch this failure is not asked about again
 			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
