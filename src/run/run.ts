@@ -437,6 +437,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		process.once("SIGINT", () => process.exit(130));
 	};
 	if (o.handleSigint !== false) process.once("SIGINT", onSigint);
+	// accepted units with only read truth and no script: the tester writes one, a few per run, one at a time on the side
+	const truthScripts = o.dry || o.spawn
+		? undefined
+		: import("./recheck.ts")
+				.then(({ writeTruthScripts }) => writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, log }))
+				.catch((e) => log(pc.yellow(`truth scripts: ${e?.message ?? e}`)));
 
 	let decisionBlocked = new Map<string, string[]>();
 	let waitingNote = "";
@@ -1003,6 +1009,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// a stop finishes the running parity check only; otherwise the queued slices are compared before the run ends
 	if (stopRecord) parityStopped = true;
 	while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
+	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
+	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
 	if (!o.dry && !stopRecord) await waitOn("whole-project check of what was merged", () => builder.finish()).catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
 	if (!o.dry) await waitOn("pushing to the target repo's remote", () => pusher.finish());

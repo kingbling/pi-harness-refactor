@@ -200,3 +200,37 @@ describe("truth read from the old code, run once it can", () => {
 		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} }).red).toBe(0);
 	});
 });
+
+describe("a script for truth that was only read", () => {
+	it("once the old code runs: the tester writes scripts for a few accepted units per run, never sees the expected values, code judges what they print", async () => {
+		const { root, config, ledger } = workspace();
+		const { writeTruthScripts } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		const env = join(root, ".bigrefactor", "legacy-env.json");
+		for (const id of ["fine", "stub", "typed"]) {
+			ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ?").run(id);
+			ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 0 WHERE unit_id = ?").run(id);
+			ledger.addEvidence(id, "truth_read", {});
+		}
+		const opts = { ledger, config, root, source, log: () => {} };
+		// the old code does not run here: nothing is tried
+		writeFileSync(env, JSON.stringify({ root: config.source.path, mode: "read" }));
+		expect((await writeTruthScripts({ ...opts, cap: 5, writer: async () => { throw new Error("not called"); } })).tried).toBe(0);
+		writeFileSync(env, JSON.stringify({ root: config.source.path, mode: "run" }));
+		const seen: string[] = [];
+		const writer = async (o: { unitId: string; truthDir: string; cases: unknown[] }) => {
+			seen.push(JSON.stringify(o.cases));
+			const value = o.unitId === "fine" ? "$(printf %s.%s 123 45)" : "99";
+			writeFileSync(join(o.truthDir, "cases.sh"), `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"${value}"'}]'\n`);
+			return "it runs";
+		};
+		const r = await writeTruthScripts({ ...opts, cap: 2, writer });
+		expect(r).toMatchObject({ tried: 2, upgraded: ["fine"], redone: ["stub"], left: 1 });
+		expect(seen.join()).not.toMatch(/123\.45/);
+		expect(ledger.hasEvidence("fine", "truth_green_on_old")).toBe(true);
+		expect(ledger.getUnit("stub")!.state).toBe("planned");
+		// the next run takes the rest; a unit already tried in this environment is not tried again
+		expect((await writeTruthScripts({ ...opts, cap: 2, writer })).tried).toBe(1);
+	});
+});

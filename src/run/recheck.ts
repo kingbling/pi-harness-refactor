@@ -6,7 +6,9 @@ import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import type { Ledger } from "../ledger/db.ts";
-import { loadLegacyEnv, notFromOldCode, verifyTruthOnOld, type TruthCase } from "./legacy-env.ts";
+import { describeTruthRun, loadLegacyEnv, notFromOldCode, verifyTruthOnOld, type TruthCase } from "./legacy-env.ts";
+import { PLAIN_LANGUAGE } from "../policy.ts";
+import { spawnLeaf } from "../sessions/spawn.ts";
 import { createHash } from "node:crypto";
 import type { SourceAdapter } from "../adapters/types.ts";
 import { run } from "./gate.ts";
@@ -204,7 +206,7 @@ function committedFiles(repo: string, sha: string): string[] {
 export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; log?: (l: string) => void }): { upgraded: string[]; redone: string[]; red: number; noScript: number } {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const source = o.source ?? getSourceAdapter(o.config.source.stack);
-	const env = createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(o.root, o.config), why: undefined })).digest("hex").slice(0, 12);
+	const env = envHash(o.root, o.config);
 	const ids = (o.ledger.db.prepare("SELECT DISTINCT unit_id AS id FROM evidence WHERE type = 'truth_read' AND unit_id NOT IN (SELECT unit_id FROM evidence WHERE type = 'truth_green_on_old')").all() as Array<{ id: string }>).map((r) => r.id);
 	const upgraded: string[] = [];
 	const redone: string[] = [];
@@ -226,26 +228,107 @@ export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: stri
 			red++;
 			continue;
 		}
-		const recorded = o.ledger.db.prepare("SELECT id, symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ?").all(id) as Array<{ id: string; symbol_id: string; inputs: string; expected: string }>;
-		const byKey = new Map(ran.cases.map((c) => [`${c.symbol}\u0000${JSON.stringify(c.inputs)}`, JSON.stringify(c.expected)]));
-		const wrong = recorded.filter((c) => byKey.has(`${c.symbol_id}\u0000${c.inputs}`) && byKey.get(`${c.symbol_id}\u0000${c.inputs}`) !== c.expected);
-		const unrun = recorded.filter((c) => !byKey.has(`${c.symbol_id}\u0000${c.inputs}`));
-		if (!wrong.length && !unrun.length && recorded.length) {
-			o.ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1 WHERE unit_id = ?").run(id);
-			o.ledger.addEvidence(id, "truth_green_on_old", { cases: recorded.length, script: relative(o.root, join(truthDir, source.truth.scriptName)), upgradedFromRead: true });
-			upgraded.push(id);
-			continue;
-		}
-		if (!wrong.length) continue; // the script covers other cases than the ones recorded: nothing proven either way
-		const note = `The expected values of this unit were written from reading the old code; now that it runs, it returns other values for ${wrong.length} case(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${byKey.get(`${c.symbol_id}\u0000${c.inputs}`)!.slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
-		if (u.state === "accepted") reopenUnit(o.ledger, id, note, `truth upgrade: ${wrong.length} case(s) differ when run on the old code`, true);
-		else {
-			o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(id);
-			o.ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_read', 'truth_none', 'truth_ahead')").run(id);
-			o.ledger.updateUnit(id, { meta: { retryNote: note } });
-		}
-		redone.push(id);
+		const r = judgeRunTruth(o.ledger, o.root, source, id, ran.cases);
+		if (r === "upgraded") upgraded.push(id);
+		else if (r === "redone") redone.push(id);
 	}
 	if (upgraded.length || redone.length || red) log(pc.cyan(`truth upgrade: ${upgraded.length} unit(s) now run green on the old code${redone.length ? `, ${redone.length} redone (the old code returns other values)` : ""}${red ? `, ${red} still red` : ""}${noScript ? `; ${noScript} have only read cases (no script)` : ""}`));
 	return { upgraded, redone, red, noScript };
+}
+
+/**
+ * Read truth against what the old code returned when run (`cases`): all recorded cases the same → they count as run on
+ * the old code; one with another value → the recorded truth was wrong and the unit is redone (an accepted one goes
+ * back to planned, code kept); the run covered other cases → nothing proven either way.
+ */
+function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: string, cases: TruthCase[]): "upgraded" | "redone" | "other" {
+	const u = ledger.getUnit(id)!;
+	const truthDir = join(root, ".bigrefactor", "truth", id);
+	const recorded = ledger.db.prepare("SELECT id, symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ?").all(id) as Array<{ id: string; symbol_id: string; inputs: string; expected: string }>;
+	const key = (symbol: string, inputs: string) => `${symbol}\u0000${inputs}`;
+	const byKey = new Map(cases.map((c) => [key(c.symbol, JSON.stringify(c.inputs)), JSON.stringify(c.expected)]));
+	const wrong = recorded.filter((c) => byKey.has(key(c.symbol_id, c.inputs)) && byKey.get(key(c.symbol_id, c.inputs)) !== c.expected);
+	const unrun = recorded.filter((c) => !byKey.has(key(c.symbol_id, c.inputs)));
+	if (!wrong.length && !unrun.length && recorded.length) {
+		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1 WHERE unit_id = ?").run(id);
+		ledger.addEvidence(id, "truth_green_on_old", { cases: recorded.length, script: relative(root, join(truthDir, source.truth.scriptName)), upgradedFromRead: true });
+		return "upgraded";
+	}
+	if (!wrong.length) return "other";
+	const note = `The expected values of this unit were written from reading the old code; now that it runs, it returns other values for ${wrong.length} case(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${byKey.get(key(c.symbol_id, c.inputs))!.slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
+	if (u.state === "accepted") reopenUnit(ledger, id, note, `truth upgrade: ${wrong.length} case(s) differ when run on the old code`, true);
+	else {
+		ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(id);
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_read', 'truth_none', 'truth_ahead')").run(id);
+		ledger.updateUnit(id, { meta: { retryNote: note } });
+	}
+	return "redone";
+}
+
+/** The old code's environment as a short hash: work tried on it is tried again only once it changes. */
+const envHash = (root: string, config: Config) => createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(root, config), why: undefined })).digest("hex").slice(0, 12);
+
+/** Writes the unit's cases script into `truthDir` (the recorded cases' symbols and inputs, never their expected values); returns its last sentence. */
+export type TruthScriptWriter = (o: { config: Config; root: string; source: SourceAdapter; unitId: string; truthDir: string; legacyFiles: string[]; cases: Array<{ symbol: string; inputs: unknown }> }) => Promise<string | void>;
+
+export const writeTruthScriptWithModel: TruthScriptWriter = async (o) => {
+	const script = join(o.truthDir, o.source.truth.scriptName);
+	const session = await spawnLeaf({
+		role: "test",
+		cwd: o.truthDir,
+		config: o.config,
+		writeGlobs: [o.source.truth.scriptName],
+		protectedGlobs: [],
+		transcriptPath: join(o.root, ".bigrefactor", "sessions", `${o.unitId}.truth-script.${Date.now()}.jsonl`),
+		systemPrompt: `You write a characterization script that runs the OLD ${o.source.id} code, so a migration tool can check expected values that were so far only read from that code. Write ${script} only: ${o.source.truth.instructions} Load the unit's real legacy files (paths relative to the legacy root ${o.config.source.path}) and call the real code with exactly the inputs you are given; print one case per input, with the same symbol and inputs and the value the old code returns as expected. Never write a result into the script yourself and never fake the code: when it cannot run, say what is missing and stop. Never change the legacy repo. Run it the way the tool will: ${describeTruthRun(o.root, o.config, o.source, script)}. End with one sentence.\n\n${PLAIN_LANGUAGE}`,
+	});
+	try {
+		const r = await session.run(`Unit ${o.unitId}. Its legacy files: ${o.legacyFiles.join(", ") || "none recorded"}. The cases to run (symbol and inputs; JSON):\n${JSON.stringify(o.cases, null, 1).slice(0, 12_000)}`);
+		return r.text.trim().split("\n").at(-1) ?? "";
+	} finally {
+		session.dispose();
+	}
+};
+
+/**
+ * Accepted units whose truth was only read from the old code and that have no script to run it: once the old code
+ * runs here, the tester writes that script, a few units per run (`cap`), one at a time on the side. Code runs it on
+ * the old code and judges it like upgradeReadTruth. A unit is tried once per environment of the old code.
+ */
+export async function writeTruthScripts(o: { ledger: Ledger; config: Config; root: string; cap: number; source?: SourceAdapter; writer?: TruthScriptWriter; stopped?: () => boolean; log?: (l: string) => void }): Promise<{ tried: number; upgraded: string[]; redone: string[]; red: number; left: number }> {
+	const log = o.log ?? ((l: string) => console.log(l));
+	const res = { tried: 0, upgraded: [] as string[], redone: [] as string[], red: 0, left: 0 };
+	if (loadLegacyEnv(o.root, o.config).mode !== "run" || o.cap <= 0) return res;
+	const source = o.source ?? getSourceAdapter(o.config.source.stack);
+	const env = envHash(o.root, o.config);
+	const ids = (o.ledger.db.prepare("SELECT DISTINCT e.unit_id AS id FROM evidence e JOIN units u ON u.id = e.unit_id WHERE e.type = 'truth_read' AND u.state = 'accepted' AND e.unit_id NOT IN (SELECT unit_id FROM evidence WHERE type = 'truth_green_on_old') ORDER BY e.unit_id").all() as Array<{ id: string }>)
+		.map((r) => r.id)
+		.filter((id) => !existsSync(join(o.root, ".bigrefactor", "truth", id, source.truth.scriptName)) && (JSON.parse(o.ledger.getUnit(id)!.meta) as { truthScriptEnv?: string }).truthScriptEnv !== env);
+	res.left = Math.max(0, ids.length - o.cap);
+	if (!ids.length) return res;
+	log(pc.cyan(`truth scripts: ${Math.min(ids.length, o.cap)} of ${ids.length} accepted unit(s) with read-only truth get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
+	for (const id of ids.slice(0, o.cap)) {
+		if (o.stopped?.()) break;
+		const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { files?: string[] };
+		const truthDir = join(o.root, ".bigrefactor", "truth", id);
+		const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(id) as Array<{ symbol_id: string; inputs: string }>).map((c) => ({ symbol: c.symbol_id, inputs: JSON.parse(c.inputs) as unknown }));
+		if (!cases.length) continue;
+		res.tried++;
+		const said = await (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases }).catch((e) => `failed: ${e?.message ?? e}`);
+		o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
+		// the unit may have been re-opened meanwhile (parity, a bug report): then its truth is redone anyway
+		if (o.ledger.getUnit(id)?.state !== "accepted") continue;
+		const ran = verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		if (!ran.ok) {
+			res.red++;
+			log(pc.dim(`  ${id}: the script does not run green on the old code (${String(ran.error ?? said).split("\n")[0]!.slice(0, 160)})`));
+			continue;
+		}
+		const r = judgeRunTruth(o.ledger, o.root, source, id, ran.cases);
+		if (r === "upgraded") res.upgraded.push(id);
+		else if (r === "redone") res.redone.push(id);
+		log(r === "upgraded" ? pc.green(`  ${id}: its read truth runs green on the old code`) : r === "redone" ? pc.yellow(`  ${id}: the old code returns other values; back to planned, truth made again`) : pc.dim(`  ${id}: the script ran other cases than the recorded ones; left as read`));
+	}
+	log(pc.cyan(`truth scripts: ${res.upgraded.length} upgraded, ${res.redone.length} redone, ${res.red} red${res.left ? `, ${res.left} left for later runs` : ""}`));
+	return res;
 }

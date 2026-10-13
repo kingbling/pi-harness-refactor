@@ -118,6 +118,8 @@ export const ConfigSchema = z.object({
 			idleMs: z.number().int().default(600_000),
 			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
 			sampleSize: z.number().int().min(0).default(10),
+			/** Accepted units with truth only read from the old code get a script that runs it, this many per run (0 = off). */
+			truthScriptsPerRun: z.number().int().min(0).default(20),
 			/** "unsure": the run decides routine questions itself when the model and the code agree (your goals guide both); "all": ask every one. */
 			ask: z.enum(["unsure", "all"]).default("unsure"),
 		})
