@@ -89,7 +89,7 @@ export const targetWorktree = (root: string) => join(root, ".bigrefactor", "work
 const TARGET_BRANCH = "parity/main";
 
 /** A fresh worktree of main for the new app (dependencies linked like a unit's). */
-export function prepareTargetCopy(config: Config, root: string, linkAll: (wt: string) => void): string {
+export async function prepareTargetCopy(config: Config, root: string, linkAll: (wt: string) => void | Promise<void>): Promise<string> {
 	const wt = targetWorktree(root);
 	removeWorktree(config.target.path, wt);
 	try {
@@ -98,7 +98,7 @@ export function prepareTargetCopy(config: Config, root: string, linkAll: (wt: st
 		/* no branch */
 	}
 	addWorktree(config.target.path, wt, TARGET_BRANCH);
-	linkAll(wt);
+	await linkAll(wt);
 	return wt;
 }
 
@@ -438,10 +438,10 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 }
 
 /** Probe the old app, then each target stack's app in a fresh worktree of main. Returns which sides are up. */
-export async function probeApps(o: { config: Config; root: string; linkAll: (wt: string) => void; again?: boolean; fixer?: AppFixer; log?: (l: string) => void; ask?: ProbeAsker; answer?: ProbeAnswer }): Promise<Record<string, boolean>> {
+export async function probeApps(o: { config: Config; root: string; linkAll: (wt: string) => void | Promise<void>; again?: boolean; fixer?: AppFixer; log?: (l: string) => void; ask?: ProbeAsker; answer?: ProbeAnswer }): Promise<Record<string, boolean>> {
 	const up: Record<string, boolean> = {};
 	up[LEGACY] = await probeApp({ ...o, side: LEGACY });
-	const wt = prepareTargetCopy(o.config, o.root, o.linkAll);
+	const wt = await prepareTargetCopy(o.config, o.root, o.linkAll);
 	try {
 		for (const s of o.config.target.stacks) up[s] = await probeApp({ ...o, side: s });
 	} finally {

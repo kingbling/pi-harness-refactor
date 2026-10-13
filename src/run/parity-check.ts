@@ -335,7 +335,7 @@ export interface SliceCheck {
  * Compare one slice: steps (written once, `rewrite` writes them anew), the old app run twice, the new app once in a
  * fresh worktree of main, differences into the ledger. Needs both apps' recipes (br parity --probe).
  */
-export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
+export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const startedAt = new Date().toISOString();
 	const mainAt = headOf(o.config.target.path);
@@ -377,7 +377,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	const stacks = [...new Set(steps.map((s) => s.target?.stack ?? o.serverStack))];
 	const down = stacks.filter((s) => !apps[s]?.up || !apps[s]!.recipe);
 	if (down.length) return fail(`the new ${down.join(", ")} app does not start here (br parity --probe)`);
-	const wt = prepareTargetCopy(o.config, o.root, o.linkAll);
+	const wt = await prepareTargetCopy(o.config, o.root, o.linkAll);
 	let neu: StepResult[];
 	try {
 		const recipes = new Map(stacks.map((s) => [s, apps[s]!.recipe as AppRecipe]));

@@ -1,6 +1,8 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { cp } from "node:fs/promises";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { linkedDirs, loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
@@ -272,8 +274,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			log(pc.yellow(`renaming area folders failed: ${String((e as Error)?.message ?? e).split("\n")[0]}`));
 		}
 	}
-	const linkAll = (wt: string) => {
-		for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(o.root, id).worktreeCopy ?? []);
+	const linkAll = async (wt: string) => {
+		for (const [id, a] of adapters) await linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(o.root, id).worktreeCopy ?? []);
 	};
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
 	excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
@@ -529,7 +531,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				// inside the try: a worktree that cannot be made skips this lane like any other failure
 				drop();
 				addWorktree(config.target.path, wt, branch);
-				linkAll(wt);
+				await linkAll(wt);
 				log(pc.cyan(`◇ ${unitId}`) + pc.dim("  truth ahead (deps still migrating)"));
 				const res = await runUnit({ ledger, config, root: o.root, unitId, client: o.client, accept: false, workDir: wt, truthOnly: true, gateSlot: (fn) => gates.run(fn), log: (l) => log(`  ${l}`), spawn: o.spawn, gate: o.gate });
 				cost += res.costUsd;
@@ -568,7 +570,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const p = agents.run(async () => {
 			const wt = worktreeDir(o.root, unitId);
 			const branch = `unit/${unitId}`;
-			const fresh = () => {
+			const fresh = async () => {
 				removeWorktree(config.target.path, wt);
 				try {
 					execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
@@ -576,7 +578,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					/* no branch */
 				}
 				addWorktree(config.target.path, wt, branch);
-				linkAll(wt);
+				await linkAll(wt);
 				ledger.updateUnit(unitId, { worktree: wt, branch });
 			};
 			let res: UnitRunResult | undefined;
@@ -594,7 +596,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			try {
 				// inside the try: a worktree that cannot be made (disk full, git lock) counts as a crash, so the unit is
 				// quarantined after the second one instead of being picked first again on every restart
-				fresh();
+				await fresh();
 				const restored = restoreKeptWork(ledger, wt, unitId);
 				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]${restored ? ` (earlier code kept${restored.length ? `, ${restored.length} file(s) clash with main` : ""})` : ""}`));
 				// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
@@ -716,7 +718,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						}
 						// the unit's code passed its checks and review: it goes back on top of the current main, only the clashing files need work
 						const sha = headOf(wt);
-						fresh();
+						await fresh();
 						const clash = sha ? restoreUnitWork(wt, sha) : undefined;
 						approved.clash = clash ?? [];
 						// only wiring files clash (route table, main module: every unit adds its entry there): one short session
@@ -1140,7 +1142,7 @@ export function excludeFromGit(repo: string, patterns: string[]): void {
 }
 
 /** Dependency dirs into a unit's worktree: linked, or copied (copy-on-write clone where the disk can) when the workspace learned that a link breaks the stack's tools. */
-export function linkDependencies(mainProject: string, wtProject: string, dirs: string[], copy: string[] = []): void {
+export async function linkDependencies(mainProject: string, wtProject: string, dirs: string[], copy: string[] = []): Promise<void> {
 	for (const d of dirs) {
 		const src = join(mainProject, d);
 		const dst = join(wtProject, d);
@@ -1151,10 +1153,11 @@ export function linkDependencies(mainProject: string, wtProject: string, dirs: s
 		}
 		mkdirSync(dirname(dst), { recursive: true });
 		try {
-			// APFS clone (macOS) / reflink (Linux): instant, no extra space; symlinks inside are kept as they are
-			execFileSync("cp", process.platform === "darwin" ? ["-cR", src, dst] : ["-R", "--reflink=auto", src, dst], { stdio: ["ignore", "pipe", "pipe"] });
+			// APFS clone (macOS) / reflink (Linux): no extra space, but it still walks every file (a 229 MB vendor
+			// took ~4 s), so it runs async: a sync copy would freeze the Pi UI and the other lanes; symlinks inside are kept
+			await promisify(execFile)("cp", process.platform === "darwin" ? ["-cR", src, dst] : ["-R", "--reflink=auto", src, dst]);
 		} catch {
-			cpSync(src, dst, { recursive: true, verbatimSymlinks: true });
+			await cp(src, dst, { recursive: true, verbatimSymlinks: true });
 		}
 	}
 }

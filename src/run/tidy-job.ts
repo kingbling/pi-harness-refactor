@@ -72,7 +72,7 @@ export function createTidyJobs(o: {
 	adapters: Map<string, TargetAdapter>;
 	log: (l: string) => void;
 	/** Links the dependency dirs into a fresh worktree, like for units. */
-	linkAll: (wt: string) => void;
+	linkAll: (wt: string) => void | Promise<void>;
 	/** Commits the worktree's changes and merges them into main (under the merge lock). */
 	mergeFix: (wt: string, branch: string, what: string) => Promise<string | undefined>;
 	/** A unit of this area is running: its task waits so the two do not conflict. */
@@ -101,7 +101,7 @@ export function createTidyJobs(o: {
 			reset();
 			const base = headOf(o.config.target.path);
 			addWorktree(o.config.target.path, wt, branch);
-			o.linkAll(wt);
+			await o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, t.stack)));
 			const overrides = keepOverrides(o.root, t.stack); // the gate commands are the setup fixer's, never a tidy job's
 			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t }).finally(() => overrides.restore() && o.log(pc.yellow(`tidy ${t.id}: the job changed the gate commands file; put back`)))) || "";

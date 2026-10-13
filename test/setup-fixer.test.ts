@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -309,8 +309,11 @@ describe("worktree dependency dirs: link or (learned) copy", () => {
 		const wtCopy = join(base, "wt2");
 		mkdirSync(wtLink);
 		mkdirSync(wtCopy);
-		linkDependencies(main, wtLink, ["vendor"]);
-		linkDependencies(main, wtCopy, ["vendor"], ["vendor"]);
+		await linkDependencies(main, wtLink, ["vendor"]);
+		// the copy runs async (a big vendor takes seconds): nothing is copied yet when the call returns, so the Pi UI keeps going
+		const copying = linkDependencies(main, wtCopy, ["vendor"], ["vendor"]);
+		expect(existsSync(join(wtCopy, "vendor", "composer", "autoload.php"))).toBe(false);
+		await copying;
 		expect(realpathSync(join(wtLink, "vendor", "composer"))).toBe(realpathSync(join(main, "vendor", "composer")));
 		expect(realpathSync(join(wtCopy, "vendor", "composer"))).toBe(join(realpathSync(wtCopy), "vendor", "composer"));
 	});

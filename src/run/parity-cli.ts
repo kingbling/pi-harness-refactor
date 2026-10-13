@@ -19,8 +19,8 @@ export async function parityCommand(o: { ledger: Ledger; config: Config; root: s
 	const slice = args.find((a) => !a.startsWith("--"));
 	if (!args.includes("--probe") && !slice) throw new Error(`usage: ${PARITY_USAGE}`);
 	const adapters = await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const));
-	const linkAll = (wt: string) => {
-		for (const [id, a] of adapters) linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(root, id).worktreeCopy ?? []);
+	const linkAll = async (wt: string) => {
+		for (const [id, a] of adapters) await linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(root, id).worktreeCopy ?? []);
 	};
 	if (slice) {
 		const serverStack = adapters.find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
