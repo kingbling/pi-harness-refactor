@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { diagnoseFailure } from "./doctor.ts";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import pc from "picocolors";
 import { keepOverrides, overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
@@ -23,7 +23,7 @@ import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, testerTools, type ToolDeps } from "../sessions/tools.ts";
-import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
@@ -188,6 +188,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastTesterText = "";
 	// the writes the last tester session was refused (a quarantine's red attempt carries them)
 	let lastTesterBlocked: string[] = [];
+	// earlier units' tests the implementer disputed and the tester then fixed: kept, and the gate allows them
+	const disputedOthers: string[] = [];
 	const envMode: TruthMode = loadLegacyEnv(o.root, o.config).mode ?? "run";
 	let truthMode: TruthMode = envMode;
 	// the tester runs in the workspace (truth dir + the target's test folders); it is told these exact globs, absolute
@@ -210,8 +212,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	/**
 	 * `testsOnly`: a retest for coverage, lint or placement. The truth cases stay as they are (no re-run, no
 	 * re-numbering): the tester only adds or fixes tests (and interface.md); a changed truth file is put back.
+	 * `codeWritten`: a retest from the implement loop (check_ported_tests runs the tests against the code).
+	 * `disputeText`: the implementer's dispute; an earlier unit's test file it names may be fixed by the tester.
 	 */
-	const runTruth = async (extra?: string, testsOnly = false): Promise<boolean> => {
+	const runTruth = async (extra?: string, testsOnly = false, more: { codeWritten?: boolean; disputeText?: string } = {}): Promise<boolean> => {
 		if (!o.truthOnly && o.ledger.getUnit(o.unitId)!.state === "planned") o.ledger.transitionUnit(o.unitId, "truth", "tester session started");
 		const attempt = o.ledger.startAttempt(o.unitId, "test", o.config.models.test.id);
 		const t0 = Date.now();
@@ -221,6 +225,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const putBack = scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
 		const overrides = keepOverrides(o.root, stackId); // the gate's commands are the setup fixer's, never the tester's
 		let overridesChanged = false;
+		const disputed = (f: string) => !!more.disputeText && (more.disputeText.includes(f) || more.disputeText.includes(basename(f)));
+		const sanctioned = [...tidyPaths, ...disputedOthers, ...(more.disputeText ? trackedFiles(targetProjectDir).filter((f) => adapter.layout.isTestFile(f) && disputed(f)) : [])];
 		lastTesterBlocked = [];
 		const tester = await spawn({
 			role: "test",
@@ -232,7 +238,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
-			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout }),
+			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && (lastTesterBlocked.push(e.blocked), log(pc.dim(`  tester blocked: ${e.blocked}`))),
 		});
@@ -255,7 +261,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		cost += res.usage.cost;
 		lastTesterText = res.text;
 		// tests of earlier units prove accepted behaviour: the tester may not rewrite them (undone, and it is told)
-		const others = othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), tidyPaths);
+		const changedOthers = othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);
+		// one the implementer disputed is kept: the tester re-checked it against the legacy code
+		const kept = changedOthers.filter(disputed);
+		if (kept.length) log(pc.yellow(`  tester fixed ${kept.length} disputed test(s) of earlier units; kept: ${kept.join(", ")}`));
+		disputedOthers.push(...kept.filter((f) => !disputedOthers.includes(f)));
+		const others = changedOthers.filter((f) => !kept.includes(f));
 		if (others.length) {
 			execFileSync("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir, stdio: "pipe" });
 			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
@@ -437,7 +448,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			log(pc.yellow(`  ${missing.length} truth case(s) have no ported test — retest`));
 			const seen = findTests(targetProjectDir, moduleDir, adapter.layout);
 			const globs = adapter.layout.testFileGlobs(moduleDir).map((g) => join(targetProjectDir, g)).join(", ");
-			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. The orchestrator searches the test files matching ${globs} for each case id as exact text, "#" included (e.g. "${missing[0]}"); a changed spelling does not count. ${seen.length ? `It searched ${seen.join(", ")} and did not find these ids.` : "It found no test files there."} Every case gets its own test asserting the case's expected value, with the exact id in its name, or next to it in a comment or test description where a name cannot hold it. check_ported_tests shows what is still missing.`, true);
+			// why ids written into an earlier unit's test file are gone
+			const undone = lastTesterText.split("\n").find((l) => l.startsWith("(Your changes to tests of earlier units were undone"));
+			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. The orchestrator searches the test files matching ${globs} for each case id as exact text, "#" included (e.g. "${missing[0]}"); a changed spelling does not count. ${seen.length ? `It searched ${seen.join(", ")} and did not find these ids.` : "It found no test files there."} Every case gets its own test asserting the case's expected value, with the exact id in its name, or next to it in a comment or test description where a name cannot hold it. check_ported_tests shows what is still missing.${undone ? `\n${undone}` : ""}`, true);
 		}
 	};
 
@@ -499,7 +512,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the implementer may not edit tests: tests that fail the stack's lint/format check would fail every attempt,
 	// so the tester fixes them now (once). Only with the real gate (simulations fake it).
 	if (testFiles.length && !o.gate) {
-		const lint = await checkTests(targetProjectDir, adapter, "lint", testFiles.map((t) => t.path));
+		// the unit's own tests: other units' formatting on main is not this tester's to fix
+		const lint = await checkTests(targetProjectDir, adapter, "lint", ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths));
 		if (lint.error) {
 			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
 			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
@@ -571,10 +585,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let regate = false;
 	// the tester re-ported: triage never sends a retest that did not help to the tester again
 	let lastRetest: LastRetest | undefined;
-	const retest = async (extra: string) => {
+	const retest = async (extra: string, more?: { codeWritten?: boolean; disputeText?: string }) => {
 		const files = () => JSON.stringify([loadTests(), readTruthFiles(), loadIface()]);
 		const before = files();
-		if (await runTruth(extra)) testFiles = loadTests();
+		if (await runTruth(extra, false, more)) testFiles = loadTests();
 		// no test, truth file or interface.md changed: no progress
 		lastRetest = { progress: files() !== before };
 	};
@@ -759,7 +773,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (straight) log(pc.dim("  ported tests still red and disputed: straight to the tester"));
 		gate = straight
 			? { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 0, output: check!.text }], changedFiles: check!.files, failedStep: "ported_tests_green", testFiles: testFiles.map((t) => t.path) }
-			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot });
+			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot });
 		// only the tests were called weak: the code was fine, so this is not an implementer failure
 		const weakOnly = !gate.ok && gate.failedStep === "wired_ok" && reviewWeakOnly;
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : weakOnly ? "gate_tests_weak" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
@@ -794,8 +808,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		// another model says the TESTS are wrong: the tester re-checks them against the legacy code first, and its
 		// answer goes into the implementer's next prompt (twice per unit; then triage decides as usual)
+		const disputeNote = disputes.length && gate.failedStep === "ported_tests_green" ? `The implementer disputes these tests:\n${disputes.map((d) => `- ${d.test}: ${d.why}\n  evidence: ${d.evidence}`).join("\n")}` : "";
 		const testsNote = [
-			disputes.length && gate.failedStep === "ported_tests_green" ? `The implementer disputes these tests:\n${disputes.map((d) => `- ${d.test}: ${d.why}\n  evidence: ${d.evidence}`).join("\n")}` : "",
+			disputeNote,
 			reviewWeak ? `The reviewer finds these tests too weak (they do not really check the legacy behaviour):\n${reviewWeak}` : "",
 		].filter(Boolean).join("\n\n");
 		const weakDrove = !!reviewWeak;
@@ -808,7 +823,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			if (weakDrove) o.ledger.updateUnit(o.unitId, { meta: { weakRounds: ++weakRounds } });
 			o.ledger.addEvidence(o.unitId, "test_disputed", { note: testsNote.slice(0, 2000) });
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
-			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`);
+			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`, { codeWritten: true, disputeText: disputeNote || undefined });
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
 			// the tests it kept, with its reasons, go to the next review: a kept test is called weak again only with a reason
 			if (weakDrove) o.ledger.updateUnit(o.unitId, { meta: { testerKept: lastTesterText.split("\n").filter((l) => /\bkept\b/i.test(l)).join("\n").slice(-2000) || undefined } });
@@ -851,7 +866,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				if (codeFault && doctorActions < 2 && !(dx.action === "retest" && noRetest)) {
 					doctorActions++;
 					if (triage.action === "escalate") forceEscalate = true;
-					if (dx.action === "retest") await retest(`The gate failed with ${gate.failedStep}: ${dx.summary}. ${dx.note ?? ""} Fix the TESTS, not production code.\n${lastGateText}`);
+					if (dx.action === "retest") await retest(`The gate failed with ${gate.failedStep}: ${dx.summary}. ${dx.note ?? ""} Fix the TESTS, not production code.\n${lastGateText}`, { codeWritten: true });
 					else lastGateText += `\n\nDiagnosis: ${dx.summary}. ${dx.note ?? ""}`;
 					previousGate = gate;
 					continue;

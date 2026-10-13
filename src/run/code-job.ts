@@ -105,7 +105,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
 		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
 		const changed = changedFiles(dir, o.adapter.toolchain.ignoredPaths);
-		const problem = changed.length ? await check(o.adapter, dir, changed, o.whole ? projectDir(o.config, o.adapter.id) : undefined) : "nothing was changed";
+		const problem = changed.length ? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole) : "nothing was changed";
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
@@ -129,13 +129,13 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 /**
  * Code's check: the changed files follow the layout, the changed code files build, there is a test among the changed files when code changed, and the
  * changed tests pass. Undefined = green. Only what the job changed is checked: the rest of main is not its job, except
- * for the builder's job (`mainDir` given: main fails its whole-project checks). There the whole-project build and lint
+ * for the builder's job (`whole`: main fails its whole-project checks). There the whole-project build and lint
  * run, with the tests that import the changed code (the builder runs no tests, accepted units' tests prove their
  * behaviour), and a fix needs no test of its own. It merges when all of that passes, or when it has fewer error lines
- * than main and none main does not have: a job that fixes part of a big red main is not thrown away.
+ * than main and none main does not have: a job that fixes part of a big red main is not thrown away. Any other job's
+ * failing steps run again on main (`mainDir`): it fails only on a step green on main or error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir?: string): Promise<string | undefined> {
-	const whole = mainDir !== undefined;
+async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean): Promise<string | undefined> {
 	// a deleted test checks nothing: the job may not make the check green by removing what was red
 	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
@@ -172,25 +172,29 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	const failing = new Map<string, string>();
 	for (const s of steps) {
 		const c = cmd(dir, s);
-		const err = await runCmd(c.cmd, c.args, dir, whole ? FULL_OUTPUT : undefined);
+		const err = await runCmd(c.cmd, c.args, dir, FULL_OUTPUT);
 		if (err !== undefined) out.push(`$ ${[c.cmd, ...c.args].join(" ")}   (${s.step})\n${err.slice(-8000)}`), failing.set(s.step, err);
 	}
 	if (!out.length) return undefined;
-	if (!whole) return out.join("\n\n");
-	// main fails its checks too: progress is fewer error lines than main and none main does not have
+	// main may fail its checks too: an error main already has is not this job's. The builder's job must fix some of them
 	let mine = 0;
 	let theirs = 0;
 	const added: string[] = [];
 	for (const s of steps) {
-		const files = s.files?.filter((f) => existsSync(join(mainDir, f)));
+		const err = failing.get(s.step);
+		// another job: only its failing steps are compared
+		if (!whole && err === undefined) continue;
+		const there = s.files?.filter((f) => existsSync(join(mainDir, f)));
+		// its files new on main: a build that ignores its file list (a full tsc) still shows main's errors
+		const files = !whole && there?.length === 0 ? s.files : there;
 		const c = files?.length === 0 ? undefined : cmd(mainDir, { ...s, files });
 		const was = c && (await runCmd(c.cmd, c.args, mainDir, FULL_OUTPUT));
-		const err = failing.get(s.step);
 		if (err !== undefined && was === undefined) return out.join("\n\n"); // red here, green on main
 		if (err !== undefined) added.push(...newErrorLines(err, dir, was!, mainDir));
 		mine += err === undefined ? 0 : errorKeys(err, dir).length;
 		theirs += was === undefined ? 0 : errorKeys(was, mainDir).length;
 	}
-	if (added.length) return `the whole-project checks fail with ${added.length} error line(s) main does not have:\n${added.join("\n").slice(-6000)}`;
+	if (added.length) return `the ${whole ? "whole-project " : ""}checks fail with ${added.length} error line(s) main does not have:\n${added.join("\n").slice(-6000)}`;
+	if (!whole) return undefined;
 	return mine < theirs ? undefined : `the whole-project checks fail as much as on main (no error fixed):\n${out.join("\n\n")}`;
 }

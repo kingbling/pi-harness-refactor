@@ -4,6 +4,7 @@ import { choiceOf, JEV_ACT, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { DecisionAnswer, ModelClient } from "../models/types.ts";
 import { errorSignature, findingKey, NOTHING_WRITTEN, type GateReport } from "./gate.ts";
+import { failureLines } from "./ported.ts";
 
 /**
  * Jev at the gate. Rules for using Jev well: the state is small and literal (the failing step's output
@@ -59,16 +60,21 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 	if (failed?.name === "structure_ok" && gate.testImported?.length && attemptNo < maxTotal && !(lastRetest && (sameFinding(gate, previous) || !lastRetest.progress)))
 		return deterministic(d, unitId, "test_bug", "retest", `layout finding on a path the ported tests import (${gate.testImported.join(", ")}): the tester moves the test's import to a path the layout allows`);
 
-	// State the decision model can actually reason on: not just the tail of the log, but what kind of failure it is.
 	const out = failed?.output ?? "";
 	const body = (out.startsWith("$ ") ? out.split("\n").slice(1).join("\n") : out).trim(); // drop the "$ cmd" line
-	// files the errors name (the command line lists every changed file: it is not an error)
-	const errFilesAll = [...new Set([...body.matchAll(/(?:^|\s)([\w./-]+\/[\w.-]+\.[A-Za-z0-9]{1,5})(?=[(:]| )/gm)].map((m) => m[1]!))];
+	// files the errors name (the command line lists every changed file: it is not an error); a path may end the line (php-cs-fixer's "1) path")
+	const errFilesAll = [...new Set([...body.matchAll(/(?:^|\s)([\w./-]+\/[\w.-]+\.[A-Za-z0-9]{1,5})(?=[(:]|\s|$)/gm)].map((m) => m[1]!))];
 	const testFiles = gate.testFiles ?? [];
 	const inTests = errFilesAll.length > 0 && errFilesAll.every((f) => testFiles.some((t) => samePath(f, t)));
 
+	// Lint errors only in the ported tests: the implementer may not edit them, the tester fixes them (once, as above).
+	// Not build errors: one in a test can mean the code the test calls is still missing, which the decision model weighs.
+	if (failed?.name === "lint_ok" && inTests && attemptNo < maxTotal && !(lastRetest && (sameFinding(gate, previous) || !lastRetest.progress)))
+		return deterministic(d, unitId, "test_bug", "retest", "lint errors only in the ported tests: the implementer may not edit them");
+
+	// State the decision model can actually reason on: not just the tail of the log, but what kind of failure it is.
 	// the tests that failed, as the output names them: the ported test files it mentions, and test-runner failure lines
-	const failingTests = [...new Set([...testFiles.filter((t) => out.includes(t) || out.includes(t.split("/").pop()!)), ...[...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gm)].map((m) => m[1]!.trim())])].slice(0, 20);
+	const failingTests = [...new Set([...testFiles.filter((t) => out.includes(t) || out.includes(t.split("/").pop()!)), ...failureLines(out)])].slice(0, 20);
 	const state = {
 		stage: failed?.name ?? "unknown",
 		attempt: attemptNo,

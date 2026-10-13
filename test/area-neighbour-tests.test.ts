@@ -63,6 +63,25 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect(r.output).toContain("FAIL tests/n1.spec");
 	});
 
+	it("names only the neighbours the output shows failing; none shown: a count", async () => {
+		write(join(main, "tests/n3.spec"), "pass\n");
+		git(main, "add", "-A");
+		git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "n3");
+		git(wt, "pull", "-q");
+		write(join(wt, "broken.txt"), "tests/n1.spec\n");
+		const tests = [...TESTS, "tests/n3.spec"];
+		// a runner that lists every file, passing ones too (vitest's "✓ file"), and goes on after a failure
+		const verbose = { ...adapter, test: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", `s=0; for f; do if grep -q pass "$f" && ! grep -qx "$f" broken.txt 2>/dev/null; then echo " ✓ $f (1 test)"; else echo " FAIL  $f > a test"; s=1; fi; done; exit $s`, "sh", ...files] }) } as unknown as TargetAdapter;
+		const r = await runPortedTests({ ledger, unitId: "u1", adapter: verbose, dir: wt, tests, mainDir: main, timeoutMs: 30_000 });
+		expect(r.output).toContain("✓ tests/n3.spec");
+		expect(r.output).toMatch(/fail with your code \(tests\/n1\.spec\)/);
+		// a runner that prints no file names
+		const quiet = { ...adapter, test: (d: string, files: string[]) => { const c = adapter.test(d, files); return { ...c, args: [c.args[0], `(${c.args[1]}) >/dev/null; s=$?; [ $s = 0 ] || echo "1 failed"; exit $s`, ...c.args.slice(2)] }; } } as TargetAdapter;
+		const q = await runPortedTests({ ledger, unitId: "u1", adapter: quiet, dir: wt, tests, mainDir: main, timeoutMs: 30_000 });
+		expect(q.ok).toBe(false);
+		expect(q.output).toMatch(/fail with your code \(2 file\(s\)\)/);
+	});
+
 	it("own tests red: red, and main is never run", async () => {
 		write(join(wt, "tests/own.spec"), "fail\n");
 		const r = await run();

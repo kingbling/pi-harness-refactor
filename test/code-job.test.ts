@@ -13,12 +13,13 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = []) {
+	async function job(worker: (dir: string) => string, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] } } = {}) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
 		writeFileSync(join(target, "src", "a.test.txt"), "expects ok\n");
 		writeFileSync(join(target, "tsconfig.json"), "{}\n");
+		for (const [f, text] of Object.entries(o.main ?? {})) writeFileSync(join(target, f), text);
 		ensureRepo(target, "migration/main", []);
 		commitAll(target, "init");
 		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
@@ -28,7 +29,7 @@ describe("the code job", () => {
 			toolchain: { ignoredPaths: [] },
 			generatedFiles: [],
 			layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], ignoreDirs: [], isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree, wiringFiles },
-			build: () => ({ cmd: "true", args: [] }),
+			build: () => o.build ?? { cmd: "true", args: [] },
 			test: () => ({ cmd: "true", args: [] }),
 		} as unknown as TargetAdapter;
 		let merged = false;
@@ -87,5 +88,16 @@ describe("the code job", () => {
 	it("code with its test is merged", async () => {
 		const r = await job((dir) => (code(dir), "added b"), ["**/tsconfig*.json"]);
 		expect(r.merged).toBe(true);
+	});
+	it("main's existing build error is not the job's: its own tests pass, it merges; a new error is refused", async () => {
+		// a build that ignores its file list (a full tsc): every BROKEN line is an error
+		const red = { main: { "src/old.txt": "BROKEN\n" }, build: { cmd: "sh", args: ["-c", "! grep -rn BROKEN src"] } };
+		expect((await job((dir) => (code(dir), "added b"), [], undefined, [], red)).merged).toBe(true);
+		const worse = (dir: string) => (code(dir), writeFileSync(join(dir, "src", "c.txt"), "BROKEN\n"), "added b and c");
+		expect((await job(worse, [], undefined, [], red)).merged).toBe(false);
+	});
+	it("a build red here and green on main is refused", async () => {
+		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "b.txt"), "BROKEN\n"), "added b"), [], undefined, [], { build: { cmd: "sh", args: ["-c", "! grep -rn BROKEN src"] } });
+		expect(r.merged).toBe(false);
 	});
 });

@@ -112,8 +112,9 @@ export function enclosing(node: Node, types: string[]): Node | null {
 	return null;
 }
 
-/** Syntax check used by the write gate: block writes that do not parse. */
+/** Syntax check used by the write gate: block writes that do not parse. A language with no grammar (twig, yaml) gets no check. */
 export async function syntaxErrors(lang: string, source: string): Promise<Array<{ line: number; text: string }>> {
+	if (!GRAMMARS[lang]) return [];
 	const tree = await parse(lang, source);
 	const out: Array<{ line: number; text: string }> = [];
 	if (!tree.rootNode.hasError) return out;

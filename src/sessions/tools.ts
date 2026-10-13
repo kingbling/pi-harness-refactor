@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
-import { caseCoverage, checkTests, runPortedTests } from "../run/ported.ts";
-import { buildFiles, changedFiles, clipOutput } from "../run/gate.ts";
+import { caseCoverage, checkTests, ownTests, runPortedTests } from "../run/ported.ts";
+import { buildFiles, changedFiles, clipOutput, othersTestsChanged } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { Config } from "../config.ts";
@@ -61,6 +61,10 @@ export interface ToolDeps {
 	mainDir?: string;
 	/** The gate's CPU slot: check_my_code runs its commands inside it, like the gate. */
 	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
+	/** Tester: earlier units' test files this unit may change (tidy, disputed), as the gate allows them. */
+	sanctioned?: string[];
+	/** Tester: the implementer's code is in place (a retest from the implement loop), so check_ported_tests runs the tests. */
+	codeWritten?: boolean;
 }
 
 const text = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details });
@@ -461,7 +465,7 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "check_ported_tests",
 		label: "Check ported tests",
-		description: "Run the orchestrator's own checks on your ported tests: which truth case ids (\"<unit>#N\", searched as exact text) no test file mentions, where it searched, the stack layout check (the gate's structure_ok) on your test files and on the production files they import, and the output of the target stack's build and lint on the test files (run in the target project dir, the same commands the gate runs). Pass code_files: every production file your tests import that does not exist yet, as the implementer must create it (project-relative path with its extension). The implementer cannot edit tests, so a path the layout does not allow fails every attempt. Call it before you finish and fix what it reports.",
+		description: "Run the orchestrator's own checks on your ported tests: which truth case ids (\"<unit>#N\", searched as exact text) no test file mentions, where it searched, the stack layout check (the gate's structure_ok) on your test files and on the production files they import, the output of the target stack's build and lint on this unit's test files (run in the target project dir, the same commands the gate runs), earlier units' test files you changed (undone when you finish), and once the implementer's code is in place the tests run against it. Pass code_files: every production file your tests import that does not exist yet, as the implementer must create it (project-relative path with its extension). The implementer cannot edit tests, so a path the layout does not allow fails every attempt. Call it before you finish and fix what it reports.",
 		promptSnippet: "check_ported_tests: the orchestrator's checks on your tests (case ids found, layout of test and imported paths, build, lint) — call before TESTER DONE",
 		parameters: Type.Object({ code_files: Type.Optional(Type.Array(Type.String(), { description: "production files the tests import, project-relative with extension (e.g. src/features/offers/pages/OffersEditPage.tsx)" })) }),
 		execute: async (_id, p) => {
@@ -481,16 +485,33 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
 			const layout = d.checkLayout ? portedLayout(d.checkLayout, cov.files, (p.code_files ?? []).filter((f) => !existsSync(join(d.targetProjectDir, f)))) : [];
 			if (d.checkLayout) out.push(layout.length ? `LAYOUT FAILED (the gate's structure_ok; the implementer cannot change a test's file name or imports, so fix them now: rename or move the test, change its imports and interface.md to paths the layout allows):\n${layout.join("\n")}` : `LAYOUT clean for ${cov.files.length} test file(s) and ${p.code_files?.length ?? 0} imported code file(s).${p.code_files?.length ? "" : " Pass code_files (the production files your tests import) to check those paths too."}`);
+			// earlier units' test files are put back when the session ends: the tester hears it now, not after
+			let others: string[] = [];
+			try {
+				others = othersTestsChanged(d.targetProjectDir, d.unitId, (f) => d.adapter.layout.isTestFile(f), d.sanctioned ?? []);
+			} catch {
+				/* not a git checkout: nothing to compare */
+			}
+			for (const f of others) out.push(`${f} holds tests of earlier units; your changes to it are undone when you finish (only those ids would remain). Put back what you changed there and put this unit's tests in a new test file next to it that the layout allows.`);
 			if (cov.files.length) {
-				// the same build and lint the gate runs on the unit's files; a whole-project one is not the tester's to fix
+				// the same build and lint the gate runs, on this unit's own test files (other units' are not the tester's to fix);
+				// a whole-project one is not the tester's to fix either
+				const own = ownTests(d.ledger, d.unitId, d.targetProjectDir, cov.files, d.adapter.toolchain.ignoredPaths);
 				for (const name of ["build", "lint"] as const) {
-					const r = await checkTests(d.targetProjectDir, d.adapter, name, cov.files);
+					const r = await checkTests(d.targetProjectDir, d.adapter, name, own);
 					const NAME = name.toUpperCase();
 					out.push(r.skipped ? `${NAME} not run per unit (${r.skipped}).` : r.error ? `${NAME} FAILED (\`${r.command}\`, run in ${d.targetProjectDir}); fix the test files (${name === "lint" ? "formatting/static issues only" : "the errors in them; code from interface.md that does not exist yet is the implementer's to write, not yours"}, behaviour unchanged):\n${r.error}` : `${NAME} clean (\`${r.command}\`, run in ${d.targetProjectDir}).`);
 				}
 			}
 			const whole = d.wholeCheck ? await d.wholeCheck() : undefined;
 			if (d.wholeCheck) out.push(whole ? `WHOLE-PROJECT check FAILED (the unit was not merged for these; errors main has too are left out). Fix the errors in your test files, behaviour unchanged; errors in code files are the implementer's:\n${whole.slice(-4000)}` : "WHOLE-PROJECT check: no errors main does not have.");
+			// after the implementer worked, the tests run against its code (the same run as check_my_code)
+			if (d.codeWritten && cov.files.length) {
+				const slot = d.slot ?? (<T>(fn: () => Promise<T>) => fn());
+				const r = await slot(() => runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir: d.targetProjectDir, tests: cov.files, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS }));
+				const full = join(d.root, ".bigrefactor", "sessions", `${d.unitId}.check_ported_tests.log`);
+				out.push(r.ok ? `TESTS green against the implementer's code (${cov.files.join(", ")}).` : `TESTS FAILED: the implementer's code is in place: a test that fails here is either wrong (check it against the legacy code and fix it) or catches a real bug in the code (keep it and say why in your final line):\n${clipOutput(r.output, 4000, full)}`);
+			}
 			return text(out.join("\n"), { missing: cov.missing, files: cov.files, layout });
 		},
 	});

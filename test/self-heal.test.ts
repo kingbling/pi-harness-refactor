@@ -392,7 +392,7 @@ describe("triage", () => {
 		const step = (name: string, output: string, testFiles: string[]) => ({ ok: false, failedStep: name, steps: [{ name, ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php", "tests/Billing/InvoiceTest.php"], testFiles }) as never;
 		const cmd = "$ vendor/bin/phpstan analyse src/Billing/Invoice.php tests/Billing/InvoiceTest.php\n";
 		// the tool prints project-relative paths, the test list is repo-relative
-		const t1 = await triageGate({ ledger, config, client }, "U1", step("lint_ok", `${cmd} tests/Billing/InvoiceTest.php:12 Call to an undefined method`, ["api/tests/Billing/InvoiceTest.php"]), undefined, 1);
+		const t1 = await triageGate({ ledger, config, client }, "U1", step("build_ok", `${cmd} tests/Billing/InvoiceTest.php:12 Call to an undefined method`, ["api/tests/Billing/InvoiceTest.php"]), undefined, 1);
 		expect(t1).toMatchObject({ action: "retest", cause: "test_bug" });
 		// the other way round
 		const t2 = await triageGate({ ledger, config, client }, "U1", step("build_ok", `${cmd}/work/api/tests/Billing/InvoiceTest.php(3,1): error`, ["tests/Billing/InvoiceTest.php"]), undefined, 1);
@@ -401,6 +401,27 @@ describe("triage", () => {
 		const t3 = await triageGate({ ledger, config, client }, "U1", step("build_ok", `${cmd}tests/Billing/InvoiceTest.php:12 x\nsrc/Billing/Invoice.php:3 y`, ["tests/Billing/InvoiceTest.php"]), undefined, 1);
 		expect(t3.action).toBe("retry");
 		expect((client.calls.at(-1)!.req as { state: { error_files: string[] } }).state.error_files).toEqual(["tests/Billing/InvoiceTest.php", "src/Billing/Invoice.php"]);
+		ledger.close();
+	});
+
+	it("lint errors only in the ported tests go to the tester by code; build errors there are still the decision model's", async () => {
+		const { config, ledger, mk } = workspace();
+		mk("U1", "billing", "implementing");
+		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug" }) });
+		const step = (name: string, output: string) => ({ ok: false, failedStep: name, steps: [{ name, ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php", "tests/Billing/InvoiceTest.php"], testFiles: ["tests/Billing/InvoiceTest.php"] }) as never;
+		// php-cs-fixer names the file at the end of the line
+		const fixer = "$ vendor/bin/php-cs-fixer fix --dry-run src/Billing/Invoice.php tests/Billing/InvoiceTest.php\n   1) tests/Billing/InvoiceTest.php\n";
+		const t1 = await triageGate({ ledger, config, client }, "U1", step("lint_ok", fixer), undefined, 1);
+		expect(t1).toMatchObject({ action: "retest", cause: "test_bug" });
+		expect(client.calls).toHaveLength(0);
+		// a retest that did not help goes the usual way
+		const t2 = await triageGate({ ledger, config, client }, "U1", step("lint_ok", fixer), step("lint_ok", fixer), 2, { progress: true });
+		expect(t2.action).not.toBe("retest");
+		expect(client.calls).toHaveLength(1);
+		// a build error in the test alone may mean the code it calls is missing: the model is asked
+		const t3 = await triageGate({ ledger, config, client }, "U1", step("build_ok", "tests/Billing/InvoiceTest.php:12 Call to an undefined method total()"), undefined, 1);
+		expect(t3.action).toBe("retry");
+		expect((client.calls.at(-1)!.req as { state: { errors_in_protected_tests_only: boolean } }).state.errors_in_protected_tests_only).toBe(true);
 		ledger.close();
 	});
 

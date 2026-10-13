@@ -69,11 +69,17 @@ export function checkTests(targetProjectDir: string, adapter: TargetAdapter, nam
 
 /**
  * The unit's own ported tests among `tests` (the area's): the files its truth cases are linked to, and test files new
- * or changed in its worktree (the tester's). The rest are other units' tests. No own file found: all of them count.
+ * or changed in its worktree (the tester's). The rest are other units' tests. No own file found (or no git): all of them count.
  */
 export function ownTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): string[] {
 	const linked = (ledger.db.prepare("SELECT DISTINCT ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(unitId) as Array<{ p: string }>).map((r) => r.p);
-	const mine = new Set([...linked, ...changedFiles(dir, ignored)]);
+	let changed: string[];
+	try {
+		changed = changedFiles(dir, ignored);
+	} catch {
+		return tests; // not a git checkout: all of them count
+	}
+	const mine = new Set([...linked, ...changed]);
 	const own = tests.filter((t) => mine.has(t));
 	return own.length ? own : tests;
 }
@@ -133,8 +139,14 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	if (!greenThere.length) return { ...mine, output: `${mine.output}${note}` };
 	const broke = await runTests(o.adapter, o.dir, greenThere, o.timeoutMs);
 	if (broke.ok) return { ...mine, output: `${mine.output}${note}` };
-	return { ...broke, output: `Your own tests pass, but other units' tests in the area pass on main and fail with your code (${greenThere.join(", ")}): fix your code (they may not be edited; a wrong one: report_migrated_bug with evidence).${note}\n${broke.output}` };
+	// name only the files on the runner's failure lines (it may list passing files too), so the failing test still fits in a clipped report
+	const fails = failureLines(broke.output);
+	const named = greenThere.filter((t) => fails.some((l) => l.includes(t)));
+	return { ...broke, output: `Your own tests pass, but other units' tests in the area pass on main and fail with your code (${named.length ? named.join(", ") : `${greenThere.length} file(s)`}): fix your code (they may not be edited; a wrong one: report_migrated_bug with evidence).${note}\n${broke.output}` };
 }
+
+/** The test runner's failure lines in `out` ("FAIL x", "✗ x", "1) x"), without the marker. */
+export const failureLines = (out: string): string[] => [...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gm)].map((m) => m[1]!.trim());
 
 /** Runs the stack's test command on `files`; true when it exits 0 (all given tests pass). */
 export function testsPass(targetProjectDir: string, adapter: TargetAdapter, files: string[]): Promise<boolean> {
