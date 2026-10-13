@@ -96,6 +96,24 @@ describe("runUnit wiring", () => {
 		expect(r.state).toBe("quarantined");
 	});
 
+	it("triage's retest is not dropped when the same step fails again and the doctor says reimplement", async () => {
+		const roles: string[] = [];
+		let retests = 0;
+		// each tester run changes its test: a retest that made progress
+		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => {
+			roles.push(opts.role);
+			if (opts.role === "test") write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), `it('u1 ${++retests}', () => {});\n`);
+			return spawn();
+		};
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "test_bug" } : undefined), chat: () => ({ json: { action: "reimplement", summary: "create() returns the wrong id", command: "", note: "" } }) });
+		// the same step with a different finding each time: never the same finding twice
+		let gates = 0;
+		const gate = async (): Promise<GateReport> => ({ ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: `- src/features/agency/case${++gates}.ts: expected 2, got 3` }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "ported_tests_green", testFiles: [] });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate, client, log: () => {} });
+		// attempt 2 is stuck (same step twice): the doctor runs, and triage's retest still runs before the next attempt
+		expect(roles.slice(0, 4)).toEqual(["implement", "test", "implement", "test"]);
+	});
+
 	it("the orchestrator's note (a retry's hint and last failure) reaches every implementer attempt, not only the first", async () => {
 		const tasks: string[] = [];
 		const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role !== "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;

@@ -33,6 +33,7 @@ describe("the code job", () => {
 			test: () => ({ cmd: "true", args: [] }),
 		} as unknown as TargetAdapter;
 		let merged = false;
+		let refused: string | undefined;
 		const said = await runCodeJob({
 			config,
 			root,
@@ -44,8 +45,9 @@ describe("the code job", () => {
 			mergeFix: async () => ((merged = true), undefined),
 			log: () => {},
 			worker: async ({ dir }) => worker(dir),
+			onRefused: (p) => (refused = p),
 		});
-		return { said, merged, target };
+		return { said, merged, target, refused };
 	}
 
 	it("a deleted test fails the check: nothing is merged", async () => {
@@ -64,7 +66,10 @@ describe("the code job", () => {
 	it("a protected wiring file (bundle list, route table) may change: a new feature folder is registered there", async () => {
 		const wire = (dir: string) => (code(dir), mkdirSync(join(dir, "config"), { recursive: true }), writeFileSync(join(dir, "config", "bundles.txt"), "B\n"), "added b");
 		expect((await job(wire, ["config/**"], undefined, ["config/bundles.txt"])).merged).toBe(true);
-		expect((await job(wire, ["config/**"])).merged).toBe(false);
+		const r = await job(wire, ["config/**"]);
+		expect(r.merged).toBe(false);
+		// the caller learns why: the resolver says "wrote it but was not merged", not "changed nothing"
+		expect(r.refused).toBe("protected config was changed: config/bundles.txt");
 	});
 	it("no code at all fails the check: the job was to write code", async () => {
 		const r = await job((dir) => (writeFileSync(join(dir, "notes.md"), "todo\n"), "wrote notes"));

@@ -41,8 +41,10 @@ export interface ToolDeps {
 	onDispute?: (d: { test: string; why: string; evidence: string }) => void;
 	/** Implementer: a reviewer finding it believes is wrong goes back to the reviewer, who keeps it with a reason or drops it (see dispute_finding). */
 	onDisputeFinding?: (d: { finding: string; why: string; evidence: string }) => void;
-	/** Implementer: every check_my_code result, so the orchestrator knows when DONE comes after a red check. */
+	/** Implementer: every check_my_code result, so the orchestrator knows when DONE comes after a red check. Tester (codeWritten): every check_ported_tests result (`failed: "tests"` when its test run was red). */
 	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[] }) => void;
+	/** Implementer: false when the unit's tester has no dispute re-check left (dispute_test then says so). */
+	disputeRecheck?: boolean;
 	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
 	onReport?: (r: { owner: string; target: string; problem: string; evidence: string }) => void;
 	/** Decision model for cheap judgements in tools (record_quirk: is this quirk already recorded?). */
@@ -390,6 +392,7 @@ export function disputeTestTool(d: ToolDeps): ToolDefinition {
 		parameters: Type.Object({ test: Type.String({ description: "test file and test name (or truth case id)" }), why: Type.String(), evidence: Type.String({ description: "what the legacy code really does (symbol, line, value)" }) }),
 		execute: async (_id, p) => {
 			d.onDispute?.(p);
+			if (d.disputeRecheck === false) return text("recorded, but the tester's re-checks for this unit are used up: nobody re-checks this test now and it stays as it is. Implement the behaviour of the legacy code, not the disputed expectation, and name the disputed test with your evidence in your final answer.");
 			return text("recorded: the tester re-checks it if this attempt fails the tests. Implement the behaviour of the legacy code, not the disputed expectation.");
 		},
 	});
@@ -511,7 +514,9 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 				const r = await slot(() => runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir: d.targetProjectDir, tests: cov.files, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS }));
 				const full = join(d.root, ".bigrefactor", "sessions", `${d.unitId}.check_ported_tests.log`);
 				out.push(r.ok ? `TESTS green against the implementer's code (${cov.files.join(", ")}).` : `TESTS FAILED: the implementer's code is in place: a test that fails here is either wrong (check it against the legacy code and fix it) or catches a real bug in the code (keep it and say why in your final line):\n${clipOutput(r.output, 4000, full)}`);
-			}
+				// the orchestrator knows when TESTER DONE comes after a red run (or tests changed after it)
+				d.onCheck?.({ ok: r.ok, failed: r.ok ? undefined : "tests", text: out.join("\n"), timedOut: r.output.endsWith("[timed out]"), files: cov.files });
+			} else if (d.codeWritten) d.onCheck?.({ ok: true, text: out.join("\n"), files: cov.files });
 			return text(out.join("\n"), { missing: cov.missing, files: cov.files, layout });
 		},
 	});

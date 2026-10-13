@@ -203,10 +203,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const adapter = stackId ? adapters.get(stackId) : undefined;
 		if (!adapter) return undefined;
 		let merged: string | undefined;
-		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		let refused: string | undefined;
+		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, onRefused: (p) => (refused = p), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 		// a fix on main may unblock quarantined units too, not only the ones waiting on this question
 		if (said && stackId) noteFix(o.root, stackId, merged, `code job q${q.id}: ${said}`);
-		return said;
+		return said ?? (refused ? { refused } : undefined);
 	};
 	let resolving: Promise<unknown> | undefined;
 	/** The resolver answered something since the run last looked: parked units may run again. */

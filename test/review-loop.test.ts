@@ -74,13 +74,45 @@ describe("DONE after a red check_my_code", () => {
 		});
 		let gates = 0;
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: async (g) => (gates++, { ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) }), log: () => {} });
-		expect(calls.map((c) => c.role)).toEqual(["implement", "implement", "test", "implement"]);
+		// the tester never ran check_ported_tests against the code: one more turn in the same session
+		expect(calls.map((c) => c.role)).toEqual(["implement", "implement", "test", "test", "implement"]);
 		expect(calls[1]!.task).toMatch(/last check_my_code was red \(tests\)[\s\S]*dispute_test[\s\S]*expected 2, got 3/);
 		expect(calls[2]!.task).toMatch(/The implementer disputes these tests:[\s\S]*u1#1 creates: expects 2/);
+		expect(calls[3]!.task).toMatch(/^You did not run check_ported_tests/);
 		// the straight route ran no gate; the second attempt's gate is green
 		expect(gates).toBe(1);
 		expect(r).toMatchObject({ state: "review", attempts: 2 });
 		expect(ledger.db.prepare("SELECT outcome FROM attempts WHERE unit_id = 'u1' AND role = 'implement' ORDER BY id").all()).toEqual([{ outcome: "gate_red:ported_tests_green" }, { outcome: "gate_green" }]);
+	});
+
+	it("a tester that says DONE after its check_ported_tests ran the tests red gets one more turn with the red output", async () => {
+		saveCommandOverride(ws, "nestjs", "build", { cmd: "true", args: [] }, "fixture");
+		saveCommandOverride(ws, "nestjs", "lint", { cmd: "true", args: [] }, "fixture");
+		// the tests pass once the tester fixed its test
+		saveCommandOverride(ws, "nestjs", "test", { cmd: "sh", args: ["-c", `grep -q fixed ${SPEC} || { echo 'u1#1 creates: expected 2, got 3'; exit 1; }`] }, "fixture");
+		const calls: Array<{ role: string; task: string }> = [];
+		const spawn = sessions(
+			calls,
+			async (opts, _task, n) => {
+				if (n === 1) {
+					write(join(ws, "migrated", CODE), "export class AgencyService {}\n");
+					await exec(opts, "dispute_test", { test: "u1#1 creates", why: "expects 2", evidence: "create.cmd.php returns 3" });
+					await exec(opts, "check_my_code");
+				}
+				return "IMPLEMENTER DONE";
+			},
+			async (opts, _task, n) => {
+				if (n === 2) write(join(ws, "migrated", SPEC), "it('u1#1 creates (fixed: returns 3)', () => {});\n");
+				await exec(opts, "check_ported_tests");
+				return n === 1 ? "u1#1 creates: kept\nTESTER DONE 1 cases" : "u1#1 creates: fixed — returns 3\nTESTER DONE 1 cases";
+			},
+		);
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: async (g) => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) }), log: () => {} });
+		const tester = calls.filter((c) => c.role === "test");
+		// one more turn only: its second check was green on unchanged tests
+		expect(tester).toHaveLength(2);
+		expect(tester[1]!.task).toMatch(/^Your last check_ported_tests ran the tests red[\s\S]*re-run check_ported_tests[\s\S]*TESTS FAILED[\s\S]*expected 2, got 3/);
+		expect(r.state).toBe("review");
 	});
 
 	it("code changed after the red check: the gate runs (no straight route on a stale check)", async () => {
@@ -216,7 +248,8 @@ describe("weak-tests-only reviews", () => {
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
 		expect(inputs).toHaveLength(2);
 		expect(inputs[1]!.testerKept).toMatch(/kept — the legacy code only renders the form/);
-		expect(calls.filter((c) => c.role === "test")).toHaveLength(1);
+		// one tester round (its follow-up turn for never running check_ported_tests is the same session)
+		expect(calls.filter((c) => c.role === "test" && !c.task.startsWith("You did not run check_ported_tests"))).toHaveLength(1);
 		expect(r.state).toBe("review");
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toBeUndefined();
 	});

@@ -232,6 +232,8 @@ describe("truth case ids stay put", () => {
 		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
 			({
 				run: async (task: string) => {
+					// the follow-up turn for never running check_ported_tests against the code changes nothing
+					if (task.startsWith("You did not run check_ported_tests")) return { text: "done", ...ok };
 					if (opts.role === "test") {
 						tasks.push(task);
 						if (tasks.length === 1) {

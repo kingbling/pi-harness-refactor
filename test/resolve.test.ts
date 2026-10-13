@@ -100,6 +100,18 @@ describe("resolver model before the owner", () => {
 		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again\nhint: what the code job changed on main: added the endpoint with tests", answered_by: CODE_JOB });
 	});
 
+	it("a code job the check refused: the resolver hears why it was not merged, not that it changed nothing", async () => {
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["symfony"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const a = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "the bundle is not registered", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
+		const resolver: Resolver = async () => ({ code: "register the Inventory bundle", then: "retry" });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: async () => ({ refused: "protected config was changed: config/bundles/registry.php" }) });
+		const answer = ledger.getQuestion(a)!.answer!;
+		expect(answer).toMatch(/a code job wrote it but was not merged: protected config was changed: config\/bundles\/registry\.php/);
+		expect(answer).not.toMatch(/changed nothing/);
+	});
+
 	it("a path the layout has no slot for runs a layout job: applied → answered; it would break code on main → the owner", async () => {
 		const { LAYOUT_JOB } = await import("../src/jev/resolve.ts");
 		const ledger = new Ledger(":memory:");

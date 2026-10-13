@@ -70,6 +70,8 @@ export async function runCodeJob(o: {
 	worker?: CodeWorker;
 	/** the builder's job (main fails its whole-project checks): green means those pass; a fix needs no new test */
 	whole?: boolean;
+	/** told why the check refused what the job wrote (it returns undefined then) */
+	onRefused?: (problem: string) => void;
 }): Promise<string | undefined> {
 	const key = o.adapter.id;
 	while (busy.has(key)) await busy.get(key)!.catch(() => undefined);
@@ -109,6 +111,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
+			if (changed.length) o.onRefused?.(problem);
 			return undefined;
 		}
 		const sha = await o.mergeFix(wt, branch, `feat(${o.adapter.id}): ${(said || o.what).split("\n")[0]!.slice(0, 120)}\n\ncode job ${o.label}`);

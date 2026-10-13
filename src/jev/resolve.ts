@@ -42,8 +42,11 @@ export type Resolution = { answer: string; why: string; hint?: string } | { owne
 /** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or undefined. */
 export type FixJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | undefined>;
 export const FIX_JOB = "setup model (fix job)";
-/** A code job: a model writes app code a unit needs but may not write (an endpoint, wiring, a shared fixture) on main, with tests. */
-export type CodeJob = FixJob;
+/**
+ * A code job: a model writes app code a unit needs but may not write (an endpoint, wiring, a shared fixture) on main, with tests.
+ * { refused }: it wrote code that the check would not merge, and why.
+ */
+export type CodeJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | { refused: string } | undefined>;
 export const CODE_JOB = "code model (code job)";
 /** A layout job: the stack's folder layout gets the slot the gate keeps refusing; applied when it only allows more, else the owner decides. */
 export type LayoutJob = (q: QuestionRow, what: string, stack?: string) => Promise<{ applied: string } | { owner: string } | undefined>;
@@ -151,16 +154,19 @@ export async function resolveOpenQuestions(d: {
     if ("fix" in r || "code" in r) {
       // the question waits while the job runs; a job that changed main answers it with the option the resolver chose (retry …)
       const [kind, job, what, by] = "fix" in r ? (["fix job", d.fixJob, r.fix, FIX_JOB] as const) : (["code job", d.codeJob, r.code, CODE_JOB] as const);
-      const fixed = job
+      const done = job
         ? await job(q, what, r.stack).catch((e) => (d.log?.(`${kind} for question #${q.id} failed: ${e?.message ?? e}`), undefined))
         : undefined;
       if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
+      const fixed = typeof done === "string" ? done : undefined;
+      // a refused job did write something: the resolver sees why it stayed off main, not "changed nothing"
+      const why = typeof done === "object" ? `a ${kind} wrote it but was not merged: ${done.refused.slice(0, 1500)} (asked for: ${what})` : `a ${kind} was tried and changed nothing: ${what}`;
       if (!fixed && parks(q)) {
-        park(`a ${kind} was tried and changed nothing: ${what}`);
+        park(why);
         continue;
       }
       if (!fixed) {
-        d.ledger.markForOwner(q.id, `a ${kind} was tried and changed nothing: ${what}`);
+        d.ledger.markForOwner(q.id, why);
         forOwner++;
         continue;
       }

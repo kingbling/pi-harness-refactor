@@ -2,6 +2,7 @@ import pc from "picocolors";
 import { getSourceAdapter, registerGeneratedTargets } from "../adapters/registry.ts";
 import { healWiringFiles } from "../adapters/target/generated.ts";
 import type { Config } from "../config.ts";
+import { projectDir } from "../init/init.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import { healNotApp, leftOut, loadNotApp } from "../inventory/not-app.ts";
 import { inventory } from "../inventory/run.ts";
@@ -15,7 +16,8 @@ import { requeueUnits } from "./run.ts";
  * - A framework profile without notApp: a session lists the folders that are not the app (healNotApp), then the
  *   inventory runs again, so planned units there drop out and a vendored folder becomes a library decision. Units
  *   started there that merged nothing go back to planned first, so they drop out too.
- * - A generated adapter without wiringFiles: one question to the model (healWiringFiles); the rest stays.
+ * - A generated adapter without wiringFiles, or naming one the project no longer has (a setup fix moved it): one
+ *   question to the model (healWiringFiles); the rest stays.
  */
 const NOT_APP_PENDING = "not_app_heal_pending";
 
@@ -51,7 +53,7 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		ledger.setMeta(NOT_APP_PENDING, "0");
 	}
 	if (o.client) {
-		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, log: (l) => o.log(pc.dim(l)) });
+		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });
 		if (changed.length) registerGeneratedTargets(o.root);
 	}
 }

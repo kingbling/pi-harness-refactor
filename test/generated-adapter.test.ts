@@ -206,6 +206,52 @@ describe("stack knowledge is checked when the adapter is written", () => {
 		expect(loadLayoutRules(ws, "sym-test")!.require).toEqual([]);
 	});
 
+	it("run start: a wiring file the project no longer has (a setup fix moved it) is asked again, with the files tracked near it", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const { healWiringFiles, loadManifests } = await import("../src/adapters/target/generated.ts");
+		const ws = join(here, ".sim", "heal-wiring-gone");
+		const proj = join(ws, "project");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+		mkdirSync(join(proj, "config", "bundles"), { recursive: true });
+		writeFileSync(join(proj, "config", "bundles.php"), "<?php return [];\n");
+		writeFileSync(join(proj, "config", "routes.yaml"), "\n");
+		const git = (...a: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd: proj });
+		git("init", "-q");
+		git("add", "-A");
+		git("commit", "-qm", "init");
+		// a setup fix moved the registration file
+		git("mv", "config/bundles.php", "config/bundles/registry.php");
+		git("commit", "-qm", "move");
+		const save = (wiringFiles: string[]) => writeFileSync(join(ws, ".bigrefactor", "adapters", "sym-test.json"), JSON.stringify(php({ wiringFiles })));
+		const { saveLayoutRules, loadLayoutRules } = await import("../src/rules/layout-rules.ts");
+		saveLayoutRules(ws, "sym-test", php().layout.rules!);
+		// a moved file the model names nothing for: the working list and the require stay
+		save(["config/bundles.php", "config/routes.yaml"]);
+		const empty = new FakeModelClient({ chat: () => ({ json: {} }) });
+		expect(await healWiringFiles(ws, { client: empty, model: "m", dirOf: () => proj })).toEqual([]);
+		expect(empty.calls.length).toBe(1);
+		expect(loadManifests(ws).find((m) => m.id === "sym-test")!.layout.wiringFiles).toEqual(["config/bundles.php", "config/routes.yaml"]);
+		expect(loadLayoutRules(ws, "sym-test")!.require).toEqual(php().layout.rules!.require);
+		// a file git never had (a unit creates it later) is not stale: no question
+		save(["config/bundles/registry.php", "config/routes.yaml", "config/services.php"]);
+		const never = new FakeModelClient({ chat: () => ({ json: { wiringFiles: [] } }) });
+		expect(await healWiringFiles(ws, { client: never, model: "m", dirOf: () => proj })).toEqual([]);
+		expect(never.calls.length).toBe(0);
+
+		save(["config/bundles.php", "config/routes.yaml", "config/{Area}/*.yaml"]);
+		const client = new FakeModelClient({ chat: () => ({ json: { wiringFiles: ["config/bundles/registry.php", "config/routes.yaml"] } }) });
+		expect(await healWiringFiles(ws, { client, model: "m", dirOf: () => proj })).toEqual(["sym-test"]);
+		expect(client.calls.length).toBe(1);
+		const asked = JSON.stringify((client.calls[0]!.req as { messages: unknown[] }).messages);
+		expect(asked).toContain("no longer has: config/bundles.php"); // the glob is not looked for
+		expect(asked).toContain("config/bundles/registry.php");
+		expect(loadManifests(ws).find((m) => m.id === "sym-test")!.layout.wiringFiles).toEqual(["config/bundles/registry.php", "config/routes.yaml"]);
+		// all present now: not asked again
+		expect(await healWiringFiles(ws, { client, model: "m", dirOf: () => proj })).toEqual([]);
+		expect(client.calls.length).toBe(1);
+	});
+
 	it("the implementer is never told the stack needs no registration when the adapter never said so", async () => {
 		const { implementerSystemPrompt } = await import("../src/run/prompts.ts");
 		const { ConfigSchema } = await import("../src/config.ts");

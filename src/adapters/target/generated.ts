@@ -455,26 +455,39 @@ function saveManifest(root: string, m: AdapterManifest): void {
 }
 
 /**
- * A saved manifest written before wiringFiles was asked for, or whose layout requires files in every feature folder
- * that no wiring file registers, gets that one question. Only wiringFiles changes (and the require, dropped when the
- * model says the framework registers nothing by hand); the rest of the manifest stays as it is. Returns the ids changed.
+ * A saved manifest written before wiringFiles was asked for, whose layout requires files in every feature folder
+ * that no wiring file registers, or that names a wiring file the project no longer has (a setup fix moved it) gets
+ * that one question. Only wiringFiles changes (and the require, dropped when the model says the framework registers
+ * nothing by hand); the rest of the manifest stays as it is. `dirOf` gives a stack's project dir: without it, or
+ * before the project exists, missing files are not looked for. Returns the ids changed.
  */
-export async function healWiringFiles(root: string, opts: { client: ModelClient; model: string; log?: (l: string) => void }): Promise<string[]> {
+export async function healWiringFiles(root: string, opts: { client: ModelClient; model: string; dirOf?: (stackId: string) => string; log?: (l: string) => void }): Promise<string[]> {
 	const done: string[] = [];
 	for (const m of loadManifests(root)) {
 		const own = loadLayoutRules(root, m.id);
 		const require = (own ?? m.layout.rules)?.require ?? [];
-		if (m.layout.wiringFiles && (m.layout.wiringFiles.length || !require.length)) continue;
+		const dir = opts.dirOf?.(m.id);
+		// gone only when git shows the project once had it: a file a unit creates later (or a dir without git) is not stale
+		const gone = dir && existsSync(dir) ? (m.layout.wiringFiles ?? []).filter((w) => !/[*?[{]/.test(w) && !existsSync(join(dir, w)) && wasTracked(dir, w)) : [];
+		if (m.layout.wiringFiles && (m.layout.wiringFiles.length || !require.length) && !gone.length) continue;
+		const ask = gone.length
+			? `The ${m.id} manifest names wiring files the project no longer has: ${gone.join(", ")} (layout.wiringFiles now: ${m.layout.wiringFiles!.join(", ")}). The project's files tracked near them:\n${trackedNear(dir!, gone)}\n\nName the files where the project registers features now (it may have moved them); keep the entries that still hold. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}.`
+			: `The ${m.id} manifest has no layout.wiringFiles yet. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}; structure doc:\n${m.layout.structureDoc}`;
 		const res = await opts.client.chat({
 			model: opts.model,
 			effort: "medium",
 			schema: obj({ wiringFiles: SA }),
 			messages: [
 				{ role: "system", content: SYSTEM },
-				{ role: "user", content: `The ${m.id} manifest has no layout.wiringFiles yet. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}; structure doc:\n${m.layout.structureDoc}\n\nAnswer only layout.wiringFiles, as the rule above says.` },
+				{ role: "user", content: `${ask}\n\nAnswer only layout.wiringFiles, as the rule above says.` },
 			],
 		});
 		const wiring = (((res.json ?? {}) as { wiringFiles?: string[] }).wiringFiles ?? []).filter((p) => p && !p.startsWith("/") && !p.includes(".."));
+		// a moved file with no answer: the working list and its require stay (only the never-asked case drops them)
+		if (gone.length && !wiring.length) {
+			opts.log?.(`  adapter ${m.id}: wiring files ${gone.join(", ")} are gone and the model named none: list kept`);
+			continue;
+		}
 		m.layout.wiringFiles = wiring;
 		// nothing registers the required files: the framework finds them itself, so no folder must hold them
 		if (!wiring.length && require.length) {
@@ -486,6 +499,21 @@ export async function healWiringFiles(root: string, opts: { client: ModelClient;
 		done.push(m.id);
 	}
 	return done;
+}
+
+/** git has a commit that touched `file` in the project dir (false without git). */
+function wasTracked(dir: string, file: string): boolean {
+	const r = spawnSync("git", ["-C", dir, "log", "-1", "--format=%h", "--", file], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	return r.status === 0 && !!r.stdout.trim();
+}
+
+/** The tracked files in the nearest folder that still holds each missing path (the project root at worst), capped. */
+function trackedNear(dir: string, missing: string[]): string {
+	const near = (p: string): string => (p === "." || existsSync(join(dir, p)) ? p : near(dirname(p)));
+	const dirs = [...new Set(missing.map((p) => near(dirname(p))))];
+	const r = spawnSync("git", ["-C", dir, "ls-files", "--", ...dirs], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const files = r.status === 0 ? r.stdout.split("\n").filter(Boolean) : [];
+	return files.length ? `${files.slice(0, 300).join("\n")}${files.length > 300 ? `\n… ${files.length - 300} more` : ""}` : "(none tracked)";
 }
 
 /** A generated adapter that could not be made to work: its manifest is gone, the stack choice should be asked again. */
