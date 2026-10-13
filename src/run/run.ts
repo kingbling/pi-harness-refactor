@@ -476,12 +476,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				   AND NOT EXISTS (SELECT 1 FROM json_each(u.deps) d JOIN units du ON du.id = d.value WHERE ${OPEN_DEP})`,
 			)
 			.all() as Array<{ id: string; meta: string }>;
+		const held = tidyJobs.heldAreas();
 		const units = rows.filter((u) => {
 			if (running.has(u.id) || blocked.has(u.id)) return false;
 			// waits for Jev or its placement question, never runs on a guess (a dry run previews before placement ran)
 			if (!o.dry && unplacedReason(config, u.meta, o.root)) return false;
 			if (busyModules.has(placementOf(u.meta).moduleKey)) return false;
-			if (tidyJobs.holds(placementOf(u.meta).stackId, placementOf(u.meta).area)) return false;
+			if (held.has(`${placementOf(u.meta).stackId}\0${placementOf(u.meta).area}`)) return false;
 			if (o.units && !o.units.includes(u.id)) return false;
 			if (o.slice && JSON.parse(u.meta).slice !== o.slice) return false;
 			return true;

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -36,41 +36,54 @@ export function recordSpend(usd: number, source: string, model?: string, o: { su
 	}
 }
 
+/** What the spend log held when last read: only lines added since are read again (the log grows to many MB). */
+type SpendTally = { size: number; tail: string; usd: number; bySource: Record<string, number>; since?: string; paid: Array<[at: string, usd: number]> };
+const tallies = new Map<string, SpendTally>();
+
+function tally(root: string): SpendTally | undefined {
+	const f = file(root);
+	if (!existsSync(f)) return undefined;
+	const size = statSync(f).size;
+	let t = tallies.get(f);
+	if (!t || size < t.size) t = { size: 0, tail: "", usd: 0, bySource: {}, paid: [] }; // new or truncated: read again
+	if (size > t.size) {
+		const buf = Buffer.alloc(size - t.size);
+		const fd = openSync(f, "r");
+		try {
+			readSync(fd, buf, 0, buf.length, t.size);
+		} finally {
+			closeSync(fd);
+		}
+		const lines = (t.tail + buf.toString("utf8")).split("\n");
+		t.tail = lines.pop() ?? ""; // a line still being written
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			try {
+				const e = JSON.parse(line) as SpendEntry;
+				t.usd += e.usd;
+				t.since ??= e.at;
+				const k = e.source.split(":")[0]!;
+				t.bySource[k] = (t.bySource[k] ?? 0) + e.usd;
+				if (!e.subscription) t.paid.push([e.at, e.usd]);
+			} catch {
+				/* torn line */
+			}
+		}
+		t.size = size;
+	}
+	tallies.set(f, t);
+	return t;
+}
+
 /** Total spend of the workspace (all-time), split by source family. */
 export function totalSpend(root: string): { usd: number; bySource: Record<string, number>; since?: string } {
-	const f = file(root);
-	if (!existsSync(f)) return { usd: 0, bySource: {} };
-	let usd = 0;
-	let since: string | undefined;
-	const bySource: Record<string, number> = {};
-	for (const line of readFileSync(f, "utf8").split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const e = JSON.parse(line) as SpendEntry;
-			usd += e.usd;
-			since ??= e.at;
-			const k = e.source.split(":")[0]!;
-			bySource[k] = (bySource[k] ?? 0) + e.usd;
-		} catch {
-			/* torn line */
-		}
-	}
-	return { usd, bySource, since };
+	const t = tally(root);
+	return t ? { usd: t.usd, bySource: { ...t.bySource }, since: t.since } : { usd: 0, bySource: {} };
 }
 
 /** Money actually paid since a time (subscription calls excluded): what the daily budget cap counts. */
 export function paidSince(root: string, sinceIso: string): number {
-	const f = file(root);
-	if (!existsSync(f)) return 0;
 	let usd = 0;
-	for (const line of readFileSync(f, "utf8").split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const e = JSON.parse(line) as SpendEntry;
-			if (!e.subscription && e.at >= sinceIso) usd += e.usd;
-		} catch {
-			/* torn line */
-		}
-	}
+	for (const [at, u] of tally(root)?.paid ?? []) if (at >= sinceIso) usd += u;
 	return usd;
 }

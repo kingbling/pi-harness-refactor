@@ -56,6 +56,8 @@ Never interactive prompts or servers; do not commit. End with one sentence sayin
 export interface TidyJobs {
 	/** Units of this area wait: one of its tasks is approved and a tidy job will do it. */
 	holds(stackId: string, area: string): boolean;
+	/** The same for every area at once ("stack\0area" keys): one read of the tasks, for a scheduler pass over many units. */
+	heldAreas(): Set<string>;
 	/** Starts the next approved task (one at a time), once no unit of its area runs. */
 	next(): void;
 	/** The job in progress, if any. */
@@ -136,6 +138,7 @@ export function createTidyJobs(o: {
 
 	return {
 		holds: (stackId, area) => !!worker && tidyTasks(o.ledger, stackId, area).some(todo),
+		heldAreas: () => new Set(worker ? tidyTasks(o.ledger).filter(todo).map((t) => `${t.stack}\0${t.area}`) : []),
 		next() {
 			if (running || !worker) return;
 			const t = tidyTasks(o.ledger).find((x) => todo(x) && !o.areaBusy(x.stack, x.area));
