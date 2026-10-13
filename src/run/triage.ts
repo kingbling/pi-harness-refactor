@@ -54,6 +54,11 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", "scope/test tampering caught by code");
 	}
 
+	// A layout finding on a path a protected test imports: the implementer cannot rename it (tests are not its to edit),
+	// so another attempt can never pass. The tester moves the import (once; a retest that did not help goes the usual way).
+	if (failed?.name === "structure_ok" && gate.testImported?.length && attemptNo < maxTotal && !(lastRetest && (sameFinding(gate, previous) || !lastRetest.progress)))
+		return deterministic(d, unitId, "test_bug", "retest", `layout finding on a path the ported tests import (${gate.testImported.join(", ")}): the tester moves the test's import to a path the layout allows`);
+
 	// State the decision model can actually reason on: not just the tail of the log, but what kind of failure it is.
 	const out = failed?.output ?? "";
 	const body = (out.startsWith("$ ") ? out.split("\n").slice(1).join("\n") : out).trim(); // drop the "$ cmd" line

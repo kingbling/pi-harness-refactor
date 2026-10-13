@@ -6,7 +6,7 @@ import { dirname, join, relative } from "node:path";
 import { loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
-import { createBuilder, type Repairer } from "./builder.ts";
+import { createBuilder, createMergeCheck, filesNamed, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
@@ -297,6 +297,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const merge = new Semaphore(1);
 	// target.git.push "on": main goes to the target repo's remote after merges, on the side
 	const pusher = createPusher({ config, root: o.root, log });
+	// a unit's merge that turns its stack's whole-project build or lint red does not land (off in simulations)
+	const mergeCheck = o.dry || o.spawn ? undefined : createMergeCheck({ config, adapters });
 	// whole-project checks run on the side, now and then after merges (never in every unit's gate)
 	const builder = createBuilder({
 		config,
@@ -307,6 +309,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		log,
 		linkAll,
 		repair: o.builderRepair ?? (o.spawn ? false : undefined),
+		// a main the repair could not fix goes to a code job (it may fix test code too), never to the owner
+		codeJob: o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (stackId, what) => {
+			let merged: string | undefined;
+			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log, what, whole: true, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+			if (said) noteFix(o.root, stackId, merged, `builder code job: ${said}`);
+			return said;
+		},
 		mergeFix: (wt, branch, what) =>
 			merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => {
 				pusher.afterMerge();
@@ -561,6 +570,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			};
 			let res: UnitRunResult | undefined;
 			let conflictNote: string | undefined;
+			// after a refused merge: the tester's note (errors only in the unit's tests) and the stack whose whole-project check it failed
+			let testsNote: string | undefined;
+			let wholeStack: string | undefined;
 			let carried: string | undefined;
 			let crash: string | undefined;
 			try {
@@ -585,6 +597,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						reuseTruth: true,
 						// the carried note holds for every round of this run, a merge conflict's note comes on top
 						retryNote: [carried, conflictNote].filter(Boolean).join("\n\n") || undefined,
+						testsNote,
+						// the implementer (and tester) see the merge's own check before DONE, not only at the next merge
+						wholeCheck: wholeStack && mergeCheck ? () => mergeCheck(wholeStack!, wt, true) : undefined,
 						gateSlot: (fn) => gates.run(fn),
 						mergeLock: (fn) => merge.run(fn),
 						log: (l) => log(`  ${l}`),
@@ -592,13 +607,21 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						gate: o.gate,
 					});
 					cost += res.costUsd;
+					testsNote = undefined;
 					if (res.state !== "review") break;
 					try {
 						await merge.run(async () => {
 							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);
 							const adapter = adapters.get(stackId)!;
 							const mainProject = projectDir(config, stackId);
-							const sha = mergeUnit(config, unitId, wt, branch, mainProject);
+							rebaseOnMain(config, wt, branch, `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`);
+							// a merge that adds errors to the stack's whole-project check (red, or new errors on a red main) does not land
+							const broke = await mergeCheck?.(stackId, wt);
+							if (broke) {
+								gitIn(wt, ["reset", "-q", mainBranch(config.target.path, config.target.git.branch)]); // the code stays, uncommitted, on top of main
+								throw new BreaksMain(stackId, broke);
+							}
+							const sha = fastForwardMain(config, branch);
 							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
 							// a success ends the crash count: a later re-open starts with a clean slate
 							ledger.updateUnit(unitId, { meta: { ...(sha ? { commit: sha } : {}), crashes: undefined } });
@@ -652,10 +675,23 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						await curate.run(() => maybeTidyReview({ ledger, config, root: o.root, client: o.client }, { stackId: tStack, area: tArea, shared: tShared })).then((r) => r.reviewed && log(pc.cyan(`  tidy review ${tStack}:${tArea}: ${r.asked} change(s) asked, ${r.proposals} convention(s) proposed`)), (e) => log(pc.yellow(`  tidy review failed: ${e?.message ?? e}`)));
 						break;
 					} catch (e: any) {
-						if (!/merge conflict/.test(String(e?.message)) || round === 3) {
+						const breaks = e instanceof BreaksMain;
+						if ((!breaks && !/merge conflict/.test(String(e?.message))) || round === 3) {
 							ledger.transitionUnit(unitId, "quarantined", `could not merge: ${String(e?.message).slice(0, 300)}`);
 							log(pc.red(`■ ${unitId}: quarantined (${String(e?.message).split("\n")[0]})${blocksNote(unitId)}`));
 							break;
+						}
+						if (breaks) {
+							// the worktree keeps the code on top of the current main: the next pass fixes it there
+							wholeStack = e.stackId;
+							const tests = res.gate?.testFiles ?? [];
+							const named = filesNamed(e.output, join(wt, relative(config.target.path, projectDir(config, e.stackId))), adapters.get(e.stackId)?.layout.sourceExtensions ?? []);
+							// errors only in the unit's own tests: the implementer may not edit them, the tester fixes them first
+							if (named.length && named.every((f) => tests.includes(f))) testsNote = `The unit passed its own checks but was not merged: with it, the whole ${e.stackId} project check has errors main does not have, all in your test files (${named.join(", ")}). Fix them in the test files, behaviour unchanged; check_ported_tests runs that check.\n${e.output.slice(-4000)}`;
+							conflictNote = `Your previous pass passed its own checks but was not merged: with it, the whole ${e.stackId} project check has errors main does not have${testsNote ? ", all in the ported tests; the tester fixed them, check_my_code shows whether any are left" : ". Fix them (in your files, or where your change breaks other code); check_my_code runs that check now"}. The worktree holds your code on top of the current main.\n${e.output.slice(-4000)}`;
+							log(pc.yellow(`  the merge would add errors to the whole-project check of ${e.stackId} → ${testsNote ? "tester, then " : ""}implement pass ${round + 1} with the errors`));
+							ledger.transitionUnit(unitId, "implementing", "not merged: the whole-project check fails with it");
+							continue;
 						}
 						conflictNote = `Your previous pass could not be merged: ${String(e?.message).split("\n")[0]}. The main branch has moved (another unit of the same module landed). The worktree now starts from the current main; re-apply the migration of this unit on top of the existing code (extend files, do not overwrite other units' work).`;
 						log(pc.yellow(`  merge conflict → fresh worktree, implement pass ${round + 1}`));
@@ -981,8 +1017,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 
 /** Bring the unit branch up to date with the main branch and fast-forward it in. */
 export function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string, message = `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`): string | undefined {
+	rebaseOnMain(config, wt, branch, message);
+	return fastForwardMain(config, branch);
+}
+
+/** Commit the worktree's changes and rebase its branch onto the main branch (a conflict throws "merge conflict …"). */
+export function rebaseOnMain(config: Config, wt: string, branch: string, message: string): void {
 	const main = mainBranch(config.target.path, config.target.git.branch);
-	const before = headOf(config.target.path);
 	gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
 	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 	if (staged) execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message], { stdio: "pipe" });
@@ -999,9 +1040,24 @@ export function mergeUnit(config: Config, unitId: string, wt: string, branch: st
 		if (/conflict|could not apply/i.test(msg)) throw new Error(`merge conflict rebasing ${branch} onto ${main}: ${msg.slice(0, 400)}`);
 		throw new Error(`could not rebase ${branch} onto ${main}: ${msg.slice(0, 400)}`);
 	}
+}
+
+/** Fast-forward the main branch to the rebased branch; the new head, or undefined when nothing changed. */
+export function fastForwardMain(config: Config, branch: string): string | undefined {
+	const before = headOf(config.target.path);
 	execFileSync("git", ["-C", config.target.path, "merge", "-q", "--ff-only", branch], { stdio: "pipe" });
 	const after = headOf(config.target.path);
 	return after !== before ? after : undefined;
+}
+
+/** A unit's merge refused: with it the stack's whole-project check has errors main does not have. */
+class BreaksMain extends Error {
+	constructor(
+		readonly stackId: string,
+		readonly output: string,
+	) {
+		super(`the whole-project check of ${stackId} fails with this merge: ${output.slice(0, 300)}`);
+	}
 }
 
 function gitIn(dir: string, args: string[]): string {

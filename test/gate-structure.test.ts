@@ -8,7 +8,7 @@ import { tsCheckStructure, tsCheckTree } from "../src/adapters/target/ts-structu
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { indexTarget } from "../src/inventory/target.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { runGate, type GateReport } from "../src/run/gate.ts";
+import { changedFiles, runGate, type GateReport } from "../src/run/gate.ts";
 
 /**
  * structure_ok + rules_ok: the gate fails what the incident produced (folders per legacy file, parallel classes,
@@ -78,6 +78,16 @@ afterEach(() => {
 });
 
 describe("gate structure_ok", () => {
+	it("retains obsolete file deletion in the patch and checks only remaining files", async () => {
+		const path = "src/features/agency/agency.service.ts";
+		rmSync(join(project, path));
+		expect(changedFiles(project)).toContain(path);
+		const patch = execFileSync("git", ["diff", "HEAD", "--", path], { cwd: project, encoding: "utf8" });
+		expect(patch).toContain("deleted file mode");
+		const report = await gate("agency");
+		expect(report.changedFiles).toContain(path);
+		expect(step(report, "structure_ok")?.ok).toBe(true);
+	});
 	it("passes a unit that extends the area's service and adds the controller", async () => {
 		write("src/features/agency/agency.service.ts", SERVICE.replace("}\n}", "}\n\tname(): string {\n\t\treturn 'agency';\n\t}\n}"));
 		write("src/features/agency/agency.controller.ts", "export class AgencyController {}\n");

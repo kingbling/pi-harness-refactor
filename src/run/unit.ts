@@ -77,6 +77,10 @@ export interface UnitRunOptions {
 	workDir?: string;
 	/** Extra instruction for the first implement pass (e.g. after a merge conflict). */
 	retryNote?: string;
+	/** The last pass was not merged for errors in the unit's own test files: the tester fixes them first (tests only). */
+	testsNote?: string;
+	/** The last pass was not merged for whole-project errors: check_my_code and check_ported_tests run that check (only errors main does not have). */
+	wholeCheck?: () => Promise<string | undefined>;
 	/** Injection points for simulation level 1 (scripted sessions, scripted build/test outcomes). */
 	spawn?: typeof spawnLeaf;
 	gate?: typeof runGate;
@@ -167,7 +171,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return r.id;
 	};
 
-	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client };
+	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck };
 	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
@@ -192,6 +196,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const ran = existsSync(join(truthDirAbs, sourceAdapter.truth.scriptName)) ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 		return ran?.ok ? { ...ran, madeBy: "run" as TruthMode } : { ...loadReadTruth(truthDirAbs), madeBy: "read" as TruthMode };
 	};
+	// the gate's structure_ok on the tester's test files and the code paths they import (check_ported_tests): a test
+	// whose own path or import the layout does not allow fails every implementer attempt
+	const checkLayout = (files: string[]) =>
+		adapter.layout.checkStructure?.(files, moduleDir, area, targetProjectDir, { isNew: (f) => !existsSync(join(targetProjectDir, f)), sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) }) ?? [];
 	const truthFiles = [sourceAdapter.truth.scriptName, READ_CASES_FILE, NO_BEHAVIOUR_FILE];
 	const readTruthFiles = () => truthFiles.map((f) => (existsSync(join(truthDirAbs, f)) ? readFileSync(join(truthDirAbs, f), "utf8") : undefined));
 	/**
@@ -219,7 +227,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
-			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth }),
+			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => e.blocked && (lastTesterBlocked.push(e.blocked), log(pc.dim(`  tester blocked: ${e.blocked}`))),
 		});
@@ -471,6 +479,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		log(pc.dim("  quirk answers differ from the ported tests: retest"));
 		// only a retest that went through counts: a failed or stopped one leaves the note for the next run
 		if (await runTruth(quirkNote)) markQuirksApplied({ ledger: o.ledger }, o.unitId);
+	}
+	// the merge was refused for errors in this unit's test files: the implementer may not edit them, the tester fixes them
+	if (o.testsNote) {
+		log(pc.dim("  the merge was refused for errors in the ported tests: the tester fixes them first"));
+		await runTruth(o.testsNote, true);
 	}
 	let testFiles = loadTests();
 	if (!testFiles.length) log(pc.yellow("  no ported test files found — the gate cannot prove behaviour"));
@@ -829,7 +842,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
 			}
 			if (triage.action === "escalate") forceEscalate = true;
-			if (triage.action === "retest") await retest(`The gate failed with ${gate.failedStep}; Jev judged the cause as ${triage.cause}. Re-check interface.md and the ported tests against the legacy behaviour and the implementation at ${targetRel}/${moduleDir}/; fix the TESTS/INTERFACE, not production code.\n${lastGateText}`);
+			if (triage.action === "retest" && gate.testImported?.length) await retest(`The gate's layout check (structure_ok) fails on ${gate.testImported.join(", ")}, a path your ported tests import. The implementer cannot change tests, so it can never pass: rename or move the test files and change their imports (and interface.md) to paths the layout below allows, behaviour unchanged. check_ported_tests with code_files checks the new paths.\n${lastGateText}\n\n${adapter.layout.structureDoc}`);
+			else if (triage.action === "retest") await retest(`The gate failed with ${gate.failedStep}; Jev judged the cause as ${triage.cause}. Re-check interface.md and the ported tests against the legacy behaviour and the implementation at ${targetRel}/${moduleDir}/; fix the TESTS/INTERFACE, not production code.\n${lastGateText}`);
 		}
 		previousGate = gate;
 	}

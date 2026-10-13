@@ -7,7 +7,7 @@ import type { TargetAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo } from "../src/git.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { createBuilder, type Repairer } from "../src/run/builder.ts";
+import { buildParkedKey, createBuilder, type Repairer } from "../src/run/builder.ts";
 import { wholeProjectSteps } from "../src/run/gate.ts";
 
 /**
@@ -92,22 +92,23 @@ describe("the builder", () => {
 		expect(readFileSync(join(target, "src", "a.txt"), "utf8")).toBe("ok\n");
 	});
 
-	it("what the model cannot fix becomes one question that blocks nothing, and is not repaired again while asked", async () => {
+	it("what the model cannot fix goes to a code job with the errors, no question, and is not repaired again", async () => {
 		const { root, config, adapter, ledger, mergeFix } = setup();
 		let calls = 0;
 		const repair: Repairer = async () => {
 			calls++;
 			return "tried";
 		};
-		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix, repair, every: { units: 1, minutes: 60 } });
+		const jobs: string[] = [];
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix, repair, codeJob: async (_s, what) => (jobs.push(what), undefined), every: { units: 1, minutes: 60 } });
 		b.afterMerge("fake");
 		await b.finish();
 		b.afterMerge("fake");
 		await b.finish();
-		const qs = ledger.openQuestions();
-		expect(qs).toHaveLength(1);
-		expect(qs[0]).toMatchObject({ point: "build", blocks: "none" });
+		expect(ledger.openQuestions()).toEqual([]);
 		expect(calls).toBe(2); // the first cycle's two tries only
+		expect(jobs).toHaveLength(2);
+		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt/);
 	});
 
 	it("a test file the repair adds is deleted, not checked out, and the fix is merged", async () => {
@@ -166,7 +167,8 @@ describe("the builder", () => {
 		}
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).buildReopens).toBe(2);
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).retryNote).toMatch(/u1#2/);
-		// after the cap the builder asks again
-		expect(ledger.openQuestions()).toHaveLength(1);
+		// after the cap: no question; with no code job to hand it to, main is parked red (br status)
+		expect(ledger.openQuestions()).toEqual([]);
+		expect(ledger.getMeta(buildParkedKey("fake"))).toMatch(/no code job/);
 	});
 });

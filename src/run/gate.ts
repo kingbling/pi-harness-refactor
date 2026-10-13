@@ -66,10 +66,14 @@ export interface GateReport {
 	failedStep?: EvidenceType;
 	/** Protected test files the gate checked (so triage can tell "error in a test file" from "error in production code"). */
 	testFiles?: string[];
+	/** structure_ok: the failing paths a protected test imports (the implementer cannot rename them; the tester must). */
+	testImported?: string[];
 }
 
 export async function runGate(g: GateInput): Promise<GateReport> {
 	const steps: GateStep[] = [];
+	// structure_ok: its failing paths a protected test imports (set by that step)
+	let testImported: string[] | undefined;
 	const changed = changedFiles(g.targetProjectDir, g.adapter.toolchain.ignoredPaths);
 	const tracked = new Set(trackedFiles(g.targetProjectDir));
 	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
@@ -145,6 +149,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const reuse = await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed);
 		nearDuplicates = reuse.near;
 		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(reuse.problems);
+		// only path findings (checkStructure) need a renamed import; size and class findings (checkTree) are about the file's content
+		testImported = importedByTests(g.targetProjectDir, g.testFiles.map((t) => t.path), lines.filter((l) => !l.startsWith("warning:")));
 		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings, ...reuse.near.map((n) => `note: ${n} (the reviewer judges it)`)].join("\n") };
 	});
 	if (!structureOk) return done();
@@ -176,8 +182,27 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 
 	function done(): GateReport {
 		const failed = steps.find((s) => !s.ok);
-		return { ok: !failed, steps, changedFiles: changed, failedStep: failed?.name, testFiles: g.testFiles.map((t) => t.path) };
+		return { ok: !failed, steps, changedFiles: changed, failedStep: failed?.name, testFiles: g.testFiles.map((t) => t.path), ...(testImported?.length ? { testImported } : {}) };
 	}
+}
+
+/**
+ * The paths of `<path>: <problem>` findings that a test file imports: its relative specifier (./pages/OfferEditPage)
+ * or its project path without the first folder and extension (an alias such as @/features/offers/pages/OfferEditPage).
+ */
+export function importedByTests(projectDir: string, tests: string[], findings: string[]): string[] {
+	const paths = [...new Set(findings.map((l) => /^([^\s:]+\.[A-Za-z0-9]+):/.exec(l)?.[1]).filter((p): p is string => !!p && !tests.includes(p)))];
+	if (!paths.length || !tests.length) return [];
+	const texts = tests.map((t) => ({ t, text: existsSync(join(projectDir, t)) ? readFileSync(join(projectDir, t), "utf8") : "" }));
+	return paths.filter((p) => {
+		const noExt = p.replace(/\.[A-Za-z0-9]+$/, "");
+		return texts.some(({ t, text }) => {
+			let rel = relative(dirname(t), noExt);
+			if (!rel.startsWith(".")) rel = `./${rel}`;
+			const tail = noExt.split("/").slice(1).join("/");
+			return ["\"", "'"].some((q) => [rel, `${rel}${p.slice(noExt.length)}`].some((s) => text.includes(`${q}${s}${q}`)) || (tail.includes("/") && text.includes(`/${tail}${q}`)));
+		});
+	});
 }
 
 /**
@@ -370,11 +395,11 @@ export function buildFiles(dir: string, adapter: TargetAdapter, changed: string[
 export function changedFiles(dir: string, ignored: string[] = []): string[] {
 	// a git failure throws: read as "nothing written" it would be blamed on the implementer, not the environment
 	const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-	const out = execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const out = execFileSync("git", ["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 	return out
-		.split("\n")
+		.split("\0")
 		.filter(Boolean)
-		.map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
+		.map((l) => l.slice(3))
 		.map((p) => relative(realpathSync(dir), join(top, p))) // top is the real path (/var → /private/var on macOS)
 		.filter((p) => !p.startsWith("..") && !ignored.some((i) => p === i || p.startsWith(`${i}/`))); // a symlinked dependency dir is not matched by a "dir/" ignore line
 }

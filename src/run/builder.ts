@@ -1,13 +1,12 @@
 import { execFile, execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { existsSync, realpathSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, removeWorktree, whitespaceOnly } from "../git.ts";
+import { addWorktree, mainBranch, removeWorktree, whitespaceOnly } from "../git.ts";
 import { projectDir } from "../init/init.ts";
-import { askViaModel } from "../jev/ask.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
@@ -21,6 +20,9 @@ import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
  * every unit's gate, they grew with the project. One builder runs them on the side, now and then after merges, in
  * its own worktree of main. When they fail (units that each passed on their own, together they do not), the big
  * model fixes the code there, code re-runs the checks, and the fix is merged like a unit. Lanes never wait for it.
+ * What it cannot fix goes to a code job (which may fix test code too; it merges when main gets fewer errors and no new
+ * ones); after MAX_BUILD_CODE_JOBS of those in a row that merged nothing the stack is parked quietly (br status shows
+ * it), never a "fix or ignore" question to the owner.
  */
 
 /** Returns the model's one-sentence account of what it changed. */
@@ -29,6 +31,10 @@ export type Repairer = (o: { config: Config; root: string; adapter: TargetAdapte
 const MAX_REPAIRS = 2;
 /** How often the builder may send one accepted unit back for its own failing tests before it asks instead. */
 export const MAX_BUILD_REOPENS = 2;
+/** Code jobs without progress a red main gets in a row before the builder stops paying for it (until it is green again or the run restarts). */
+export const MAX_BUILD_CODE_JOBS = 3;
+/** Ledger meta: why a stack's main stays red with nobody working on it; br status shows it, cleared once it is green. */
+export const buildParkedKey = (stackId: string) => `build_parked:${stackId}`;
 
 /** Accepted units whose ported tests (named by their case id) fail in `problem`: back to planned, code kept. */
 export function reopenBroken(ledger: Ledger, problem: string): string[] {
@@ -64,10 +70,55 @@ export const repairWithModel: Repairer = async (o) => {
 	}
 };
 
-export function runCmd(cmd: string, args: string[], cwd: string): Promise<string | undefined> {
+/** `max`: the output's tail kept; comparing two outputs line by line needs all of it. */
+export function runCmd(cmd: string, args: string[], cwd: string, max = 8000): Promise<string | undefined> {
 	return new Promise((res) => {
-		execFile(cmd, args, { cwd, timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => res(err ? `${stdout}\n${stderr}`.trim().slice(-8000) || String(err.message) : undefined));
+		execFile(cmd, args, { cwd, timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => res(err ? `${stdout}\n${stderr}`.trim().slice(-max) || String(err.message) : undefined));
 	});
+}
+/** All of a check's output, for comparing it with main's line by line. */
+export const FULL_OUTPUT = 4 * 1024 * 1024;
+
+/**
+ * The lines of a check's output (run in `dir`) that the other output (run in `otherDir`) does not have: the run dir
+ * and line and column numbers are dropped, and a line without a file of its own keeps the file named above it
+ * (eslint and PHPStan print the file once over its errors). Counted per line, so a second copy of an error is new too.
+ */
+export function newErrorLines(output: string, dir: string, other: string, otherDir: string): string[] {
+	const seen = new Map<string, number>();
+	for (const { key } of errorKeys(other, otherDir)) seen.set(key, (seen.get(key) ?? 0) + 1);
+	return errorKeys(output, dir).flatMap(({ key, line }) => {
+		const n = seen.get(key) ?? 0;
+		seen.set(key, n - 1);
+		return n > 0 ? [] : [line];
+	});
+}
+
+/** The files with one of `exts` that a check's output names, relative to `dir` (where it ran); the echoed command does not count. */
+export function filesNamed(output: string, dir: string, exts: string[]): string[] {
+	const dirs = [dir, ...(existsSync(dir) ? [realpathSync(dir)] : [])].map((d) => `${d.replace(/\/$/, "")}/`);
+	const out = new Set<string>();
+	for (const line of output.split("\n")) {
+		if (line.startsWith("$ ")) continue;
+		for (const [t] of line.matchAll(/[^\s'"`():,]+/g)) if (exts.some((e) => t.endsWith(e))) out.add(dirs.reduce((f, d) => (f.startsWith(d) ? f.slice(d.length) : f), t).replace(/^\.\//, ""));
+	}
+	return [...out];
+}
+
+/** The comparable lines of a check's output (see newErrorLines). */
+export function errorKeys(output: string, dir: string): Array<{ key: string; line: string }> {
+	const dirs = [dir, ...(existsSync(dir) ? [realpathSync(dir)] : [])].map((d) => `${d.replace(/\/$/, "")}/`);
+	let file = "";
+	const out: Array<{ key: string; line: string }> = [];
+	for (const raw of output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)) {
+		const line = dirs.reduce((l, d) => l.split(d).join(""), raw).trim();
+		if (!line || line.startsWith("$ ")) continue;
+		const header = /^(?:Line\s+)?([^\s:()'"]+\.[A-Za-z0-9]+)$/.exec(line)?.[1];
+		if (header) file = header;
+		const key = line.replace(/\b\d+\b/g, "N").replace(/\s+/g, " ");
+		out.push({ key: header || /[^\s'"`]+\.[A-Za-z0-9]+[:(]/.test(line) ? key : `${file} ${key}`, line });
+	}
+	return out;
 }
 
 export interface Builder {
@@ -89,12 +140,16 @@ export function createBuilder(o: {
 	/** Commits the worktree's changes and merges them into main (under the merge lock). */
 	mergeFix: (wt: string, branch: string, what: string) => Promise<string | undefined>;
 	repair?: Repairer | false;
+	/** Hands a red main to a code job (writes app and test code on main); returns what it changed, undefined when nothing merged. */
+	codeJob?: (stackId: string, what: string) => Promise<string | undefined>;
 	every?: { units: number; minutes: number };
 }): Builder {
 	const every = o.every ?? { units: o.config.run.buildEveryUnits, minutes: o.config.run.buildEveryMinutes };
 	const merged = new Map<string, number>();
 	// repairs paid per problem: the same problem is not repaired again on every build cycle
 	const tried = new Map<string, number>();
+	// code jobs per stack since main was last green
+	const jobs = new Map<string, number>();
 	const ignored = (sig: string) =>
 		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND json_extract(context, '$.sameAs') = ? AND status IN ('answered', 'auto') ORDER BY id DESC LIMIT 1").get(sig) as { answer: string } | undefined)?.answer === "ignore";
 	let last = Date.now();
@@ -149,10 +204,15 @@ export function createBuilder(o: {
 			};
 			o.log(pc.dim(`builder ${stackId}: whole-project ${steps.map((s) => s.step).join(" + ")} on main`));
 			let problem = await check();
-			if (!problem) return o.log(pc.green(`builder ${stackId}: whole project ok`));
+			const green = () => {
+				jobs.delete(stackId);
+				o.ledger.setMeta(buildParkedKey(stackId), "");
+			};
+			if (!problem) return green(), o.log(pc.green(`builder ${stackId}: whole project ok`));
 			const sig = errorSignature(`build:${stackId}`, problem);
-			// a problem already with the owner (open, or answered "leave it"), or already repaired in vain: no more paid repairs
-			const skip = o.ledger.openQuestionFor("build", sig) !== undefined || ignored(sig) || (tried.get(sig) ?? 0) >= MAX_REPAIRS;
+			const parked = (jobs.get(stackId) ?? 0) >= MAX_BUILD_CODE_JOBS;
+			// a problem already with the owner (open, or answered "leave it"), parked, or already repaired in vain: no more paid repairs
+			const skip = parked || o.ledger.openQuestionFor("build", sig) !== undefined || ignored(sig) || (tried.get(sig) ?? 0) >= MAX_REPAIRS;
 			const repair = o.repair === false || skip ? undefined : (o.repair ?? repairWithModel);
 			const protectedRes = adapter.protectedGlobs.map(globToRegExp);
 			const isProtected = (rel: string) => protectedRes.some((r) => r.test(rel));
@@ -179,6 +239,7 @@ export function createBuilder(o: {
 				problem = await check();
 			}
 			if (!problem) {
+				green();
 				const sha = await o.mergeFix(wt, branch, `fix(${stackId}): whole-project check after merges\n\n${said || "builder"}`);
 				o.log(pc.green(`builder ${stackId}: fixed and merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said}`));
 				return;
@@ -188,19 +249,22 @@ export function createBuilder(o: {
 			const reopened = reopenBroken(o.ledger, problem);
 			if (reopened.length) o.log(pc.yellow(`builder ${stackId}: re-opened ${reopened.join(", ")}, whose tests fail on main`));
 			if (reopened.length) return;
-			// one question for this problem, blocking nothing: units keep running
-			await askViaModel(
-				{ ledger: o.ledger, config: o.config, root: o.root, client: o.client },
-				{
-					point: "build",
-					facts: `The whole ${stackId} project fails its checks after recent merges; the builder model${repair ? ` tried ${MAX_REPAIRS} times and` : ""} could not fix it. Units keep running; the builder tries again after the next merges.\n${problem.slice(-2000)}`,
-					options: [{ value: "fixed", facts: "I fixed it on main" }, { value: "ignore", facts: "leave it for now" }],
-					blocks: "none",
-					askedBy: "builder",
-					sameAs: sig,
-				},
-			).catch(() => undefined);
-			o.log(pc.yellow(`builder ${stackId}: whole project still fails; asked once (blocks nothing)`));
+			if (parked) return;
+			// a code job fixes it on main (it may change test code, the repair may not); the owner is never asked
+			// "fix or ignore": after MAX_BUILD_CODE_JOBS jobs in a row main stays red quietly, br status says so
+			const n = (jobs.get(stackId) ?? 0) + 1;
+			jobs.set(stackId, n);
+			const changedMain = o.codeJob
+				? await o.codeJob(stackId, `The whole ${stackId} project fails its checks on main after merges of units that each passed their own checks. Fix the code so these commands pass: types, imports, signatures and calls between modules, also in test files (type errors there), without changing what a test checks. Never weaken the checks (no excluded paths, ignore comments, config changes). Run the failing commands again before you stop.\n${problem.slice(-6000)}`).catch((e) => (o.log(pc.yellow(`builder ${stackId}: code job failed: ${e?.message ?? e}`)), undefined))
+				: undefined;
+			// a merged job made main better (green, or fewer errors and none new): only jobs in a row without progress lead to the park
+			if (changedMain) return jobs.delete(stackId), o.log(pc.cyan(`builder ${stackId}: a code job changed main: ${changedMain.split("\n")[0]!.slice(0, 160)}; checked again after the next merges`));
+			if (o.codeJob) o.log(pc.yellow(`builder ${stackId}: code job ${n}/${MAX_BUILD_CODE_JOBS} merged nothing; tried again after the next merges`));
+			if (n < MAX_BUILD_CODE_JOBS && o.codeJob) return;
+			jobs.set(stackId, MAX_BUILD_CODE_JOBS);
+			const first = problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? problem.split("\n")[0]!;
+			o.ledger.setMeta(buildParkedKey(stackId), `${new Date().toISOString()} main fails its whole-project checks; ${o.codeJob ? `${n} code job(s) did not make it green` : "no code job to fix it"}, the builder stops until it is green or the run restarts: ${first.slice(0, 200)}`);
+			o.log(pc.yellow(`builder ${stackId}: whole project still fails; parked, no question (br status)`));
 		} finally {
 			reset();
 		}
@@ -216,5 +280,68 @@ export function createBuilder(o: {
 			start(true);
 			await running;
 		},
+	};
+}
+
+/**
+ * Whether a unit's merge turns its stack's whole-project build or lint red where main passed it, or adds errors to a
+ * step main already fails: the output of each step it breaks (only the new error lines for a step red on main), or
+ * undefined (merge it). `wt` is the unit's worktree, already rebased onto main. Runs only when the merge changes files
+ * of that stack; main is checked only when this fails, and its result is kept per tree, so main is checked again only
+ * after merges that did not pass here (code jobs, the builder, tidy).
+ * `draft`: the implementer's check before DONE (check_my_code), its code uncommitted in `wt`: always run, nothing kept
+ * but main's own result.
+ */
+export type MergeCheck = (stackId: string, wt: string, draft?: boolean) => Promise<string | undefined>;
+
+export function createMergeCheck(o: { config: Config; adapters: Map<string, TargetAdapter> }): MergeCheck {
+	const repo = o.config.target.path;
+	const seen = new Map<string, { tree: string; dir: string; failing: Map<string, string> }>();
+	const git = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	const failingSteps = async (adapter: TargetAdapter, dir: string) => {
+		const failing = new Map<string, string>();
+		for (const s of wholeProjectSteps(adapter, dir)) {
+			const err = await runCmd(s.cmd, s.args, dir, FULL_OUTPUT);
+			if (err !== undefined) failing.set(s.step, err);
+		}
+		return failing;
+	};
+	return async (stackId, wt, draft = false) => {
+		const adapter = o.adapters.get(stackId);
+		if (!adapter) return undefined;
+		const rel = relative(repo, projectDir(o.config, stackId));
+		const main = mainBranch(repo, o.config.target.git.branch);
+		if (!draft) {
+			try {
+				git(wt, ["diff", "--quiet", main, "HEAD", "--", rel || "."]);
+				return undefined; // nothing of this stack changes
+			} catch {
+				/* it changes files of this stack */
+			}
+		}
+		const dir = join(wt, rel);
+		const steps = wholeProjectSteps(adapter, dir);
+		if (!steps.length) return undefined;
+		const failing = await failingSteps(adapter, dir);
+		const mainTree = git(repo, ["rev-parse", `${main}^{tree}`]);
+		let before = seen.get(stackId);
+		if (failing.size && before?.tree !== mainTree) {
+			const mainDir = projectDir(o.config, stackId);
+			before = { tree: mainTree, dir: mainDir, failing: await failingSteps(adapter, mainDir) };
+			if (draft) seen.set(stackId, before);
+		}
+		const broke = steps.flatMap((s) => {
+			const out = failing.get(s.step);
+			if (out === undefined) return [];
+			const head = `$ ${[s.cmd, ...s.args].join(" ")}   (whole-project ${s.step})`;
+			const was = before?.failing.get(s.step);
+			if (was === undefined) return [`${head}\n${out.slice(-8000)}`];
+			// main fails this step already: only errors main does not have count
+			const added = newErrorLines(out, dir, was, before!.dir);
+			return added.length ? [`${head}; main fails it too, these ${added.length} error line(s) are new:\n${added.join("\n").slice(-8000)}`] : [];
+		});
+		// kept: main as it stays (refused), or as it is once this merges
+		if (!draft) seen.set(stackId, broke.length ? before! : { tree: git(wt, ["rev-parse", "HEAD^{tree}"]), dir, failing });
+		return broke.length ? broke.join("\n\n") : undefined;
 	};
 }

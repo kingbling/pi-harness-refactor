@@ -11,8 +11,8 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
-import { runCmd } from "./builder.ts";
-import { changedFiles, trackedFiles } from "./gate.ts";
+import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
+import { addedLines, changedFiles, importedByTests, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
 
 /**
@@ -68,6 +68,8 @@ export async function runCodeJob(o: {
 	mergeFix: (wt: string, branch: string, what: string) => Promise<string | undefined>;
 	log: (l: string) => void;
 	worker?: CodeWorker;
+	/** the builder's job (main fails its whole-project checks): green means those pass; a fix needs no new test */
+	whole?: boolean;
 }): Promise<string | undefined> {
 	const key = o.adapter.id;
 	while (busy.has(key)) await busy.get(key)!.catch(() => undefined);
@@ -103,7 +105,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
 		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
 		const changed = changedFiles(dir, o.adapter.toolchain.ignoredPaths);
-		const problem = changed.length ? await check(o.adapter, dir, changed) : "nothing was changed";
+		const problem = changed.length ? await check(o.adapter, dir, changed, o.whole ? projectDir(o.config, o.adapter.id) : undefined) : "nothing was changed";
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
@@ -126,9 +128,14 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 
 /**
  * Code's check: the changed files follow the layout, the changed code files build, there is a test among the changed files when code changed, and the
- * changed tests pass. Undefined = green. Only what the job changed is checked: the rest of main is not its job.
+ * changed tests pass. Undefined = green. Only what the job changed is checked: the rest of main is not its job, except
+ * for the builder's job (`mainDir` given: main fails its whole-project checks). There the whole-project build and lint
+ * run, with the tests that import the changed code (the builder runs no tests, accepted units' tests prove their
+ * behaviour), and a fix needs no test of its own. It merges when all of that passes, or when it has fewer error lines
+ * than main and none main does not have: a job that fixes part of a big red main is not thrown away.
  */
-async function check(adapter: TargetAdapter, dir: string, changed: string[]): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir?: string): Promise<string | undefined> {
+	const whole = mainDir !== undefined;
 	// a deleted test checks nothing: the job may not make the check green by removing what was red
 	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
@@ -148,14 +155,42 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[]): Pr
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	// no code and no test: nothing for the check to run, and the job was to write code
 	if (!present.length) return `no code was written, only other files: ${changed.slice(0, 5).join(", ")}`;
+	// a comment that silences the type check or the linter hides an error instead of fixing it (the gate's rule, in tests too)
+	const silence = adapter.layout.suppressMarker;
+	const silenced = silence ? present.flatMap((f) => addedLines(dir, f, tracked.has(f)).filter((l) => silence.test(l.text)).map((l) => `${f}:${l.line} (${l.text.trim().slice(0, 80)})`)) : [];
+	if (silenced.length) return `checks were silenced instead of fixed: ${silenced.slice(0, 5).join(", ")}`;
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
-	if (code.length && !tests.length) return `code changed without a test: ${code.slice(0, 5).join(", ")}`;
-	const steps = [...(code.length ? [{ step: "build", ...adapter.build(dir, code) }] : []), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
+	if (code.length && !tests.length && !whole) return `code changed without a test: ${code.slice(0, 5).join(", ")}`;
+	const wholeSteps = whole ? wholeProjectSteps(adapter, dir).map((w) => w.step) : [];
+	// the builder's job: also the tests of accepted units that import the changed code
+	const related = whole && code.length ? [...tracked].filter((t) => adapter.layout.isTestFile(t) && adapter.layout.sourceExtensions.some((e) => t.endsWith(e)) && !tests.includes(t) && importedByTests(dir, [t], code.map((f) => `${f}: changed`)).length) : [];
+	// each step with the files it checks (none: the whole project), so the same step can run on main
+	const steps: Array<{ step: string; files?: string[] }> = [...wholeSteps.map((step) => ({ step })), ...(code.length && !wholeSteps.includes("build") ? [{ step: "build", files: code }] : []), ...(tests.length + related.length ? [{ step: "test", files: [...tests, ...related] }] : [])];
+	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === s.step)!);
 	const out: string[] = [];
+	const failing = new Map<string, string>();
 	for (const s of steps) {
-		const err = await runCmd(s.cmd, s.args, dir);
-		if (err !== undefined) out.push(`$ ${[s.cmd, ...s.args].join(" ")}   (${s.step})\n${err}`);
+		const c = cmd(dir, s);
+		const err = await runCmd(c.cmd, c.args, dir, whole ? FULL_OUTPUT : undefined);
+		if (err !== undefined) out.push(`$ ${[c.cmd, ...c.args].join(" ")}   (${s.step})\n${err.slice(-8000)}`), failing.set(s.step, err);
 	}
-	return out.length ? out.join("\n\n") : undefined;
+	if (!out.length) return undefined;
+	if (!whole) return out.join("\n\n");
+	// main fails its checks too: progress is fewer error lines than main and none main does not have
+	let mine = 0;
+	let theirs = 0;
+	const added: string[] = [];
+	for (const s of steps) {
+		const files = s.files?.filter((f) => existsSync(join(mainDir, f)));
+		const c = files?.length === 0 ? undefined : cmd(mainDir, { ...s, files });
+		const was = c && (await runCmd(c.cmd, c.args, mainDir, FULL_OUTPUT));
+		const err = failing.get(s.step);
+		if (err !== undefined && was === undefined) return out.join("\n\n"); // red here, green on main
+		if (err !== undefined) added.push(...newErrorLines(err, dir, was!, mainDir));
+		mine += err === undefined ? 0 : errorKeys(err, dir).length;
+		theirs += was === undefined ? 0 : errorKeys(was, mainDir).length;
+	}
+	if (added.length) return `the whole-project checks fail with ${added.length} error line(s) main does not have:\n${added.join("\n").slice(-6000)}`;
+	return mine < theirs ? undefined : `the whole-project checks fail as much as on main (no error fixed):\n${out.join("\n\n")}`;
 }
