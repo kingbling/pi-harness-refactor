@@ -391,7 +391,7 @@ describe("runUnit wiring", () => {
 
 	describe("reviewer findings outside the unit's files", () => {
 		const outOfScope = "- the autoload map does not cover src/Agency → add the mapping to the project manifest";
-		const reviewer = async () => ({ ok: false, judged: true, output: `outside the unit's files (setup fixer, else the owner):\n${outOfScope}`, outOfScope });
+		const reviewer = async () => ({ ok: false, judged: true, output: `outside the unit's files (setup fixer, else the owner):\n${outOfScope}`, outOfScope, outOfScopeSetup: true });
 		const gate = async (g: GateInput): Promise<GateReport> => {
 			const r = await g.review!(["src/features/agency/agency.service.ts"]);
 			return { ok: false, steps: [{ name: "wired_ok", ok: false, ms: 1, output: r.output }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "wired_ok", testFiles: [] };
@@ -409,6 +409,16 @@ describe("runUnit wiring", () => {
 			expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "open"]]);
 			expect(qs[0]!.question).toContain("autoload map does not cover src/Agency");
 			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
+		});
+
+		it("app code outside the unit (not the setup, says the reviewer) skips the setup fixer: straight to one question", async () => {
+			const fixerSaw: string[] = [];
+			const setupFixer = async (o: { problem: string }) => void fixerSaw.push(o.problem);
+			const appCode = "- the backend has no GET /agency endpoint the screen calls → add it in the api stack";
+			const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer: async () => ({ ok: false, judged: true, output: appCode, outOfScope: appCode }), setupFixer, log: () => {} });
+			expect(r.attempts).toBe(1);
+			expect(fixerSaw).toEqual([]);
+			expect(ledger.openQuestions().map((q) => q.point)).toEqual(["gate_env"]);
 		});
 
 		it("a reviewer that cannot judge burns no attempt: three in a row become one provider question, never quarantine", async () => {
@@ -431,5 +441,57 @@ describe("runUnit wiring", () => {
 			expect(ledger.openQuestions()).toEqual([]);
 			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.diagnosis.summary).toMatch(/setup was fixed \(added the autoload mapping\)/);
 		});
+	});
+});
+
+describe("runUnit prompt and truth routing", () => {
+	const ok = async (g: GateInput): Promise<GateReport> => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+
+	it("the implementer gets the unit's own tests in full and the area's other tests by path only", async () => {
+		const dir = join(ws, "migrated");
+		write(join(dir, "src", "features", "agency", "other.spec.ts"), "it('OTHER_UNIT_BODY', () => {});\n");
+		execFileSync("git", ["init", "-q"], { cwd: dir });
+		execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"], { cwd: dir });
+		execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "main"], { cwd: dir });
+		// the unit's own test: new in its checkout
+		write(join(dir, "src", "features", "agency", "agency.service.spec.ts"), "it('OWN_UNIT_BODY', () => {});\n");
+		const tasks: string[] = [];
+		const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role !== "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnTasks as never, gate: ok, log: () => {} });
+		expect(tasks[0]).toContain("OWN_UNIT_BODY");
+		expect(tasks[0]).not.toContain("OTHER_UNIT_BODY");
+		expect(tasks[0]).toMatch(/Other tests in this area[^\n]*\n- src\/features\/agency\/other\.spec\.ts/);
+	});
+
+	describe("read truth from when the old code could not run", () => {
+		beforeEach(() => {
+			ledger.db.prepare("DELETE FROM evidence").run();
+			ledger.addEvidence("u1", "truth_read", { why: "the old code does not run here" });
+		});
+		const roles: string[] = [];
+		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => (roles.push(opts.role), spawn());
+
+		it("is not reused once the old code runs here: the tester runs it", async () => {
+			roles.length = 0;
+			await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate: ok, legacyFixer: false, log: () => {} });
+			expect(roles[0]).toBe("test");
+		});
+
+		it("is reused while it still cannot run", async () => {
+			roles.length = 0;
+			writeFileSync(join(ws, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read" }));
+			await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate: ok, legacyFixer: false, log: () => {} });
+			expect(roles).not.toContain("test");
+		});
+	});
+
+	it("an identical anti-gaming red twice never goes to the setup model, even when the doctor says fix", async () => {
+		const client = new FakeModelClient({ chat: () => ({ json: { action: "fix", summary: "re-set the vendor dir", command: "", question: "The gate keeps refusing writes outside the unit: what now?", options: [], recommended: "leave", opinion: "scope" } }) });
+		let fixerCalls = 0;
+		const setupFixer = async () => (fixerCalls++, "re-set the vendor dir");
+		const gate = async (): Promise<GateReport> => failing("write outside unit scope: src/shared/db.ts");
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, client, setupFixer, log: () => {} });
+		expect(fixerCalls).toBe(0);
+		expect(ledger.openQuestions().map((q) => q.point)).toEqual(["gate_env"]);
 	});
 });

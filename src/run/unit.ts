@@ -120,6 +120,9 @@ type CheckResult = Parameters<NonNullable<ToolDeps["onCheck"]>>[0];
 /** Review rounds per run that give their try back because fewer findings are open than at the review before. */
 export const MAX_PROGRESS_ROUNDS = 5;
 
+/** Why read truth was written while the legacy env mode was "read" (the old code could not run anywhere here). */
+const NOT_RUN_HERE = "the old code does not run here";
+
 export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const unit = o.ledger.getUnit(o.unitId);
@@ -370,14 +373,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			o.ledger.addEvidence(o.unitId, "truth_green_on_old", { cases: cases.length, script: `${truthDirRel}/${sourceAdapter.truth.scriptName}` });
 			log(pc.green(`  truth: ${cases.length} cases green on old code`));
 		} else {
-			o.ledger.addEvidence(o.unitId, "truth_read", { cases: cases.length, file: `${truthDirRel}/${READ_CASES_FILE}`, why: envMode === "read" ? "the old code does not run here" : "the script did not run green on the old code", ...(lastRunError ? { runError: lastRunError.slice(-800) } : {}) });
+			o.ledger.addEvidence(o.unitId, "truth_read", { cases: cases.length, file: `${truthDirRel}/${READ_CASES_FILE}`, why: envMode === "read" ? NOT_RUN_HERE : "the script did not run green on the old code", ...(lastRunError ? { runError: lastRunError.slice(-800) } : {}) });
 			log(pc.yellow(`  truth: ${cases.length} cases read from the old code, not run`));
 		}
 	};
 
 	const portedDir = join(truthDirAbs, "ported");
 	const ahead = !o.truthOnly && o.ledger.hasEvidence(o.unitId, "truth_ahead") && existsSync(portedDir);
-	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || o.ledger.hasEvidence(o.unitId, "truth_read") || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
+	// read truth from when the old code could not run here is not reused once it can: the tester runs it now
+	const readTruthOk = o.ledger.evidenceOf(o.unitId).some((e) => e.type === "truth_read" && (envMode !== "run" || JSON.parse(e.payload).why !== NOT_RUN_HERE));
+	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || readTruthOk || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
 	if (!hasTruth) {
 		// Playbook: a red truth script gets one more tester pass with the exact error; then a human question (only this unit waits).
 		let truthOk = false;
@@ -624,6 +629,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let reviewWeak: string | undefined;
 	// what the reviewer says must change outside the unit's files (setup, config, plugin): never the implementer's
 	let reviewOutOfScope: string | undefined;
+	// the reviewer says the fix is in the project setup or config (else it is app code: no setup model)
+	let reviewOutOfScopeSetup = false;
 	// tester rounds for the reviewer's weak-tests verdict and for the implementer's disputes: each has its own 2, so a
 	// dispute about a test the weak-tests rewrite just broke still reaches the tester
 	let testRounds = 0;
@@ -678,9 +685,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		});
 		log(pc.red(`  provider failing repeatedly; asked question #${q} (only this unit waits)`));
 	};
-	const outOfScopeRoute = async (problem: string): Promise<UnitRunResult | undefined> => {
+	const outOfScopeRoute = async (problem: string, setup: boolean): Promise<UnitRunResult | undefined> => {
 		const signature = errorSignature("wired_ok", problem);
-		const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
+		// app code outside the unit is no setup gap: the question goes straight to the resolver (it can start a code or fix job)
+		const setupFixer = !setup || o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 		let setupTried = "";
 		if (setupFixer) {
 			const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature, problem: `The reviewer of unit ${o.unitId} (code in ${moduleDir}/) found what must change outside the unit's files; the unit's implementer may write only ${writeGlobs.join(", ")}. Fix it in the project setup if it belongs there, not in the unit's code:\n${problem}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
@@ -738,6 +746,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				onToolCall: (e) => e.blocked && log(pc.dim(`  implementer blocked: ${e.blocked}`)),
 			});
 			const open = openFindings();
+			// only the unit's own tests in full (the area's others can be many and long): the rest by path, the gate runs them all
+			const own = new Set(ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths));
+			const others = testFiles.filter((t) => !own.has(t.path)).map((t) => t.path);
 			const prompt = [
 				// the truth as recorded now (the card was built before the tester ran)
 				renderTaskCard({ ...card, ...truthCounts(o.ledger, o.unitId) }, o.config),
@@ -745,8 +756,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				"## Target interface drafted by the tester (satisfy it)",
 				loadIface(),
 				"",
-				`## Ported tests (read-only): ${testFiles.map((t) => t.path).join(", ") || "none"}`,
-				...testFiles.filter((t) => existsSync(join(targetProjectDir, t.path))).map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
+				`## This unit's ported tests (read-only): ${testFiles.filter((t) => own.has(t.path)).map((t) => t.path).join(", ") || "none"}`,
+				...testFiles.filter((t) => own.has(t.path) && existsSync(join(targetProjectDir, t.path))).map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
+				others.length ? `\n## Other tests in this area (read-only, must stay green; read one if you need it)\n${others.map((p) => `- ${p}`).join("\n")}` : "",
 				lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
 				open.length ? `\n## Open reviewer findings for this unit (from all its reviews so far: fix every one; one you are sure is wrong: dispute_finding with evidence, the reviewer answers it)\n${open.join("\n")}` : "",
 				// every attempt reads it: each is a new session, and a later (stronger) one needs the hint as much as the first
@@ -834,6 +846,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					}
 					reviewWeak = r.weakTests;
 					reviewOutOfScope = r.outOfScope;
+					reviewOutOfScopeSetup = !!r.outOfScopeSetup;
 					reviewJudged = r.judged;
 					// the reviewer lists every open finding each time: its list replaces the kept one (a pass clears it)
 					if (r.judged && (r.ok || r.findings)) o.ledger.updateUnit(o.unitId, { meta: { reviewFindings: r.ok ? [] : r.findings } });
@@ -884,12 +897,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 
 		// the reviewer found something that must change outside the unit's files: another attempt cannot fix it.
-		// Like a setup problem: the setup model first, then one owner question; only this unit waits.
+		// The setup model first when the reviewer puts it in the setup, then one question (the resolver first); only this unit waits.
 		if (gate.failedStep === "wired_ok" && reviewOutOfScope) {
 			const problem = reviewOutOfScope;
 			reviewOutOfScope = undefined;
-			log(pc.yellow(`  the reviewer asks for changes outside the unit's files: setup fixer, else the owner`));
-			const parked = await outOfScopeRoute(problem);
+			log(pc.yellow(`  the reviewer asks for changes outside the unit's files: ${reviewOutOfScopeSetup ? "setup fixer, else " : ""}a question`));
+			const parked = await outOfScopeRoute(problem, reviewOutOfScopeSetup);
 			if (parked) return parked;
 		}
 
@@ -991,7 +1004,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				// a setup problem of the new project: the setup model fixes it first; the owner only when it cannot
 				let setupTried = "";
 				const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
-				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
+				// never for anti-gaming: scope or test tampering is no setup gap, the setup model only re-sets what works
+				if (setupFixer && gate.failedStep !== "antigaming_ok" && (dx.action === "fix" || triage.cause === "env")) {
 					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
 						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)

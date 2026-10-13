@@ -62,8 +62,8 @@ export interface ReviewInput {
 }
 export type Finding = { file: string; line?: number; problem: string; fix: string };
 /** findings: every code finding still open after this review, one line each (the unit keeps them for the next round). */
-export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number; weakTests?: string; outOfScope?: string; findings?: string[] }>;
-type Verdict = { ok: boolean; findings: Finding[]; fixed?: string[]; weakTests?: Array<{ file: string; problem: string }>; outOfScope?: Array<{ problem: string; fix: string }>; disputeAnswers?: Array<{ finding: string; kept: boolean; reason: string }> };
+export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number; weakTests?: string; outOfScope?: string; outOfScopeSetup?: boolean; findings?: string[] }>;
+type Verdict = { ok: boolean; findings: Finding[]; fixed?: string[]; weakTests?: Array<{ file: string; problem: string }>; outOfScope?: Array<{ problem: string; fix: string; setup?: boolean }>; disputeAnswers?: Array<{ finding: string; kept: boolean; reason: string }> };
 
 export const reviewWithModel: Reviewer = async (o) => {
 	let verdict: Verdict | undefined;
@@ -72,9 +72,9 @@ export const reviewWithModel: Reviewer = async (o) => {
 	const verdictTool = {
 		name: "review_verdict",
 		label: "Review verdict",
-		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. findings lists ALL open problems, earlier ones still open included. fixed: your earlier findings that the code fixes now. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester. outOfScope: what must change outside the files the implementer may write (project setup, config, manifests, folder names, the migration tool); they go to the setup fixer or the owner, never to the implementer. disputeAnswers: one per finding the implementer disputes — kept (still in findings) with the reason the dispute is wrong, or dropped with the reason it is right.",
+		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. findings lists ALL open problems, earlier ones still open included. fixed: your earlier findings that the code fixes now. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester. outOfScope: what must change outside the files the implementer may write (project setup, config, manifests, folder names, the migration tool); setup = true when the fix is in the project setup or config (manifests, packages, tool config, autoloading, env files) and false when it is app code or files outside the unit (they go to the setup fixer when setup, else straight to the resolver or the owner; never to the implementer). disputeAnswers: one per finding the implementer disputes — kept (still in findings) with the reason the dispute is wrong, or dropped with the reason it is right.",
 		promptSnippet: "review_verdict: your verdict (ok + findings for the code, weakTests for the tester, outOfScope for setup/config)",
-		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), fixed: Type.Optional(Type.Array(Type.String())), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))), outOfScope: Type.Optional(Type.Array(Type.Object({ problem: Type.String(), fix: Type.String() }))), disputeAnswers: Type.Optional(Type.Array(Type.Object({ finding: Type.String(), kept: Type.Boolean(), reason: Type.String() }))) }),
+		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), fixed: Type.Optional(Type.Array(Type.String())), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))), outOfScope: Type.Optional(Type.Array(Type.Object({ problem: Type.String(), fix: Type.String(), setup: Type.Optional(Type.Boolean()) }))), disputeAnswers: Type.Optional(Type.Array(Type.Object({ finding: Type.String(), kept: Type.Boolean(), reason: Type.String() }))) }),
 		execute: async (_id: string, p: Verdict) => {
 			const disputed = o.findingDisputes?.length ?? 0;
 			if (disputed > (p.disputeAnswers?.length ?? 0) && !askedAnswers) {
@@ -114,6 +114,7 @@ Judge only what this unit added or changed, against the facts below: the behavio
 		const v = verdict as Verdict;
 		const weakTests = v.weakTests?.length ? v.weakTests.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
 		const outOfScope = v.outOfScope?.length ? v.outOfScope.map((f) => `- ${f.problem} → ${f.fix}`).join("\n") : undefined;
+		const outOfScopeSetup = !!v.outOfScope?.some((f) => f.setup);
 		const ok = v.ok && !v.findings.length && !weakTests && !outOfScope;
 		const findings = v.findings.map((f) => `- ${f.file}${f.line ? `:${f.line}` : ""}: ${f.problem} → ${f.fix}`);
 		const out = [
@@ -123,7 +124,7 @@ Judge only what this unit added or changed, against the facts below: the behavio
 			outOfScope ? `outside the unit's files (setup fixer, else the owner):\n${outOfScope}` : "",
 			v.disputeAnswers?.length ? `answers to the implementer's disputes:\n${v.disputeAnswers.map((a) => `- ${a.finding}: ${a.kept ? "kept" : "dropped"} — ${a.reason}`).join("\n")}` : "",
 		].filter(Boolean).join("\n");
-		return { ok, judged: true, costUsd: r.usage.cost, weakTests, outOfScope, findings, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
+		return { ok, judged: true, costUsd: r.usage.cost, weakTests, outOfScope, outOfScopeSetup, findings, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
 	} catch (e: any) {
 		return { ok: false, judged: false, output: `not judged: ${e?.message ?? e}` };
 	} finally {
