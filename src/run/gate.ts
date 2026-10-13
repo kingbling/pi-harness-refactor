@@ -137,6 +137,11 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		if (silence) for (const f of prodFiles) for (const l of addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
 		// a merge conflict restored into the worktree: no marker line may reach main (build and tests do not read every file)
 		for (const f of conflictMarkers(g.targetProjectDir, changed)) problems.push(`unresolved merge conflict in ${f}: keep the changes of both sides and remove the <<<<<<< ======= >>>>>>> lines`);
+		// a stub mark names the unit that replaces it when it runs: a name that is no unit still to come is a stub nobody replaces
+		for (const f of prodFiles) for (const l of addedLines(g.targetProjectDir, f, tracked.has(f))) for (const m of l.text.matchAll(/TODO\(br:([^)]*)\)/g)) {
+			const why = stubOwnerProblem(g.ledger, g.unitId, m[1]!.trim());
+			if (why) problems.push(`${f}:${l.line}: TODO(br:${m[1]}) ${why}`);
+		}
 		// no code written but ported tests to run: existing code may already do it (reuse); the tests and the reviewer decide
 		const reuse = prodFiles.length === 0 && g.testFiles.length > 0;
 		if (prodFiles.length === 0 && !reuse && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
@@ -608,6 +613,16 @@ export function scopedCheck(adapter: TargetAdapter, dir: string, name: "build" |
 
 /** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */
 export const NOTHING_WRITTEN = "no production files were written";
+
+/** Why a stub mark TODO(br:<owner>) cannot stand: the owner is no unit, this unit, or a unit already done (it would never come back to replace it). */
+export function stubOwnerProblem(ledger: Ledger, unitId: string, owner: string): string | undefined {
+	const u = ledger.getUnit(owner);
+	const own = "Code no unit migrates (a framework's generic behaviour, e.g. its create/update/save) is this unit's to write, with the target stack's own means.";
+	if (!u) return `names no unit: a stub is only for code a real unit still migrates (symbol_lookup shows the unit of a legacy symbol; "-" = none). ${own}`;
+	if (owner === unitId) return "names this unit: write the code instead of a stub.";
+	if (u.state === "accepted") return `names ${owner}, which is accepted: it will not run again to replace the stub. Use its code (target_lookup), report a gap with report_migrated_bug, or write what it does not cover.`;
+	return undefined;
+}
 
 /**
  * A pass may rightly change no code: the unit was re-opened with its merged code kept (recheck, parity, owner) and

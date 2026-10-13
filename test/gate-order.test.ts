@@ -91,6 +91,21 @@ describe("gate: own scope", () => {
 		expect(step(await gate(), "antigaming_ok")?.ok).toBe(true);
 	});
 
+	it("a stub mark this unit adds must name a unit still to come: not an invented owner, not this unit, not an accepted one", async () => {
+		ledger.createUnit({ id: "u2", tier: "T0", symbolIds: [] });
+		ledger.createUnit({ id: "u3", tier: "T0", symbolIds: [] });
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'u3'").run();
+		const withMark = (owner: string) => write("src/features/agency/agency.service.ts", `export class AgencyService {\n\t// TODO(br:${owner}) save\n\ttotal(): number {\n\t\treturn 1;\n\t}\n}\n`);
+		withMark("shared-workflow-owner");
+		expect(step(await gate(), "antigaming_ok")).toMatchObject({ ok: false, output: expect.stringMatching(/agency\.service\.ts:2: TODO\(br:shared-workflow-owner\) names no unit[\s\S]*generic behaviour/) });
+		withMark("u1");
+		expect(step(await gate(), "antigaming_ok")?.output).toMatch(/names this unit/);
+		withMark("u3");
+		expect(step(await gate(), "antigaming_ok")?.output).toMatch(/names u3, which is accepted/);
+		withMark("u2");
+		expect(step(await gate(), "antigaming_ok")?.ok).toBe(true);
+	});
+
 	it("a stub the unit was told to replace passes structure_ok when sanctioned", async () => {
 		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });
 		write("src/features/billing/billing.service.ts", "export class BillingService {\n\tagencyTotal(): number {\n\t\treturn 2;\n\t}\n}\n");
