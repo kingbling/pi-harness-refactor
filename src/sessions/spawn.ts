@@ -32,6 +32,8 @@ export interface SpawnOptions {
 	writeGlobs: string[];
 	/** Globs never writable even when inside writeGlobs (tests, configs, generated files). */
 	protectedGlobs?: string[];
+	/** A protected path the globs cannot say (config, but not the tests and wiring files a job may write). */
+	isProtected?: (rel: string) => boolean;
 	/** Globs where NEW files may be created but existing ones never edited (shared helpers used by other units). */
 	appendOnlyGlobs?: string[];
 	systemPrompt: string;
@@ -212,7 +214,7 @@ export function globToRegExp(glob: string): RegExp {
 	return new RegExp(`^${out}$`);
 }
 
-export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot: string; writeGlobs: string[]; protectedGlobs: string[]; appendOnlyGlobs?: string[] }) {
+export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot: string; writeGlobs: string[]; protectedGlobs: string[]; isProtected?: (rel: string) => boolean; appendOnlyGlobs?: string[] }) {
 	const allow = opts.writeGlobs.map(globToRegExp);
 	const deny = opts.protectedGlobs.map(globToRegExp);
 	const named = new Set(opts.writeGlobs.filter((g) => !/[*?[{]/.test(g)));
@@ -224,7 +226,7 @@ export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot
 		const rel = relative(opts.globRoot ?? opts.cwd, abs).split(sep).join("/");
 		if (rel.startsWith("..")) return "outside the working directory";
 		// a file the session is given by name (a stack's wiring file) beats a broad protected glob (config/**)
-		if (deny.some((r) => r.test(rel)) && !named.has(rel)) return `protected path: ${rel}`;
+		if ((deny.some((r) => r.test(rel)) || opts.isProtected?.(rel)) && !named.has(rel)) return `protected path: ${rel}`;
 		if (allow.some((r) => r.test(rel))) return undefined;
 		if (appendOnly.some((r) => r.test(rel))) return existsSync(abs) ? `shared file exists and may be used by other units; add a new file instead of editing ${rel}` : undefined;
 		return `outside this unit's scope: ${rel}`;
@@ -232,7 +234,7 @@ export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot
 }
 
 /** File-only mutations use the same scope as writes, and reject symlink traversal and directory removal. */
-export function scopedFileTools(opts: Pick<SpawnOptions, "cwd" | "globRoot" | "writeGlobs" | "protectedGlobs" | "appendOnlyGlobs"> & { sourceRoot: string }): ToolDefinition[] {
+export function scopedFileTools(opts: Pick<SpawnOptions, "cwd" | "globRoot" | "writeGlobs" | "protectedGlobs" | "isProtected" | "appendOnlyGlobs"> & { sourceRoot: string }): ToolDefinition[] {
 	const gate = makeWriteGate({ ...opts, protectedGlobs: opts.protectedGlobs ?? [] });
 	// Built on first use: the session's folder may not exist yet when its tools are made.
 	let physicalGate: ReturnType<typeof makeWriteGate> | undefined;
@@ -342,7 +344,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	const role = opts.modelOverride ?? opts.config.models[opts.role === "setup" || opts.role === "review" ? "escalate" : opts.role];
 	const model = await resolveSessionModel(role);
 	const orCost = await openRouterCost(role.id);
-	const gate = makeWriteGate({ cwd: opts.cwd, globRoot: opts.globRoot, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], appendOnlyGlobs: opts.appendOnlyGlobs });
+	const gate = makeWriteGate({ cwd: opts.cwd, globRoot: opts.globRoot, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], isProtected: opts.isProtected, appendOnlyGlobs: opts.appendOnlyGlobs });
 	let toolCalls = 0;
 	let blocked = 0;
 	// one agent per session in the live panel: label = unit (from the transcript name "<unit>.<role>.<attempt>.jsonl")
