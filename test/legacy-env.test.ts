@@ -113,6 +113,19 @@ describe("the old code's environment", () => {
 		expect(loadLegacyEnv(other.root, other.config).mode).toBe("read");
 	});
 
+	it("a probe that runs but prints the wrong shape gets code's own error back once, and is green when fixed", async () => {
+		const { root, config, source } = workspace();
+		const problems: string[] = [];
+		const fixer: LegacyFixer = async (o) => {
+			problems.push(o.problem);
+			writeFileSync(o.script, problems.length === 1 ? "echo '[{\"id\":\"probe\",\"result\":\"1.23 M\"}]'\n" : "echo '[{\"symbol\":\"probe\",\"inputs\":[1234567],\"expected\":\"1.23 M\"}]'\n");
+			return "it runs";
+		};
+		expect(await probeLegacyEnv({ config, root, source, fixer, log: () => {} })).toBe("run");
+		expect(problems[0]).toMatch(/exactly this shape: \[\{"symbol": "probe"/);
+		expect(problems[1]).toMatch(/refused it:[\s\S]*without a symbol id/);
+	});
+
 	it("a red probe nobody was asked about is probed once more (the machine may have changed), then decided", async () => {
 		const { root, config, source } = workspace();
 		let calls = 0;

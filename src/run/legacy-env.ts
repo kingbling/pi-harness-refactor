@@ -248,15 +248,22 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 	mkdirSync(dir, { recursive: true });
 	const script = join(dir, o.source.truth.scriptName);
 	const db = o.config.db.schemaFiles?.length ? ` The old code uses ${o.config.db.from.join(" + ") || "a database"} (schema in ${o.config.db.schemaFiles.join(", ")}); a unit that needs no database is the better probe. Start a database only if one is needed and this machine can run it.` : "";
-	const said = await (o.fixer ?? fixLegacyEnvWithModel)({
+	const fixer = o.fixer ?? fixLegacyEnvWithModel;
+	let said = await fixer({
 		config: o.config,
 		root: o.root,
 		source: o.source,
 		script,
 		probe: true,
-		problem: `Nothing has run on the old code yet. Find out whether single units of the old code can be loaded and called with what this machine has (any installed runtime or tool; check which ones and their versions). The whole app does not need to boot: loading one real file of the old code (and what it needs) and calling one of its functions is enough. Install dependencies in a copy only if that unit needs them.${db} Then write the probe ${script}: it loads that file, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} Use the symbol id "probe". Try more than one way before giving up; if nothing works, say exactly what is missing.`,
+		problem: `Nothing has run on the old code yet. Find out whether single units of the old code can be loaded and called with what this machine has (any installed runtime or tool; check which ones and their versions). The whole app does not need to boot: loading one real file of the old code (and what it needs) and calling one of its functions is enough. Install dependencies in a copy only if that unit needs them.${db} Then write the probe ${script}: it loads that file, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} The array must have exactly this shape: [{"symbol": "probe", "inputs": <the arguments, JSON>, "expected": <what the function returned, JSON>}]. Try more than one way before giving up; if nothing works, say exactly what is missing.`,
 	}).catch((e) => `setup model failed: ${e?.message ?? e}`);
-	const ok = verifyTruthOnOld(dir, o.config, o.source, o.root).ok;
+	let probe = verifyTruthOnOld(dir, o.config, o.source, o.root);
+	// the probe ran but code refused what it printed (a wrong shape, a typo): one more turn with code's own error
+	if (!probe.ok && existsSync(script)) {
+		said = await fixer({ config: o.config, root: o.root, source: o.source, script, probe: true, problem: `The tool ran your probe ${script} itself and refused it:\n${String(probe.error).slice(-1500)}\nFix the probe (or the run command) so the tool's own run passes. The array must have exactly this shape: [{"symbol": "probe", "inputs": <JSON>, "expected": <JSON>}].` }).catch((e) => `setup model failed: ${e?.message ?? e}`);
+		probe = verifyTruthOnOld(dir, o.config, o.source, o.root);
+	}
+	const ok = probe.ok;
 	const mode: TruthMode = ok ? "run" : "read";
 	saveLegacyEnv(o.root, o.config, { mode, probeQuestion: undefined, ...(unasked ? { probedAgain: true } : {}) }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
 	appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} probe → ${mode}: ${String(said || "").replace(/\s+/g, " ")}\n`);
