@@ -74,7 +74,7 @@ export async function runCodeJob(o: {
 	what: string;
 	/** names the worktree, branch and transcript (e.g. q2109) */
 	label: string;
-	linkAll: (wt: string) => void;
+	linkAll: (wt: string) => void | Promise<void>;
 	/** commits the worktree and merges it into main under the merge lock */
 	mergeFix: (wt: string, branch: string, what: string) => Promise<string | undefined>;
 	log: (l: string) => void;
@@ -112,7 +112,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	const attempt = o.ledger.startAttempt("__code__", `code:${o.adapter.id}`, o.config.models.escalate.id);
 	o.log(pc.cyan(`code job ${o.label} (${o.adapter.id}): ${o.what.split("\n")[0]!.slice(0, 160)}`));
 	try {
-		o.linkAll(wt);
+		await o.linkAll(wt);
 		const dir = join(wt, relative(repo, projectDir(o.config, o.adapter.id)));
 		const reply = (await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what: o.what, label: o.label })) || "";
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short

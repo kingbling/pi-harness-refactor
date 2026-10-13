@@ -147,7 +147,7 @@ export function createBuilder(o: {
 	client?: ModelClient;
 	log: (l: string) => void;
 	/** Links the dependency dirs into a fresh worktree, like for units. */
-	linkAll: (wt: string) => void;
+	linkAll: (wt: string) => void | Promise<void>;
 	/** Commits the worktree's changes and merges them into main (under the merge lock). */
 	mergeFix: (wt: string, branch: string, what: string) => Promise<string | undefined>;
 	repair?: Repairer | false;
@@ -200,7 +200,7 @@ export function createBuilder(o: {
 		reset();
 		addWorktree(o.config.target.path, wt, branch);
 		try {
-			o.linkAll(wt);
+			await o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, stackId)));
 			// every accepted unit's tests too: later units, tidy and repairs change accepted code, and a unit's gate
 			// only runs the tests of its own area
