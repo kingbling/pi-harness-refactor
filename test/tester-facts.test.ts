@@ -145,6 +145,33 @@ describe("retests for coverage leave the truth cases alone", () => {
 		]);
 		expect(r.state).not.toBe("quarantined");
 	});
+
+	it("a checked no-behaviour declaration in a coverage retest replaces the recorded cases instead of being put back", async () => {
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		write(join(truthDir, "cases.json"), '[{"symbol":"s","inputs":[],"expected":1}]');
+		ledger.addEvidence("u1", "truth_read", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',0,'t0')").run();
+		let testers = 0;
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => {
+					if (opts.role === "test") {
+						testers++;
+						// an interface: the tester writes no test for the read case and declares no behaviour instead
+						await exec(opts.customTools!.find((t) => t.name === "no_behaviour_to_pin"), { reason: "only declares the IUploadFolderId contract" });
+						opts.onToolCall?.({ toolName: "no_behaviour_to_pin" });
+					}
+					return { text: "TESTER DONE 0 cases", ...ok };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate: async (g) => green(g), legacyFixer: false, log: () => {} });
+		expect(testers).toBe(1);
+		expect(r.state).not.toBe("quarantined");
+		expect(noBehaviour(ledger, "u1")).toBe("only declares the IUploadFolderId contract");
+		expect(ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = 'u1'").get()).toEqual({ n: 0 });
+		expect(existsSync(join(truthDir, NO_BEHAVIOUR_FILE))).toBe(true);
+	});
 });
 
 describe("a full tester pass with the same cases", () => {

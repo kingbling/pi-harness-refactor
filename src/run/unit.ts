@@ -36,7 +36,7 @@ import { askPendingQuirks, markQuirksApplied, quirkList, quirkRetestNote, quirkS
 import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
-import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { caseCoverage, checkTests, findTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
@@ -254,6 +254,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const disputed = (f: string) => !!more.disputeText && (more.disputeText.includes(f) || more.disputeText.includes(basename(f)));
 		const sanctioned = [...tidyPaths, ...disputedOthers, ...(more.disputeText ? trackedFiles(targetProjectDir).filter((f) => adapter.layout.isTestFile(f) && disputed(f)) : [])];
 		lastTesterBlocked = [];
+		// the tester called no_behaviour_to_pin (the decision model checked it against the legacy code)
+		let declaredNone = false;
 		// with the code in place: the tester's last check_ported_tests and its tests as they were then (see TESTER DONE below)
 		const testsKey = () => sha1(JSON.stringify(findTests(targetProjectDir, moduleDir, adapter.layout).map((f) => [f, readFileSync(join(targetProjectDir, f), "utf8")])));
 		let testerCheck: { c: CheckResult; key: string } | undefined;
@@ -269,7 +271,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
 			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onCheck: more.codeWritten ? (c) => (testerCheck = { c, key: testsKey() }) : undefined }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
-			onToolCall: (e) => e.blocked && (lastTesterBlocked.push(e.blocked), log(pc.dim(`  tester blocked: ${e.blocked}`))),
+			onToolCall: (e) => {
+				if (e.toolName === "no_behaviour_to_pin" && !e.blocked) declaredNone = true;
+				if (e.blocked) {
+					lastTesterBlocked.push(e.blocked);
+					log(pc.dim(`  tester blocked: ${e.blocked}`));
+				}
+			},
 		});
 		let res;
 		try {
@@ -325,7 +333,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		log(pc.dim(`  tester: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 
-		if (before) {
+		// tests only, but the tester declared a checked "no behaviour": that replaces the recorded cases (verified below
+		// like any truth pass); putting it back would leave cases no test can pin and loop the unit through quarantine
+		const noneNow = !!before && declaredNone && !!noBehaviourReason(truthDirAbs);
+		if (noneNow) log(pc.yellow(`  tester declared no runtime behaviour in a tests-only retest; the truth is checked again`));
+		if (before && !noneNow) {
 			// tests only: the recorded truth stands; a truth file the tester changed anyway is put back
 			const changed = readTruthFiles().flatMap((now, i) => (now === before[i] ? [] : [truthFiles[i]!]));
 			for (const f of changed) {
