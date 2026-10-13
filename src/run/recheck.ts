@@ -15,6 +15,7 @@ import { run } from "./gate.ts";
 import { placementDir, placeUnit } from "./placement.ts";
 import { projectDir } from "../init/init.ts";
 import { mentionsCase } from "./ported.ts";
+import { differences } from "./differences.ts";
 import { Semaphore } from "./pool.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
 
@@ -238,24 +239,27 @@ export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: stri
 
 /**
  * Read truth against what the old code returned when run (`cases`): all recorded cases the same → they count as run on
- * the old code; one with another value → the recorded truth was wrong and the unit is redone (an accepted one goes
- * back to planned, code kept); the run covered other cases → nothing proven either way.
+ * the old code; one with another value where both hold one → the recorded truth was wrong and the unit is redone (an
+ * accepted one goes back to planned, code kept); the run covered other cases or other keys → nothing proven either way.
  */
 function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: string, cases: TruthCase[]): "upgraded" | "redone" | "other" {
 	const u = ledger.getUnit(id)!;
 	const truthDir = join(root, ".bigrefactor", "truth", id);
 	const recorded = ledger.db.prepare("SELECT id, symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ?").all(id) as Array<{ id: string; symbol_id: string; inputs: string; expected: string }>;
 	const key = (symbol: string, inputs: string) => `${symbol}\u0000${inputs}`;
-	const byKey = new Map(cases.map((c) => [key(c.symbol, JSON.stringify(c.inputs)), JSON.stringify(c.expected)]));
-	const wrong = recorded.filter((c) => byKey.has(key(c.symbol_id, c.inputs)) && byKey.get(key(c.symbol_id, c.inputs)) !== c.expected);
-	const unrun = recorded.filter((c) => !byKey.has(key(c.symbol_id, c.inputs)));
+	const byKey = new Map(cases.map((c) => [key(c.symbol, JSON.stringify(c.inputs)), c.expected]));
+	const ranFor = (c: { symbol_id: string; inputs: string }) => byKey.get(key(c.symbol_id, c.inputs));
+	const diffs = (c: { symbol_id: string; inputs: string; expected: string }) => differences(JSON.parse(c.expected), ranFor(c));
+	// wrong only where both sides hold a value: a key one side lacks proves nothing either way
+	const wrong = recorded.filter((c) => byKey.has(key(c.symbol_id, c.inputs)) && diffs(c).some((d) => d.a !== undefined && d.b !== undefined));
+	const unrun = recorded.filter((c) => !byKey.has(key(c.symbol_id, c.inputs)) || diffs(c).length);
 	if (!wrong.length && !unrun.length && recorded.length) {
 		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1 WHERE unit_id = ?").run(id);
 		ledger.addEvidence(id, "truth_green_on_old", { cases: recorded.length, script: relative(root, join(truthDir, source.truth.scriptName)), upgradedFromRead: true });
 		return "upgraded";
 	}
 	if (!wrong.length) return "other";
-	const note = `The expected values of this unit were written from reading the old code; now that it runs, it returns other values for ${wrong.length} case(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${byKey.get(key(c.symbol_id, c.inputs))!.slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
+	const note = `The expected values of this unit were written from reading the old code; now that it runs, it returns other values for ${wrong.length} case(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${JSON.stringify(ranFor(c)).slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
 	if (u.state === "accepted") reopenUnit(ledger, id, note, `truth upgrade: ${wrong.length} case(s) differ when run on the old code`, true);
 	else {
 		ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(id);
@@ -270,8 +274,8 @@ function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: 
 const RUN_RULES = 2;
 const envHash = (root: string, config: Config) => createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(root, config), why: undefined, rules: RUN_RULES })).digest("hex").slice(0, 12);
 
-/** Writes the unit's cases script into `truthDir` (the recorded cases' symbols and inputs, never their expected values); returns its last sentence. */
-export type TruthScriptWriter = (o: { config: Config; root: string; source: SourceAdapter; unitId: string; truthDir: string; legacyFiles: string[]; cases: Array<{ symbol: string; inputs: unknown }> }) => Promise<string | void>;
+/** Writes the unit's cases script into `truthDir` (the recorded cases' symbols and inputs, never their expected values); returns its last sentence. `failed`: why the script already there does not do it. */
+export type TruthScriptWriter = (o: { config: Config; root: string; source: SourceAdapter; unitId: string; truthDir: string; legacyFiles: string[]; cases: Array<{ symbol: string; inputs: unknown }>; failed?: string }) => Promise<string | void>;
 
 export const writeTruthScriptWithModel: TruthScriptWriter = async (o) => {
 	const script = join(o.truthDir, o.source.truth.scriptName);
@@ -285,7 +289,7 @@ export const writeTruthScriptWithModel: TruthScriptWriter = async (o) => {
 		systemPrompt: `You write a characterization script that runs the OLD ${o.source.id} code, so a migration tool can check expected values that were so far only read from that code. Write ${script} only: ${o.source.truth.instructions} Load the unit's real legacy files by paths relative to the folder the script runs in (the old code's folder; the legacy repo is ${o.config.source.path}, but the old code may run from a copy or a container, so never write that absolute path) and call the real code with exactly the inputs you are given; print one case per input, with the same symbol and inputs and the value the old code returns as expected: [{"symbol": <as given>, "inputs": <as given>, "expected": <what the old code returned>}]. Never write a result into the script yourself and never fake the code: when it cannot run, say what is missing and stop. Never change the legacy repo. Run it the way the tool will: ${describeTruthRun(o.root, o.config, o.source, script)}. End with one sentence.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
-		const r = await session.run(`Unit ${o.unitId}. Its legacy files: ${o.legacyFiles.join(", ") || "none recorded"}. The cases to run (symbol and inputs; JSON):\n${JSON.stringify(o.cases, null, 1).slice(0, 12_000)}`);
+		const r = await session.run(`Unit ${o.unitId}. Its legacy files: ${o.legacyFiles.join(", ") || "none recorded"}.${o.failed ? ` A ${o.source.truth.scriptName} is there already but does not do it here; fix it or write it again. When run it gave:\n${o.failed.slice(0, 2000)}\n` : ""} The cases to run (symbol and inputs; JSON):\n${JSON.stringify(o.cases, null, 1).slice(0, 12_000)}`);
 		return r.text.trim().split("\n").at(-1) ?? "";
 	} finally {
 		session.dispose();
@@ -293,8 +297,9 @@ export const writeTruthScriptWithModel: TruthScriptWriter = async (o) => {
 };
 
 /**
- * Accepted units whose truth was only read from the old code and that have no script to run it: once the old code
- * runs here, the tester writes that script, a few units per run (`cap`), one at a time on the side. Code runs it on
+ * Accepted units whose truth was only read from the old code and that have no script to run it, or one the truth
+ * upgrade already ran in this environment without it counting: once the old code runs here, the tester writes or
+ * fixes that script (told why the old one failed), a few units per run (`cap`), one at a time on the side. Code runs it on
  * the old code and judges it like upgradeReadTruth. A unit is tried once per environment of the old code.
  */
 export async function writeTruthScripts(o: { ledger: Ledger; config: Config; root: string; cap: number; source?: SourceAdapter; writer?: TruthScriptWriter; stopped?: () => boolean; log?: (l: string) => void }): Promise<{ tried: number; upgraded: string[]; redone: string[]; red: number; left: number }> {
@@ -305,7 +310,11 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 	const env = envHash(o.root, o.config);
 	const ids = (o.ledger.db.prepare("SELECT DISTINCT e.unit_id AS id FROM evidence e JOIN units u ON u.id = e.unit_id WHERE e.type = 'truth_read' AND u.state = 'accepted' AND e.unit_id NOT IN (SELECT unit_id FROM evidence WHERE type = 'truth_green_on_old') ORDER BY e.unit_id").all() as Array<{ id: string }>)
 		.map((r) => r.id)
-		.filter((id) => !existsSync(join(o.root, ".bigrefactor", "truth", id, source.truth.scriptName)) && (JSON.parse(o.ledger.getUnit(id)!.meta) as { truthScriptEnv?: string }).truthScriptEnv !== env);
+		.filter((id) => {
+			const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { truthScriptEnv?: string; truthUpgradeEnv?: string };
+			// a script run here that is still read truth: red, or it printed other cases
+			return meta.truthScriptEnv !== env && (!existsSync(join(o.root, ".bigrefactor", "truth", id, source.truth.scriptName)) || meta.truthUpgradeEnv === env);
+		});
 	res.left = Math.max(0, ids.length - o.cap);
 	if (!ids.length) return res;
 	log(pc.cyan(`truth scripts: ${Math.min(ids.length, o.cap)} of ${ids.length} accepted unit(s) with read-only truth get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
@@ -316,7 +325,9 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 		const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(id) as Array<{ symbol_id: string; inputs: string }>).map((c) => ({ symbol: c.symbol_id, inputs: JSON.parse(c.inputs) as unknown }));
 		if (!cases.length) continue;
 		res.tried++;
-		const said = await (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases }).catch((e) => `failed: ${e?.message ?? e}`);
+		const before = existsSync(join(truthDir, source.truth.scriptName)) ? verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []) : undefined;
+		const failed = before && (before.ok ? `it runs, but its cases do not match the recorded ones (other symbols or inputs, or other keys in expected); it printed these (expected left out): ${JSON.stringify(before.cases.map((c) => ({ symbol: c.symbol, inputs: c.inputs }))).slice(0, 1000)}` : before.error ?? "it does not run");
+		const said = await (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases, failed }).catch((e) => `failed: ${e?.message ?? e}`);
 		o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
 		// the unit may have been re-opened meanwhile (parity, a bug report): then its truth is redone anyway
 		if (o.ledger.getUnit(id)?.state !== "accepted") continue;
