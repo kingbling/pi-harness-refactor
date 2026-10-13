@@ -93,9 +93,18 @@ export function withCommandOverrides(adapter: TargetAdapter, root: string | unde
 }
 
 
-export function saveWorktreeCopy(root: string, stackId: string, dir: string, why: string): void {
+/** The dependency dirs still linked into a unit's worktree (not the ones the workspace learned to copy). */
+export function linkedDirs(adapter: TargetAdapter, root: string | undefined): string[] {
+	const copied = loadCommandOverrides(root, adapter.id).worktreeCopy ?? [];
+	return adapter.toolchain.worktreeLinks.filter((d) => !copied.includes(d));
+}
+
+/** False when the dir is a copy already: nothing is written, so a fix that only repeats it changes nothing. */
+export function saveWorktreeCopy(root: string, stackId: string, dir: string, why: string): boolean {
 	const cur = loadCommandOverrides(root, stackId);
+	if (cur.worktreeCopy?.includes(dir)) return false;
 	const p = overridesPath(root, stackId);
 	mkdirSync(dirname(p), { recursive: true });
 	writeFile(p, JSON.stringify({ ...cur, worktreeCopy: [...new Set([...(cur.worktreeCopy ?? []), dir])], why: [cur.why, `worktree copy of ${dir}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+	return true;
 }

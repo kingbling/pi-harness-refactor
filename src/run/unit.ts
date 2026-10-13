@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import pc from "picocolors";
-import { keepOverrides, overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
+import { keepOverrides, linkedDirs, overridesPath, setupLogPath } from "../adapters/command-overrides.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 // static on purpose: Pi loads plugins without a module cache, and units starting together that each import a
 // module the first time get half-loaded copies of what it imports ("Cannot read properties of undefined")
@@ -992,7 +992,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				let setupTried = "";
 				const setupFixer = o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 				if (setupFixer && (dx.action === "fix" || triage.cause === "env")) {
-					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${adapter.toolchain.worktreeLinks.join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${linkedDirs(adapter, o.root).join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
 						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
 						o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: dx.summary } } } });
