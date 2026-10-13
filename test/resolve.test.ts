@@ -174,17 +174,28 @@ describe("resolver failures and shared problems", () => {
 		expect(ctx.forOwner).toMatch(/429 rate limited \(3 times\)/);
 	});
 
-	it("tries on a problem several units share are counted per problem, not per unit", async () => {
+	it("tries on a problem several units share count per unit: other units' answers are shown, not counted; a leave is no try", async () => {
 		const { MAX_RESOLVER_TRIES } = await import("../src/jev/resolve.ts");
 		const ledger = new Ledger(":memory:");
-		const resolver: Resolver = async () => ({ answer: "retry", why: "w" });
-		let last = 0;
+		const seen: string[][] = [];
+		const resolver: Resolver = async ({ earlier }) => (seen.push(earlier ?? []), { answer: "retry", why: "w" });
+		const ask = (unitId: string) => ledger.askQuestion({ unitId, point: "gate_env", question: "lint fails", options: ["retry — retry", "leave — leave"], context: { sameAs: "lint:missing-config" }, askedBy: "orchestrator" });
 		for (let i = 0; i <= MAX_RESOLVER_TRIES; i++) {
 			ledger.createUnit({ id: `u${i}`, tier: "T1", deps: [], meta: {}, symbolIds: [] });
-			last = ledger.askQuestion({ unitId: `u${i}`, point: "gate_env", question: "lint fails", options: ["retry — retry"], context: { sameAs: "lint:missing-config" }, askedBy: "orchestrator" });
+			const q = ask(`u${i}`);
 			await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+			expect(ledger.getQuestion(q)!.answer).toMatch(/^retry/);
 		}
-		expect(ledger.getQuestion(last)!.answer).toMatch(/answered this \d+ times and it came back/);
+		// the last unit saw the others' answers, each marked with its unit
+		expect(seen.at(-1)).toHaveLength(MAX_RESOLVER_TRIES);
+		expect(seen.at(-1)![0]).toMatch(/\(unit u0\): retry/);
+		// the resolver's own leave answers on one unit do not use up its tries
+		for (let i = 0; i < MAX_RESOLVER_TRIES; i++) ledger.answerQuestion(ask("u0"), "leave — leave\nhint: nothing left", RESOLVER);
+		const q = ask("u0");
+		const calls = seen.length;
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+		expect(seen.length).toBe(calls + 1);
+		expect(ledger.getQuestion(q)!.answer).toMatch(/^retry/);
 	});
 
 	it("a key that names its own unit never joins another unit's question", async () => {
@@ -241,6 +252,8 @@ describe("a parked unit's question", () => {
 		expect(ledger.getQuestion(e)).toMatchObject({ status: "open", question: "u3 is parked until you do this: the TTD account id is a credential only you have", options: JSON.stringify(["retry — done, run it again", "leave — leave it parked"]) });
 		ledger.answerQuestion(e, "leave");
 		// the resolver answered it MAX_RESOLVER_TRIES times or more: parked, not handed to the owner
+		const { MAX_RESOLVER_TRIES } = await import("../src/jev/resolve.ts");
+		for (let i = 1; i < MAX_RESOLVER_TRIES; i++) ledger.answerQuestion(ask(), "retry — try again", RESOLVER);
 		const f = ask();
 		let called = false;
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver: async () => ((called = true), { answer: "retry", why: "again" }) });

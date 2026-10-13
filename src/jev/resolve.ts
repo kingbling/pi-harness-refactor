@@ -55,7 +55,7 @@ export type Resolver = (o: {
   config: Config;
   root: string;
   q: QuestionRow;
-  /** the resolver's earlier answers on this point for this unit, oldest first (they came back) */
+  /** the models' earlier answers on this point for this unit (and, marked with their unit, for others with the same problem), oldest first */
   earlier?: string[];
 }) => Promise<Resolution | undefined>;
 
@@ -85,7 +85,7 @@ export async function resolveOpenQuestions(d: {
     // the resolver failed on it lately (provider outage, rate limit): wait a little longer after each failure
     const failed = ctx.resolverFailed ?? 0;
     if (failed && Date.now() - (ctx.resolverFailedAt ?? 0) < failed * RESOLVER_RETRY_MS) continue;
-    const earlier = triedBefore(d.ledger, q);
+    const { earlier, tries } = triedBefore(d.ledger, q);
     // what only a person can do, in those words: not "retry or leave"
     const askOwnerTo = (why: string) =>
       d.ledger.db.prepare("UPDATE questions SET question = ?, options = ? WHERE id = ?").run(`${q.unit_id} is parked until you do this: ${why}`, JSON.stringify(["retry — done, run it again", "leave — leave it parked"]), q.id);
@@ -95,14 +95,14 @@ export async function resolveOpenQuestions(d: {
       d.log?.(`question #${q.id} (${q.point} ${q.unit_id}): stays parked, the owner is not asked — ${why.slice(0, 160)}`);
       answered++;
     };
-    if (earlier.length >= MAX_RESOLVER_TRIES && !again && parks(q)) {
-      park(`the resolver model answered this ${earlier.length} times and it came back`);
+    if (tries >= MAX_RESOLVER_TRIES && !again && parks(q)) {
+      park(`the resolver model answered this ${tries} times and it came back`);
       continue;
     }
-    if (earlier.length >= MAX_RESOLVER_TRIES && !again) {
+    if (tries >= MAX_RESOLVER_TRIES && !again) {
       d.ledger.markForOwner(
         q.id,
-        `the resolver model answered this ${earlier.length} times and it came back`,
+        `the resolver model answered this ${tries} times and it came back`,
       );
       forOwner++;
       continue;
@@ -208,17 +208,21 @@ export async function resolveOpenQuestions(d: {
 /** Who answers for the run's models: their "retry" is one more try, never the owner's fresh set of tries. */
 export const MODEL_ANSWERERS: readonly string[] = [RESOLVER, FIX_JOB, CODE_JOB, LAYOUT_JOB];
 
-function triedBefore(ledger: Ledger, q: QuestionRow): string[] {
-  // a problem several units share (sameAs) is counted per problem: otherwise each unit that asks it next starts at 0
+function triedBefore(ledger: Ledger, q: QuestionRow): { earlier: string[]; tries: number } {
+  // a problem several units share (sameAs): the model sees what other units got, but only this unit's own answers count
+  // as its tries; a resolver "leave" is no try either (it sends nothing back, it keeps the unit parked)
   const sameAs = q.context ? (JSON.parse(q.context) as { sameAs?: string }).sameAs : undefined;
-  const who = sameAs ? "json_extract(context, '$.sameAs') = ?" : "unit_id IS ?";
-  return (
+  const rows = (
     ledger.db
       .prepare(
-        `SELECT answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND ${who} AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
+        `SELECT unit_id, answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND (unit_id IS ? OR json_extract(context, '$.sameAs') = ?) AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
       )
-      .all(q.id, q.point, sameAs ?? q.unit_id, ...MODEL_ANSWERERS) as Array<{ answered_at: string; answer: string; answered_by: string }>
-  ).map((r) => `${r.answered_at}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`);
+      .all(q.id, q.point, q.unit_id, sameAs ?? null, ...MODEL_ANSWERERS) as Array<{ unit_id: string | null; answered_at: string; answer: string; answered_by: string }>
+  ).filter((r) => !(r.answered_by === RESOLVER && answerValue(r.answer).toLowerCase() === "leave"));
+  return {
+    earlier: rows.map((r) => `${r.answered_at}${r.unit_id === q.unit_id ? "" : ` (unit ${r.unit_id})`}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`),
+    tries: rows.filter((r) => r.unit_id === q.unit_id).length,
+  };
 }
 
 export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) => {
@@ -316,7 +320,7 @@ Read the files the question is about with your tools, then call exactly one tool
           ? `Facts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 6000)}`
           : "",
         earlier?.length
-          ? `You answered this point for this unit before, and it came back:\n${earlier.map((e) => `- ${e}`).join("\n")}\nThe same answer again only helps when something changed since (check: git log of the new project, a setup fix, a different error in the facts) or with a hint that changes what the next attempt does. If the cause is in the setup, call fix_job; if code outside the unit is missing, call code_job; if the folder layout has no slot for the path, call layout_job. If nothing a model can do is left, call ${parks(q) ? "leave_parked, or needs_owner when a person must do something (say what)" : "needs_owner and say what the owner must do"}.`
+          ? `This point was answered before (for this unit unless another unit is named), and it came back:\n${earlier.map((e) => `- ${e}`).join("\n")}\nThe same answer again only helps when something changed since (check: git log of the new project, a setup fix, a different error in the facts) or with a hint that changes what the next attempt does. If the cause is in the setup, call fix_job; if code outside the unit is missing, call code_job; if the folder layout has no slot for the path, call layout_job. If nothing a model can do is left, call ${parks(q) ? "leave_parked, or needs_owner when a person must do something (say what)" : "needs_owner and say what the owner must do"}.`
           : "",
         brief ? `What the legacy repo is:\n${brief.slice(0, 4000)}` : "",
       ]
