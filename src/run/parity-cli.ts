@@ -28,7 +28,7 @@ export async function parityCommand(o: { ledger: Ledger; config: Config; root: s
 		const lines = [`${slice}: ${r.outcome} — ${r.note}`];
 		if (r.runId !== undefined && r.outcome === "differs" && !args.includes("--no-judge")) {
 			const j = await judgeRun({ ledger, config, root, runId: r.runId, slice, client, log: o.log });
-			lines.push(`judge: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you, ${j.allowed} allowed${j.open ? `, ${j.open} not judged` : ""}`);
+			lines.push(`judge: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you, ${j.allowed} allowed${j.setup ? `, ${j.setup} from the test setup (br parity --probe fixes it)` : ""}${j.open ? `, ${j.open} not judged` : ""}`);
 		}
 		for (const d of r.diffs.slice(0, 30)) lines.push(`  ${d.step} ${d.route} ${d.kind}${d.path ? ` ${d.path}` : ""}: old ${JSON.stringify(d.legacy)?.slice(0, 120)} · new ${JSON.stringify(d.target)?.slice(0, 120)}`);
 		if (r.diffs.length > 30) lines.push(`  … ${r.diffs.length - 30} more (ledger: parity_diffs, run ${r.runId})`);

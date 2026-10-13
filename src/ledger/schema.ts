@@ -366,7 +366,7 @@ CREATE TABLE IF NOT EXISTS parity_diffs (
   kind TEXT NOT NULL,                 -- status|redirect|body|data|error
   path TEXT NOT NULL,                 -- where in the answer ('' = the whole answer)
   legacy TEXT, target TEXT,           -- JSON
-  status TEXT NOT NULL DEFAULT 'open', -- open|bug|quirk|allowed (judge, then code: allowed = a quirk the owner dropped)
+  status TEXT NOT NULL DEFAULT 'open', -- open|bug|quirk|setup|allowed (judge, then code: allowed = a quirk the owner dropped)
   unit_id TEXT,                       -- the unit the judge holds responsible
   quirk_id INTEGER REFERENCES quirks(id) ON DELETE SET NULL,
   note TEXT                           -- the judge's words

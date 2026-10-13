@@ -55,6 +55,10 @@ export interface AppState {
 	selfRedirect?: string;
 	/** Set once the old app was probed again over that redirect (asked once, whatever came of it). */
 	redirectProbed?: boolean;
+	/** The parity judge found a difference that only this app's setup here causes (what and why). */
+	setupProblem?: string;
+	/** Set once the app was probed again over such a problem (asked once, whatever came of it). */
+	setupProbed?: boolean;
 	at?: string;
 }
 
@@ -389,12 +393,15 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const lacksData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump);
 	// an app that only redirects to itself on https: no request reaches a handler, so it is asked once to fix that (and the data, if missing)
 	const redirect = cur.up === true && !!cur.recipe && !!cur.selfRedirect && !cur.redirectProbed;
-	const fixUp = (lacksData && !cur.dataProbed) || redirect;
+	// the judge blamed a difference on how this app runs here: it is asked once to fix that
+	const setup = cur.up === true && !!cur.recipe && !!cur.setupProblem && !cur.setupProbed;
+	const fixUp = (lacksData && !cur.dataProbed) || redirect || setup;
 	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
 	const missing = [
 		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
 		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy (the app's or its web server's own setting that forces https)`] : []),
+		...(setup ? [`comparing it with the other app showed a difference that only its setup here causes (${cur.setupProblem}): fix that in its setup, not in the app's code`] : []),
 	];
 	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
 	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem }).catch((e) => `setup model failed: ${e?.message ?? e}`);
@@ -406,8 +413,8 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		// the app started before: a new recipe that does not work is dropped, the old one stays; one that only fails
 		// on its dump keeps the rest (the reset ran before the app came up, so it works)
 		const kept = res.ok ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
-		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: true } : {}), ...(redirect ? { redirectProbed: true, ...(res.ok ? { selfRedirect: undefined } : {}) } : {}) });
-		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: true } : {}), ...(redirect ? { redirectProbed: true, ...(res.ok ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: true, ...(res.ok ? { setupProblem: undefined } : {}) } : {}) });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
 	}

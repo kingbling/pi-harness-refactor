@@ -385,7 +385,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				showParity(`judging ${r.diffs.length} difference(s) in ${slice}`);
 				const { judgeRun } = await import("./parity-judge.ts");
 				const j = await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log });
-				parityLast = `${slice}: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you${j.allowed ? `, ${j.allowed} allowed` : ""}`;
+				parityLast = `${slice}: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you${j.allowed ? `, ${j.allowed} allowed` : ""}${j.setup ? `, ${j.setup} from the test setup` : ""}`;
+				// differences only an app's setup here causes: that setup is asked once to fix it, then the slice runs again
+				const blamed = Object.entries(loadApps(o.root)).filter(([, a]) => a.setupProblem && !a.setupProbed).map(([side]) => side);
+				if (blamed.length) {
+					showParity(`setting up ${blamed.join(", ")} again: a difference comes from how it runs here`);
+					const { probeApps } = await import("./parity.ts");
+					await probeApps({ config, root: o.root, linkAll, log, ...probeAsk });
+					if (blamed.some((side) => !loadApps(o.root)[side]?.setupProblem)) parityQueue.push(slice);
+				}
 			}
 		})()
 			.catch((e) => log(pc.yellow(`parity ${slice}: ${e?.message ?? e}`)))
