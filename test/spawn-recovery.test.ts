@@ -10,6 +10,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 	},
 	getAgentDir: () => "/nonexistent-agent-dir",
 	SessionManager: { inMemory: () => ({}) },
+	SettingsManager: { create: () => ({ applyOverrides: () => {}, getCompactionKeepRecentTokens: () => 20_000 }) },
 	createAgentSession: async () => {
 		let listener: ((ev: unknown) => void) | undefined;
 		return {

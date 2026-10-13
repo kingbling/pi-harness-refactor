@@ -6,7 +6,7 @@ import { mkdirSync, lstatSync, realpathSync, renameSync, unlinkSync } from "node
 import { Type, type TSchema } from "typebox";
 import { basename, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
@@ -301,6 +301,11 @@ export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "gl
  * Runaway control inside one model session: fresh tokens (input + output, cache reads excluded) over `maxTokens`, or
  * no model or tool activity for `idleMs`, stops it once (`onStop` with the reason). What it wrote still goes to the gate.
  */
+/** Pi compacts when the context passes the window minus this reserve: the reserve that makes it compact at `share` of the window. */
+export function compactionReserve(contextWindow: number, share: number): number {
+	return Math.max(16_384, Math.round(contextWindow * (1 - share)));
+}
+
 export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (why: string) => void }) {
 	let stopped: string | undefined;
 	const stop = (why: string) => {
@@ -319,7 +324,7 @@ export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (w
 		active,
 		/** The session's fresh tokens so far. */
 		used: (tokens: number) => {
-			if (tokens > o.maxTokens) stop(`budget: the session used ${tokens} tokens, over run.maxUnitTokens (${o.maxTokens})`);
+			if (o.maxTokens > 0 && tokens > o.maxTokens) stop(`budget: the session used ${tokens} tokens, over run.maxUnitTokens (${o.maxTokens})`);
 		},
 		stopped: () => stopped,
 		end: () => clearTimeout(idle),
@@ -403,9 +408,13 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	await resourceLoader.reload();
 
 	const customTools = [...(opts.customTools ?? []), ...(["implement", "escalate"].includes(opts.role) ? scopedFileTools({ ...opts, sourceRoot: opts.config.source.path }) : [])];
+	// long work in one session: older turns are summarized once the context is run.compactAt full, never cut off
+	const settingsManager = SettingsManager.create(opts.cwd, getAgentDir());
+	settingsManager.applyOverrides({ compaction: { enabled: true, reserveTokens: compactionReserve(model.contextWindow, opts.config.run.compactAt), keepRecentTokens: settingsManager.getCompactionKeepRecentTokens(model) } });
 	const { session } = await createAgentSession({
 		cwd: opts.cwd,
 		model,
+		settingsManager,
 		thinkingLevel: thinkingLevelOf(role.effort),
 		modelRuntime: await modelRuntime(),
 		tools: [...ROLE_TOOLS[opts.role], ...(opts.tools ?? []), ...customTools.map((t) => t.name)],

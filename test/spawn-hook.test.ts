@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bashDeletesOutside, bashTouchesReadOnly, sessionLimits, thinkingLevelOf } from "../src/sessions/spawn.ts";
+import { bashDeletesOutside, bashTouchesReadOnly, compactionReserve, sessionLimits, thinkingLevelOf } from "../src/sessions/spawn.ts";
 
 /**
  * The inline tool_call guard is what keeps the source repo read-only for roles that have bash.
@@ -79,6 +79,18 @@ describe("runaway control inside a model session (run.maxUnitTokens, run.idleMs)
 		l.used(5000); // the abort takes a moment: further usage does not stop it again
 		expect(stops).toEqual(["budget: the session used 1200 tokens, over run.maxUnitTokens (1000)"]);
 		expect(l.stopped()).toMatch(/^budget/);
+		l.end();
+	});
+
+	it("compaction starts at run.compactAt of the context window", () => {
+		expect(compactionReserve(400_000, 0.65)).toBe(140_000); // compacts past 260k
+		expect(compactionReserve(32_000, 0.65)).toBe(16_384); // room for the summary on a small window
+	});
+
+	it("0 is no token limit", () => {
+		const { stops, l } = limits(0);
+		l.used(50_000_000);
+		expect(stops).toEqual([]);
 		l.end();
 	});
 

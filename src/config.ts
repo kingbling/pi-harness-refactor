@@ -112,8 +112,10 @@ export const ConfigSchema = z.object({
 			/** Quarantined units go back into the queue every this many minutes (sooner when a fix landed), up to maxAutoHeals times; then the owner is asked. */
 			healEveryMinutes: z.number().min(1).default(60),
 			maxAutoHeals: z.number().int().min(0).default(5),
-			/** A model session whose fresh tokens (input + output, cache reads excluded) go over this is stopped; what it wrote goes to the gate. */
-			maxUnitTokens: z.number().int().default(250_000),
+			/** A model session whose fresh tokens (input + output, cache reads excluded) go over this is stopped; what it wrote goes to the gate. 0 = no limit (the idle timeout and the daily budget still hold). */
+			maxUnitTokens: z.number().int().min(0).default(0),
+			/** A model session's context is compacted (older turns summarized) once it fills this share of the model's context window. */
+			compactAt: z.number().gt(0).lt(1).default(0.65),
 			/** A model session with no model or tool activity for this long is stopped (idle_timeout). */
 			idleMs: z.number().int().default(600_000),
 			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
