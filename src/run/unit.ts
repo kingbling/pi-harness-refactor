@@ -201,7 +201,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const currentTruth = () => {
 		if (truthMode === "run") return { ...verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files), madeBy: "run" as TruthMode };
 		const ran = existsSync(join(truthDirAbs, sourceAdapter.truth.scriptName)) ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
-		return ran?.ok ? { ...ran, madeBy: "run" as TruthMode } : { ...loadReadTruth(truthDirAbs), madeBy: "read" as TruthMode };
+		// why the script did not run green is kept: it is what the old code's environment needs
+		return ran?.ok ? { ...ran, madeBy: "run" as TruthMode } : { ...loadReadTruth(truthDirAbs), madeBy: "read" as TruthMode, runError: ran?.error };
 	};
 	// the gate's structure_ok on the tester's test files and the code paths they import (check_ported_tests): a test
 	// whose own path or import the layout does not allow fails every implementer attempt
@@ -314,7 +315,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
 		// type the results in) and load the cases; read-not-run cases are only checked for shape.
 		const verified = currentTruth();
-		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, cases: verified.cases.length, error: verified.error } });
+		const runError = "runError" in verified ? verified.runError : undefined;
+		if (runError) lastRunError = runError;
+		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, cases: verified.cases.length, error: verified.error, ...(runError ? { runError } : {}) } });
 		if (!verified.ok) {
 			log(pc.red(`  truth (${truthMode}) failed: ${verified.error}`));
 			return false;
@@ -325,6 +328,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return true;
 	};
 	let linkedOnce = false;
+	// in read mode: why the tester's script did not run green on the old code (the last time it was tried)
+	let lastRunError: string | undefined;
 	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks).
 	// The same cases as recorded stay untouched (ids, links to their tests): a retest never makes them drift.
 	const recordTruth = (cases: TruthCase[], mode: TruthMode, none?: string) => {
@@ -353,7 +358,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			o.ledger.addEvidence(o.unitId, "truth_green_on_old", { cases: cases.length, script: `${truthDirRel}/${sourceAdapter.truth.scriptName}` });
 			log(pc.green(`  truth: ${cases.length} cases green on old code`));
 		} else {
-			o.ledger.addEvidence(o.unitId, "truth_read", { cases: cases.length, file: `${truthDirRel}/${READ_CASES_FILE}`, why: envMode === "read" ? "the old code does not run here" : "the script did not run green on the old code" });
+			o.ledger.addEvidence(o.unitId, "truth_read", { cases: cases.length, file: `${truthDirRel}/${READ_CASES_FILE}`, why: envMode === "read" ? "the old code does not run here" : "the script did not run green on the old code", ...(lastRunError ? { runError: lastRunError.slice(-800) } : {}) });
 			log(pc.yellow(`  truth: ${cases.length} cases read from the old code, not run`));
 		}
 	};
@@ -382,6 +387,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				truthOk = true;
 				// units that asked the owner about the same thing run again in the new environment
 				for (const q of o.ledger.openQuestions().filter((x) => x.point === "truth_env")) o.ledger.answerQuestion(q.id, `auto: the old code's environment was set up (${fixed})`, "setup model");
+			}
+		}
+		// read mode, and the tester's script ran red while its cases.json passed: the setup model fixes the old code's
+		// environment with that error (once for all units, capped); green → the cases come from running it after all
+		if (truthOk && envMode === "read" && legacyFixer && lastRunError && !o.ledger.hasEvidence(o.unitId, "truth_green_on_old")) {
+			const err = lastRunError;
+			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: err, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(err)), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
+			const verified = fixed ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
+			if (fixed && verified?.ok) {
+				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
+				recordTruth(verified.cases, "run", verified.none);
 			}
 		}
 		// running it still fails for this unit: truth from reading the old code instead, marked as not run

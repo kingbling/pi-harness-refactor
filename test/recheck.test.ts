@@ -176,3 +176,27 @@ describe("br recheck: findings outside the unit's files", () => {
 		expect(ledger.openQuestions().some((q) => q.point === "review_outside" && q.unit_id === "stub")).toBe(true);
 	});
 });
+
+describe("truth read from the old code, run once it can", () => {
+	it("same values → counted as run on the old code; other values → the unit is redone; red → tried again only once the environment changes", async () => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		const print = (expected: string) => `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"${expected}"'}]'\n`;
+		for (const [id, script] of [["fine", print("$(printf %s.%s 123 45)")], ["stub", print("99")], ["typed", "exit 1\n"]] as const) {
+			ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ?").run(id);
+			ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 0 WHERE unit_id = ?").run(id);
+			ledger.addEvidence(id, "truth_read", {});
+			writeFileSync(join(root, ".bigrefactor", "truth", id, "cases.sh"), script);
+		}
+		const r = upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		expect(r).toMatchObject({ upgraded: ["fine"], redone: ["stub"], red: 1 });
+		expect(ledger.hasEvidence("fine", "truth_green_on_old")).toBe(true);
+		expect(ledger.db.prepare("SELECT verified_on_old v FROM truth_cases WHERE unit_id = 'fine'").get()).toEqual({ v: 1 });
+		expect(ledger.getUnit("stub")!.state).toBe("planned");
+		expect(JSON.parse(ledger.getUnit("stub")!.meta).retryNote).toMatch(/the old code returns 99/);
+		// the same environment: the red one is not run again
+		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} }).red).toBe(0);
+	});
+});

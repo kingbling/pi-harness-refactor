@@ -79,6 +79,16 @@ describe("the old code's environment", () => {
 		expect(notFromOldCode(real, [{ symbol: "x", inputs: ["Acme Ltd"], expected: ["Acme Ltd", 84.03] }], files)).toBeUndefined();
 	});
 
+	it("a value that is only part of a longer name in the script is not typed in; a quoted literal of its own is", () => {
+		const files = ["app/commands/status.php"];
+		const real = "<?php require 'app/commands/status.php'; $c = new StatusUnconfirmedCampaignCommand(); echo json_encode([['symbol'=>'x','inputs'=>null,'expected'=>$c->get_name()]]);";
+		expect(notFromOldCode(real, [{ symbol: "x", inputs: null, expected: "Unconfirm" }], files)).toBeUndefined();
+		const typed = "<?php require 'app/commands/status.php'; echo json_encode([['symbol'=>'x','inputs'=>null,'expected'=>'Unconfirm']]);";
+		expect(notFromOldCode(typed, [{ symbol: "x", inputs: null, expected: "Unconfirm" }], files)).toMatch(/written into the script/);
+		// a number inside a longer one is not typed in either
+		expect(notFromOldCode("<?php require 'app/commands/status.php'; $x = 123456;", [{ symbol: "x", inputs: null, expected: 2345 }], files)).toBeUndefined();
+	});
+
 	it("a script loading the unit by module or class name (Python, Java, Ruby, Go) loads the legacy file", () => {
 		const loads = (script: string, file: string) => notFromOldCode(script, [], [file]) === undefined;
 		expect(loads("from billing.models import Invoice\nprint(json.dumps([]))", "billing/models.py")).toBe(true);
@@ -101,6 +111,17 @@ describe("the old code's environment", () => {
 		const other = workspace();
 		expect(await probeLegacyEnv({ ...other, fixer: async () => "no php on this machine", log: () => {} })).toBe("read");
 		expect(loadLegacyEnv(other.root, other.config).mode).toBe("read");
+	});
+
+	it("a red probe nobody was asked about is probed once more (the machine may have changed), then decided", async () => {
+		const { root, config, source } = workspace();
+		let calls = 0;
+		const red: LegacyFixer = async () => (calls++, "docker is not installed");
+		expect(await probeLegacyEnv({ config, root, source, fixer: red, log: () => {} })).toBe("read");
+		expect(await probeLegacyEnv({ config, root, source, fixer: red, log: () => {} })).toBe("read");
+		expect(await probeLegacyEnv({ config, root, source, fixer: red, log: () => {} })).toBe("read");
+		expect(calls).toBe(2);
+		expect(loadLegacyEnv(root, config).probedAgain).toBe(true);
 	});
 
 	it("the probe asks for single units with whatever this machine has; red asks the owner once, and retry probes again", async () => {

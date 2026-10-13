@@ -170,6 +170,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "truth_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
 			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
 		})).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
+		// truth written from reading the old code: its scripts run again once the old code's environment changed
+		const { upgradeReadTruth } = await import("./recheck.ts");
+		await waitOn("running read-only truth on the old code again", async () => upgradeReadTruth({ ledger, config, root: o.root, log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
 	}
 	// ---- stack knowledge written before the plugin asked for it (notApp, wiringFiles): a model adds just that
 	if (!o.dry && !o.spawn) {

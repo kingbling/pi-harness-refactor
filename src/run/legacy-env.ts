@@ -32,6 +32,8 @@ export interface LegacyEnv {
 	mode?: TruthMode;
 	/** The owner question asked once after a red probe (blocks nothing): "retry" makes the next run probe again. */
 	probeQuestion?: number;
+	/** A red probe with no question on it (made before probes asked, or the ask failed) is probed once more: set then. */
+	probedAgain?: boolean;
 }
 
 /** run = expected values recorded by running the old code; read = written from reading it (not run). */
@@ -196,9 +198,16 @@ export function notFromOldCode(script: string, cases: TruthCase[], legacyFiles: 
 		const own = leaves(c.expected).filter((l) => !inputs.includes(l) && !inputs.includes(JSON.stringify(l).slice(1, -1)));
 		if (!own.length) continue;
 		checked++;
-		if (own.every((l) => script.includes(l))) typed++;
+		if (own.every((l) => typedIn(script, l))) typed++;
 	}
 	return checked && typed * 2 > checked ? `${typed} of ${checked} cases have their expected values written into the script: run the legacy code and print what it returns, never type the result in` : undefined;
+}
+
+/** The value is written in the script as a literal of its own: a quoted string, or a number standing alone (not part of a longer name). */
+function typedIn(script: string, value: string): boolean {
+	if (/^-?\d+(\.\d+)?$/.test(value)) return new RegExp(String.raw`(?<![\w.])${esc(value)}(?![\w.])`).test(script);
+	const quoted = (q: string) => script.includes(`${q}${value}${q}`) || script.includes(`${q}${value.replaceAll(q, `\\${q}`)}${q}`);
+	return quoted('"') || quoted("'") || quoted("`");
 }
 
 /** Read-not-run truth: the tester's cases.json, checked for shape only (nothing ran). */
@@ -232,7 +241,9 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 	const cur = loadLegacyEnv(o.root, o.config);
 	// read mode: probe again only when the owner said so (after installing something); otherwise decided
 	const retry = cur.mode === "read" && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
-	if (cur.mode && !retry) return cur.mode;
+	// a red probe nobody was asked about: the machine may have changed since (docker installed), so it is probed once more
+	const unasked = cur.mode === "read" && cur.probeQuestion === undefined && !cur.probedAgain;
+	if (cur.mode && !retry && !unasked) return cur.mode;
 	const dir = join(o.root, ".bigrefactor", "legacy-env", "probe");
 	mkdirSync(dir, { recursive: true });
 	const script = join(dir, o.source.truth.scriptName);
@@ -247,7 +258,7 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 	}).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	const ok = verifyTruthOnOld(dir, o.config, o.source, o.root).ok;
 	const mode: TruthMode = ok ? "run" : "read";
-	saveLegacyEnv(o.root, o.config, { mode, probeQuestion: undefined }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
+	saveLegacyEnv(o.root, o.config, { mode, probeQuestion: undefined, ...(unasked ? { probedAgain: true } : {}) }, ok ? `probe green: ${said || "the old code runs"}` : `probe red: ${said || "the old code does not run here"}`);
 	appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} probe → ${mode}: ${String(said || "").replace(/\s+/g, " ")}\n`);
 	if (ok) {
 		log(pc.green(`truth: the old code runs here — expected values come from running it`));
@@ -328,7 +339,7 @@ export const fixLegacyEnvWithModel: LegacyFixer = async (o) => {
 		protectedGlobs: [],
 		customTools: [legacyCopyTool(o.root, o.config), legacyRunTool(o.root, o.config)],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__setup__.legacy.${Date.now()}.jsonl`),
-		systemPrompt: `You make the OLD ${o.source.id} code runnable on this machine, so a migration tool can run characterization scripts against it. The legacy repo (${o.config.source.path}) is read-only: never write into it. Use make_legacy_copy for a copy you may change (install the dependencies with the project's own package manager, as its manifest and docs say), and set_legacy_run when the run command itself must change. Check which tools this machine really has (versions, docker) before choosing a way. ${o.probe ? "You also write the probe script you are asked for; keep it tiny." : "Do not edit the script: it belongs to the tester; when it is the script itself that is wrong (not the environment), say so and stop."} Never interactive prompts, never servers left running (a database container the old code needs may stay up). End with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You make the OLD ${o.source.id} code runnable on this machine, so a migration tool can run characterization scripts against it. The legacy repo (${o.config.source.path}) is read-only: never write into it. Use make_legacy_copy for a copy you may change (install the dependencies with the project's own package manager, as its manifest and docs say), and set_legacy_run when the run command itself must change. Check which tools this machine really has (versions, docker) before choosing a way. ${o.probe ? "You also write the probe script you are asked for; keep it tiny." : "Do not edit the script: it belongs to the tester; when it is the script itself that is wrong (not the environment), say so and stop. What any script needs before the old code can load (the framework's bootstrap, an autoloader, constants the app defines at start) is environment: provide it with set_legacy_run (e.g. a file the runtime loads first)."} Never interactive prompts, never servers left running (a database container the old code needs may stay up). End with one sentence saying what you did.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const now = truthCommand(env, o.source, o.script);

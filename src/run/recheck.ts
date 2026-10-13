@@ -6,7 +6,9 @@ import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import type { Ledger } from "../ledger/db.ts";
-import { notFromOldCode, type TruthCase } from "./legacy-env.ts";
+import { loadLegacyEnv, notFromOldCode, verifyTruthOnOld, type TruthCase } from "./legacy-env.ts";
+import { createHash } from "node:crypto";
+import type { SourceAdapter } from "../adapters/types.ts";
 import { run } from "./gate.ts";
 import { placementDir, placeUnit } from "./placement.ts";
 import { projectDir } from "../init/init.ts";
@@ -190,4 +192,60 @@ function committedFiles(repo: string, sha: string): string[] {
 	} catch {
 		return [];
 	}
+}
+
+/**
+ * Truth written from reading the old code while it could not run here, now that it can: each unit whose tester
+ * also left a script has it run on the old code. Green with the same expected values → the cases count as run on
+ * the old code. Green with other values → the recorded truth was wrong: the unit is redone from running it (an
+ * accepted one goes back to planned with its code kept). Red → left as it is, tried again once the old code's
+ * environment changes. Units with only cases.json are counted, not touched (they need a tester session each).
+ */
+export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; log?: (l: string) => void }): { upgraded: string[]; redone: string[]; red: number; noScript: number } {
+	const log = o.log ?? ((l: string) => console.log(l));
+	const source = o.source ?? getSourceAdapter(o.config.source.stack);
+	const env = createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(o.root, o.config), why: undefined })).digest("hex").slice(0, 12);
+	const ids = (o.ledger.db.prepare("SELECT DISTINCT unit_id AS id FROM evidence WHERE type = 'truth_read' AND unit_id NOT IN (SELECT unit_id FROM evidence WHERE type = 'truth_green_on_old')").all() as Array<{ id: string }>).map((r) => r.id);
+	const upgraded: string[] = [];
+	const redone: string[] = [];
+	let red = 0;
+	let noScript = 0;
+	for (const id of ids) {
+		const u = o.ledger.getUnit(id);
+		if (!u || !["accepted", "planned", "quarantined"].includes(u.state)) continue;
+		const meta = JSON.parse(u.meta) as { files?: string[]; truthUpgradeEnv?: string };
+		const truthDir = join(o.root, ".bigrefactor", "truth", id);
+		if (!existsSync(join(truthDir, source.truth.scriptName))) {
+			noScript++;
+			continue;
+		}
+		if (meta.truthUpgradeEnv === env) continue;
+		const ran = verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		o.ledger.updateUnit(id, { meta: { truthUpgradeEnv: env } });
+		if (!ran.ok) {
+			red++;
+			continue;
+		}
+		const recorded = o.ledger.db.prepare("SELECT id, symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ?").all(id) as Array<{ id: string; symbol_id: string; inputs: string; expected: string }>;
+		const byKey = new Map(ran.cases.map((c) => [`${c.symbol}\u0000${JSON.stringify(c.inputs)}`, JSON.stringify(c.expected)]));
+		const wrong = recorded.filter((c) => byKey.has(`${c.symbol_id}\u0000${c.inputs}`) && byKey.get(`${c.symbol_id}\u0000${c.inputs}`) !== c.expected);
+		const unrun = recorded.filter((c) => !byKey.has(`${c.symbol_id}\u0000${c.inputs}`));
+		if (!wrong.length && !unrun.length && recorded.length) {
+			o.ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1 WHERE unit_id = ?").run(id);
+			o.ledger.addEvidence(id, "truth_green_on_old", { cases: recorded.length, script: relative(o.root, join(truthDir, source.truth.scriptName)), upgradedFromRead: true });
+			upgraded.push(id);
+			continue;
+		}
+		if (!wrong.length) continue; // the script covers other cases than the ones recorded: nothing proven either way
+		const note = `The expected values of this unit were written from reading the old code; now that it runs, it returns other values for ${wrong.length} case(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${byKey.get(`${c.symbol_id}\u0000${c.inputs}`)!.slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
+		if (u.state === "accepted") reopenUnit(o.ledger, id, note, `truth upgrade: ${wrong.length} case(s) differ when run on the old code`, true);
+		else {
+			o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(id);
+			o.ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_read', 'truth_none', 'truth_ahead')").run(id);
+			o.ledger.updateUnit(id, { meta: { retryNote: note } });
+		}
+		redone.push(id);
+	}
+	if (upgraded.length || redone.length || red) log(pc.cyan(`truth upgrade: ${upgraded.length} unit(s) now run green on the old code${redone.length ? `, ${redone.length} redone (the old code returns other values)` : ""}${red ? `, ${red} still red` : ""}${noScript ? `; ${noScript} have only read cases (no script)` : ""}`));
+	return { upgraded, redone, red, noScript };
 }
