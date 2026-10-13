@@ -81,7 +81,9 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	// a change whose job failed its check is not proposed again every review (its failure stays on the task)
 	const failed = tidyTasks(d.ledger, o.stackId, o.area).filter((t) => t.status === "failed");
 	const sig = (op: string, from: string[], to: string[]) => `${op}|${[...from].sort().join(",")}|${[...to].sort().join(",")}`;
-	const seen = new Set([...open, ...rejected, ...failed].map((t) => sig(t.op, t.from, t.to)));
+	const seen = new Set([...open, ...rejected].map((t) => sig(t.op, t.from, t.to)));
+	// a failed one by its files alone: the same split or move to other names fails the same way
+	const tried = new Set(failed.map((t) => sig(t.op, t.from, [])));
 	// a stray folder's move may come from any review of the stack: once one is pending, the others do not ask again
 	const pending = tidyTasks(d.ledger, o.stackId).filter((t) => t.status === "asked" || t.status === "approved").flatMap((t) => t.from);
 	const takenStray = (from: string[]) => from.some((f) => stray.some((s) => f.startsWith(s)) && pending.includes(f));
@@ -130,7 +132,7 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const tasks = loadTasks(d.ledger);
 	let asked = 0;
 	for (const c of j.changes ?? []) {
-		if (!c.from.length || (c.op !== "delete" && !c.to.length) || !deletable(c) || !c.from.every(allowedFrom) || !c.to.every(allowed) || seen.has(sig(c.op, c.from, c.to)) || takenStray(c.from) || onlyCase(c) || misfit(c.to)) continue;
+		if (!c.from.length || (c.op !== "delete" && !c.to.length) || !deletable(c) || !c.from.every(allowedFrom) || !c.to.every(allowed) || seen.has(sig(c.op, c.from, c.to)) || tried.has(sig(c.op, c.from, [])) || takenStray(c.from) || onlyCase(c) || misfit(c.to)) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
 			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, a separate job does it once on the main branch and updates every file that uses the moved code; it is kept only when the build and the tests of the changed files pass. Nothing waits for this answer.`,

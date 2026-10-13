@@ -35,6 +35,8 @@ export const codeWithModel: CodeWorker = async (o) => {
 		config: o.config,
 		writeGlobs: ["**"],
 		protectedGlobs: [".git/**"],
+		// told at the write, not after the whole job: the check throws away a job that changed protected config
+		isProtected: (rel) => protectedConfig(o.adapter, rel),
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__code__.${o.label}.jsonl`),
 		systemPrompt: `You write one piece of missing app code in a ${o.adapter.id} project under migration, so the units waiting on it can finish. The legacy code is at ${o.config.source.path} (read it for the behaviour to keep).
 - Read the project first and follow its layout and conventions (RULES.md, the existing modules); reuse what exists, add nothing the task does not need. A new feature folder gets the files every feature folder has, and their wiring.
@@ -50,6 +52,15 @@ Never interactive prompts or servers; do not commit. End with a short paragraph 
 		session.dispose();
 	}
 };
+
+/**
+ * Protected config (tsconfig, test and lint config, manifests) holds the checks: changing it could turn them green.
+ * Tests are the job's to write; the stack's wiring files (bundle list, route table) are where new code is registered, as a unit may when nothing generates them.
+ */
+function protectedConfig(adapter: TargetAdapter, f: string): boolean {
+	const wiring = adapter.generateRegistration ? [] : adapter.layout.wiringFiles;
+	return !adapter.layout.isTestFile(f) && !isWiringFile(f, wiring) && adapter.protectedGlobs.some((g) => globToRegExp(g).test(f));
+}
 
 /** Code jobs for one question at a time per stack: two would change main at once. */
 const busy = new Map<string, Promise<string | undefined>>();
@@ -142,11 +153,7 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	// a deleted test checks nothing: the job may not make the check green by removing what was red
 	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
-	// protected config (tsconfig, test and lint config, manifests) holds the checks: changing it could turn them green.
-	// The stack's wiring files (bundle list, route table) are where new code is registered, as a unit may when nothing generates them
-	const protectedRes = adapter.protectedGlobs.map(globToRegExp);
-	const wiring = adapter.generateRegistration ? [] : adapter.layout.wiringFiles;
-	const config = changed.filter((f) => !adapter.layout.isTestFile(f) && !isWiringFile(f, wiring) && protectedRes.some((r) => r.test(f)));
+	const config = changed.filter((f) => protectedConfig(adapter, f));
 	if (config.length) return `protected config was changed: ${config.slice(0, 5).join(", ")}`;
 	// the same drift check a unit's gate runs on its files: a note or a misplaced file stays off main. A new file in a
 	// folder outside the layout (src/api/ next to the feature root) too: there the gate's "outside the feature folder" says it

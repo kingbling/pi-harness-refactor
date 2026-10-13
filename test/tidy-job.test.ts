@@ -32,8 +32,8 @@ function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
 		protectedGlobs: [],
 		toolchain: { ignoredPaths: [] },
 		layout: { isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree },
-		// the whole-project build (it cannot take files): red while anything still points at the old path
-		build: () => ({ cmd: "sh", args: ["-c", "! grep -rq 'src/A/Old.txt' src"] }),
+		// the whole-project build (it cannot take files): red while a file's first line points at a path that is not there
+		build: () => ({ cmd: "sh", args: ["-c", 'for f in $(grep -rl "src/" src); do i=$(head -1 "$f" | cut -d" " -f2); test -f "$i" || { echo "$f: cannot find $i"; bad=1; }; done; exit ${bad:-0}'] }),
 		lint: (_r: string, files: string[]) => ({ cmd: "true", args: files }),
 		// a test passes when its import resolves
 		test: (_r: string, files: string[]) => ({ cmd: "sh", args: ["-c", 'for f in "$@"; do i=$(head -1 "$f" | cut -d" " -f2); test -f "$i" || exit 1; done', "sh", ...files] }),
@@ -91,6 +91,26 @@ describe("the tidy job", () => {
 		expect(existsSync(join(target, "src", "B", "New.txt"))).toBe(false);
 		expect(git(target, ["status", "--porcelain"])).toBe("");
 		expect(j.holds("fake", "a")).toBe(false); // units are not blocked
+	});
+
+	it("main red already: its errors are not the task's, only error lines main does not have fail it", async () => {
+		const { target, ledger, jobs } = setup();
+		mkdirSync(join(target, "src", "Z"), { recursive: true });
+		writeFileSync(join(target, "src", "Z", "Broken.txt"), "import src/Z/Missing.txt\n");
+		commitAll(target, "main is red");
+		const j = jobs(mover(true));
+		j.next();
+		await j.busy;
+		expect(tidyTasks(ledger)[0]!.status).toBe("done");
+		expect(existsSync(join(target, "src", "B", "New.txt"))).toBe(true);
+		// a reference left behind is an error main does not have
+		ledger.setMeta("tidy_tasks", JSON.stringify([{ ...tidyTasks(ledger)[0]!, id: "T9", from: ["src/B/New.txt"], to: ["src/C/New.txt"], status: "approved" }]));
+		const k = jobs(async ({ dir }) => (mkdirSync(join(dir, "src", "C"), { recursive: true }), renameSync(join(dir, "src", "B", "New.txt"), join(dir, "src", "C", "New.txt")), "moved"));
+		k.next();
+		await k.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/1 error line\(s\) main does not have:\nsrc\/A\/Old\.test\.txt: cannot find src\/B\/New\.txt$/);
 	});
 
 	it("a move to a path the layout check refuses is failed like the gate would, before any build; files touched only for imports are not checked", async () => {
