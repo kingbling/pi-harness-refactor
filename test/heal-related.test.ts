@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -160,21 +160,28 @@ describe("self-heal asks about every change and keeps the unit's code", () => {
 		git(repo, "commit", "-q", "-m", "another unit");
 		const wt = join(root, "wt", "U1-again");
 		addWorktree(repo, wt, "unit/U1");
-		expect(restoreKeptWork(ledger, wt, "U1")).toBe(true);
+		expect(restoreKeptWork(ledger, wt, "U1")).toEqual([]);
 		expect(git(wt, "status", "--porcelain")).toBe("?? U1.txt");
 		// the kept code is used once; the findings about it stay with it
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).not.toHaveProperty("keptWork");
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).reviewFindings).toEqual(["- U1.txt:1: stub → port it"]);
 		expect(git(wt, "ls-files")).toContain("b.txt");
-		// main wrote the same file another way: the code no longer applies, the unit starts clean
+		// main wrote the same file another way: the code comes back with both sides in that file, the findings stay
 		writeFileSync(join(repo, "U1.txt"), "other\n");
 		git(repo, "add", "-A");
 		git(repo, "commit", "-q", "-m", "clash");
 		const wt2 = join(root, "wt", "U1-clash");
 		addWorktree(repo, wt2, "unit/U1-clash");
 		ledger.updateUnit("U1", { meta: { keptWork: kept } });
-		expect(restoreKeptWork(ledger, wt2, "U1")).toBe(false);
-		expect(git(wt2, "status", "--porcelain")).toBe("");
+		expect(restoreKeptWork(ledger, wt2, "U1")).toEqual(["U1.txt"]);
+		expect(readFileSync(join(wt2, "U1.txt"), "utf8")).toMatch(/<<<<<<< HEAD\nother\n=======\ncode\n>>>>>>> /);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta).reviewFindings).toEqual(["- U1.txt:1: stub → port it"]);
+		// a kept commit that is gone cannot be put back: the unit starts clean, without the findings about it
+		const wt3 = join(root, "wt", "U1-gone");
+		addWorktree(repo, wt3, "unit/U1-gone");
+		ledger.updateUnit("U1", { meta: { keptWork: "0".repeat(40) } });
+		expect(restoreKeptWork(ledger, wt3, "U1")).toBeUndefined();
+		expect(git(wt3, "status", "--porcelain")).toBe("");
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).not.toHaveProperty("reviewFindings");
 		ledger.close();
 	});

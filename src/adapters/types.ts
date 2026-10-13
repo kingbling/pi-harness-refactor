@@ -401,6 +401,8 @@ export interface TargetAdapter {
 	build(root: string, files?: string[]): { cmd: string; args: string[] };
 	lint(root: string, files: string[]): { cmd: string; args: string[] };
 	test(root: string, relatedFiles: string[]): { cmd: string; args: string[] };
+	/** The test command that does not fail a run on deprecations or notices alone (set by the setup fixer per workspace). None = a red run stays red. */
+	testLenient?(root: string, relatedFiles: string[]): { cmd: string; args: string[] } | undefined;
 	/** Applies every migration, in order, to a new empty throwaway database: a DB unit's last gate step. None = skipped. */
 	migrateFresh?(root: string): { cmd: string; args: string[] };
 	/** Paths the implementer may never write (protected). */

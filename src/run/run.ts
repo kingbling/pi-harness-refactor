@@ -580,10 +580,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				// quarantined after the second one instead of being picked first again on every restart
 				fresh();
 				const restored = restoreKeptWork(ledger, wt, unitId);
-				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]${restored ? " (earlier code kept)" : ""}`));
+				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]${restored ? ` (earlier code kept${restored.length ? `, ${restored.length} file(s) clash with main` : ""})` : ""}`));
 				// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
-				carried = [takeRetryNote(ledger, unitId), restored && "The worktree already holds your code from the earlier try, put on top of the current main: fix what failed instead of starting over."].filter(Boolean).join("\n\n") || undefined;
-				// Playbook: run → (merge conflict → fresh worktree on current main, one more implement pass with the conflict as the gate output) ×2 → accept or quarantine.
+				carried = [takeRetryNote(ledger, unitId), restored && "The worktree already holds your code from the earlier try, put on top of the current main: fix what failed instead of starting over.", restored?.length && conflictFilesNote(restored)].filter(Boolean).join("\n\n") || undefined;
+				// Playbook: run → (merge conflict → fresh worktree on current main with the unit's commit put back on top, one more implement pass to resolve the clashing files) ×2 → accept or quarantine.
 				for (let round = 1; round <= 3; round++) {
 					res = await runUnit({
 						ledger,
@@ -693,10 +693,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							ledger.transitionUnit(unitId, "implementing", "not merged: the whole-project check fails with it");
 							continue;
 						}
-						conflictNote = `Your previous pass could not be merged: ${String(e?.message).split("\n")[0]}. The main branch has moved (another unit of the same module landed). The worktree now starts from the current main; re-apply the migration of this unit on top of the existing code (extend files, do not overwrite other units' work).`;
-						log(pc.yellow(`  merge conflict → fresh worktree, implement pass ${round + 1}`));
-						ledger.transitionUnit(unitId, "implementing", "merge conflict: re-implementing on current main");
+						// the unit's code passed its checks and review: it goes back on top of the current main, only the clashing files need work
+						const sha = headOf(wt);
 						fresh();
+						const clash = sha ? restoreUnitWork(wt, sha) : undefined;
+						conflictNote = clash
+							? `Your previous pass passed its checks and the review but could not be merged: the main branch has moved (another unit landed). Your code is back in the worktree on top of the current main. ${clash.length ? conflictFilesNote(clash) : "It applied cleanly this time."} Change nothing else unless a check asks for it.`
+							: `Your previous pass could not be merged: ${String(e?.message).split("\n")[0]}. The main branch has moved (another unit of the same module landed). The worktree now starts from the current main; re-apply the migration of this unit on top of the existing code (extend files, do not overwrite other units' work).`;
+						log(pc.yellow(`  merge conflict → ${clash ? `code put back on current main${clash.length ? `, ${clash.length} file(s) to resolve` : ""}` : "fresh worktree"}, implement pass ${round + 1}`));
+						ledger.transitionUnit(unitId, "implementing", clash ? `merge conflict: resolving ${clash.length} file(s) on current main` : "merge conflict: re-implementing on current main");
 					}
 				}
 				if (res && res.state !== "review" && ledger.getUnit(unitId)!.state !== "accepted") {
@@ -1564,32 +1569,51 @@ export function mayKeepCode(ledger: Ledger, unitId: string): boolean {
 /**
  * A self-healed unit goes on from its kept code (keptWork), put on top of current main in its fresh worktree; the
  * kept code is used once. The reviewer's open findings point at that code: they carry over only when it does.
+ * Returns the files that conflicted with main (they hold both sides), or undefined when nothing was put back.
  */
-export function restoreKeptWork(ledger: Ledger, wt: string, unitId: string): boolean {
+export function restoreKeptWork(ledger: Ledger, wt: string, unitId: string): string[] | undefined {
 	const keptWork = (JSON.parse(ledger.getUnit(unitId)!.meta) as { keptWork?: string }).keptWork;
-	const restored = !!keptWork && restoreUnitWork(wt, keptWork);
+	const conflicts = keptWork ? restoreUnitWork(wt, keptWork) : undefined;
 	if (keptWork) ledger.updateUnit(unitId, { meta: { keptWork: undefined } });
-	if (!restored) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.reviewFindings') WHERE id = ?").run(unitId);
-	return restored;
+	if (!conflicts) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.reviewFindings') WHERE id = ?").run(unitId);
+	return conflicts;
 }
 
 /**
- * Put kept code (keepUnitWork) back into a fresh worktree on current main, uncommitted as it was. false when it no
- * longer applies on main: the worktree is left clean.
+ * Put kept code (keepUnitWork, or a unit commit that did not rebase) back into a fresh worktree on current main,
+ * uncommitted as it was. Files that clash with main are kept with git's conflict markers (both sides) for the
+ * implementer to resolve; the rest applies as it was. Returns the clashing files ([] when all applied), or
+ * undefined when the commit could not be applied at all: the worktree is left clean.
  */
-export function restoreUnitWork(wt: string, sha: string): boolean {
+export function restoreUnitWork(wt: string, sha: string): string[] | undefined {
 	try {
 		gitIn(wt, ["cherry-pick", "--no-commit", sha]);
 		gitIn(wt, ["reset", "-q"]);
-		return true;
+		return [];
 	} catch {
+		let conflicts: string[] = [];
 		try {
+			conflicts = gitIn(wt, ["diff", "--name-only", "--diff-filter=U"]).split("\n").filter(Boolean);
+		} catch {
+			/* no index to read: nothing was applied */
+		}
+		try {
+			if (conflicts.length) {
+				// a plain reset ends the cherry-pick but keeps its files: the clean ones applied, the clashing ones with both sides
+				gitIn(wt, ["reset", "-q"]);
+				return conflicts;
+			}
 			gitIn(wt, ["reset", "-q", "--hard"]);
 		} catch {
 			/* nothing was applied */
 		}
-		return false;
+		return undefined;
 	}
+}
+
+/** What the implementer is told about files that clashed with main when its code was put back on top of it. */
+export function conflictFilesNote(files: string[]): string {
+	return `These files clashed with the current main and hold git conflict markers: ${files.join(", ")}. Between "<<<<<<< HEAD" and "=======" is main's version (other units' work), between "=======" and ">>>>>>>" is yours. Keep both sides' changes and remove every marker; the other files already hold your code.`;
 }
 
 /**

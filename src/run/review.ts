@@ -5,15 +5,14 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { resolveChoices } from "../init/stack.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { goalsText } from "../policy.ts";
 import { getSourceAdapter } from "../adapters/registry.ts";
 import { noBehaviour } from "./gate.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { behaviourPolicy } from "./prompts.ts";
+import { behaviourPolicy, choicesText } from "./prompts.ts";
 import { quirksOf } from "./quirks.ts";
-import { docsLookup, readFunctionTool, sourceSymbolBody, targetLookup, whoCalls } from "../sessions/tools.ts";
+import { docsLookup, fileAliases, readFunctionTool, sourceSymbolBody, targetLookup, unitOfLegacy, unitState, whoCalls } from "../sessions/tools.ts";
 import { unitFacts } from "../sessions/taskcard.ts";
 
 /**
@@ -50,23 +49,36 @@ export interface ReviewInput {
 	testFiles?: string[];
 	/** The unit's code findings still open from its earlier reviews (kept in unit meta across attempts and runs). */
 	openFindings?: string[];
+	/** The implementer's final message of its last session (its claims, to check against the code). */
+	implementerNote?: string;
+	/** Open findings the implementer disputes (dispute_finding): the reviewer keeps each with a reason or drops it. */
+	findingDisputes?: Array<{ finding: string; why: string; evidence: string }>;
+	/** The tester's answer after re-checking tests the reviewer called weak: the ones it kept, with its reasons. */
+	testerKept?: string;
 	transcriptPath?: string;
 	spawn?: typeof spawnLeaf;
 }
 export type Finding = { file: string; line?: number; problem: string; fix: string };
 /** findings: every code finding still open after this review, one line each (the unit keeps them for the next round). */
 export type Reviewer = (o: ReviewInput) => Promise<{ ok: boolean; output: string; judged: boolean; costUsd?: number; weakTests?: string; outOfScope?: string; findings?: string[] }>;
-type Verdict = { ok: boolean; findings: Finding[]; fixed?: string[]; weakTests?: Array<{ file: string; problem: string }>; outOfScope?: Array<{ problem: string; fix: string }> };
+type Verdict = { ok: boolean; findings: Finding[]; fixed?: string[]; weakTests?: Array<{ file: string; problem: string }>; outOfScope?: Array<{ problem: string; fix: string }>; disputeAnswers?: Array<{ finding: string; kept: boolean; reason: string }> };
 
 export const reviewWithModel: Reviewer = async (o) => {
 	let verdict: Verdict | undefined;
+	// a verdict that leaves a disputed finding unanswered is sent back once
+	let askedAnswers = false;
 	const verdictTool = {
 		name: "review_verdict",
 		label: "Review verdict",
-		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. findings lists ALL open problems, earlier ones still open included. fixed: your earlier findings that the code fixes now. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester. outOfScope: what must change outside the files the implementer may write (project setup, config, manifests, folder names, the migration tool); they go to the setup fixer or the owner, never to the implementer.",
+		description: "Your one verdict on the unit. ok = true only when nothing below is a problem. Each finding names the file (and line), the problem and the fix, so the implementer can act on it without asking. findings lists ALL open problems, earlier ones still open included. fixed: your earlier findings that the code fixes now. weakTests: ported tests that do not really check the legacy behaviour; they go to the tester. outOfScope: what must change outside the files the implementer may write (project setup, config, manifests, folder names, the migration tool); they go to the setup fixer or the owner, never to the implementer. disputeAnswers: one per finding the implementer disputes — kept (still in findings) with the reason the dispute is wrong, or dropped with the reason it is right.",
 		promptSnippet: "review_verdict: your verdict (ok + findings for the code, weakTests for the tester, outOfScope for setup/config)",
-		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), fixed: Type.Optional(Type.Array(Type.String())), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))), outOfScope: Type.Optional(Type.Array(Type.Object({ problem: Type.String(), fix: Type.String() }))) }),
+		parameters: Type.Object({ ok: Type.Boolean(), findings: Type.Array(Type.Object({ file: Type.String(), line: Type.Optional(Type.Number()), problem: Type.String(), fix: Type.String() })), fixed: Type.Optional(Type.Array(Type.String())), weakTests: Type.Optional(Type.Array(Type.Object({ file: Type.String(), problem: Type.String() }))), outOfScope: Type.Optional(Type.Array(Type.Object({ problem: Type.String(), fix: Type.String() }))), disputeAnswers: Type.Optional(Type.Array(Type.Object({ finding: Type.String(), kept: Type.Boolean(), reason: Type.String() }))) }),
 		execute: async (_id: string, p: Verdict) => {
+			const disputed = o.findingDisputes?.length ?? 0;
+			if (disputed > (p.disputeAnswers?.length ?? 0) && !askedAnswers) {
+				askedAnswers = true;
+				return { content: [{ type: "text" as const, text: `not recorded: the implementer disputes ${disputed} finding(s); answer each in disputeAnswers (kept with the reason the dispute is wrong, or dropped) and call review_verdict again` }], details: { error: true } };
+			}
 			verdict = p;
 			return { content: [{ type: "text" as const, text: "verdict recorded; stop here" }], details: {} };
 		},
@@ -84,10 +96,10 @@ export const reviewWithModel: Reviewer = async (o) => {
 			transcriptPath: o.transcriptPath,
 			systemPrompt: `You review ONE unit of an automated migration (${o.config.source.stack} → ${o.config.target.stacks.join(" + ")}) before it is accepted. Build, lint and the layout checks already passed; the tests from the old behaviour run after you. You judge what tests and compilers cannot see:
 1. Real: the unit's legacy behaviour is really ported. No stubs or placeholders (TODO, "not implemented", a fixed empty result where the legacy code computes something, code that special-cases the truth inputs or returns their expected values as literals instead of computing them, an interface or port nothing implements, an endpoint that only answers "not implemented"). Compare with the legacy code (source_symbol_body, read_function). Comments, names and TODO notes in the new code are the implementer's claims, not facts: a comment saying why the new code does less or differs from the legacy code never makes it fine. Check it against the legacy code; a difference the legacy code does not support is a finding.
-2. Connected: the new code can be reached the way the legacy callers (listed below) reached the old code — an HTTP handler has its route/page registered the way this stack does it; code the legacy callers reached through a factory or another class is reached that way, not turned into an entry point nobody calls — and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet. Code owned by planned units (listed below) is expected as a minimal stub marked TODO(br:<the owning unit>): that is not a finding. A stub marked TODO(br:${o.unitId}) (grep for it) that stands in for this unit's own legacy code was left by an earlier unit for this one: one still there, not replaced by the real code or pointed at it, is a finding.
+2. Connected: the new code can be reached the way the legacy callers (listed below) reached the old code — an HTTP handler or page has its route registered the way this stack does it once the legacy caller that reached it (e.g. the controller that renders the page) is migrated: while that caller's unit is not accepted and is on this same stack (its state and stack are listed below), an unregistered page or handler, or a typed seam marked TODO(br:<that unit>), is fine and not a finding; a caller's unit on another stack can never write this stack's wiring files, so then the page or handler is registered here by this unit (only its data access may wait behind TODO(br:<that unit>)), and a missing registration is a finding; code the legacy callers reached through a factory or another class is reached that way, not turned into an entry point nobody calls — and it uses the code already migrated (listed below) instead of rewriting or skipping it. Code that only later units will call is fine: do not fail a unit for work that belongs to units not migrated yet. Code owned by planned units (listed below) is expected as a minimal stub marked TODO(br:<the owning unit>): that is not a finding. A stub marked TODO(br:${o.unitId}) (grep for it) that stands in for this unit's own legacy code was left by an earlier unit for this one: one still there, not replaced by the real code or pointed at it, is a finding.
 3. On the chosen stack: the owner's stack choices below are used where they apply (data access, rendering, data fetching, routing, forms, styling …), not gone around.
 4. The tests: the ported tests (listed below) really check the legacy behaviour — they assert the expected values, not only that something renders or exists. Weak tests go in weakTests (the tester rewrites them), never in findings.
-Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and complete: list ALL open problems in this one verdict, not a few at a time (the implementer fixes them in one go), but only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
+Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and complete: list ALL open problems in this one verdict, not a few at a time (the implementer fixes them in one go), but only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings. The implementer has no shell: it writes source files by hand and cannot run scripts or copy files. A data or asset file it cannot write by hand (binary such as a certificate, made by running a tool or converter, copied from the legacy repo, or very large) goes in outOfScope too, naming where the file comes from; check that source exists in the legacy repo first, and if it does not, it is no finding at all.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
 		});
 		const r = await session.run(facts(o));
 		// no verdict: ask once more in the same session; still none is red, never a pass
@@ -107,6 +119,7 @@ Judge only what this unit added or changed, against the facts below: the behavio
 			v.fixed?.length ? `fixed since the earlier review:\n${v.fixed.map((f) => `- ${f}`).join("\n")}` : "",
 			weakTests ? `weak tests (the tester rewrites them):\n${weakTests}` : "",
 			outOfScope ? `outside the unit's files (setup fixer, else the owner):\n${outOfScope}` : "",
+			v.disputeAnswers?.length ? `answers to the implementer's disputes:\n${v.disputeAnswers.map((a) => `- ${a.finding}: ${a.kept ? "kept" : "dropped"} — ${a.reason}`).join("\n")}` : "",
 		].filter(Boolean).join("\n");
 		return { ok, judged: true, costUsd: r.usage.cost, weakTests, outOfScope, findings, output: ok ? "reviewer: real, connected, on the chosen stack" : out };
 	} catch (e: any) {
@@ -126,7 +139,7 @@ function facts(o: ReviewInput): string {
 			return targets.length ? `- ${d}: ${[...new Set(targets)].slice(0, 8).join(", ")}` : "";
 		})
 		.filter(Boolean);
-	const choices = resolveChoices(o.adapter, o.config.target.choices).map((r) => `- ${r.choice.question}: ${r.option.label}${r.option.platform ? ` (${Object.values(r.option.platform).join("; ")})` : ""}`);
+	const choices = choicesText(o.adapter, o.config.target.choices);
 	const none = noBehaviour(o.ledger, o.unitId);
 	return [
 		`Unit ${o.unitId}${unit ? ` (${unitFacts(o.ledger, unit, o.config.source.path).join("; ") || "no facts"})` : ""}, area module ${o.moduleDir}/ in ${o.adapter.id}.`,
@@ -135,6 +148,9 @@ function facts(o: ReviewInput): string {
 		...(o.writeGlobs?.length ? [`The implementer may write only: ${o.writeGlobs.join(", ")}. A fix anywhere else is an outOfScope item, not a finding.`] : []),
 		...(o.greenBefore ? [o.greenBefore] : []),
 		...(o.openFindings?.length ? [`\nYour earlier reviews of this unit found these, still open as far as the ledger knows. Check each against the code now: a fixed one goes in fixed, one still open goes in findings again (with any new ones), so findings is the whole open list. Raise a new one only when it is a real blocker, not a change of mind:\n${o.openFindings.join("\n")}`] : []),
+		...(o.findingDisputes?.length ? [`\nThe implementer disputes these findings. Check each against the legacy code and the code now, then answer each in disputeAnswers: kept (it stays in findings) with the reason the dispute is wrong, or dropped (it leaves findings) with the reason it is right:\n${o.findingDisputes.map((d) => `- ${d.finding}: ${d.why}\n  evidence: ${d.evidence}`).join("\n")}`] : []),
+		...(o.implementerNote ? [`\nThe implementer's final message (its claims, not facts: check them against the code):\n${o.implementerNote}`] : []),
+		...(o.testerKept ? [`\nThe tester re-checked the tests you called weak against the legacy code and kept these, with its reasons. Call a kept test weak again only when its reason is wrong, and say why:\n${o.testerKept}`] : []),
 		...(o.ownerNote ? [`Note from the orchestrator for this run (only an answer by the owner, a person, counts as decided; a model's hint is context to check against the legacy code): ${o.ownerNote}`] : []),
 		...legacyFacts(o),
 		...(none ? [`The tester found no runtime behaviour to pin in this unit, so it has no truth cases and no ported tests. Its reason: ${none}. Check that against the legacy code: if the unit does compute or decide something, name it in weakTests (the tester then writes cases for it).`] : []),
@@ -183,12 +199,13 @@ export function legacyFacts(o: Pick<ReviewInput, "ledger" | "config" | "unitId" 
 			) e LEFT JOIN symbols f ON f.id = e.from_id ORDER BY e.from_id`)
 			.all(o.unitId, o.unitId) as Array<{ from_id: string; how: string; unit_id: string | null }>
 	).filter((c) => c.unit_id !== o.unitId && outside(c.from_id));
-	const names = (db.prepare("SELECT DISTINCT name FROM symbols WHERE unit_id = ? AND kind IN ('class','function')").all(o.unitId) as Array<{ name: string }>).map((r) => r.name);
+	// names the code is reached by: its classes/functions, plus the names the framework knows a file by (a template's view name)
+	const names = [...new Set([...(db.prepare("SELECT DISTINCT name FROM symbols WHERE unit_id = ? AND kind IN ('class','function')").all(o.unitId) as Array<{ name: string }>).map((r) => r.name), ...o.legacyFiles.flatMap((f) => fileAliases(o.config, f))])];
 	const literal = names.length ? (db.prepare(`SELECT DISTINCT name, path FROM index_literal_refs WHERE name IN (${names.map(() => "?").join(",")}) ORDER BY path`).all(...names) as Array<{ name: string; path: string }>).filter((l) => !own.has(l.path)) : [];
 	if (callers.length || literal.length)
 		out.push(
-			`\nLegacy callers of this unit's code (who_calls for more). Can the new code be reached the way these callers reached the old code?\n${capped(
-				[...callers.map((c) => `- ${c.from_id} (${c.how}${c.unit_id ? `, unit ${c.unit_id}` : ""})`), ...literal.map((l) => `- ${l.path} names "${l.name}" in a string (maybe a factory or dynamic call)`)],
+			`\nLegacy callers of this unit's code (who_calls for more). Can the new code be reached the way these callers reached the old code? A caller whose unit is not accepted yet and is on ${o.adapter.id} too is not migrated: the new code need not be reached from it yet (an unregistered page or handler, or a seam marked TODO(br:<that unit>), is fine); that unit wires it. A caller's unit on another stack can never write ${o.adapter.id}'s wiring files: registering the page or handler here (route, menu entry) is this unit's own job, with only its data access behind a seam marked TODO(br:<that unit>) while that unit is not accepted.\n${capped(
+				[...callers.map((c) => `- ${c.from_id} (${c.how}${unitState(o.ledger, c.unit_id ?? unitOfLegacy(o.ledger, c.from_id))})`), ...literal.map((l) => `- ${l.path} names "${l.name}" in a string (maybe a factory, dynamic call or rendered view${unitState(o.ledger, unitOfLegacy(o.ledger, l.path))})`)],
 				"callers",
 			).join("\n")}`,
 		);

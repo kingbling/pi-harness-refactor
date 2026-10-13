@@ -32,6 +32,7 @@ export function renderLayoutSection(adapter: TargetAdapter): string {
 		`- One legacy area → one feature module per stack: \`${l.moduleDir("<area>")}/\`. Every unit of the area extends the area's existing files and classes; never a parallel class or folder per legacy file.`,
 		`- Cross-cutting helpers (used by ≥2 areas) live in ${l.sharedDirs.map((d) => `\`${slashed(d)}<topic>/\``).join(" or ")}: reuse via shared_lookup, add new files, never edit existing ones from a feature unit.`,
 		`- No module root other than \`${l.moduleDir("<area>").replace(/<area>$/, "")}\` and the shared dirs; no folder or file named after a legacy file name or legacy extension.`,
+		...(!adapter.generateRegistration && l.wiringFiles?.length ? [`- Wiring files (${l.wiringFiles.map((f) => `\`${f}\``).join(", ")}): every unit may edit them to register what it adds (routes, pages, handlers), keeping other units' entries; they are in its write paths.`] : []),
 		"",
 		l.structureDoc,
 		LAYOUT_END,

@@ -309,7 +309,7 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 				if (outsideScope) write("src/other/leak.ts", "export const leak = 1;"); // blocked by the write gate
 				const moduleDir = moduleOf(o.writeGlobs[0]!);
 				const file = fileIn(moduleDir);
-				const existing = existsSync(join(base, moduleDir, `${file}.ts`)) ? readFileSync(join(base, moduleDir, `${file}.ts`), "utf8").replace(/\/\/ simulated port of \S+ attempt \d+\n/g, "") : "";
+				const existing = existsSync(join(base, moduleDir, `${file}.ts`)) ? readFileSync(join(base, moduleDir, `${file}.ts`), "utf8").replace(/\/\/ simulated port of \S+ attempt \d+\n/g, "").replace(/^(?:<{7}|={7}|>{7}).*\n/gm, "") : ""; // a restored merge conflict: both sides kept
 				const own = symbols.map((s) => `export const ${s.split("::").pop()!.replace(/\W/g, "_")} = "value-of-${s.split("::").pop()}";`).filter((l) => !existing.includes(l));
 				write(`${moduleDir}/${file}.ts`, `// simulated port of ${unitId} attempt ${n}\n${existing}${own.join("\n")}\n`);
 				write("package.json", "{}"); // protected → blocked

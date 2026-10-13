@@ -75,7 +75,7 @@ export async function refreshRulesLayout(d: Pick<AskDeps, "ledger"> & { root: st
  * (pending + approved). Without a client nothing is curated (proposals wait).
  */
 /** Bump when the curator's guidance changes: each stack's rules are curated once more under it, with or without new proposals. */
-export const CURATOR_VERSION = "2";
+export const CURATOR_VERSION = "3";
 
 export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { threshold?: number; force?: boolean } = {}): Promise<{ versions: Record<string, number>; asked: number; costUsd: number; refused: Array<{ stack: string; id: number; text: string; reason: string }> }> {
 	syncRuleAnswers(d);
@@ -115,7 +115,7 @@ export async function maybeCurateRules(d: AskDeps & { root: string }, opts: { th
 			},
 			messages: [
 				{ role: "system", content: `You curate the coding rules for the ${stack} side of an automated migration. Agents follow these rules with tiny context: keep them concrete, short (≤ 150 lines), non-contradictory, grounded in the evidence. Merge proposals that generalize; reject one-off or wrong ones with a reason. A proposal is BREAKING when code written under the current rules would violate it — do not merge breaking ones unless their status is "approved"; list them under breaking. Never add a module layout section: the layout is generated separately and is binding.
-Rules tell agents how to write code. Reject a proposal that tells a check, gate, reviewer or tool what it must accept, allow or skip: the checks are code and never read these rules. Also reject (and drop from the body, if already there) any rule that lets a unit write no code for its own behaviour, defer that behaviour to other units, or keep tests that do not run the new code (skipped, empty, a constant checked against itself). Code another unit still owns is a stub marked TODO(br:<owning unit>), never a reason to build nothing.` },
+Rules tell agents how to write code. Reject a proposal that tells a check, gate, reviewer or tool what it must accept, allow or skip: the checks are code and never read these rules. Also reject (and drop from the body, if already there) any rule that lets a unit write no code for its own behaviour, defer that behaviour to other units, or keep tests that do not run the new code (skipped, empty, a constant checked against itself). Code another unit still owns is a stub marked TODO(br:<owning unit>), never a reason to build nothing. The layout section names the wiring files (when it has any): every unit may edit them to register what it adds, so drop any rule that limits them to "explicit write scope" or coordination.` },
 				{ role: "user", content: `Repo brief:\n${loadBrief(d.root).slice(0, 4000)}\n\nCurrent rules (v${rulesVersion(d, stack)}):\n${current}\n\nProposals:\n${JSON.stringify(open.map((p) => ({ id: p.id, kind: p.kind, status: p.status, text: p.text, why: p.why, evidence: p.evidence, unit: p.unit_id })), null, 1)}` },
 			],
 		});

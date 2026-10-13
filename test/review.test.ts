@@ -95,7 +95,7 @@ describe("wired_ok: the reviewer model", () => {
 		expect(task).toMatch(/loose in_array .* → dropped/);
 		expect(task).toContain("app/Campaign.php::Campaign: 1 case(s)");
 		expect(task).toMatch(/app\/Mailer\.php::Mailer \(unit U20, planned, app\/Mailer\.php\)/);
-		expect(task).toMatch(/Can the new code be reached the way these callers reached the old code\?\n- app\/Factory\.php::Factory \(new, unit U30\)\n- app\/registry\.php names "Campaign"/);
+		expect(task).toMatch(/Can the new code be reached the way these callers reached the old code\? A caller whose unit is not accepted yet[^\n]*\n- app\/Factory\.php::Factory \(new, unit U30 planned\)\n- app\/registry\.php names "Campaign"/);
 		expect(task).toContain("- acme/mail: replace → symfony/mailer");
 		expect(system).toMatch(/goes in outOfScope, never in findings/);
 		expect(r).toMatchObject({ ok: false, judged: true, outOfScope: "- the manifest does not map the Campaign namespace → add the mapping" });

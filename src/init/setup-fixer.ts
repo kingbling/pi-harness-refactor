@@ -4,7 +4,7 @@ import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
-import { keepOverrides, loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy, withCommandOverrides } from "../adapters/command-overrides.ts";
+import { type CommandStep, keepOverrides, loadCommandOverrides, noteFix, saveCommandOverride, saveWorktreeCopy, withCommandOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -28,10 +28,10 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 	return {
 		name: "set_gate_command",
 		label: "Set gate command",
-		description: `Replace the ${stackId} gate's build, lint or test command for this workspace, when the built-in one does not fit the installed tools. Use "{files}" as one arg where the unit's files go (build/lint: the files to check; test: the test files to run): each unit's gate then checks only its own files. A build or lint command without "{files}" checks the whole project: it is not run per unit but by the builder after merges, now and then. It must really build/lint/test: commands that cannot fail are refused.`,
+		description: `Replace the ${stackId} gate's build, lint or test command for this workspace, when the built-in one does not fit the installed tools. Use "{files}" as one arg where the unit's files go (build/lint: the files to check; test: the test files to run): each unit's gate then checks only its own files. A build or lint command without "{files}" checks the whole project: it is not run per unit but by the builder after merges, now and then. testLenient: the test command with the test runner's own flags (check its --help) so deprecations and notices alone do not fail a run; the flags must reach the runner itself, not a wrapper script that reads every arg as a test file. The gate runs it only after a red test run that mentions deprecations or notices. It must really build/lint/test: commands that cannot fail are refused.`,
 		promptSnippet: "set_gate_command: replace the stack's build/lint/test command for this workspace",
-		parameters: Type.Object({ step: Type.Union([Type.Literal("build"), Type.Literal("lint"), Type.Literal("test")]), cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
-		execute: async (_id: string, p: { step: "build" | "lint" | "test"; cmd: string; args: string[]; why: string }) => {
+		parameters: Type.Object({ step: Type.Union([Type.Literal("build"), Type.Literal("lint"), Type.Literal("test"), Type.Literal("testLenient")]), cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
+		execute: async (_id: string, p: { step: CommandStep; cmd: string; args: string[]; why: string }) => {
 			const out = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 			if (NO_OP.test(p.cmd.trim()) || /\|\|\s*(true|exit 0)|--passWithNoTests/.test(p.args.join(" "))) return out("refused: the command must be able to fail");
 			saveCommandOverride(root, stackId, p.step, { cmd: p.cmd, args: p.args }, p.why);
@@ -71,6 +71,7 @@ function checkDoc(adapter: TargetAdapter, projectDir: string): string {
 - build: ${[b.cmd, ...b.args].join(" ")}
 - lint: ${[l.cmd, ...l.args].join(" ")}
 - test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the test files to run)
+When a test run where every test passed is still red on deprecations or notices alone, set testLenient (set_gate_command) instead of changing the test command.
 ${probe ? `The check writes ${probe.path} with this content, runs build, then lint and test with {files} = ${probe.path}:\n${probe.content}\n${probe.failing ? `It also writes this version (wrong expected value) and checks that the test command FAILS on it:\n${probe.failing}\n` : ""}To try it, write that file yourself and delete it afterwards.\n` : ""}When a command is wrong for the installed version (an option removed or renamed, a different runner), replace it with set_gate_command — check the tool's --help first.`;
 }
 

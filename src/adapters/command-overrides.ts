@@ -7,8 +7,10 @@ export interface Cmd {
 	cmd: string;
 	args: string[];
 }
+/** testLenient: the test command with the runner's own flags so deprecations and notices alone do not fail a run. */
+export type CommandStep = "build" | "lint" | "test" | "testLenient";
 /** Per-workspace replacements of a stack's gate commands; `{files}` in an arg expands to the files (may be none). */
-export type CommandOverrides = Partial<Record<"build" | "lint" | "test", Cmd>> & {
+export type CommandOverrides = Partial<Record<CommandStep, Cmd>> & {
 	why?: string;
 	/** Dependency dirs a unit's worktree gets as a copy (copy-on-write where the disk can) instead of a link: tools that resolve real paths (autoloaders) would otherwise load the main project's code. */
 	worktreeCopy?: string[];
@@ -41,7 +43,7 @@ export function loadCommandOverrides(root: string | undefined, stackId: string):
 	}
 }
 
-export function saveCommandOverride(root: string, stackId: string, step: "build" | "lint" | "test", c: Cmd, why: string): void {
+export function saveCommandOverride(root: string, stackId: string, step: CommandStep, c: Cmd, why: string): void {
 	const cur = loadCommandOverrides(root, stackId);
 	const p = overridesPath(root, stackId);
 	mkdirSync(dirname(p), { recursive: true });
@@ -86,6 +88,7 @@ export function withCommandOverrides(adapter: TargetAdapter, root: string | unde
 		build: (r, files = []) => (o().build ? expand(o().build!, files) : adapter.build(r, files)),
 		lint: (r, files) => (o().lint ? expand(o().lint!, files) : adapter.lint(r, files)),
 		test: (r, files) => (o().test ? expand(o().test!, files) : adapter.test(r, files)),
+		testLenient: (r, files) => (o().testLenient ? expand(o().testLenient!, files) : adapter.testLenient?.(r, files)),
 	};
 }
 

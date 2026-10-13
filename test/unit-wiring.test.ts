@@ -312,7 +312,8 @@ describe("runUnit wiring", () => {
 
 	it("the reviewer's open findings are kept in the unit's meta: every implementer and reviewer gets them; a pass clears them", async () => {
 		const tasks: string[] = [];
-		const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role !== "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+		// each implementer changes the code (unchanged code would reuse the last verdict)
+		const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role !== "test" && (tasks.push(task), write(join(ws, "migrated", "src/features/agency/agency.service.ts"), `// ${tasks.length}\n`)), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
 		const lists = [["- a.ts:1: A → fix A", "- b.ts:2: B → fix B"], ["- b.ts:2: B → fix B"]];
 		const seen: Array<string[] | undefined> = [];
 		let n = 0;

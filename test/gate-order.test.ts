@@ -65,6 +65,17 @@ describe("gate: own scope", () => {
 		expect(step(other, "antigaming_ok")?.output).toContain("edited an existing shared file (add-only zone): src/shared/agency/agency.spec.ts");
 	});
 
+	it("a file that still holds a merge conflict marker fails antigaming_ok, in any file type", async () => {
+		write("src/features/agency/agency.module.yaml", "routes:\n<<<<<<< HEAD\n  - a\n=======\n  - b\n>>>>>>> unit\n");
+		const r = await gate();
+		expect(step(r, "antigaming_ok")?.ok).toBe(false);
+		expect(step(r, "antigaming_ok")?.output).toContain("unresolved merge conflict in src/features/agency/agency.module.yaml:2");
+		// a markdown heading underline is no marker
+		write("src/features/agency/agency.module.yaml", "routes:\n  - a\n  - b\n");
+		write("src/features/agency/README.md", "Agency\n=======\n");
+		expect(step(await gate(), "antigaming_ok")?.ok).toBe(true);
+	});
+
 	it("a stub the unit was told to replace passes structure_ok when sanctioned", async () => {
 		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });
 		write("src/features/billing/billing.service.ts", "export class BillingService {\n\tagencyTotal(): number {\n\t\treturn 2;\n\t}\n}\n");

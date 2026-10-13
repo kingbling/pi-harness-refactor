@@ -227,6 +227,6 @@ class Helper { function format() {} function total() {} }`,
 		// file-scope callers (the template's format_money calls) stay visible next to code-map callers
 		const fm = (ledger.db.prepare("SELECT id FROM index_symbols WHERE name = 'format_money'").get() as { id: string }).id;
 		const out = await whoCalls({ ledger, config } as never).execute("t", { symbolId: fm }, undefined as never, undefined as never, undefined as never);
-		expect((out.content[0] as { text: string }).text).toMatch(/templates\/invoice\.php \(call\)/);
+		expect((out.content[0] as { text: string }).text).toMatch(/templates\/invoice\.php \(call, unit \S+ planned\)/);
 	});
 });

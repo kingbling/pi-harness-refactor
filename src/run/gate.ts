@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative } from "node:path";
 import type { TargetAdapter, TargetSymbol } from "../adapters/types.ts";
@@ -11,6 +11,7 @@ import { activeRuleFiles } from "../rules/layout.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
+import { runPortedTests } from "./ported.ts";
 
 /**
  * The gate: deterministic, cheapest-first, stops at the first failure. Runs AFTER the implementer
@@ -26,8 +27,10 @@ export interface GateInput {
 	writeGlobs: string[];
 	/** Globs where only NEW files are acceptable (shared helpers). */
 	appendOnlyGlobs?: string[];
-	/** Test files written by the tester, with their hashes at hand-over time. */
+	/** The area's ported test files (this unit's and earlier units'), with their hashes at hand-over time. */
 	testFiles: Array<{ path: string; sha1: string }>;
+	/** Main's checkout of the unit's project: another unit's test that fails here counts only if it passes there. */
+	mainDir?: string;
 	/** The unit's placement: module dir (relative to targetProjectDir) and legacy area, for the structure check. */
 	moduleDir?: string;
 	area?: string;
@@ -93,7 +96,9 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const t0 = Date.now();
 		slotMs = 0;
 		const r = await fn();
-		steps.push({ name, ok: r.ok, ms: Date.now() - t0, slotMs, output: clipOutput(r.output), exitCode: r.exitCode });
+		// cut output is saved whole in the unit's sessions folder: the prompt names the file
+		const full = g.root ? join(g.root, ".bigrefactor", "sessions", `${g.unitId}.${name}.log`) : undefined;
+		steps.push({ name, ok: r.ok, ms: Date.now() - t0, slotMs, output: clipOutput(r.output, 6000, full), exitCode: r.exitCode });
 		if (r.ok) g.ledger.addEvidence(g.unitId, name, { ms: Date.now() - t0, ...(r.judged === false ? { judged: false, note: r.output.slice(0, 300) } : {}) });
 		return r.ok;
 	};
@@ -130,6 +135,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		// a comment that silences the type check or the linter hides an error instead of fixing it (only lines this unit added)
 		const silence = g.adapter.layout.suppressMarker;
 		if (silence) for (const f of prodFiles) for (const l of addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
+		// a merge conflict restored into the worktree: no marker line may reach main (build and tests do not read every file)
+		for (const f of conflictMarkers(g.targetProjectDir, changed)) problems.push(`unresolved merge conflict in ${f}: keep the changes of both sides and remove the <<<<<<< ======= >>>>>>> lines`);
 		if (prodFiles.length === 0 && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
 		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 	});
@@ -169,11 +176,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	if (!(await step("rules_ok", () => cpu(() => checkRules(g, prodFiles.filter((f) => g.adapter.layout.lang(f) && existsSync(join(g.targetProjectDir, f))), timeout))))) return done();
 
 	// 7. the ported characterization tests (one per truth case), before the review: a red test is cheaper to find than a review
-	const t = g.adapter.test(g.targetProjectDir, g.testFiles.map((x) => x.path));
 	const cases = (g.ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ?").get(g.unitId) as { n: number }).n;
 	// a unit the tester found without runtime behaviour (a pure contract, constants) has nothing to pin: no tests to run
 	const none = !cases && !g.testFiles.length ? noBehaviour(g.ledger, g.unitId) : undefined;
-	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : cpu(() => run(t.cmd, t.args, g.targetProjectDir, timeout)))))) return done();
+	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : cpu(() => runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests: g.testFiles.map((x) => x.path), mainDir: g.mainDir, timeoutMs: timeout })))))) return done();
 
 	// 8. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
 	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
@@ -205,29 +211,96 @@ export function importedByTests(projectDir: string, tests: string[], findings: s
 	});
 }
 
+/** Changed files (project-relative) that still hold a git conflict marker line, as "file:line". */
+export function conflictMarkers(dir: string, files: string[]): string[] {
+	const out: string[] = [];
+	for (const f of files) {
+		let text = "";
+		try {
+			text = readFileSync(join(dir, f), "utf8");
+		} catch {
+			continue; // removed, or not a file
+		}
+		if (text.includes("\0")) continue; // binary
+		const i = text.split("\n").findIndex((l) => /^(?:<{7}|>{7})(?: |$)/.test(l));
+		if (i >= 0) out.push(`${f}:${i + 1}`);
+	}
+	return out;
+}
+
+/** Terminal colour codes: test runners print them even with FORCE_COLOR=0 and they only cost room. */
+const ANSI = /\x1b\[[0-9;]*m/g;
+/** A line that says what failed, in any runner's words (a failed test, an error, an assertion, a ✗ mark). */
+const FAILURE = /\b(?:fail(?:ed|ures?|s)?|errors?|exception|assert\w*|expect(?:ed)?|not ok)\b|[✗×✕]|\w+Error\b/i;
+/** A deprecation or notice: noise next to a failure, never its cause. */
+const NOTICE = /\b(?:deprecat\w*|notices?)\b/i;
+
 /**
- * A step's output for the report and the next prompt, at most `max` chars. Long output (phpstan, phpunit) keeps its
- * start (the command, the first file and errors) and its end (the summary): trailing padding goes, a line already
- * shown twice is left out, and what still does not fit is cut from the middle.
+ * A step's output for the report and the next prompt, at most `max` chars. Long output (phpstan, phpunit, vitest)
+ * shows the failure blocks first (the lines around what says FAIL, Error, assert, expected, ✗), then the rest with
+ * its start (the command, the first errors) and its end (the summary): colour codes, deprecation and notice lines
+ * and padding go, a line already shown twice is left out, and what still does not fit is cut from the middle.
+ * `saveTo`: when anything was cut, the full output is written there and the clip names the file.
  */
-export function clipOutput(out: string, max = 6000): string {
-	if (out.length <= max) return out;
+export function clipOutput(out: string, max = 6000, saveTo?: string): string {
+	const plain = out.replace(ANSI, "");
+	if (plain.length <= max) return plain;
 	const seen = new Map<string, number>();
 	let dropped = 0;
-	const kept = out
+	let notices = 0;
+	const all = plain
 		.split("\n")
 		.map((l) => l.trimEnd())
 		.filter((l) => {
+			if (!l.trim()) return true;
 			const n = (seen.get(l.trim()) ?? 0) + 1;
 			seen.set(l.trim(), n);
-			if (n <= 2 || !l.trim()) return true;
+			if (n <= 2) return true;
 			dropped++;
 			return false;
 		});
-	const text = (dropped ? [`(${dropped} repeated line(s) left out)`, ...kept] : kept).join("\n");
-	if (text.length <= max) return text;
-	const head = Math.floor(max / 3);
-	return `${text.slice(0, head)}\n… ${text.length - max} chars left out …\n${text.slice(-(max - head))}`;
+	// the failure blocks: each failure line with one line before and eight after (the message, the code frame).
+	// Deprecation and notice lines go, but never from a failure line or the eight after it (a code line with the word)
+	const frame = new Set<number>();
+	const before = new Set<number>();
+	all.forEach((l, i) => {
+		if (!FAILURE.test(l)) return;
+		if (i > 0) before.add(i - 1);
+		for (let j = i; j <= Math.min(all.length - 1, i + 8); j++) frame.add(j);
+	});
+	const inBlock = new Set<number>();
+	const lines = all.filter((l, i) => {
+		if (!frame.has(i) && NOTICE.test(l)) return (notices++, false);
+		if (frame.has(i) || before.has(i)) inBlock.add(i - notices);
+		return true;
+	});
+	let saved = "";
+	if (saveTo)
+		try {
+			mkdirSync(dirname(saveTo), { recursive: true });
+			writeFileSync(saveTo, plain);
+			saved = `(full output: ${saveTo})\n`;
+		} catch {
+			/* no file: the clip alone */
+		}
+	const note = `${saved}${dropped ? `(${dropped} repeated line(s) left out)\n` : ""}${notices ? `(${notices} deprecation or notice line(s) left out)\n` : ""}`;
+	const cut = (text: string, room: number) => {
+		if (text.length <= room) return text;
+		const head = Math.floor(room / 3);
+		return `${text.slice(0, head)}\n… ${text.length - room} chars left out …\n${text.slice(-(room - head))}`;
+	};
+	const rest = lines.filter((_, i) => !inBlock.has(i)).join("\n");
+	// no failure line, or nothing outside the blocks: the whole text with its start and its end
+	if (!inBlock.size || !rest.trim()) return note + cut(lines.join("\n"), Math.max(200, max - note.length));
+	const blocks: string[] = [];
+	lines.forEach((l, i) => {
+		if (!inBlock.has(i)) return;
+		if (i > 0 && !inBlock.has(i - 1) && blocks.length) blocks.push("…");
+		blocks.push(l);
+	});
+	const room = Math.max(400, max - note.length - 40);
+	const failures = blocks.join("\n").slice(0, Math.floor((room * 2) / 3));
+	return `${note}failures:\n${failures}\n── rest of the output ──\n${cut(rest, room - failures.length)}`;
 }
 
 /** The tester's reason why the unit has no runtime behaviour to pin (latest truth_none evidence), or undefined. */
@@ -368,6 +441,23 @@ export function run(cmd: string, args: string[], cwd: string, timeoutMs: number)
 			resolvePromise({ ok: !err, output, exitCode: typeof code === "number" ? code : code === undefined ? 1 : -1 });
 		});
 	});
+}
+
+/**
+ * The stack's test command on `files`. A red run that talks about deprecations or notices is run again with the
+ * stack's lenient test command when the workspace has one (the setup fixer writes it with the runner's own flags,
+ * e.g. PHPUnit's --do-not-fail-on-deprecation): green then means every test passed, and the deprecations and notices
+ * are a warning. Still red: the first run's output stands (the real failure).
+ */
+export async function runTests(adapter: TargetAdapter, dir: string, files: string[], timeoutMs: number): Promise<{ ok: boolean; output: string; exitCode?: number }> {
+	const t = adapter.test(dir, files);
+	const r = await run(t.cmd, t.args, dir, timeoutMs);
+	if (r.ok || !NOTICE.test(r.output.replace(ANSI, "")) || r.output.endsWith("[timed out]")) return r;
+	const l = adapter.testLenient?.(dir, files);
+	if (!l) return r;
+	const again = await run(l.cmd, l.args, dir, timeoutMs);
+	if (!again.ok) return r;
+	return { ...again, output: `warning: every test passed; the run failed only on deprecations or notices, so they are warnings here (\`${[l.cmd, ...l.args].join(" ")}\`); fix them when you can\n${again.output}` };
 }
 
 /** Files changed in the working tree under `dir` (git status), relative to `dir`. */

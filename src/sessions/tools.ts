@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
-import { caseCoverage, checkTests } from "../run/ported.ts";
-import { buildFiles, changedFiles, run } from "../run/gate.ts";
+import { caseCoverage, checkTests, runPortedTests } from "../run/ported.ts";
+import { buildFiles, changedFiles, clipOutput } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { Config } from "../config.ts";
@@ -39,6 +39,10 @@ export interface ToolDeps {
 	moduleDir?: string;
 	/** Implementer: a test it believes is wrong goes to the tester before the next attempt (see dispute_test). */
 	onDispute?: (d: { test: string; why: string; evidence: string }) => void;
+	/** Implementer: a reviewer finding it believes is wrong goes back to the reviewer, who keeps it with a reason or drops it (see dispute_finding). */
+	onDisputeFinding?: (d: { finding: string; why: string; evidence: string }) => void;
+	/** Implementer: every check_my_code result, so the orchestrator knows when DONE comes after a red check. */
+	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[] }) => void;
 	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
 	onReport?: (r: { owner: string; target: string; problem: string; evidence: string }) => void;
 	/** Decision model for cheap judgements in tools (record_quirk: is this quirk already recorded?). */
@@ -53,6 +57,8 @@ export interface ToolDeps {
 	wholeCheck?: () => Promise<string | undefined>;
 	/** Implementer: the unit's ported test files (project-relative) as they are now, for check_my_code. */
 	testFiles?: () => string[];
+	/** Main's checkout of the unit's project: another unit's test that fails counts only if it passes there (as in the gate). */
+	mainDir?: string;
 	/** The gate's CPU slot: check_my_code runs its commands inside it, like the gate. */
 	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
@@ -87,6 +93,34 @@ export function symbolLookup(d: ToolDeps): ToolDefinition {
 	});
 }
 
+/** The names the source framework knows a legacy file by besides its symbols (a template's view name, a command name). */
+export function fileAliases(config: Config, path: string): string[] {
+	try {
+		return getSourceAdapter(config.source.stack).fileAliases?.(path) ?? [];
+	} catch {
+		return []; // unknown source adapter
+	}
+}
+
+/** The unit that owns a legacy symbol (exact id first) or else any symbol of its file, or null. */
+export function unitOfLegacy(ledger: Ledger, idOrPath: string): string | null {
+	const row = ledger.db.prepare("SELECT unit_id FROM symbols WHERE (id = ? OR path = ?) AND unit_id IS NOT NULL ORDER BY id = ? DESC LIMIT 1").get(idOrPath, idOrPath.split("::")[0]!, idOrPath) as { unit_id: string } | undefined;
+	return row?.unit_id ?? null;
+}
+
+/** ", unit X <state> on <stack>" for a legacy caller's unit: one not accepted yet is not migrated; its stack says who can wire what. */
+export function unitState(ledger: Ledger, unit: string | null): string {
+	if (!unit) return "";
+	const u = ledger.getUnit(unit);
+	let stack: string | undefined;
+	try {
+		stack = (JSON.parse(u?.meta ?? "{}") as { place?: { stack?: string } }).place?.stack;
+	} catch {
+		/* no meta: no stack */
+	}
+	return `, unit ${unit} ${u?.state ?? "unknown"}${stack ? ` on ${stack}` : ""}`;
+}
+
 export function whoCalls(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "who_calls",
@@ -97,11 +131,14 @@ export function whoCalls(d: ToolDeps): ToolDefinition {
 		execute: async (_id, p) => {
 			const fromCalls = callersOf(d.ledger, [p.symbolId]).map((c) => ({ from_id: `${c.from} L${c.line}`, kind: `${c.kind} call` }));
 			const callers = [...fromCalls, ...(d.ledger.db.prepare("SELECT from_id, kind FROM index_deps WHERE to_id = ? AND (kind NOT IN ('call','static_call') OR from_id NOT IN (SELECT id FROM code_functions))").all(p.symbolId) as Array<{ from_id: string; kind: string }>)];
-			const name = p.symbolId.split("::").pop()!;
-			const literal = d.ledger.db.prepare("SELECT DISTINCT path FROM index_literal_refs WHERE name = ?").all(name) as Array<{ path: string }>;
+			// the symbol's name, plus the names the framework knows its file by (a template's view name, a command name)
+			const names = [...new Set([p.symbolId.split("::").pop()!, ...fileAliases(d.config, p.symbolId.split("::")[0]!)])];
+			const literal = d.ledger.db.prepare(`SELECT DISTINCT name, path FROM index_literal_refs WHERE name IN (${names.map(() => "?").join(",")}) ORDER BY path`).all(...names) as Array<{ name: string; path: string }>;
+			// the caller's unit, its state and stack: a caller whose unit is not accepted yet is not migrated
+			const where = (from: string) => unitState(d.ledger, unitOfLegacy(d.ledger, from.split(" L")[0]!));
 			return text(
-				`${callers.length} static reference(s)${callers.length ? ":\n" + callers.map((c) => `- ${c.from_id} (${c.kind})`).join("\n") : ""}` +
-					(literal.length ? `\n${literal.length} string-literal mention(s) of "${name}" (possible dynamic dispatch): ${literal.map((l) => l.path).join(", ")}` : ""),
+				`${callers.length} static reference(s)${callers.length ? ":\n" + callers.map((c) => `- ${c.from_id} (${c.kind}${where(c.from_id)})`).join("\n") : ""}` +
+					(literal.length ? `\n${literal.length} string-literal mention(s) (possible dynamic dispatch or rendered view):\n${literal.map((l) => `- ${l.path} names "${l.name}"${where(l.path)}`).join("\n")}` : ""),
 			);
 		},
 	});
@@ -354,6 +391,21 @@ export function disputeTestTool(d: ToolDeps): ToolDefinition {
 	});
 }
 
+export function disputeFindingTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "dispute_finding",
+		label: "Dispute a reviewer finding",
+		description: "An open reviewer finding is wrong: the legacy code does not do what it asks, or the code already does it. The reviewer reads your dispute at the next review and must keep the finding with a reason or drop it. Give the finding as it was written and evidence (legacy symbol and line, or the file and line of your code that already does it), not a guess. Fix the findings you do not dispute.",
+		promptSnippet: "dispute_finding: a reviewer finding you believe is wrong goes back to the reviewer (with evidence)",
+		parameters: Type.Object({ finding: Type.String({ description: "the finding as the reviewer wrote it (file:line and problem)" }), why: Type.String(), evidence: Type.String({ description: "what the legacy code or your code really does (symbol or file, line)" }) }),
+		execute: async (_id, p) => {
+			if (!d.onDisputeFinding) return text("not available in this session", { error: true });
+			d.onDisputeFinding(p);
+			return text("recorded: the reviewer must keep this finding with a reason or drop it at the next review.");
+		},
+	});
+}
+
 /** The accepted unit whose ported code is `target` (`path::Name`, or a file path), via the ledger's moves. */
 export function ownerOf(ledger: Ledger, target: string, except: string): string[] {
 	const file = target.split("::")[0]!;
@@ -472,6 +524,11 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 			const secs = CHECK_MY_CODE_TIMEOUT_MS / 1000;
 			const files = buildFiles(dir, d.adapter, changedFiles(dir, d.adapter.toolchain.ignoredPaths));
 			const out = [`Changed files checked: ${files.length ? files.join(", ") : "none"}.`];
+			// every result reaches the orchestrator: DONE after a red check gets one more turn
+			const done = (r: { ok: boolean; failed?: string; files: string[] }, timedOut?: boolean) => {
+				d.onCheck?.({ ...r, text: out.join("\n"), timedOut });
+				return text(out.join("\n"), r);
+			};
 			for (const name of ["build", "lint"] as const) {
 				const r = await slot(() => checkTests(dir, d.adapter, name, files, CHECK_MY_CODE_TIMEOUT_MS));
 				const NAME = name.toUpperCase();
@@ -479,7 +536,7 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 				else if (!r.error) out.push(`${NAME} clean (\`${r.command}\`).`);
 				else {
 					out.push(`${NAME} FAILED (\`${r.command}\`, run in ${dir}${r.error.endsWith("[timed out]") ? `, stopped after ${secs} s: the gate runs it again with more time` : ""}); fix it and call check_my_code again:\n${r.error}`);
-					return text(out.join("\n"), { ok: false, failed: name, files });
+					return done({ ok: false, failed: name, files }, r.error.endsWith("[timed out]"));
 				}
 			}
 			// the last pass was not merged for whole-project errors: the same check the merge runs, so DONE comes after they are gone
@@ -487,19 +544,21 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 				const whole = await slot(() => d.wholeCheck!());
 				if (whole) {
 					out.push(`WHOLE-PROJECT check FAILED (your last pass was not merged for these; errors main has too are left out); fix them and call check_my_code again:\n${whole.slice(-4000)}`);
-					return text(out.join("\n"), { ok: false, failed: "whole", files });
+					return done({ ok: false, failed: "whole", files });
 				}
 				out.push("WHOLE-PROJECT check clean: no errors main does not have.");
 			}
 			const tests = (d.testFiles?.() ?? []).filter((f) => existsSync(join(dir, f)));
 			if (!tests.length) {
 				out.push("TESTS not run: this unit has no ported test files.");
-				return text(out.join("\n"), { ok: true, files });
+				return done({ ok: true, files });
 			}
-			const t = d.adapter.test(dir, tests);
-			const r = await slot(() => run(t.cmd, t.args, dir, CHECK_MY_CODE_TIMEOUT_MS));
-			out.push(r.ok ? `TESTS green (${tests.join(", ")}).` : `TESTS FAILED${r.output.endsWith("[timed out]") ? ` (stopped after ${secs} s: the gate runs them again with more time)` : ""}; fix the code, not the tests (or call dispute_test with evidence):\n${r.output.slice(-2500)}`);
-			return text(out.join("\n"), { ok: r.ok, failed: r.ok ? undefined : "tests", files });
+			const r = await slot(() => runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir, tests, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS }));
+			// the failing tests first; the whole output is saved in the unit's sessions folder when it is cut
+			const full = join(d.root, ".bigrefactor", "sessions", `${d.unitId}.check_my_code.log`);
+			const warned = r.ok ? r.output.split("\n").filter((l) => l.startsWith("warning:")).map((l) => ` ${l}`).join("") : "";
+			out.push(r.ok ? `TESTS green (${tests.join(", ")}).${warned}` : `TESTS FAILED${r.output.endsWith("[timed out]") ? ` (stopped after ${secs} s: the gate runs them again with more time)` : ""}; fix the code, not the tests (or call dispute_test with evidence):\n${clipOutput(r.output, 4000, full)}`);
+			return done({ ok: r.ok, failed: r.ok ? undefined : "tests", files }, r.output.endsWith("[timed out]"));
 		},
 	});
 }
@@ -558,7 +617,7 @@ async function behaviourFound(d: ToolDeps, reason: string): Promise<string | und
 const MAX_BODY_CHARS = 20_000;
 
 export function implementerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), reportMigratedBugTool(d), checkMyCodeTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), disputeFindingTool(d), reportMigratedBugTool(d), checkMyCodeTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
 	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d), checkPortedTestsTool(d), noBehaviourTool(d)];

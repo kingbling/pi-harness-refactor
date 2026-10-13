@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
@@ -56,6 +56,21 @@ describe("check_my_code", () => {
 		const r = await exec(tool({ build: sh("true"), lint: sh("true"), test: sh("echo 'expected 2, got 3'; exit 1") }));
 		expect(r.details).toMatchObject({ ok: false, failed: "tests" });
 		expect(r.content[0]!.text).toMatch(/TESTS FAILED[\s\S]*expected 2, got 3/);
+	});
+
+	it("long red test output shows the failure first and is saved whole in the unit's sessions folder", async () => {
+		const r = await exec(tool({ build: sh("true"), lint: sh("true"), test: sh("echo 'FAIL u1#1 total: expected 2, got 3'; i=0; while [ $i -lt 600 ]; do echo \"  <div class=row-$i>\"; i=$((i+1)); done; exit 1") }));
+		const out = r.content[0]!.text;
+		const full = join(dir, ".bigrefactor", "sessions", "u1.check_my_code.log");
+		expect(out).toMatch(/TESTS FAILED[\s\S]*failures:\n[\s\S]*expected 2, got 3/);
+		expect(out).toContain(`(full output: ${full})`);
+		expect(readFileSync(full, "utf8")).toContain("row-599");
+	});
+
+	it("tests red only on deprecations are green with the warning", async () => {
+		const r = await exec(tool({ build: sh("true"), lint: sh("true"), test: sh("echo 'OK, but there were issues! Deprecations: 1'; exit 1"), testLenient: sh("echo 'OK, but 1 deprecation'") }));
+		expect(r.details).toMatchObject({ ok: true });
+		expect(r.content[0]!.text).toMatch(/TESTS green \(.*\)\. warning: every test passed; the run failed only on deprecations/);
 	});
 
 	it("is one of the implementer's tools and its prompt asks for it before DONE", () => {

@@ -22,8 +22,8 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
-import { implementerTools, testerTools } from "../sessions/tools.ts";
-import { errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
+import { implementerTools, testerTools, type ToolDeps } from "../sessions/tools.ts";
+import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { placementDir, placeUnit, unplacedReason } from "./placement.ts";
@@ -36,7 +36,7 @@ import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
-import { caseCoverage, checkTests, findTests, scopeGuard, testsPass } from "./ported.ts";
+import { caseCoverage, checkTests, findTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
 /**
@@ -114,6 +114,9 @@ export async function testsGreenBefore(o: { files: () => string[]; pass: (files:
 	return `${why()} The tester was asked once to fix them and they still pass: check in weakTests that each one really calls this unit's code.`;
 }
 
+/** One check_my_code result (see ToolDeps.onCheck). */
+type CheckResult = Parameters<NonNullable<ToolDeps["onCheck"]>>[0];
+
 export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const unit = o.ledger.getUnit(o.unitId);
@@ -139,6 +142,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	process.env["BR_WORKSPACE"] = o.root; // the stack's layout.json lives in this workspace
 	const adapter = await getTargetAdapter(stackId);
 	const targetProjectDir = o.workDir ? join(o.workDir, relative(o.config.target.path, projectDir(o.config, stackId))) : projectDir(o.config, stackId);
+	// main's checkout: an area test of another unit that fails in the worktree counts against this unit only if it passes there
+	const mainDir = o.workDir ? projectDir(o.config, stackId) : undefined;
 	if (!adapter.toolchain.isProjectReady(targetProjectDir)) throw new Error(`target project missing at ${targetProjectDir}; run br setup`);
 	const sourceAdapter = getSourceAdapter(o.config.source.stack);
 	// one legacy area = one feature module (or, for code ≥ 2 areas use, the shared dir + area)
@@ -171,7 +176,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return r.id;
 	};
 
-	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck };
+	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck, mainDir };
 	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
@@ -500,7 +505,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const greenBefore =
 		testFiles.length && !o.gate && !implementedBefore
 			? await testsGreenBefore({
-					files: () => testFiles.map((t) => t.path),
+					// the unit's own tests: other units' tests in the area pass without this unit's code anyway
+					files: () => ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths),
 					pass: (files) => testsPass(targetProjectDir, adapter, files),
 					retest: async (why) => {
 						log(pc.yellow("  ported tests pass before any code exists: the tester makes them call the unit's code"));
@@ -530,12 +536,31 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const openFindings = () => (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { reviewFindings?: string[] }).reviewFindings ?? [];
 	// what other models said about the TESTS during an attempt: the implementer disputes one, the reviewer finds some weak
 	let disputes: Array<{ test: string; why: string; evidence: string }> = [];
+	// open reviewer findings the implementer disputes: the next review keeps each with a reason or drops it
+	let findingDisputes: Array<{ finding: string; why: string; evidence: string }> = [];
+	// the implementer's final message (the reviewer reads it) and its last check_my_code result in this attempt
+	let implementerNote: string | undefined;
+	let lastCheck: CheckResult | undefined;
+	// the worktree's changed files as they were at that check: code changed after it makes the check stale
+	const treeKey = () => {
+		const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
+		try {
+			return sha1(JSON.stringify(changedFiles(targetProjectDir, adapter.toolchain.ignoredPaths).sort().map((f) => [f, read(f)])));
+		} catch {
+			return undefined; // no git answer: the check counts as stale
+		}
+	};
+	let checkedTree: string | undefined;
+	// the last judged review and what it judged: code and tests unchanged since (and nothing disputed) reuse its verdict
+	let lastReview: { key: string; r: Awaited<ReturnType<Reviewer>> } | undefined;
 	let reviewWeak: string | undefined;
 	// what the reviewer says must change outside the unit's files (setup, config, plugin): never the implementer's
 	let reviewOutOfScope: string | undefined;
 	let testRounds = 0;
-	// tester rounds the reviewer's weak-tests verdict drove (disputes do not count): the waiver below needs 2 of them
-	let weakRounds = 0;
+	// tester rounds the reviewer's weak-tests verdict drove (disputes do not count): the waiver below needs 2 of them.
+	// Kept in unit meta with the tester's "kept" answers, so a later run of the unit goes on counting
+	const unitMeta = () => JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { weakRounds?: number; testerKept?: string };
+	let weakRounds = unitMeta().weakRounds ?? 0;
 	// the reviewer found only weak tests (the code is fine): after the tester's retest the gate runs again on the same
 	// code, with no new implementer session and no new attempt
 	let reviewWeakOnly = false;
@@ -596,6 +621,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// the tests as they are on disk now: the tester (it has a shell) may have renamed or removed one since they
 		// were listed; the implementer cannot write tests, so the gate still catches any change during this attempt
 		testFiles = loadTests();
+		lastCheck = undefined;
 		const role = forceEscalate || attemptNo > maxImpl ? "escalate" : "implement";
 		const modelRole = o.config.models[role];
 		const attempt = o.ledger.startAttempt(o.unitId, regateOnly ? "gate" : role, regateOnly ? undefined : modelRole.id);
@@ -610,7 +636,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				appendOnlyGlobs,
 				protectedGlobs: adapter.protectedGlobs,
 				systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs, source: sourceAdapter, target: adapter }),
-				customTools: implementerTools({ ...deps, attemptId: attempt, testFiles: () => testFiles.map((t) => t.path), slot: gateSlot, onDispute: (d) => disputes.push(d), onReport: (r) => reports.push(r) }),
+				customTools: implementerTools({ ...deps, attemptId: attempt, testFiles: () => testFiles.map((t) => t.path), slot: gateSlot, onDispute: (d) => disputes.push(d), onDisputeFinding: (d) => findingDisputes.push(d), onCheck: (c) => ((lastCheck = c), (checkedTree = treeKey())), onReport: (r) => reports.push(r) }),
 				transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
 				validateWrite: async (path, content) => {
 					const lang = adapter.layout.lang(path);
@@ -631,15 +657,23 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				`## Ported tests (read-only): ${testFiles.map((t) => t.path).join(", ") || "none"}`,
 				...testFiles.filter((t) => existsSync(join(targetProjectDir, t.path))).map((t) => `### ${t.path}\n\`\`\`${adapter.layout.lang(t.path) ?? ""}\n${readFileSync(join(targetProjectDir, t.path), "utf8")}\n\`\`\``),
 				lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
-				open.length ? `\n## Open reviewer findings for this unit (from all its reviews so far: fix every one)\n${open.join("\n")}` : "",
+				open.length ? `\n## Open reviewer findings for this unit (from all its reviews so far: fix every one; one you are sure is wrong: dispute_finding with evidence, the reviewer answers it)\n${open.join("\n")}` : "",
 				// every attempt reads it: each is a new session, and a later (stronger) one needs the hint as much as the first
 				o.retryNote ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
 			].join("\n");
 			try {
 				res = await impl.run(prompt);
+				// DONE while its own last check_my_code was red: the gate would fail the same way, so one more turn
+				const red = lastCheck as CheckResult | undefined; // set by the tool during run()
+				if (red && !red.ok && !red.timedOut && !res.error && !reports.length) {
+					log(pc.dim(`  ${role} said DONE after a red check_my_code (${red.failed}): one more turn`));
+					const more = await impl.run(`Your last check_my_code was red (${red.failed}), so the gate fails the same way. Fix it and call check_my_code again until it is clean.${red.failed === "tests" ? " A red test you are sure is wrong (it expects what the legacy code does not do): call dispute_test for it by name, with evidence from the legacy code. Every red test must be fixed or disputed." : ""} Then end with your final line as before.\n\nThe red check:\n${red.text.slice(0, 5000)}`);
+					res = { ...more, toolCalls: res.toolCalls + more.toolCalls, blocked: res.blocked + more.blocked, usage: { input: res.usage.input + more.usage.input, output: res.usage.output + more.usage.output, cost: res.usage.cost + more.usage.cost } };
+				}
 			} finally {
 				impl.dispose();
 			}
+			implementerNote = res.text.trim().slice(-1500) || undefined;
 			cost += res.usage.cost;
 			log(pc.dim(`  ${role} #${attemptNo}: ${res.toolCalls} tool calls, ${res.blocked} blocked, ${Math.round((Date.now() - t0) / 1000)}s, $${res.usage.cost.toFixed(4)} — ${res.text.split("\n").at(-1)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 			// the implementer found a bug in another unit's accepted code: that unit is re-opened with the report, this one
@@ -680,8 +714,19 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
 		const review = reviewer
 			? async (changedFiles: string[], nearDuplicates?: string[]) => {
-					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					let r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), transcriptPath: transcriptPath(o.root, o.unitId, "review", ra) });
+					// what the review judges: the changed code and the ported tests as they are now, and the tester's answers
+					// (a tester that kept every test and only answered gets a fresh review that reads them)
+					const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
+					const key = sha1(JSON.stringify([[...changedFiles].sort().map((f) => [f, read(f)]).concat(testFiles.map((t) => [t.path, read(t.path)])), unitMeta().testerKept ?? ""]));
+					const disputed = findingDisputes;
+					findingDisputes = [];
+					const reuse = !disputed.length && lastReview?.key === key;
+					if (reuse) log(pc.dim("  code and tests unchanged since the last review: its verdict stands (no new review)"));
+					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
+					let r = reuse
+						? { ...lastReview!.r, costUsd: 0 }
+						: await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), implementerNote, findingDisputes: disputed, testerKept: unitMeta().testerKept, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra!) });
+					if (!reuse && r.judged) lastReview = { key, r };
 					cost += r.costUsd ?? 0;
 					reviewWeakOnly = r.judged && !r.ok && !!r.weakTests && !r.findings?.length && !r.outOfScope;
 					// the tester had 2 weak-tests rounds and only the tests are still called weak: the code passes, the doubt is noted
@@ -697,13 +742,23 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					reviewJudged = r.judged;
 					// the reviewer lists every open finding each time: its list replaces the kept one (a pass clears it)
 					if (r.judged && (r.ok || r.findings)) o.ledger.updateUnit(o.unitId, { meta: { reviewFindings: r.ok ? [] : r.findings } });
-					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
+					if (ra !== undefined) o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : reviewWeakOnly ? "review_weak_tests" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					return r;
 				}
 			: undefined;
 		// the gate takes a CPU slot only for its commands: the review (a model session) never holds one
-		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot });
-		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
+		// still red on the ported tests after the extra turn, and the implementer disputed tests: the gate would only
+		// repeat that test run, so the disputes go straight to the tester (the next attempt runs the whole gate)
+		const check = lastCheck as CheckResult | undefined;
+		// only when no file changed after that check: a fix made after it (DONE without checking again) needs the real gate
+		const straight = !!check && !check.ok && check.failed === "tests" && !check.timedOut && disputes.length > 0 && checkedTree !== undefined && checkedTree === treeKey();
+		if (straight) log(pc.dim("  ported tests still red and disputed: straight to the tester"));
+		gate = straight
+			? { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 0, output: check!.text }], changedFiles: check!.files, failedStep: "ported_tests_green", testFiles: testFiles.map((t) => t.path) }
+			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot });
+		// only the tests were called weak: the code was fine, so this is not an implementer failure
+		const weakOnly = !gate.ok && gate.failedStep === "wired_ok" && reviewWeakOnly;
+		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : weakOnly ? "gate_tests_weak" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
 		if (gate.ok) break;
 
@@ -746,11 +801,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (testsNote && testRounds < 2 && gate.failedStep === "wired_ok" && reviewWeakOnly) regate = true;
 		if (testsNote && testRounds < 2) {
 			testRounds++;
-			if (weakDrove) weakRounds++;
+			if (weakDrove) o.ledger.updateUnit(o.unitId, { meta: { weakRounds: ++weakRounds } });
 			o.ledger.addEvidence(o.unitId, "test_disputed", { note: testsNote.slice(0, 2000) });
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
 			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`);
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
+			// the tests it kept, with its reasons, go to the next review: a kept test is called weak again only with a reason
+			if (weakDrove) o.ledger.updateUnit(o.unitId, { meta: { testerKept: lastTesterText.split("\n").filter((l) => /\bkept\b/i.test(l)).join("\n").slice(-2000) || undefined } });
 			previousGate = gate;
 			continue;
 		}
@@ -849,6 +906,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	}
 
 	if (gate?.ok) {
+		// the weak-tests count is for this round of the unit: a re-opened unit's new tests get their tester rounds again
+		if (weakRounds) o.ledger.updateUnit(o.unitId, { meta: { weakRounds: 0, testerKept: undefined } });
 		// The new code is now part of what later units can reuse: index it (exports, helpers, docs).
 		const indexed = await indexTarget(o.ledger, adapter, targetProjectDir, gate.changedFiles).catch((e) => (log(pc.yellow(`  target index failed: ${e?.message ?? e}`)), 0));
 		log(pc.dim(`  indexed ${indexed} target symbols`));
