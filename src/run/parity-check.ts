@@ -9,7 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
-import { appRoot, bootApp, dumpData, LEGACY, loadApps, prepareTargetCopy, type AppRecipe } from "./parity.ts";
+import { appRoot, bootApp, dumpData, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe } from "./parity.ts";
 
 /**
  * Differential parity for one slice: the same requests go to the old app (twice) and to the new app, code compares
@@ -224,11 +224,15 @@ function view(s: Step, r: StepResult, withData: boolean): Record<string, unknown
 	return v;
 }
 
+/** The old app sent the request on to itself over another scheme (http → https): no handler answered it. */
+export const selfRedirect = (r: StepResult) => (r.status ?? 0) >= 300 && (r.status ?? 0) < 400 && /^\w+:\/\/\(this app\)/.test(r.location ?? "");
+
 const covers = (noise: string, path: string) => path === noise || path.startsWith(`${noise}.`) || path.startsWith(`${noise}[`);
 
 /**
  * The real differences between the old app (two runs) and the new app. Only what differs between the two old runs
- * is ignored. A step the old app itself fails on (no answer, 5xx, in either run) proves nothing and is listed as not compared.
+ * is ignored. A step the old app itself fails on (no answer, 5xx, in either run) proves nothing and is listed as not compared,
+ * and so is one it only redirects to itself on https: both apps forcing https says nothing about the handler.
  */
 export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[], neu: StepResult[], withData: boolean): { diffs: Diff[]; compared: number; notCompared: string[] } {
 	const diffs: Diff[] = [];
@@ -238,6 +242,7 @@ export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[
 		const a = old1[i]!;
 		if (s.compare === "none") return;
 		if (a.error || (a.status ?? 0) >= 500) return void notCompared.push(`${s.id} (the old app: ${a.error ?? `status ${a.status}`})`);
+		if (selfRedirect(a)) return void notCompared.push(`${s.id} (the old app only redirects it to itself: ${a.status} → ${a.location})`);
 		// a failed second old run would make everything look like noise and hide every real difference
 		const a2 = old2[i]!;
 		if (a2.error || (a2.status ?? 0) >= 500) return void notCompared.push(`${s.id} (the old app's second run: ${a2.error ?? `status ${a2.status}`})`);
@@ -394,8 +399,11 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// written data is compared only when both apps keep the same tables and both can dump them
 	const withData = o.config.db.strategy === "keep-schema" && !!apps[LEGACY].recipe!.dump && stacks.some((s) => apps[s]!.recipe!.dump);
 	const c = compareRuns(steps, old1, old2, neu, withData);
+	// the old app's setup is asked (once) to let plain http reach its handlers
+	const hop = steps.findIndex((s, i) => s.compare !== "none" && selfRedirect(old1[i]!));
+	if (hop >= 0 && !apps[LEGACY].selfRedirect) saveApp(o.root, LEGACY, { selfRedirect: `${steps[hop]!.method} ${steps[hop]!.path} → ${old1[hop]!.status} ${old1[hop]!.location}` });
 	const note = [`${c.compared} step(s) compared`, withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : ""].filter(Boolean).join("; ");
-	const res = record({ outcome: c.diffs.length ? "differs" : "same", diffs: c.diffs, compared: c.compared, note }, steps.length);
+	const res = record({ outcome: c.diffs.length ? "differs" : c.compared ? "same" : "error", diffs: c.diffs, compared: c.compared, note }, steps.length);
 	log(c.diffs.length ? pc.yellow(`parity ${o.slice}: ${c.diffs.length} difference(s) in ${new Set(c.diffs.map((d) => d.step)).size} step(s) — ${note}`) : pc.green(`parity ${o.slice}: the new app answers like the old one — ${note}`));
 	return res;
 }

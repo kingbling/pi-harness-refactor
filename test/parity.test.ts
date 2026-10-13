@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { appBootTools, bootApp, LEGACY, loadApps, probeApp, type AppFixer } from "../src/run/parity.ts";
+import { appBootTools, bootApp, dumpData, LEGACY, loadApps, probeApp, saveApp, type AppFixer } from "../src/run/parity.ts";
 
 /**
  * Differential parity starts with: can each app run here as a local server? The setup model saves a recipe;
@@ -95,6 +95,40 @@ describe("starting the apps for parity", () => {
 		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, dataProbed: true, recipe: { start: { args: ["server.js", String(port)] } } });
 		// asked once only
 		expect(await probeApp({ config, root, side: LEGACY, fixer: broken, log: () => {} })).toBe(true);
+		expect(problems).toHaveLength(1);
+	});
+
+	it("a new recipe whose reset works but whose dump fails keeps its reset; a dump bigger than any buffer is read whole", async () => {
+		const { root, legacy, config: base } = workspace();
+		const config = ConfigSchema.parse({ ...base, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" } });
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		const half: AppFixer = async (o) => (await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), resetCmd: process.execPath, resetArgs: ["-e", "0"], dumpCmd: process.execPath, dumpArgs: ["-e", "process.exit(2)"] }), "reset works, dump not");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: half, log: () => {} })).toBe(true);
+		const kept = loadApps(root)[LEGACY]!;
+		expect(kept.recipe!.reset).toEqual({ cmd: process.execPath, args: ["-e", "0"] });
+		expect(kept.recipe!.dump).toBeUndefined();
+		// 70 MB on stdout: more than the 64 MB a buffer would take
+		const big = dumpData({ ...asRecipe(serverRecipe(port)), dump: { cmd: process.execPath, args: ["-e", "process.stdout.write(JSON.stringify({ t: ['x'.repeat(70 * 1024 * 1024)] }))"] } }, legacy);
+		expect((big["t"]![0] as string).length).toBe(70 * 1024 * 1024);
+	});
+
+	it("an old app that only redirects to itself on https is probed again once, told so; a working new recipe clears it", async () => {
+		const { root, config } = workspace();
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		saveApp(root, LEGACY, { selfRedirect: "POST /post_command → 301 https://(this app)/post_command" });
+		const problems: string[] = [];
+		const fix: AppFixer = async (o) => (problems.push(o.problem), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), env: { HTTPS: "off" } }), "turned off the https redirect");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: fix, log: () => {} })).toBe(true);
+		expect(problems[0]).toMatch(/redirect to itself[\s\S]*301 https:\/\/\(this app\)\/post_command[\s\S]*plain http/);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, redirectProbed: true, recipe: { env: { HTTPS: "off" } } });
+		expect(loadApps(root)[LEGACY]!.selfRedirect).toBeUndefined();
+		// once only, even when a later slice check sees the redirect again
+		saveApp(root, LEGACY, { selfRedirect: "GET / → 301 https://(this app)/" });
+		expect(await probeApp({ config, root, side: LEGACY, fixer: fix, log: () => {} })).toBe(true);
 		expect(problems).toHaveLength(1);
 	});
 

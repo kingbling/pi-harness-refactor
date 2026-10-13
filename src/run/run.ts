@@ -16,7 +16,7 @@ import { loadConfig, type Config } from "../config.ts";
 import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
-import { probeLegacyEnv } from "./legacy-env.ts";
+import { probeLegacyEnv, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
 import { resolveChoices } from "../init/stack.ts";
 import { indexTarget } from "../inventory/target.ts";
 import { applySlicePlan, blockingOrder, planSlices, renderSlicePlan, type SliceOverrides } from "../inventory/slices.ts";
@@ -332,20 +332,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	});
 	// parity: can the old app and the new app each start here as a local server? decided once per workspace, on the
 	// side (lanes never wait); a side that does not start asks the owner once, blocking nothing
+	const probeAsk: { ask: ProbeAsker; answer: ProbeAnswer } = {
+		ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
+		answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
+	};
 	const parityProbe =
 		o.dry || o.spawn || !isRepo(config.target.path)
 			? undefined
 			: import("./parity.ts")
-					.then(({ probeApps }) =>
-						probeApps({
-							config,
-							root: o.root,
-							linkAll,
-							log,
-							ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
-							answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
-						}),
-					)
+					.then(({ probeApps }) => probeApps({ config, root: o.root, linkAll, log, ...probeAsk }))
 					.catch((e) => log(pc.yellow(`parity probe failed: ${e?.message ?? e} (the run goes on without comparing the apps)`)));
 	// parity checks: a slice whose units are all accepted is compared old vs new on the side, one slice at a time;
 	// the judge re-opens the units whose answers differ and turns odd old behaviour into quirks for the owner
@@ -374,6 +369,14 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			showParity(`comparing ${slice} with the old app`);
 			const { checkSlice } = await import("./parity-check.ts");
 			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log });
+			// the old app only redirected to itself on https: its setup is asked once to fix that, then the slice runs again
+			const old = loadApps(o.root)["legacy"];
+			if (old?.selfRedirect && !old.redirectProbed) {
+				showParity("setting up the old app again: it only redirects to itself on https");
+				const { probeApp } = await import("./parity.ts");
+				await probeApp({ config, root: o.root, side: "legacy", log, ...probeAsk });
+				if (!loadApps(o.root)["legacy"]?.selfRedirect) parityQueue.push(slice);
+			}
 			parityLast = `${slice}: ${r.outcome === "same" ? "answers like the old app" : r.outcome === "error" ? `not compared (${r.note.slice(0, 80)})` : `${r.diffs.length} difference(s)`}`;
 			if (r.runId !== undefined && r.outcome === "differs") {
 				showParity(`judging ${r.diffs.length} difference(s) in ${slice}`);

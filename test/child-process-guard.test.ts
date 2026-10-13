@@ -34,8 +34,8 @@ describe("child processes never write to the terminal", () => {
 		for (const { f, text } of all) {
 			for (const c of calls(text, /\b(execFileSync|spawnSync|execSync|spawn)\(/g)) {
 				if (/^\w+\(\s*(\)|\{)/.test(c)) continue; // spawn({ … }) starts an agent session, not a process
-				// stdio given, every stream captured or discarded ("pipe" / "ignore"), never "inherit"
-				const stdio = /stdio:\s*("(?:pipe|ignore)"|\[\s*"(?:pipe|ignore)",\s*"(?:pipe|ignore)",\s*"(?:pipe|ignore)"\s*\])/.test(c);
+				// stdio given, every stream captured or discarded ("pipe" / "ignore"), stdout perhaps into a file it opened (fd), never "inherit"
+				const stdio = /stdio:\s*("(?:pipe|ignore)"|\[\s*"(?:pipe|ignore)",\s*(?:"(?:pipe|ignore)"|fd),\s*"(?:pipe|ignore)"\s*\])/.test(c);
 				const ok = stdio || (f === "proc.ts" && /tracked \? \["ignore", "pipe", "pipe"\]/.test(c));
 				if (!ok) bad.push(`${f}: ${c.replace(/\s+/g, " ").slice(0, 140)}`);
 			}
