@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
@@ -50,6 +51,10 @@ export interface AppState {
 	redProbes?: number;
 	/** Set once an app that was up was probed again to add a data reset and dump (asked once, whatever came of it). */
 	dataProbed?: boolean;
+	/** The old app only: a slice check saw it answer with a redirect to itself on another scheme (http → https), so no handler was reached. */
+	selfRedirect?: string;
+	/** Set once the old app was probed again over that redirect (asked once, whatever came of it). */
+	redirectProbed?: boolean;
 	at?: string;
 }
 
@@ -65,7 +70,7 @@ export function loadApps(root: string): Record<string, AppState> {
 	}
 }
 
-function saveApp(root: string, side: string, change: Partial<AppState>): AppState {
+export function saveApp(root: string, side: string, change: Partial<AppState>): AppState {
 	const all = loadApps(root);
 	const next = { ...all[side], ...change, at: new Date().toISOString() };
 	all[side] = next;
@@ -209,13 +214,14 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 }
 
 /** Start, check, stop: what code (and the model's check_app_boot) runs to decide a recipe works. */
-export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number } = {}): Promise<{ ok: boolean; error?: string }> {
+export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number } = {}): Promise<{ ok: boolean; error?: string; dumpFailed?: boolean }> {
 	const b = await bootApp(recipe, appDir, o);
 	if (!b.ok) return b;
 	try {
 		if (recipe.dump) dumpData(recipe, appDir);
 	} catch (e: any) {
-		return { ok: false, error: `the app starts, but the data dump fails: ${String(e?.message ?? e).slice(-800)}` };
+		// the app came up after the reset ran, so the reset works: say so, it can be kept without the dump
+		return { ok: false, dumpFailed: true, error: `the app starts${recipe.reset ? " and the data reset works" : ""}, but the data dump fails: ${String(e?.message ?? e).slice(-800)}` };
 	} finally {
 		await b.stop();
 	}
@@ -225,7 +231,20 @@ export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeou
 /** The app's data as {table: rows}, from the recipe's dump command. Throws when it prints anything else. */
 export function dumpData(recipe: AppRecipe, appDir: string): Record<string, unknown[]> {
 	if (!recipe.dump) return {};
-	const outText = execFileSync(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, encoding: "utf8", timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+	// stdout goes to a file, not a buffer: a real database dump is easily bigger than any buffer
+	const tmp = mkdtempSync(join(tmpdir(), "br-dump-"));
+	let outText: string;
+	try {
+		const fd = openSync(join(tmp, "dump.json"), "w");
+		try {
+			execFileSync(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", fd, "pipe"] });
+		} finally {
+			closeSync(fd);
+		}
+		outText = readFileSync(join(tmp, "dump.json"), "utf8");
+	} finally {
+		rmSync(tmp, { recursive: true, force: true });
+	}
 	const data = JSON.parse(outText.slice(outText.indexOf("{"))) as unknown;
 	if (!data || typeof data !== "object" || Array.isArray(data) || !Object.values(data).every(Array.isArray)) throw new Error('the dump must print {"table": [rows]}');
 	return data as Record<string, unknown[]>;
@@ -367,20 +386,28 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const commit = o.side === LEGACY ? undefined : headOf(o.config.target.path);
 	const moved = cur.up === false && commit !== undefined && commit !== cur.commit && (cur.redProbes ?? 0) < MAX_RED_PROBES;
 	// an app that starts but cannot reset or dump its data: written data is never compared, so it is asked once to add them
-	const noData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump) && !cur.dataProbed;
-	if (cur.up !== undefined && !retry && !moved && !noData && !o.again) return cur.up;
+	const lacksData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump);
+	// an app that only redirects to itself on https: no request reaches a handler, so it is asked once to fix that (and the data, if missing)
+	const redirect = cur.up === true && !!cur.recipe && !!cur.selfRedirect && !cur.redirectProbed;
+	const fixUp = (lacksData && !cur.dataProbed) || redirect;
+	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
-	const problem = noData ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared. Keep how it starts; add what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
+	const missing = [
+		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
+		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy (the app's or its web server's own setting that forces https)`] : []),
+	];
+	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
 	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem }).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	const recipe = loadApps(o.root)[o.side]?.recipe;
 	// the copy may have been made during the session: the root is read again
 	const bad = recipe ? recipeProblem(o.config, o.root, o.side, recipe) : "no recipe saved";
 	const res = bad || !recipe ? { ok: false, error: bad } : await checkRecipe(recipe, appRoot(o.config, o.root, o.side));
-	if (noData) {
-		// the app started before: a new recipe that does not work is dropped, the old one stays
-		const kept = res.ok ? recipe! : cur.recipe!;
-		saveApp(o.root, o.side, { up: true, recipe: kept, dataProbed: true });
-		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${res.ok ? "" : ` (the new recipe did not start: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+	if (fixUp) {
+		// the app started before: a new recipe that does not work is dropped, the old one stays; one that only fails
+		// on its dump keeps the rest (the reset ran before the app came up, so it works)
+		const kept = res.ok ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: true } : {}), ...(redirect ? { redirectProbed: true, ...(res.ok ? { selfRedirect: undefined } : {}) } : {}) });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
 	}

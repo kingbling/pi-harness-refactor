@@ -9,7 +9,8 @@ import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { checkSlice, compareRuns, dataChanges, runSteps, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
+import { LEGACY, loadApps } from "../src/run/parity.ts";
+import { checkSlice, compareRuns, dataChanges, runSteps, selfRedirect, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
@@ -56,7 +57,7 @@ describe("comparing the old and the new app", () => {
 		expect(compareRuns(s, [w(5)], [w(5)], [w(6)], false).diffs).toEqual([]);
 	});
 
-	it("an http → https redirect to the app itself matches the other app doing the same on its own port", async () => {
+	it("an http → https redirect of the old app to itself reaches no handler: not compared, and the old app is marked for another probe", async () => {
 		const serve = (to: (host: string) => string) =>
 			new Promise<{ base: string; close: () => void }>((res) => {
 				const s = createServer((q, r) => r.writeHead(301, { location: to(q.headers.host!) }).end()).listen(0, () => {
@@ -68,8 +69,12 @@ describe("comparing the old and the new app", () => {
 			const s = [step("r", "redirect")];
 			const [ra, rb, rc] = await Promise.all([a, b, c].map((app) => runSteps(s, { side: "legacy", base: () => app.base })));
 			expect(ra![0]!.location).toBe("https://(this app)/x?y=1");
-			expect(compareRuns(s, ra!, ra!, rb!, false).diffs).toEqual([]);
-			expect(compareRuns(s, ra!, ra!, rc!, false).diffs).toMatchObject([{ kind: "redirect" }]);
+			expect(selfRedirect(ra![0]!)).toBe(true);
+			// both apps forcing https says nothing about the handler, and neither does one that does not
+			for (const neu of [rb!, rc!]) expect(compareRuns(s, ra!, ra!, neu, false)).toEqual({ diffs: [], compared: 0, notCompared: ["r (the old app only redirects it to itself: 301 → https://(this app)/x?y=1)"] });
+			// a redirect somewhere else is the handler's answer, and still compared
+			expect(selfRedirect(rc![0]!)).toBe(false);
+			expect(compareRuns(s, rc!, rc!, ra!, false).diffs).toMatchObject([{ kind: "redirect" }]);
 		} finally {
 			for (const app of [a, b, c]) app.close();
 		}
@@ -97,6 +102,7 @@ describe("comparing the old and the new app", () => {
 		writeFileSync(
 			join(legacy, "server.js"),
 			`require('http').createServer((q, s) => {
+				if (q.headers['x-force-https']) return s.writeHead(301, { location: 'https://' + q.headers.host + q.url }).end();
 				if (q.method === 'POST') return s.writeHead(302, { location: '/invoices' }).end();
 				if (q.url === '/login') return s.writeHead(200, { 'set-cookie': 'sid=abc; Path=/' }).end('ok');
 				if (q.url === '/invoices') return s.end(JSON.stringify({ count: 2, at: Date.now() + Math.random() }));
@@ -155,5 +161,13 @@ describe("comparing the old and the new app", () => {
 		// steps are kept: a second check does not write them again
 		await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer, log: () => {} });
 		expect(writes).toBe(1);
+		// an old app that only sends requests on to itself over https: nothing is compared, and it is marked for another probe
+		const hop: StepWriter = async (o) => {
+			const steps: Step[] = [{ id: "list", route: "GET /invoices", compare: "data", method: "GET", path: "/invoices", headers: { "x-force-https": "1" } }];
+			writeFileSync(join(o.dir, "steps.json"), JSON.stringify({ steps, skipped: { "GET /invoices/{id}": "t", "POST /invoices": "t" } }));
+		};
+		const h = await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer: hop, rewrite: true, log: () => {} });
+		expect(h).toMatchObject({ outcome: "error", compared: 0, diffs: [] });
+		expect(loadApps(root)[LEGACY]!.selfRedirect).toBe("GET /invoices → 301 https://(this app)/invoices");
 	}, 60_000);
 });
