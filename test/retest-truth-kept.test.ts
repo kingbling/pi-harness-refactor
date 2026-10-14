@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
+import { saveCommandOverride } from "../src/adapters/command-overrides.ts";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
@@ -36,6 +37,9 @@ beforeEach(() => {
 	write(join(truthDir(), "cases.json"), CASES);
 	ledger.addEvidence("u1", "truth_read", { cases: 1, why: "the script did not run green on the old code" });
 	ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',0,'t')").run();
+	// fixture lint and test commands: the stack's own (npx eslint / npx jest) reach the npm registry when nothing is installed here
+	saveCommandOverride(ws, "nestjs", "lint", { cmd: "sh", args: ["-c", "exit 0", "sh", "{files}"] }, "fixture lint");
+	saveCommandOverride(ws, "nestjs", "test", { cmd: "sh", args: ["-c", "echo '1 failing'; exit 1", "sh", "{files}"] }, "fixture runner");
 });
 
 type Exec = { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }> }> };

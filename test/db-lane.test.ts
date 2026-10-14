@@ -2,6 +2,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, wr
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
+import { saveCommandOverride } from "../src/adapters/command-overrides.ts";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import { applyTableJudgement, askDbInputs, dbDetected, findDbFiles, foundTablesPath, groupTables, planDbLane, readSchema, TABLE_PLAN_KEY, type TableJudgement } from "../src/inventory/db.ts";
@@ -347,6 +348,8 @@ describe("DB lane: a failed gate is read by the triage model", () => {
 		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
 		write(join(ws, "migrated", "package.json"), "{}");
 		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		// the setup fix checks that the test command can still fail: a red fixture runner, not npx jest (which reaches the npm registry)
+		saveCommandOverride(ws, "nestjs", "test", { cmd: "sh", args: ["-c", "echo '1 failing'; exit 1", "sh", "{files}"] }, "fixture runner");
 		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
 		await planDbLane(ledger, config);
 		let sessions = 0;
