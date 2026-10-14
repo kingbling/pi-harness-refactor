@@ -156,6 +156,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			const why = stubOwnerProblem(g.ledger, g.unitId, m[1]!.trim());
 			if (why) problems.push(`${f}:${l.line}: TODO(br:${m[1]}) ${why}`);
 		}
+		// stubs earlier units left for this unit (the task card listed them): once it is accepted nobody replaces them
+		for (const hit of await stubsLeftFor(g.targetProjectDir, g.unitId)) if (!problems.some((p) => p.startsWith(`${hit.file}:${hit.line}:`))) problems.push(`${hit.file}:${hit.line}: ${STUB_LEFT}`);
 		// no code written but ported tests to run: existing code may already do it (reuse); the tests and the reviewer decide
 		const reuse = prodFiles.length === 0 && g.testFiles.length > 0;
 		if (prodFiles.length === 0 && !reuse && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
@@ -718,6 +720,22 @@ export function scopedCheck(adapter: TargetAdapter, dir: string, name: "build" |
 
 /** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */
 export const NOTHING_WRITTEN = "no production files were written";
+/** Also the implementer's own to fix: a stub an earlier unit left for this unit, still in place. */
+export const STUB_LEFT = "stub left for this unit is still here: replace it with your code, or point its callers at your code, and remove it; if it stands in for another unit's code, mark it with that unit instead (symbol_lookup)";
+
+/** Lines in the worktree's tracked files that still carry this unit's stub mark TODO(br:<unitId>). */
+async function stubsLeftFor(dir: string, unitId: string): Promise<Array<{ file: string; line: number }>> {
+	let out: string;
+	try {
+		out = await exec("git", ["grep", "-n", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: dir });
+	} catch {
+		return []; // no match, or not a repo
+	}
+	return out.split("\n").flatMap((l) => {
+		const m = /^(.+?):(\d+):/.exec(l);
+		return m ? [{ file: m[1]!, line: Number(m[2]) }] : [];
+	});
+}
 
 /** Why a stub mark TODO(br:<owner>) cannot stand: the owner is no unit, this unit, or a unit already done (it would never come back to replace it). */
 export function stubOwnerProblem(ledger: Ledger, unitId: string, owner: string): string | undefined {

@@ -42,7 +42,6 @@ beforeEach(() => {
 	mkdirSync(project, { recursive: true });
 	write("package.json", JSON.stringify({ dependencies: { "@nestjs/core": "^11" } }));
 	write("src/shared/agency/agency.spec.ts", "it('u1#1 old', () => {});\n");
-	write("src/features/billing/billing.service.ts", "export class BillingService {\n\t// TODO(br:u1)\n}\n");
 	execFileSync("git", ["init", "-q"], { cwd: project });
 	commit();
 	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
@@ -108,7 +107,24 @@ describe("gate: own scope", () => {
 		expect(step(await gate(), "antigaming_ok")?.ok).toBe(true);
 	});
 
+	/** An earlier unit's stub for u1 on main (only that file is committed: the unit's own work stays uncommitted). */
+	const stubOnMain = (rel: string, body: string) => {
+		write(rel, body);
+		execFileSync("git", ["add", rel], { cwd: project });
+		execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "stub"], { cwd: project });
+	};
+
+	it("a stub an earlier unit left for this unit fails antigaming_ok while it is still there", async () => {
+		stubOnMain("src/features/billing/billing.service.ts", "export class BillingService {\n\tagencyTotal(): number {\n\t\treturn 0; // TODO(br:u1)\n\t}\n}\n");
+		const r = await gate();
+		expect(step(r, "antigaming_ok")).toMatchObject({ ok: false, output: expect.stringContaining("src/features/billing/billing.service.ts:3: stub left for this unit is still here") });
+		// replaced: green
+		write("src/features/billing/billing.service.ts", "export class BillingService {\n\tagencyTotal(): number {\n\t\treturn 2;\n\t}\n}\n");
+		expect(step(await gate({ writeGlobs: ["src/features/agency/**", "src/features/billing/billing.service.ts"] }), "antigaming_ok")?.ok).toBe(true);
+	});
+
 	it("a stub the unit was told to replace passes structure_ok when sanctioned", async () => {
+		stubOnMain("src/features/billing/billing.service.ts", "export class BillingService {\n\t// TODO(br:u1)\n}\n");
 		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });
 		write("src/features/billing/billing.service.ts", "export class BillingService {\n\tagencyTotal(): number {\n\t\treturn 2;\n\t}\n}\n");
 		const writeGlobs = ["src/features/agency/**", "src/features/billing/billing.service.ts"];

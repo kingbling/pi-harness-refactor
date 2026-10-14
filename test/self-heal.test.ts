@@ -9,6 +9,7 @@ import { askPendingQuirks, quirksOf, recordQuirk } from "../src/run/quirks.ts";
 import { applyParkedAnswer, requeueUnits, resubmitParkedUnits } from "../src/run/run.ts";
 import { curateAreas, currentAreas, syncTaxonomyAnswers } from "../src/run/taxonomy.ts";
 import { triageGate } from "../src/run/triage.ts";
+import { STUB_LEFT } from "../src/run/gate.ts";
 
 /**
  * Self-heal and questions: an answer does what its option says, nothing strands a unit, a crashed decision
@@ -472,6 +473,9 @@ describe("triage", () => {
 		const ag = (output: string) => ({ ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output, exitCode: 1 }], changedFiles: [] }) as never;
 		const none = await triageGate({ ledger, config, client }, "U1", ag("no production files were written"), ag("no production files were written"), 2);
 		expect(none).toMatchObject({ action: "retry" });
+		// stubs left for this unit are its own to replace: retried, never an environment cause
+		const left = `src/a.ts:3: ${STUB_LEFT}\nsrc/b.ts:9: ${STUB_LEFT}`;
+		expect(await triageGate({ ledger, config, client }, "U1", ag(left), ag(left), 2)).toMatchObject({ action: "retry", cause: "scope" });
 		const out = await triageGate({ ledger, config, client }, "U1", ag("write outside unit scope: composer.json"), ag("write outside unit scope: composer.json"), 2);
 		expect(out).toMatchObject({ action: "ask_human", cause: "env" });
 		// triage asks nobody: unit.ts lets the doctor and the setup model try first

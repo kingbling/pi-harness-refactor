@@ -3,7 +3,7 @@ import { decide, setDecisionAction } from "../jev/decide.ts";
 import { choiceOf, JEV_ACT, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { DecisionAnswer, ModelClient } from "../models/types.ts";
-import { errorSignature, findingKey, NOTHING_WRITTEN, type GateReport } from "./gate.ts";
+import { errorSignature, findingKey, NOTHING_WRITTEN, STUB_LEFT, type GateReport } from "./gate.ts";
 import { failureLines } from "./ported.ts";
 
 /**
@@ -49,9 +49,9 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		// once). Not when the problem is the implementer's own to fix: having written nothing is answered by another
 		// attempt that is told so, never by the owner.
 		const prevFailed = previous?.steps.find((s) => !s.ok);
-		const own = failed.output.split("\n").every((l) => l.trim() === NOTHING_WRITTEN);
+		const own = failed.output.split("\n").every((l) => l.trim() === NOTHING_WRITTEN || l.endsWith(STUB_LEFT));
 		if (!own && prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) return deterministic(d, unitId, "env", "ask_human", "identical anti-gaming failure twice → not the model's fault");
-		if (own) return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", `${NOTHING_WRITTEN}: the implementer is told and tries again`);
+		if (own) return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", `${failed.output.includes(STUB_LEFT) ? "stubs left for this unit" : NOTHING_WRITTEN}: the implementer is told and tries again`);
 		return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", "scope/test tampering caught by code");
 	}
 
