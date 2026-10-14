@@ -275,7 +275,7 @@ export function failingFiles(out: string, files: string[], dir: string): string[
 }
 
 /** `sha` is in the history of the checkout at `dir` (true when git cannot say: nothing to bring in then). */
-async function holds(dir: string, sha: string): Promise<boolean> {
+export async function holds(dir: string, sha: string): Promise<boolean> {
 	try {
 		await exec("git", ["-C", dir, "cat-file", "-e", `${sha}^{commit}`]);
 	} catch {
@@ -292,10 +292,10 @@ async function holds(dir: string, sha: string): Promise<boolean> {
 /**
  * Brings main's commits since the worktree was made into it, the work in it kept uncommitted on top as before: it is
  * committed, the branch rebased onto main (`to`, else the commit main's checkout `mainDir` is on), and the commit
- * undone. A clash with main leaves the worktree as it was and names the files. Nothing to bring in, or a worktree in
- * the middle of a git operation: undefined.
+ * undone. A clash with main leaves the worktree as it was and names the files and the main commit it could not take.
+ * Nothing to bring in, or a worktree in the middle of a git operation: undefined.
  */
-export async function catchUpWithMain(dir: string, mainDir: string, to?: string): Promise<{ commits: number } | { clash: string[] } | undefined> {
+export async function catchUpWithMain(dir: string, mainDir: string, to?: string): Promise<{ commits: number } | { clash: string[]; main: string } | undefined> {
 	const git = async (args: string[]) => (await exec("git", ["-C", dir, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", ...args])).trim();
 	try {
 		const sha = to ?? (await exec("git", ["-C", mainDir, "rev-parse", "HEAD"])).trim();
@@ -313,7 +313,7 @@ export async function catchUpWithMain(dir: string, mainDir: string, to?: string)
 			const clash = (await git(["diff", "--name-only", "--diff-filter=U"]).catch(() => "")).split("\n").filter(Boolean);
 			await git(["rebase", "--abort"]).catch(() => "");
 			await git(["reset", "-q", before]);
-			return { clash };
+			return { clash, main: sha };
 		}
 		if (work) await git(["reset", "-q", "HEAD~1"]);
 		return { commits };

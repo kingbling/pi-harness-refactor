@@ -859,10 +859,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (!regateOnly) attemptNo++;
 		// main moved on since the worktree was made (other units, setup fixes): its new commits come in under the
 		// unit's work before each attempt, so the attempt and its gate run on the main it will merge into
+		// a clash leaves the worktree on the older main: the session is told, so it does not take code other units merged
+		// since then for missing
+		let behindMain = "";
 		if (mainDir) {
 			const caught = await catchUpWithMain(targetProjectDir, mainDir);
 			if (caught && "commits" in caught) log(pc.dim(`  main's ${caught.commits} new commit(s) brought in under the unit's work`));
-			else if (caught) log(pc.dim(`  main's new commits clash with the unit's work in ${caught.clash.join(", ") || "some files"}: the merge resolves them`));
+			else if (caught) {
+				const files = caught.clash.join(", ") || "some files";
+				log(pc.dim(`  main's new commits clash with the unit's work in ${files}: the merge resolves them`));
+				const main = caught.main.slice(0, 12);
+				behindMain = `Main has newer commits that clash with your work in ${files}, so code other units merged since then is on main but not in your worktree (git log HEAD..${main} lists those commits, git show ${main}:<file> reads a file as main has it). Do not take that code for missing or report it as a bug: keep your change compatible with it; the merge of this unit brings it in.`;
+			}
 		}
 		// the tests as they are on disk now: the tester (it has a shell) may have renamed or removed one since they
 		// were listed; the implementer cannot write tests, so the gate still catches any change during this attempt
@@ -915,6 +923,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				fixedFindings().length ? `\n## Fixed before: keep these working (the reviewer confirmed each fix; a change that undoes one is a finding again)\n${fixedFindings().map((f) => `- ${f}`).join("\n")}` : "",
 				// every attempt reads it: each is a new session, and a later (stronger) one needs the hint as much as the first
 				o.retryNote ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
+				behindMain ? `\n## Your worktree is behind main\n${behindMain}` : "",
 			].join("\n");
 			try {
 				res = await impl.run(prompt);
