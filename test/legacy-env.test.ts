@@ -4,7 +4,10 @@ import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { SourceAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
-import { describeTruthRun, fixLegacyEnv, legacyCopyTool, legacyEnvOutage, legacyRunTool, loadLegacyEnv, MAX_LEGACY_FIXES_PER_PROBLEM, notFromOldCode, probeLegacyEnv, verifyTruthOnOld, type LegacyFixer } from "../src/run/legacy-env.ts";
+import { execFileSync } from "node:child_process";
+import { phpAdapter } from "../src/adapters/source/php.ts";
+import { Ledger } from "../src/ledger/db.ts";
+import { describeTruthRun, fixLegacyEnv, legacyCopyTool, legacyDeclaredTool, legacyEnvOutage, legacyRunTool, loadLegacyEnv, MAX_LEGACY_FIXES_PER_PROBLEM, truthBrokenKey, notFromOldCode, probeLegacyEnv, verifyTruthOnOld, type LegacyFixer } from "../src/run/legacy-env.ts";
 
 /**
  * The old code runs for truth in its own environment: when its packages are missing, the setup model makes a
@@ -250,5 +253,57 @@ describe("truth that changes from run to run", () => {
 		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: legacy, mode: "read" }));
 		writeFileSync(join(legacy, "down"), "");
 		expect(await legacyEnvOutage(root, config, source, wait)).toBe("none");
+	});
+});
+
+const hasPhp = (() => {
+	try {
+		execFileSync("php", ["-v"], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
+describe("the start-up the old code's run command loads first", () => {
+	it.skipIf(!hasPhp)("the tester sees which classes and functions it already declares, through the same run command its script runs with", async () => {
+		const { root, legacy, truthDir, config } = workspace();
+		writeFileSync(join(legacy, "boot.php"), "<?php\nclass Kernel {}\nfunction app_config() { return 1; }\n");
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: legacy, mode: "run", run: { cmd: "php", args: ["-d", "auto_prepend_file=boot.php", "{script}"] } }));
+		const tool = legacyDeclaredTool(root, config, phpAdapter, truthDir);
+		expect(tool?.name).toBe("legacy_declared");
+		const said = JSON.parse((await call(tool, { names: ["Kernel", "app_config", "Invoice"] })).content[0]!.text) as { names: Record<string, string>; loaded_files: string[] };
+		expect(said.names).toEqual({ Kernel: "class declared", app_config: "function declared", Invoice: "not declared" });
+		expect(said.loaded_files.some((f) => f.endsWith("boot.php"))).toBe(true);
+		// the check leaves nothing behind in the truth folder
+		expect(readdirSync(truthDir)).toEqual(["cases.sh"]);
+	});
+
+	it("a setup fix that breaks truth scripts that ran green before marks those units for their tester", async () => {
+		const { root, legacy, truthDir, config, source } = workspace();
+		const ledger = new Ledger(":memory:");
+		for (const id of ["U1", "U2", "U3"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		// U2 and U3 ran green before; U2's script loads what the start-up will declare itself
+		for (const id of ["U2", "U3"]) {
+			mkdirSync(join(root, ".bigrefactor", "truth", id), { recursive: true });
+			ledger.addEvidence(id, "truth_green_on_old", {});
+		}
+		writeFileSync(join(root, ".bigrefactor", "truth", "U2", "cases.sh"), "test ! -e declared || { echo 'Cannot declare class Kernel' >&2; exit 1; }\necho '[{\"symbol\":\"u2\",\"inputs\":[],\"expected\":1}]'\n");
+		writeFileSync(join(root, ".bigrefactor", "truth", "U3", "cases.sh"), "echo '[{\"symbol\":\"u3\",\"inputs\":[],\"expected\":1}]'\n");
+		writeFileSync(join(legacy, "app.sh"), "cat deps/lib.json\n");
+		// the fix for U1 makes the start-up declare more (here: a marker file in the old code's folder)
+		const fixer: LegacyFixer = async () => {
+			mkdirSync(join(legacy, "deps"), { recursive: true });
+			writeFileSync(join(legacy, "deps", "lib.json"), '[{"symbol":"u1","inputs":[],"expected":1}]');
+			writeFileSync(join(legacy, "declared"), "");
+			return "the start-up loads the framework now";
+		};
+		const lines: string[] = [];
+		expect(await fixLegacyEnv({ config, root, source, problem: "no deps", truthDir, signature: "truth: start-up", fixer, ledger, log: (l) => lines.push(l) })).toBe("the start-up loads the framework now");
+		expect(ledger.getMeta(truthBrokenKey("U2"))).toMatch(/Cannot declare class Kernel/);
+		expect(ledger.getMeta(truthBrokenKey("U3"))).toBeUndefined();
+		expect(ledger.getMeta(truthBrokenKey("U1"))).toBeUndefined();
+		expect(lines.join("\n")).toMatch(/broke 1 truth script.*U2/);
+		ledger.close();
 	});
 });

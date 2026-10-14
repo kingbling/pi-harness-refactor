@@ -236,6 +236,12 @@ export interface SourceAdapter {
 		scriptName: string;
 		run(sourceRoot: string, scriptPath: string): { cmd: string; args: string[] };
 		instructions: string;
+		/**
+		 * A script (the runtime's own source text) that prints one JSON object: for each name, whether the runtime
+		 * already has it declared before the script loads anything (a start-up file the run command loads first), and
+		 * the files already loaded. Lets the tester see what not to load or stub again. Optional.
+		 */
+		declared?(names: string[]): string;
 	};
 	/**
 	 * Where one source file belongs in the target: its legacy feature `area` (kebab-case, no dots; one area =

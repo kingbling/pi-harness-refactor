@@ -5,6 +5,7 @@ import pc from "picocolors";
 import { Type } from "typebox";
 import type { SourceAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
+import type { Ledger } from "../ledger/db.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
@@ -419,6 +420,69 @@ export function legacyRunTool(root: string, config: Config, source?: SourceAdapt
 	} as unknown as ToolDefinition;
 }
 
+/**
+ * Tester: what the old code's start-up has already declared when a truth script starts (the run command may load a
+ * start-up file first, and a setup fix can grow it). Runs the source adapter's check through the truth run command,
+ * from the unit's truth folder, so it sees exactly what the unit's script will see.
+ */
+export function legacyDeclaredTool(root: string, config: Config, source: SourceAdapter, truthDir: string): ToolDefinition | undefined {
+	const declared = source.truth.declared;
+	if (!declared) return undefined;
+	return {
+		name: "legacy_declared",
+		label: "What the old code's start-up declares",
+		description: `Before your truth script loads anything, the old code's run command may already have loaded a start-up file that declares classes, functions and constants. Give names (classes, functions, constants); this runs a check through the same run command your ${source.truth.scriptName} runs with and says, for each, whether it is already declared, plus the files already loaded. Load a legacy file or declare a stub only behind such a check, never unconditionally: a name declared twice crashes the script.`,
+		promptSnippet: "legacy_declared: which classes/functions the old code's start-up already declares before your truth script runs",
+		parameters: Type.Object({ names: Type.Array(Type.String(), { description: "class, function or constant names as the legacy code spells them" }) }),
+		execute: async (_id: string, p: { names: string[] }) => {
+			mkdirSync(truthDir, { recursive: true });
+			const script = join(truthDir, `.declared-${++runcheckSeq}.${source.truth.scriptName}`);
+			writeFileSync(script, declared(p.names));
+			try {
+				const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script, config.source.path);
+				return out((await exec(cmd, args, { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024 })).trim().slice(-8000) || "(no output)");
+			} catch (e: any) {
+				return out(`the check did not run: ${[e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-1500) || String(e?.message ?? e)}`);
+			} finally {
+				rmSync(script, { force: true });
+			}
+		},
+	} as unknown as ToolDefinition;
+}
+
+/** Ledger meta key: a unit's truth script that ran green before, crashes after a setup fix; the error, for its tester. */
+export const truthBrokenKey = (unitId: string) => `truth_broken:${unitId}`;
+
+/**
+ * After a setup fix changed the old code's environment (the start-up file grew, the run command changed), the truth
+ * scripts that ran green before are run once more: the fix may have broken them ("Cannot declare class" when the
+ * start-up now declares what a script loads itself). Units not accepted whose script now fails are marked
+ * (truthBrokenKey): their next run sends the tester in with the error instead of reusing the truth. Returns them.
+ */
+export async function rerunTruthScripts(o: { config: Config; root: string; source: SourceAdapter; ledger: Ledger; except?: string; log?: (l: string) => void }): Promise<string[]> {
+	const units = o.ledger.db
+		.prepare("SELECT DISTINCT u.id FROM units u JOIN evidence e ON e.unit_id = u.id WHERE e.type = 'truth_green_on_old' AND u.state != 'accepted' ORDER BY u.id")
+		.all() as Array<{ id: string }>;
+	const todo = units.map((u) => u.id).filter((id) => id !== o.except && existsSync(join(o.root, ".bigrefactor", "truth", id, o.source.truth.scriptName)));
+	const broken: string[] = [];
+	// a few at once: each run starts the old code's runtime (a container, maybe)
+	const worker = async () => {
+		for (let id = todo.shift(); id; id = todo.shift()) {
+			const r = await verifyTruthOnOld(join(o.root, ".bigrefactor", "truth", id), o.config, o.source, o.root);
+			if (r.ok) continue;
+			o.ledger.setMeta(truthBrokenKey(id), r.error ?? "it no longer runs green");
+			broken.push(id);
+		}
+	};
+	await Promise.all([1, 2, 3, 4].map(worker));
+	broken.sort();
+	if (broken.length) {
+		o.log?.(pc.yellow(`  the setup fix broke ${broken.length} truth script(s) that ran green before; their testers fix them on the next run: ${broken.slice(0, 10).join(", ")}${broken.length > 10 ? ", …" : ""}`));
+		appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} re-run after the fix: ${broken.length} truth script(s) no longer run green: ${broken.join(", ")}\n`);
+	}
+	return broken;
+}
+
 /** Returns the model's one-sentence account of what it changed. */
 export type LegacyFixer = (o: { config: Config; root: string; source: SourceAdapter; problem: string; script: string; probe?: boolean }) => Promise<string | void>;
 
@@ -465,7 +529,7 @@ export const MAX_LEGACY_FIXES = 10;
  * for all units (units failing meanwhile wait for the running fix). It counts only when code then runs the failed
  * script green. Returns what changed, or undefined.
  */
-export async function fixLegacyEnv(o: { config: Config; root: string; source: SourceAdapter; problem: string; truthDir: string; signature: string; fixer?: LegacyFixer }): Promise<string | undefined> {
+export async function fixLegacyEnv(o: { config: Config; root: string; source: SourceAdapter; problem: string; truthDir: string; signature: string; fixer?: LegacyFixer; ledger?: Ledger; log?: (l: string) => void }): Promise<string | undefined> {
 	if (fixing) {
 		const said = await fixing;
 		return said && (await verifyTruthOnOld(o.truthDir, o.config, o.source, o.root)).ok ? said : undefined;
@@ -477,6 +541,8 @@ export async function fixLegacyEnv(o: { config: Config; root: string; source: So
 	fixing = (async () => {
 		const said = await (o.fixer ?? fixLegacyEnvWithModel)({ config: o.config, root: o.root, source: o.source, problem: o.problem, script: join(o.truthDir, o.source.truth.scriptName) });
 		if (!(await verifyTruthOnOld(o.truthDir, o.config, o.source, o.root)).ok) return undefined;
+		// the fix changed what every truth script runs on: the ones that ran green before are run once more
+		if (o.ledger) await rerunTruthScripts({ config: o.config, root: o.root, source: o.source, ledger: o.ledger, except: basename(o.truthDir), log: o.log }).catch((e) => o.log?.(pc.yellow(`  re-running the truth scripts failed: ${e?.message ?? e}`)));
 		const what = said || "the old code's environment was set up";
 		const env = loadLegacyEnv(o.root, o.config);
 		appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} ${relative(o.root, resolve(env.root)) || env.root} ${what.replace(/\s+/g, " ")}\n`);
