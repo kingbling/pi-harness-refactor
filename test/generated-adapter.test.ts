@@ -252,6 +252,45 @@ describe("stack knowledge is checked when the adapter is written", () => {
 		expect(client.calls.length).toBe(1);
 	});
 
+	it("run start: a saved manifest without boot gets that one question; the command is tried on main's project, a failure goes back once", async () => {
+		const { execFileSync } = await import("node:child_process");
+		const { chmodSync } = await import("node:fs");
+		const { healBoot, loadManifests } = await import("../src/adapters/target/generated.ts");
+		const ws = join(here, ".sim", "heal-boot");
+		const proj = join(ws, "project");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+		mkdirSync(join(proj, "bin"), { recursive: true });
+		writeFileSync(join(proj, "bin", "console"), "#!/bin/sh\n[ \"$1\" = \"lint:container\" ] || { echo \"Command $1 is not defined.\"; exit 1; }\necho ok\n");
+		chmodSync(join(proj, "bin", "console"), 0o755);
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "init", "-q"], { cwd: proj });
+		execFileSync("git", ["add", "-A"], { cwd: proj });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], { cwd: proj });
+		const save = (over: Partial<AdapterManifest> = {}) => writeFileSync(join(ws, ".bigrefactor", "adapters", "sym-test.json"), JSON.stringify({ ...php(), ...over }));
+		save();
+		// first a wrong command, then the right one after its output
+		const answers = [{ boot: { cmd: "bin/console", args: ["about:nothing"] } }, { boot: { cmd: "bin/console", args: ["lint:container"] } }];
+		const client = new FakeModelClient({ chat: () => ({ json: answers.shift() }) });
+		expect(await healBoot(ws, { client, model: "m", dirOf: () => proj })).toEqual(["sym-test"]);
+		expect(client.calls.length).toBe(2);
+		expect(JSON.stringify((client.calls[0]!.req as { messages: unknown[] }).messages)).toContain("bin/console");
+		expect(JSON.stringify((client.calls[1]!.req as { messages: unknown[] }).messages)).toContain("Command about:nothing is not defined.");
+		expect(loadManifests(ws)[0]!.boot).toEqual({ cmd: "bin/console", args: ["lint:container"] });
+		expect(await healBoot(ws, { client, model: "m", dirOf: () => proj })).toEqual([]); // asked once
+		expect(client.calls.length).toBe(2);
+		// the same command again after it failed: the app itself does not start, the command is kept
+		save();
+		const broken = new FakeModelClient({ chat: () => ({ json: { boot: { cmd: "bin/console", args: ["cache:clear"] } } }) });
+		await healBoot(ws, { client: broken, model: "m", dirOf: () => proj });
+		expect(broken.calls.length).toBe(2);
+		expect(loadManifests(ws)[0]!.boot).toEqual({ cmd: "bin/console", args: ["cache:clear"] });
+		// the workspace already has its own boot command (the setup fixer's): not asked
+		save();
+		const own = new FakeModelClient({ chat: () => ({ json: {} }) });
+		expect(await healBoot(ws, { client: own, model: "m", dirOf: () => proj, hasOwn: () => true })).toEqual([]);
+		expect(own.calls.length).toBe(0);
+	});
+
 	it("the implementer is never told the stack needs no registration when the adapter never said so", async () => {
 		const { implementerSystemPrompt } = await import("../src/run/prompts.ts");
 		const { ConfigSchema } = await import("../src/config.ts");
