@@ -32,7 +32,10 @@ export function lanes(configPath: string, set: { lanes?: number; gates?: number 
 	if (s && s.grants) {
 		const waitS = s.waitedMs / s.grants / 1000;
 		const busy = s.heldMs / (Math.max(1, s.at - s.since) * s.limit);
-		L.push(`gate slots this run: ${Math.round(busy * 100)}% busy (${s.limit} slot(s)), a wait for one ~${waitS.toFixed(1)} s on average over ${s.grants} run(s)`);
+		// saved every few seconds while a run goes: older than a minute, the run has ended
+		const ageMin = Math.round((Date.now() - s.at) / 60_000);
+		const which = Date.now() - s.at > 60_000 ? `last run (${ageMin} min ago)` : "this run";
+		L.push(`gate slots ${which}: ${Math.round(busy * 100)}% busy (${s.limit} slot(s)), a wait for one ~${waitS.toFixed(1)} s on average over ${s.grants} run(s)`);
 		if (waitS > 10) L.push(`work waits ~${Math.round(waitS)} s for a gate slot: raise --gates before adding lanes`);
 	}
 	L.push("change: br lanes <n> [--gates <m>]  ·  in Pi: /br lanes <n> [gates <m>]");

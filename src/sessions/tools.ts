@@ -549,7 +549,7 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 			const secs = CHECK_MY_CODE_TIMEOUT_MS / 1000;
 			const files = buildFiles(dir, d.adapter, changedFiles(dir, d.adapter.toolchain.ignoredPaths));
 			const out = [`Changed files checked: ${files.length ? files.join(", ") : "none"}.`];
-			// what really ran (not skipped): a green check that ran all three on the gate's tree spares the gate those runs
+			// what really ran (not skipped): a green check on the gate's tree spares the gate the runs it holds
 			const ran: Array<"build" | "lint" | "tests"> = [];
 			// every result reaches the orchestrator: DONE after a red check gets one more turn
 			const done = (r: { ok: boolean; failed?: string; files: string[]; tests?: string[] }, timedOut?: boolean) => {

@@ -11,7 +11,7 @@ import { activeRuleFiles } from "../rules/layout.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
-import { runPortedTests } from "./ported.ts";
+import { FAIL_ON_MAIN_TOO, runPortedTests } from "./ported.ts";
 
 /**
  * The gate: deterministic, cheapest-first, stops at the first failure. Runs AFTER the implementer
@@ -50,10 +50,11 @@ export interface GateInput {
 	/** Gate pool slot for the CPU-bound commands (build, lint, rules, tests); the review never holds one. */
 	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 	/**
-	 * A green check_my_code on this same tree (no file changed since) that ran build, lint and the ported tests
-	 * `tests`: build_ok and lint_ok are taken from it, ported_tests_green too when it ran the gate's test files.
+	 * A green check_my_code on this same tree (no file changed since) that ran the ported tests `tests`: build_ok and
+	 * lint_ok are taken from it when it ran them (`ran`), ported_tests_green when it ran the gate's test files and
+	 * excused no test that fails on main too.
 	 */
-	cleanCheck?: { tests: string[]; text: string };
+	cleanCheck?: { ran: string[]; tests: string[]; text: string };
 	timeoutMs?: number;
 }
 
@@ -182,10 +183,11 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const unitFiles = buildFiles(g.targetProjectDir, g.adapter, changed);
 	const fromCheck = "from check_my_code on the same tree";
 	const scopedStep = (name: "build" | "lint") => () => {
-		if (g.cleanCheck) return Promise.resolve({ ok: true, output: fromCheck });
 		const c = scopedCheck(g.adapter, g.targetProjectDir, name, unitFiles);
 		// skipped is not a pass: it is stored as not judged, so nobody reads a 0 ms build_ok as a green build
-		return "skip" in c ? Promise.resolve({ ok: true, output: c.skip, judged: false }) : run(c.cmd, c.args, g.targetProjectDir, timeout);
+		if ("skip" in c) return Promise.resolve({ ok: true, output: c.skip, judged: false });
+		if (g.cleanCheck?.ran.includes(name)) return Promise.resolve({ ok: true, output: fromCheck });
+		return run(c.cmd, c.args, g.targetProjectDir, timeout);
 	};
 	// build, lint and 6. the stack's ast-grep rules on the changed production files: short commands, so one slot for
 	// the three instead of a wait in the queue before each
@@ -205,9 +207,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const cases = (g.ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = ?").get(g.unitId) as { n: number }).n;
 	// a unit the tester found without runtime behaviour (a pure contract, constants) has nothing to pin: no tests to run
 	const none = !cases && !g.testFiles.length ? noBehaviour(g.ledger, g.unitId) : undefined;
-	// the check ran exactly the gate's test files: its green run stands (the tree is the same)
+	// the check ran exactly the gate's test files: its green run stands (the tree is the same). Not when it excused
+	// another unit's test as red on main too: main may have been fixed since, so the gate asks main again
 	const tests = g.testFiles.map((x) => x.path);
-	const checked = !!g.cleanCheck && tests.length > 0 && [...g.cleanCheck.tests].sort().join("\0") === [...tests].sort().join("\0");
+	const checked = !!g.cleanCheck && tests.length > 0 && !g.cleanCheck.text.includes(FAIL_ON_MAIN_TOO) && [...g.cleanCheck.tests].sort().join("\0") === [...tests].sort().join("\0");
 	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : checked ? Promise.resolve({ ok: true, output: `${fromCheck}\n${clipOutput(g.cleanCheck!.text, 1000)}` }) : runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests, mainDir: g.mainDir, timeoutMs: timeout, slot: cpu }))))) return done();
 
 	// 8. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
@@ -223,11 +226,12 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 
 /**
  * The check_my_code result the gate may take build_ok, lint_ok and ported_tests_green from: green, not timed out,
- * build, lint and tests all run (none skipped), and no file changed since (`sameTree`). Never a red one.
+ * its tests run, and no file changed since (`sameTree`). Never a red one. Build and lint are taken only when it ran
+ * them (`ran`): a whole-project one is skipped by both.
  */
 export function reusableCheck(check: { ok: boolean; timedOut?: boolean; ran?: string[]; tests?: string[]; text: string } | undefined, sameTree: boolean): GateInput["cleanCheck"] {
-	if (!check?.ok || check.timedOut || !sameTree || !["build", "lint", "tests"].every((n) => check.ran?.includes(n))) return undefined;
-	return { tests: check.tests ?? [], text: check.text };
+	if (!check?.ok || check.timedOut || !sameTree || !check.ran?.includes("tests")) return undefined;
+	return { ran: check.ran, tests: check.tests ?? [], text: check.text };
 }
 
 /**

@@ -36,6 +36,11 @@ describe("gate slots", () => {
 			const out = lanes(f, {});
 			expect(out).toMatch(/gate slots this run: 50% busy \(2 slot\(s\)\), a wait for one ~40\.0 s on average over 100 run\(s\)/);
 			expect(out).toMatch(/raise --gates before adding lanes/);
+			// totals saved long ago: the run has ended, so they are the last run's
+			const old = new Ledger(join(dir, ".bigrefactor", "ledger.sqlite"));
+			old.setMeta("gate_slots", JSON.stringify({ grants: 100, waitedMs: 100 * 40_000, heldMs: 3_600_000, since: since - 600_000, at: since + 3_000_000, limit: 2 }));
+			old.close();
+			expect(lanes(f, {})).toMatch(/gate slots last run \(10 min ago\): 50% busy/);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

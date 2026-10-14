@@ -84,6 +84,9 @@ export function ownTests(ledger: Ledger, unitId: string, dir: string, tests: str
 	return own.length ? own : tests;
 }
 
+/** The note on a green run that excused other units' tests because main fails them too. */
+export const FAIL_ON_MAIN_TOO = "fail on main too, not counted against this unit";
+
 type TestRun = { ok: boolean; output: string; exitCode?: number };
 /** Neighbour test files that pass on main, per main's tree: main is run again only after it changed. */
 const greenOnMain = new Map<string, boolean>();
@@ -138,7 +141,7 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	});
 	const greenThere = others.filter((t) => green.get(t));
 	const redThere = others.filter((t) => !greenThere.includes(t));
-	const note = redThere.length ? `\nwarning: ${redThere.length} test file(s) of other units fail on main too, not counted against this unit: ${redThere.join(", ")}` : "";
+	const note = redThere.length ? `\nwarning: ${redThere.length} test file(s) of other units ${FAIL_ON_MAIN_TOO}: ${redThere.join(", ")}` : "";
 	if (!greenThere.length) return { ...mine, output: `${mine.output}${note}` };
 	const broke = await test(o.dir, greenThere);
 	if (broke.ok) return { ...mine, output: `${mine.output}${note}` };

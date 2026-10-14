@@ -9,6 +9,7 @@ import { NEST_LAYOUT } from "../src/adapters/target/ts-structure.ts";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { clipOutput, reusableCheck, runGate, type GateReport } from "../src/run/gate.ts";
+import { FAIL_ON_MAIN_TOO } from "../src/run/ported.ts";
 import { checkLayoutRules, normalize } from "../src/rules/layout-rules.ts";
 
 /**
@@ -181,14 +182,48 @@ describe("gate: order and output", () => {
 		expect((await gate({ testFiles, review, adapter: red })).failedStep).toBe("build_ok");
 	});
 
-	it("a red check, a changed tree or a skipped command is never reused", () => {
+	it("a red check, a changed tree or a check whose tests did not run is never reused", () => {
 		const green = { ok: true, ran: ["build", "lint", "tests"], tests: ["a.spec.ts"], text: "TESTS green" };
-		expect(reusableCheck(green, true)).toEqual({ tests: ["a.spec.ts"], text: "TESTS green" });
+		expect(reusableCheck(green, true)).toEqual({ ran: ["build", "lint", "tests"], tests: ["a.spec.ts"], text: "TESTS green" });
 		expect(reusableCheck({ ...green, ok: false }, true)).toBeUndefined();
 		expect(reusableCheck(green, false)).toBeUndefined();
 		expect(reusableCheck({ ...green, timedOut: true }, true)).toBeUndefined();
-		expect(reusableCheck({ ...green, ran: ["lint", "tests"] }, true)).toBeUndefined();
+		expect(reusableCheck({ ...green, ran: ["build", "lint"] }, true)).toBeUndefined();
+		// a skipped build (whole-project) still lets the tests stand
+		expect(reusableCheck({ ...green, ran: ["lint", "tests"] }, true)?.ran).toEqual(["lint", "tests"]);
 		expect(reusableCheck(undefined, true)).toBeUndefined();
+	});
+
+	it("a whole-project build stays the skip while the check's tests and lint are reused", async () => {
+		const spec = "src/features/agency/agency.service.spec.ts";
+		write(spec, "it('x', () => {});\n");
+		const testFiles = [{ path: spec, sha1: sha1(spec) }];
+		const fail = (_d: string, files: string[]) => ({ cmd: "false", args: files });
+		// build ignores the files: it checks the whole project, so neither check_my_code nor the gate runs it per unit
+		const whole = { ...adapter, build: () => ({ cmd: "false", args: [] as string[] }), lint: fail, test: fail };
+		const check = { ok: true, ran: ["lint", "tests"], tests: [spec], text: "BUILD not run per unit\nTESTS green" };
+		const review = async () => ({ ok: true, output: "fine", judged: true });
+		const r = await gate({ testFiles, review, adapter: whole, cleanCheck: reusableCheck(check, true) });
+		expect(r.ok).toBe(true);
+		expect(step(r, "build_ok")!.output).toMatch(/^whole-project build/);
+		expect(step(r, "lint_ok")!.output).toMatch(/^from check_my_code on the same tree/);
+		expect(step(r, "ported_tests_green")!.output).toMatch(/^from check_my_code on the same tree/);
+		// lint not in the check's run: the gate runs it itself (red here)
+		const noLint = await gate({ testFiles, review, adapter: whole, cleanCheck: reusableCheck({ ...check, ran: ["tests"] }, true) });
+		expect(noLint.failedStep).toBe("lint_ok");
+	});
+
+	it("a green check that excused a test red on main too is not reused for the tests", async () => {
+		const spec = "src/features/agency/agency.service.spec.ts";
+		write(spec, "it('x', () => {});\n");
+		const testFiles = [{ path: spec, sha1: sha1(spec) }];
+		const fail = (_d: string, files: string[]) => ({ cmd: "false", args: files });
+		const red = { ...adapter, build: fail, lint: fail, test: fail };
+		const text = `TESTS green (${spec}). warning: 1 test file(s) of other units ${FAIL_ON_MAIN_TOO}: src/features/agency/other.spec.ts`;
+		const review = async () => ({ ok: true, output: "fine", judged: true });
+		const r = await gate({ testFiles, review, adapter: red, cleanCheck: reusableCheck({ ok: true, ran: ["build", "lint", "tests"], tests: [spec], text }, true) });
+		expect(step(r, "build_ok")!.output).toMatch(/^from check_my_code on the same tree/);
+		expect(r.failedStep).toBe("ported_tests_green");
 	});
 
 	it("clipOutput keeps the start and the end and collapses repeated lines", () => {
