@@ -542,7 +542,9 @@ export async function changedFiles(dir: string, ignored: string[] = []): Promise
 /**
  * Tests of earlier units this unit changed or removed: test files git already tracks whose committed version does
  * not name one of this unit's truth cases (`<unit>#N`). Only their own unit's tester may change them (a reopen);
- * a test that looks wrong is reported (dispute_test, report_migrated_bug), not rewritten. Tidy-sanctioned paths pass.
+ * a test that looks wrong is disputed (dispute_test, report_migrated_bug), not silently rewritten. Lines only added
+ * (a new test, a new fixture next to the old ones) change nothing the file already proves, so they pass; so do
+ * tidy-sanctioned and disputed paths.
  */
 export async function othersTestsChanged(dir: string, unitId: string, isTestFile: (f: string) => boolean, sanctioned: string[] = []): Promise<string[]> {
 	const tracked = new Set(await trackedFiles(dir));
@@ -550,6 +552,7 @@ export async function othersTestsChanged(dir: string, unitId: string, isTestFile
 	const out: string[] = [];
 	for (const f of await changedFiles(dir)) {
 		if (!isTestFile(f) || !tracked.has(f) || sanctioned.includes(f)) continue;
+		if (existsSync(join(dir, f)) && (await onlyAdded(dir, f))) continue;
 		try {
 			if (!own.test(await exec("git", ["show", `HEAD:./${f}`], { cwd: dir, maxBuffer: 32 * 1024 * 1024 }))) out.push(f);
 		} catch {
@@ -557,6 +560,16 @@ export async function othersTestsChanged(dir: string, unitId: string, isTestFile
 		}
 	}
 	return out;
+}
+
+/** The file's change against HEAD only adds lines (none changed or removed). */
+async function onlyAdded(dir: string, f: string): Promise<boolean> {
+	try {
+		const [added, removed] = (await exec("git", ["diff", "--numstat", "HEAD", "--", f], { cwd: dir })).trim().split("\t");
+		return removed === "0" && added !== "-";
+	} catch {
+		return false;
+	}
 }
 
 /** Files git already tracks under `dir` (relative to `dir`). */

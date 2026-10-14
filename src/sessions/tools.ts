@@ -37,7 +37,7 @@ export interface ToolDeps {
 	adapter: TargetAdapter;
 	/** The unit's area module (from placement), relative to the target project; lookups rank it first. */
 	moduleDir?: string;
-	/** Implementer: a test it believes is wrong goes to the tester before the next attempt (see dispute_test). */
+	/** Implementer: a test it believes is wrong goes to the tester before the next attempt (see dispute_test). Tester: an earlier unit's test file it had to change, with evidence: the change is kept (disputeEarlierTestTool). */
 	onDispute?: (d: { test: string; why: string; evidence: string }) => void;
 	/** Implementer: a reviewer finding it believes is wrong goes back to the reviewer, who keeps it with a reason or drops it (see dispute_finding). */
 	onDisputeFinding?: (d: { finding: string; why: string; evidence: string }) => void;
@@ -398,6 +398,27 @@ export function disputeTestTool(d: ToolDeps): ToolDefinition {
 	});
 }
 
+/**
+ * Tester: an earlier unit's test that is wrong now (its fixture cannot build what this unit's code must be, it
+ * expects what the legacy code does not do) is changed in the open, with evidence, instead of being undone.
+ */
+export function disputeEarlierTestTool(d: ToolDeps): ToolDefinition {
+	return def({
+		name: "dispute_test",
+		label: "Dispute an earlier unit's test",
+		description: "An earlier unit's test file must change for this unit (not just get new tests added, which is always fine): one of its tests or fixtures is wrong, or cannot work with what the legacy code really does. Name the file and give evidence from the legacy code. Your change to that file is then kept (otherwise changed or removed lines in an earlier unit's test file are undone when you finish); the tests still have to pass at the gate.",
+		promptSnippet: "dispute_test: keep your change to an earlier unit's test file (with evidence from the legacy code)",
+		parameters: Type.Object({ test: Type.String({ description: "the earlier unit's test file, project-relative" }), why: Type.String(), evidence: Type.String({ description: "what the legacy code really does (symbol, line, value)" }) }),
+		execute: async (_id, p) => {
+			const file = p.test.trim();
+			if (!d.adapter.layout.isTestFile(file) || !existsSync(join(d.targetProjectDir, file))) return text(`${file} is not a test file in ${d.targetProjectDir}: give the project-relative path of the earlier unit's test file.`, { error: true });
+			if (!d.onDispute) return text("not available in this session", { error: true });
+			d.onDispute({ test: file, why: p.why, evidence: p.evidence });
+			return text(`recorded: your change to ${file} is kept and logged with your evidence; the gate still runs it.`);
+		},
+	});
+}
+
 export function disputeFindingTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "dispute_finding",
@@ -495,7 +516,7 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			} catch {
 				/* not a git checkout: nothing to compare */
 			}
-			for (const f of others) out.push(`${f} holds tests of earlier units; your changes to it are undone when you finish (only those ids would remain). Put back what you changed there and put this unit's tests in a new test file next to it that the layout allows.`);
+			for (const f of others) out.push(`${f} holds tests of earlier units; you changed or removed lines there, and that is undone when you finish (only those ids would remain). Adding new tests or fixtures to it is fine. If an existing test or fixture there is wrong, call dispute_test with the file and evidence from the legacy code and your change is kept; otherwise put back what you changed and put this unit's tests in a new test file next to it that the layout allows.`);
 			if (cov.files.length) {
 				// the same build and lint the gate runs, on this unit's own test files (other units' are not the tester's to fix);
 				// a whole-project one is not the tester's to fix either
@@ -653,7 +674,7 @@ export function implementerTools(d: ToolDeps): ToolDefinition[] {
 	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), patternExamples(d), docsLookup(d), truthLookup(d), ledgerProve(d), findCapabilityTool(d), proposeRuleTool(d), disputeTestTool(d), disputeFindingTool(d), reportMigratedBugTool(d), checkMyCodeTool(d)];
 }
 export function testerTools(d: ToolDeps): ToolDefinition[] {
-	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d), checkPortedTestsTool(d), noBehaviourTool(d)];
+	return [symbolLookup(d), whoCalls(d), readFunctionTool(d), sourceSymbolBody(d), targetLookup(d), sharedLookup(d), docsLookup(d), findCapabilityTool(d), recordQuirkTool(d), proposeRuleTool(d), checkPortedTestsTool(d), noBehaviourTool(d), ...(d.onDispute ? [disputeEarlierTestTool(d)] : [])];
 }
 
 function safeRead(p: string): string | undefined {

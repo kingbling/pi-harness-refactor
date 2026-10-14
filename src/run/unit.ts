@@ -217,8 +217,22 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastTesterText = "";
 	// the writes the last tester session was refused (a quarantine's red attempt carries them)
 	let lastTesterBlocked: string[] = [];
-	// earlier units' tests the implementer disputed and the tester then fixed: kept, and the gate allows them
-	const disputedOthers: string[] = [];
+	// earlier units' tests the implementer disputed and the tester then fixed, or the tester disputed itself with
+	// evidence: kept, and the gate allows them. Saved, so a restart that keeps the unit's work keeps them allowed too.
+	const disputedKey = `tests_disputed:${o.unitId}`;
+	const disputedOthers: string[] = (() => {
+		try {
+			return JSON.parse(o.ledger.getMeta(disputedKey) ?? "[]") as string[];
+		} catch {
+			return [];
+		}
+	})();
+	const allowDisputed = (files: string[]) => {
+		const add = files.filter((f) => !disputedOthers.includes(f));
+		if (!add.length) return;
+		disputedOthers.push(...add);
+		o.ledger.setMeta(disputedKey, JSON.stringify(disputedOthers));
+	};
 	const envMode: TruthMode = loadLegacyEnv(o.root, o.config).mode ?? "run";
 	let truthMode: TruthMode = envMode;
 	// the tester runs in the workspace (truth dir + the target's test folders); it is told these exact globs, absolute
@@ -274,7 +288,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
-			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onCheck: more.codeWritten ? (c) => void (testerCheck = { c, key: testsKey() }) : undefined }),
+			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onDispute: (dsp) => {
+					// an earlier unit's test the tester had to change, with its evidence: kept instead of undone
+					if (!sanctioned.includes(dsp.test)) sanctioned.push(dsp.test);
+					allowDisputed([dsp.test]);
+					log(pc.yellow(`  tester disputes an earlier unit's test, change kept: ${dsp.test}: ${dsp.why} (evidence: ${dsp.evidence})`));
+				}, onCheck: more.codeWritten ? (c) => void (testerCheck = { c, key: testsKey() }) : undefined }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => {
 				if (e.toolName === "no_behaviour_to_pin" && !e.blocked) declaredNone = true;
@@ -311,17 +330,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		cost += res.usage.cost;
 		lastTesterText = res.text;
-		// tests of earlier units prove accepted behaviour: the tester may not rewrite them (undone, and it is told)
+		// tests of earlier units prove accepted behaviour: the tester may add to them, but a changed or removed line it
+		// did not dispute with evidence is undone (and it is told)
 		const changedOthers = await othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);
 		// one the implementer disputed is kept: the tester re-checked it against the legacy code
 		const kept = changedOthers.filter(disputed);
 		if (kept.length) log(pc.yellow(`  tester fixed ${kept.length} disputed test(s) of earlier units; kept: ${kept.join(", ")}`));
-		disputedOthers.push(...kept.filter((f) => !disputedOthers.includes(f)));
+		allowDisputed(kept);
 		const others = changedOthers.filter((f) => !kept.includes(f));
 		if (others.length) {
 			await exec("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir });
 			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
-			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. If one is wrong, say which and why in your final answer.)` };
+			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. Adding new tests or fixtures to them is fine; to change or remove an existing line there, call dispute_test with the file and evidence from the legacy code first.)` };
 			lastTesterText = res.text;
 		}
 		if (overridesChanged) {
