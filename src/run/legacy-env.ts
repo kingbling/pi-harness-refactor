@@ -384,7 +384,8 @@ async function reachesTruthScripts(root: string, config: Config, source: SourceA
 	if (!existsSync(probe)) return undefined;
 	const env = run ? { ...loadLegacyEnv(root, config), run } : loadLegacyEnv(root, config);
 	if (await runError(env, source, probe, config.source.path)) return undefined; // the probe itself does not run: nothing to compare
-	const dir = join(root, ".bigrefactor", "truth", "__runcheck__");
+	// a folder per check: two checks at once must not delete each other's copy
+	const dir = join(root, ".bigrefactor", "truth", `__runcheck__${process.pid}-${runcheckSeq++}`);
 	mkdirSync(dir, { recursive: true });
 	const copy = join(dir, source.truth.scriptName);
 	cpSync(probe, copy);
@@ -395,6 +396,8 @@ async function reachesTruthScripts(root: string, config: Config, source: SourceA
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
+
+let runcheckSeq = 0;
 
 export function legacyRunTool(root: string, config: Config, source?: SourceAdapter): ToolDefinition {
 	return {

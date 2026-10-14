@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -137,7 +137,7 @@ describe("the old code's environment", () => {
 		expect((await call(tool, onlyProbe)).content[0]!.text).toMatch(/^refused: the probe runs from[\s\S]*truth folders[\s\S]*Could not open input file/);
 		expect(loadLegacyEnv(root, config).run).toBeUndefined();
 		expect((await call(tool, { cmd: "sh", args: ["{script}"], why: "plain sh" })).content[0]!.text).toMatch(/^truth scripts run with/);
-		expect(existsSync(join(root, ".bigrefactor", "truth", "__runcheck__"))).toBe(false);
+		expect(readdirSync(join(root, ".bigrefactor", "truth")).filter((n) => n.startsWith("__runcheck__"))).toEqual([]);
 	});
 
 	it("a saved run command that reaches the probe but no truth script is probed again (once per command), even with the owner's question open", async () => {
