@@ -83,6 +83,41 @@ describe("runUnit wiring", () => {
 		expect(r.attempts).toBe(2);
 	});
 
+	it("an identical anti-gaming red twice stops the tries even when the doctor says reimplement: one question, no third attempt", async () => {
+		const client = new FakeModelClient({ chat: () => ({ json: { action: "reimplement", summary: "the implementer touched the test", question: "The gate keeps refusing a test edit: what now?", options: [], recommended: "retry", opinion: "scope" } }) });
+		const gate = async (): Promise<GateReport> => failing("test file modified after hand-over: src/features/agency/agency.service.spec.ts");
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, client, log: () => {} });
+		expect(r.attempts).toBe(2);
+		expect(r.state).not.toBe("quarantined");
+		expect(ledger.openQuestions().map((q) => q.point)).toEqual(["gate_env"]);
+	});
+
+	it("build errors only in the unit's own test files go to the tester and use no try: the gate runs again on the same code", async () => {
+		const spec = join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts");
+		write(spec, "it('u1#1 creates', () => { const x: number = 'a'; });\n");
+		const roles: string[] = [];
+		const tasks: string[] = [];
+		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> =>
+			({
+				run: async (task: string) => {
+					roles.push(opts.role);
+					if (opts.role === "test") (tasks.push(task), write(spec, "it('u1#1 creates', () => { const x: number = 1; });\n"));
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const out = "$ tsc --noEmit src/features/agency/agency.service.ts src/features/agency/agency.service.spec.ts\nsrc/features/agency/agency.service.spec.ts:1:33 - error TS2322: Type 'string' is not assignable to type 'number'.";
+		let gates = 0;
+		const gate = async (g: GateInput): Promise<GateReport> => (gates++ === 0 ? { ok: false, steps: [{ name: "build_ok", ok: false, ms: 1, output: out }], changedFiles: ["src/features/agency/agency.service.ts"], failedStep: "build_ok", testFiles: g.testFiles.map((t) => t.path) } : { ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		const client = new FakeModelClient({});
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate, client, log: () => {} });
+		expect(roles.filter((x) => x !== "test")).toEqual(["implement"]);
+		expect(tasks[0]).toContain("TS2322");
+		expect(gates).toBe(2);
+		expect(r.attempts).toBe(1);
+		expect(r.gate?.ok).toBe(true);
+	});
+
 	it("the same reviewer finding after a retest goes to the stronger model, not the tester again; nobody is asked", async () => {
 		const roles: string[] = [];
 		const spawnRoles = async (opts: { role: string }): Promise<LeafSession> => (roles.push(opts.role), spawn());
@@ -463,6 +498,27 @@ describe("runUnit prompt and truth routing", () => {
 		expect(tasks[0]).toMatch(/Other tests in this area[^\n]*\n- src\/features\/agency\/other\.spec\.ts/);
 	});
 
+	it("before implementing, build errors in the unit's own tests go to the tester once the code they call is in place", async () => {
+		const dir = join(ws, "migrated");
+		const spec = join(dir, "src", "features", "agency", "agency.service.spec.ts");
+		write(spec, "it('u1#1 creates', () => { BAD });\n");
+		// a per-file build: red for a file holding BAD
+		saveCommandOverride(ws, "nestjs", "build", { cmd: "sh", args: ["-c", 'for f; do grep -q BAD "$f" && echo "$f:1:1 - error TS2304: Cannot find name BAD." && exit 1; done; exit 0', "sh", "{files}"] }, "fixture build");
+		saveCommandOverride(ws, "nestjs", "lint", { cmd: "sh", args: ["-c", "exit 0", "sh", "{files}"] }, "fixture lint");
+		const runOnce = async () => {
+			const tasks: string[] = [];
+			const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role === "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+			await runUnit({ ledger, config: { ...config, run: { ...config.run, maxImplementAttempts: 1, maxEscalateAttempts: 0 } }, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnTasks as never, legacyFixer: false, log: () => {} });
+			return tasks;
+		};
+		// the service the tests call is not written yet: a build error is the implementer's
+		expect((await runOnce()).filter((t) => t.includes("build/type check"))).toEqual([]);
+		write(join(dir, "src", "features", "agency", "agency.service.ts"), "export class AgencyService {}\n");
+		ledger.db.prepare("UPDATE units SET state = 'planned'").run();
+		const tasks = await runOnce();
+		expect(tasks[0]).toMatch(/build\/type check[\s\S]*TS2304/);
+	});
+
 	describe("read truth from when the old code could not run", () => {
 		beforeEach(() => {
 			ledger.db.prepare("DELETE FROM evidence").run();
@@ -475,6 +531,35 @@ describe("runUnit prompt and truth routing", () => {
 			roles.length = 0;
 			await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnRoles as never, gate: ok, legacyFixer: false, log: () => {} });
 			expect(roles[0]).toBe("test");
+		});
+
+		it("read again the same after the script ran red here: the new reason is recorded, so the next pass reuses it", async () => {
+			const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+			const expected = { id: 7 };
+			ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, ported_test_path, created_at) VALUES ('u1#1','u1',?,?,?,0,'src/features/agency/agency.service.spec.ts','t')").run("app/behaviour/commands/agency/create.cmd.php::create", JSON.stringify(["Acme"]), JSON.stringify(expected));
+			write(join(ws, "migrated", "src", "features", "agency", "agency.service.spec.ts"), "it('u1#1 creates', () => {});\n");
+			const tester = async (opts: { role: string }): Promise<LeafSession> =>
+				({
+					run: async (task: string) => {
+						roles.push(opts.role);
+						if (opts.role === "test") {
+							write(join(truthDir, "cases.php"), "<?php exit(1);\n"); // never runs green
+							if (task.includes("cases.json")) write(join(truthDir, "cases.json"), JSON.stringify([{ symbol: "app/behaviour/commands/agency/create.cmd.php::create", inputs: ["Acme"], expected }]));
+						}
+						return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+					},
+					dispose() {},
+				}) as unknown as LeafSession;
+			const logs: string[] = [];
+			roles.length = 0;
+			await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: tester as never, gate: ok, legacyFixer: false, log: (s: string) => logs.push(s) });
+			expect(roles[0]).toBe("test");
+			expect(logs.join("\n")).toMatch(/the same 1 cases as recorded; kept/);
+			const whys = ledger.evidenceOf("u1").filter((e) => e.type === "truth_read").map((e) => JSON.parse(e.payload).why);
+			expect(whys).toEqual(["the old code does not run here", "the script did not run green on the old code"]);
+			roles.length = 0;
+			await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: tester as never, gate: ok, legacyFixer: false, log: () => {} });
+			expect(roles).not.toContain("test");
 		});
 
 		it("is reused while it still cannot run", async () => {

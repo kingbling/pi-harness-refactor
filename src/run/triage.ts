@@ -146,7 +146,7 @@ export function sameFinding(gate: GateReport, previous: GateReport | undefined):
 }
 
 /** One path names the other: tools print paths relative to the project, the repo or absolute, so either may be the longer one. */
-function samePath(a: string, b: string): boolean {
+export function samePath(a: string, b: string): boolean {
 	const x = a.replace(/^\.\//, "");
 	const y = b.replace(/^\.\//, "");
 	return x === y || x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
