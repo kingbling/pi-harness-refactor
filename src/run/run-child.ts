@@ -12,7 +12,7 @@ import type { ChildArgs, FromChild, ToChild } from "../pi/run-process.ts";
  *   out: the progress snapshot (newest only, at most every 200 ms), a decision to ask, decisions done, done
  *   in:  stop (drain) / abort, an answer, a log line from Pi's side, hello (a reloaded Pi shows the run again)
  * When Pi goes away (IPC disconnect) the run stops as after /br stop and the process ends.
- * New plugin code (a new commit in the plugin's folder): a plain run drains and ends with `restart`, Pi starts it again.
+ * New plugin code (a higher version in the plugin's package.json): a plain run drains and ends with `restart`, Pi starts it again.
  */
 const send = (m: FromChild) => {
 	if (process.connected) process.send!(m);
@@ -106,7 +106,12 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 		if (!dry && a.hasUI)
 			asking = askOnTheSide()
 				.catch((e) => progress.log(`decision dialog failed: ${e?.message ?? e}`))
-				.finally(() => ((decisionsDone = true), send({ type: "decisions-done" })));
+				.finally(() => {
+					// ended for new code with a dialog maybe still open in Pi: the next run process says when the decisions are through
+					if (newCode !== undefined && !progress.stopping) return;
+					decisionsDone = true;
+					send({ type: "decisions-done" });
+				});
 		// Scheduler lines → panel steps: "▶ <unit>" starts one, "✓ <unit> accepted" / "■ <unit>: …" / "✗ <unit>: …" end it.
 		const log = (l: string) => {
 			progress.log(l);
@@ -121,7 +126,7 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 		// Only a plain run starts again on new plugin code: a pilot (--limit), --units, --slice or --dry is a
 		// one-off whose count or scope a second process would not know, so it keeps the code it started on.
 		const plain = !dry && !["--limit", "--units", "--slice"].some((f) => flags.includes(f));
-		if (plain) void watchNewCode();
+		if (plain) void watchNewCode(a.head);
 		// a run never dies on an error: it starts again after a pause (longer each time), until /br stop
 		// (errors in a pass are caught inside the scheduler; what reaches here happened while no unit ran)
 		let r: Awaited<ReturnType<typeof runScheduler>>;
@@ -149,15 +154,16 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 	}
 }
 
-/** Watch the plugin's commit; a new one that stayed for the quiet time drains the run for a start on the new code. */
-async function watchNewCode() {
-	const { pluginHead, waitForNewCode } = await import("./plugin-head.ts");
-	const from = await pluginHead();
-	if (!from) return; // not a git checkout: the feature is off
+/** Watch the plugin's version; a higher one that stayed for the quiet time drains the run for a start on the new code. */
+async function watchNewCode(started?: string) {
+	const { pluginVersion, waitForNewCode } = await import("./plugin-version.ts");
+	// the version Pi saw at the start: one raised while this process loaded counts as new
+	const from = started ?? (await pluginVersion());
+	if (!from) return; // no version: the feature is off
 	const to = await waitForNewCode(from, () => progress.stopping || workEnded);
 	if (!to || progress.stopping || workEnded) return;
 	newCode = to;
-	progress.log(`the plugin has new code (${from.slice(0, 7)} → ${to.slice(0, 7)}): running units finish, then the run starts again on it`);
+	progress.log(`the plugin has new code (${from} → ${to}): running units finish, then the run starts again on it`);
 	// the decision asked now stays open in Pi; its answer goes to the next run process
 	for (const done of answers.values()) done(undefined);
 	answers.clear();

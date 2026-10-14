@@ -446,12 +446,14 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 		ctx.ui.setWidget("br-progress", lines, { placement: "aboveEditor" } as any);
 	};
 	// step transitions go into the chat as they happen (one entry each; activity lines stay in the panel)
-	const posted = new Map<number, string>();
+	// keyed by the step, not its place: a run started again on new code sends a new step list
+	const posted = new Map<string, string>();
 	const postSteps = (s: ProgressSnapshot) => {
 		if (!ctx.hasUI) return;
 		s.steps.forEach((st, i) => {
-			if (posted.get(i) === st.status) return;
-			posted.set(i, st.status);
+			const key = `${st.name}\0${st.startedAt ?? i}`;
+			if (posted.get(key) === st.status) return;
+			posted.set(key, st.status);
 			// a migration run has one step per unit: only outcomes, not every start
 			if (!s.plan.length && st.status === "running") return;
 			pi.appendEntry<BrEntry>("br", { title: s.job ?? "job", text: stepEntry(st, s), colored: true });
@@ -1105,7 +1107,8 @@ export default function (pi: ExtensionAPI) {
 		if (!runJobEnded) return;
 		const { detachRunProcess } = await import("./run-process.ts");
 		detachRunProcess();
-		await runJobEnded;
+		// a run job still loading its run process has nothing to let go of yet: never hold Pi's reload for long
+		await Promise.race([runJobEnded, new Promise((r) => setTimeout(r, 5000).unref())]);
 	});
 
 	// Keep the ledger in view: a one-line footer status, refreshed when a session starts.

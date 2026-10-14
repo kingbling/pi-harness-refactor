@@ -218,19 +218,16 @@ describe("migration run in its own process", () => {
  */
 describe("a run that outlives plugin changes", () => {
 	const repo = join(here, ".sim", "plugin-head");
-	const commit = (msg: string) => {
-		writeFileSync(join(repo, "f.txt"), msg);
-		execFileSync("git", ["add", "."], { cwd: repo });
-		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", msg], { cwd: repo });
-	};
+	// a new plugin version: what starts the run again (commits that keep the version change nothing)
+	let patch = 0;
+	const commit = (_why: string) => writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "p", version: `0.1.${++patch}` }));
 	const pids = () => [...new Set(progress.snapshot().activity.flatMap((l) => /fake run process pid (\d+)/.exec(l)?.[1] ?? []))];
 	const has = (s: string) => progress.snapshot().activity.some((l) => l.includes(s));
-	const env = { BR_RUN_CHILD_SCHEDULER: fake, BR_PLUGIN_HEAD_DIR: repo, BR_NEW_CODE_CHECK_MS: "100", BR_NEW_CODE_QUIET_MS: "300" };
+	const env = { BR_RUN_CHILD_SCHEDULER: fake, BR_PLUGIN_DIR: repo, BR_NEW_CODE_CHECK_MS: "100", BR_NEW_CODE_QUIET_MS: "300" };
 	beforeAll(async () => {
 		await makeWorkspace(ws);
 		rmSync(repo, { recursive: true, force: true });
 		mkdirSync(repo, { recursive: true });
-		execFileSync("git", ["init", "-q"], { cwd: repo });
 		commit("one");
 	}, 60_000);
 	beforeEach(() => Object.assign(process.env, env));
@@ -242,7 +239,7 @@ describe("a run that outlives plugin changes", () => {
 		if (progress.running) progress.end();
 	});
 
-	it("a new plugin commit drains the run process and starts a new one; a stop during that drain cancels the restart", async () => {
+	it("a higher plugin version drains the run process and starts a new one; a stop during that drain cancels the restart", async () => {
 		process.env["BR_FAKE_DRAIN_MS"] = "1500";
 		progress.begin("migration run");
 		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
@@ -268,7 +265,54 @@ describe("a run that outlives plugin changes", () => {
 		progress.end();
 	}, 60_000);
 
-	it("a run process started again that fails at start waits for the next commit, then starts again", async () => {
+	it("a decision dialog open across a restart: answered during the drain, the new run process applies it once; the question cards wait for it", async () => {
+		const ws4 = join(here, ".sim", "run-process-restart-dialog");
+		await makeWorkspace(ws4);
+		process.env["BR_WORKSPACE"] = ws;
+		process.env["BR_FAKE_DRAIN_MS"] = "1500";
+		progress.begin("migration run");
+		const asked: Ask[] = [];
+		let answerFirst: ((v: string | undefined) => void) | undefined;
+		let decisionsDone = 0;
+		const run = runInChild(
+			{ cwd: ws4, flags: [], hasUI: true, job: "migration run" },
+			{
+				ask: (q) => (asked.push(q), asked.length === 1 ? new Promise((r) => (answerFirst = r)) : Promise.resolve(q.recommended ?? q.options[0]!.value)),
+				decisionsDone: () => decisionsDone++,
+			},
+		);
+		await until("the first dialog", () => answerFirst !== undefined && pids().length === 1);
+		const first = asked[0]!;
+		commit("dialog");
+		await until("the new code line", () => has("the plugin has new code"));
+		// answered while the first run process drains: it must not be lost
+		answerFirst!(first.recommended ?? first.options[0]!.value);
+		await until("the second run process", () => pids().length === 2, 30_000);
+		await until("the decision applied", () => has(`decided ${first.id} = `));
+		await until("the decisions through", () => decisionsDone > 0);
+		expect(progress.snapshot().activity.filter((l) => l.startsWith(`decided ${first.id} = `))).toHaveLength(1);
+		// one dialog for it, and the cards started once, after it
+		expect(asked.filter((q) => q.id === first.id)).toHaveLength(1);
+		expect(decisionsDone).toBe(1);
+		await progress.stop("drain");
+		const out = await run;
+		expect(out.error).toBeUndefined();
+		progress.end();
+	}, 60_000);
+
+	it("only a higher plugin version counts as new code", async () => {
+		const { pluginVersion, higher } = await import("../src/run/plugin-version.ts");
+		expect(await pluginVersion()).toMatch(/^\d+\.\d+/);
+		expect(higher("0.1.10", "0.1.9")).toBe(true);
+		expect(higher("0.2.0", "0.1.9")).toBe(true);
+		expect(higher("0.1.0", "0.1.0")).toBe(false);
+		expect(higher("0.1.0", "0.1.1")).toBe(false);
+		// no package.json: the feature is off
+		process.env["BR_PLUGIN_DIR"] = join(repo, "nothing-here");
+		expect(await pluginVersion()).toBeUndefined();
+	});
+
+	it("a run process started again that fails at start waits for the next higher version, then starts again", async () => {
 		const marker = join(repo, "..", "plugin-broken");
 		process.env["BR_FAKE_FAIL_IF"] = marker;
 		rmSync(marker, { force: true });
@@ -280,7 +324,7 @@ describe("a run that outlives plugin changes", () => {
 		commit("broken");
 		await until("the failed start", () => has("the run on the new code failed at start"), 30_000);
 		expect(progress.running).toBe(true);
-		expect(progress.snapshot().waiting?.what).toMatch(/next plugin commit/);
+		expect(progress.snapshot().waiting?.what).toMatch(/next higher plugin version/);
 		// the fix lands
 		rmSync(marker);
 		commit("fixed");
