@@ -489,6 +489,10 @@ describe("runUnit wiring", () => {
 			expect(reviewIn!.writeGlobs).toEqual(["src/features/agency/**"]);
 			expect(r.attempts).toBe(1);
 			expect(fixerSaw[0]).toContain("autoload map does not cover src/Agency");
+			// a file the unit may write is the unit's: the setup model on main (without the unit's code) leaves it alone
+			expect(fixerSaw[0]).toMatch(/may write only src\/features\/agency\/\*\*[\s\S]*A file on that list is the unit's to change[^\n]*: change nothing there/);
+			// the retry option does not invite a hint that "authorizes" a file outside the list
+			expect(ledger.openQuestions()[0]!.options).toContain("A hint never lets the unit write a file outside its list");
 			const qs = ledger.db.prepare("SELECT point, status, question FROM questions WHERE unit_id = 'u1'").all() as Array<{ point: string; status: string; question: string }>;
 			expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "open"]]);
 			expect(qs[0]!.question).toContain("autoload map does not cover src/Agency");
@@ -527,6 +531,9 @@ describe("runUnit wiring", () => {
 			expect(r.attempts).toBe(1);
 			expect(ledger.openQuestions()).toEqual([]);
 			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.diagnosis.summary).toMatch(/setup was fixed \(added the autoload mapping\)/);
+			// the scheduler keeps its code: it goes on from it on the fixed main instead of starting over
+			const { keepsCode } = await import("../src/run/run.ts");
+			expect(keepsCode(ledger, "u1")).toBe(true);
 		});
 	});
 });

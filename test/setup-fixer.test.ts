@@ -414,3 +414,71 @@ describe("setup fixes during the run: one stack's fix stays in its own project",
 		expect(existsSync(join(target, "api", "app.en.yaml"))).toBe(false);
 	});
 });
+
+describe("setup fixes during the run: main stays mergeable and startable", () => {
+	it("the merge lock is held while the model edits main, not only for the commit", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { root, target, adapter, config } = stack({ id: "lockall" } as never);
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
+		let held = false;
+		let lockCalls = 0;
+		const lock = async <T>(fn: () => Promise<T>) => {
+			lockCalls++;
+			held = true;
+			try {
+				return await fn();
+			} finally {
+				held = false;
+			}
+		};
+		const editedUnderLock: boolean[] = [];
+		const fixer: SetupFixer = async (o) => {
+			editedUnderLock.push(held);
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
+			return "added the vitest config";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "vitest: no config", fixer, lock })).toBe("added the vitest config");
+		expect(editedUnderLock).toEqual([true]);
+		expect(lockCalls).toBe(1);
+	});
+
+	it("a fix after which the app's start-up check fails (it passed before) is put back whole", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { execFileSync } = await import("node:child_process");
+		// the start-up check: fails when the wiring names a class that is not there
+		const boot = () => ({ cmd: "sh", args: ["-c", "if grep -q Missing services.yaml; then echo 'class Missing does not exist' >&2; exit 1; fi"] });
+		const { root, target, adapter, config } = stack({ id: "bootguard", boot } as never);
+		writeFileSync(join(target, "services.yaml"), "services: {}\n");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
+		const ledger = new Ledger(":memory:");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "services.yaml"), "services: { Missing: ~ }\n");
+			return "wired Missing (boot still fails: the class is missing from this checkout)";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "wire Missing", fixer, ledger })).toBeUndefined();
+		expect(execFileSync("git", ["-C", target, "log", "-1", "--format=%s"], { encoding: "utf8" }).trim()).toBe("init");
+		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+		const row = ledger.db.prepare("SELECT outcome, gate_report FROM attempts").get() as { outcome: string; gate_report: string };
+		expect(row.outcome).toBe("boot_broken");
+		expect(row.gate_report).toMatch(/class Missing does not exist/);
+	});
+
+	it("a start-up check that already failed before the fix does not hold the fix back", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const boot = () => ({ cmd: "sh", args: ["-c", "exit 1"] });
+		const { root, target, adapter, config } = stack({ id: "bootred", boot } as never);
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
+		const fixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
+			return "added the vitest config";
+		};
+		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "vitest: no config", fixer })).toBe("added the vitest config");
+	});
+});

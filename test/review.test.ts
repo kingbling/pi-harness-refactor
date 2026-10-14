@@ -98,6 +98,8 @@ describe("wired_ok: the reviewer model", () => {
 		expect(task).toMatch(/Can the new code be reached the way these callers reached the old code\? A caller whose unit is not accepted yet[^\n]*\n- app\/Factory\.php::Factory \(new, unit U30 planned\)\n- app\/registry\.php names "Campaign"/);
 		expect(task).toContain("- acme/mail: replace → symfony/mailer");
 		expect(system).toMatch(/goes in outOfScope, never in findings/);
+		// a config file on the implementer's list (services.yaml) is its own: a finding, not a setup fix on main
+		expect(system).toMatch(/A file the implementer may write \(the list in the facts below\) is the implementer's even when it is config[^\n]*a finding, never outOfScope/);
 		expect(r).toMatchObject({ ok: false, judged: true, outOfScope: "- the manifest does not map the Campaign namespace → add the mapping" });
 	});
 

@@ -814,7 +814,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const setupFixer = !setup || o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 		let setupTried = "";
 		if (setupFixer) {
-			const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature, problem: `The reviewer of unit ${o.unitId} (code in ${moduleDir}/) found what must change outside the unit's files; the unit's implementer may write only ${writeGlobs.join(", ")}. Fix it in the project setup if it belongs there, not in the unit's code:\n${problem}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
+			const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature, problem: `The reviewer of unit ${o.unitId} (code in ${moduleDir}/) found what must change outside the unit's files; the unit's implementer may write only ${writeGlobs.join(", ")}. Fix it in the project setup if it belongs there, not in the unit's code. A file on that list is the unit's to change (it may name code only the unit's worktree has): change nothing there.\n${problem}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 			if (fixed) {
 				o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: problem.slice(0, 500) } } } });
 				log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
@@ -827,7 +827,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			sameAs: signature,
 			facts: `The reviewer of ${o.unitId} says something must change outside the unit's files (the implementer may write only ${writeGlobs.join(", ")}), so another attempt cannot fix it.${setupTried}\n${problem.slice(0, 1500)}`,
 			options: [
-				{ value: "retry", facts: "I changed it (or it is not needed — say so in a hint): run the unit again" },
+				{ value: "retry", facts: "it was changed on main, or it is not needed (say why in a hint): run the unit again. A hint never lets the unit write a file outside its list" },
 				{ value: "leave", facts: "leave the unit parked" },
 			],
 			context: { failedStep: "wired_ok", outOfScope: problem.slice(0, 1500) },
@@ -1219,7 +1219,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				if (setupFixer && gate.failedStep !== "antigaming_ok" && (dx.action === "fix" || triage.cause === "env")) {
 					const fixed = await fixRunSetup({ config: o.config, root: o.root, adapter, projectDir: projectDir(o.config, stackId), fixer: setupFixer, ledger: o.ledger, lock: o.mergeLock, unitId: o.unitId, signature: errorSignature(gate.failedStep ?? "", failedOut), problem: `Gate step ${gate.failedStep} failed for unit ${o.unitId} (code in ${moduleDir}/). Diagnosis: ${dx.summary}${dx.command ? ` (suggested: ${dx.command})` : ""}. Fix the project setup, not the unit's code.\nThe unit works in its own git worktree (${targetProjectDir}); these dependency dirs are linked into it from the main project: ${linkedDirs(adapter, o.root).join(", ") || "none"}. Tools that resolve real paths (autoloaders, module resolution) then see the main project's code, not the worktree's: set_worktree_copy gives every later worktree a copy instead.\nGate output tail:\n${failedOut.slice(-3000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 					if (fixed) {
-						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree)
+						// parked without a question: the scheduler resubmits it on the fixed main (fresh worktree, its code kept and put back on top)
 						o.ledger.updateUnit(o.unitId, { meta: { parked: { diagnosis: { summary: `the project setup was fixed (${fixed})`, note: dx.summary } } } });
 						log(pc.cyan(`  setup fixed by the model: ${fixed} — the unit runs again`));
 						return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, triage, costUsd: cost };
