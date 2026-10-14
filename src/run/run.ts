@@ -140,8 +140,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	};
 
 	{
+		// a run that never got to its end (Pi closed, the run process killed) is written down from the ledger now
+		const lost = o.dry ? undefined : recordLostRun(ledger, o.root);
 		const prev = lastRun(ledger);
-		if (prev?.outcome === "stopped" && !o.dry) log(pc.dim(renderLastRun(prev)));
+		if ((prev?.outcome === "stopped" || lost) && !o.dry) log(pc.dim(renderLastRun(prev!)));
 	}
 
 	// ---- the project must match the stack choices (a mismatch fails every unit's gate the same way)
@@ -465,6 +467,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	let cost = 0;
 	let stop = false;
 	const startedAt = new Date().toISOString();
+	if (!o.dry) ledger.setMeta(OPEN_RUN, JSON.stringify({ startedAt }));
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
 	setStep("removing leftover worktrees");
@@ -483,6 +486,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		if (stopRecord) return;
 		stop = true;
 		stopRecord = { at: new Date().toISOString(), reason, finishing: [...running.keys()] };
+		if (!o.dry) ledger.setMeta(OPEN_RUN, JSON.stringify({ startedAt, stop: stopRecord }));
 		// the builder starts nothing new from now on (no check, repair or code job while the lanes finish); its running
 		// check is killed, a running repair or code job finishes; the run's end waits for it
 		void builder.stop().catch(() => undefined);
@@ -1146,6 +1150,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	cost = Math.max(cost, progress.tally().costUsd - usageAtStart.costUsd);
 	log(`\nrun ${stopRecord ? "stopped" : "finished"}: ${acceptedNow} accepted, ${quarantined} quarantined, ${waiting} still planned${ledger.ownDecisions(startedAt).length ? `, ${ledger.ownDecisions(startedAt).length} routine question(s) decided from your goals` : ""}${ledger.openQuestions().length ? `, ${ledger.openQuestions().length} question(s) open → br questions` : ""}, $${cost.toFixed(3)}`);
 	if (!o.dry) log(pc.dim(renderForecastLine(forecast(ledger))));
+	if (!o.dry) ledger.setMeta(OPEN_RUN, "");
 	if (!o.dry) writeRunRecord(ledger, o.root, { startedAt, endedAt: new Date().toISOString(), outcome: stopRecord ? "stopped" : "finished", stop: stopRecord ? { ...stopRecord, lanes } : undefined, accepted: acceptedNow, quarantined, planned: waiting, openQuestions: ledger.openQuestions().length, costUsd: Number(cost.toFixed(4)), units: ran.map((r) => ({ unit: r.unitId, state: r.state })) });
 	return { ran, accepted: acceptedNow, quarantined, waiting, costUsd: cost };
 }
@@ -1909,7 +1914,8 @@ export function applyParkedAnswer(answer: string | undefined, options: string[])
 export interface RunRecord {
 	startedAt: string;
 	endedAt: string;
-	outcome: "finished" | "stopped";
+	/** "ended": the run never reached its end (Pi closed, the process killed); written by the next run from the ledger */
+	outcome: "finished" | "stopped" | "ended";
 	stop?: { at: string; reason: string; finishing: string[]; lanes: Array<{ unit: string; state: string }> };
 	accepted: number;
 	quarantined: number;
@@ -1930,6 +1936,45 @@ export function writeRunRecord(ledger: Ledger, root: string, r: RunRecord): void
 	ledger.setMeta("last_run", JSON.stringify(r));
 }
 
+/** Ledger meta of the run going on: its start and, once asked, its stop. Cleared when its record is written. */
+const OPEN_RUN = "open_run";
+
+/**
+ * A run that started but wrote no record (Pi closed, the run process killed): its record from the ledger, with the
+ * time of its last write as its end. Returns it, or undefined when the last run ended normally.
+ */
+export function recordLostRun(ledger: Ledger, root: string): RunRecord | undefined {
+	const m = ledger.getMeta(OPEN_RUN);
+	if (!m) return undefined;
+	ledger.setMeta(OPEN_RUN, "");
+	let open: { startedAt: string; stop?: { at: string; reason: string; finishing: string[] } };
+	try {
+		open = JSON.parse(m);
+	} catch {
+		return undefined;
+	}
+	const since = open.startedAt;
+	const one = <T>(sql: string, ...a: string[]) => ledger.db.prepare(sql).get(...a) as T;
+	const last = one<{ t: string | null }>("SELECT MAX(t) t FROM (SELECT MAX(created_at) t FROM transitions WHERE created_at >= ? UNION ALL SELECT MAX(COALESCE(ended_at, started_at)) FROM attempts WHERE started_at >= ?)", since, since).t;
+	const into = (state: string) => one<{ n: number }>("SELECT COUNT(DISTINCT entity_id) n FROM transitions WHERE entity = 'unit' AND to_state = ? AND created_at >= ?", state, since).n;
+	const stateOf = (id: string) => ledger.getUnit(id)?.state ?? "?";
+	const units = (ledger.db.prepare("SELECT DISTINCT unit_id FROM attempts WHERE unit_id IS NOT NULL AND started_at >= ?").all(since) as Array<{ unit_id: string }>).map((r) => ({ unit: r.unit_id, state: stateOf(r.unit_id) }));
+	const r: RunRecord = {
+		startedAt: since,
+		endedAt: last ?? since,
+		outcome: "ended",
+		stop: open.stop ? { ...open.stop, lanes: open.stop.finishing.map((id) => ({ unit: id, state: stateOf(id) })) } : undefined,
+		accepted: into("accepted"),
+		quarantined: into("quarantined"),
+		planned: ledger.listUnits({ state: "planned" }).length,
+		openQuestions: ledger.openQuestions().length,
+		costUsd: Number(one<{ c: number }>("SELECT COALESCE(SUM(cost_usd), 0) c FROM attempts WHERE started_at >= ?", since).c.toFixed(4)),
+		units,
+	};
+	writeRunRecord(ledger, root, r);
+	return r;
+}
+
 export function lastRun(ledger: Ledger): RunRecord | undefined {
 	const m = ledger.getMeta("last_run");
 	return m ? (JSON.parse(m) as RunRecord) : undefined;
@@ -1937,6 +1982,7 @@ export function lastRun(ledger: Ledger): RunRecord | undefined {
 
 export function renderLastRun(r: RunRecord): string {
 	const when = r.endedAt.slice(0, 16).replace("T", " ");
+	if (r.outcome === "ended") return `last run ended ${when} without finishing (Pi closed or the run process stopped)${r.stop ? `, after ${r.stop.reason}` : ""}: ${r.accepted} accepted, ${r.quarantined} quarantined, ${r.planned} still planned — /br run continues`;
 	if (r.outcome === "stopped" && r.stop) return `last run stopped ${when} (${r.stop.reason}); finished lanes: ${r.stop.lanes.map((l) => `${l.unit} → ${l.state}`).join(", ") || "none"} · ${r.accepted} accepted · ${r.planned} still planned — /br run continues`;
 	return `last run finished ${when}: ${r.accepted} accepted, ${r.quarantined} quarantined, ${r.planned} still planned`;
 }
