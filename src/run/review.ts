@@ -12,6 +12,7 @@ import { noBehaviour } from "./gate.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { behaviourPolicy, choicesText } from "./prompts.ts";
 import { quirksOf } from "./quirks.ts";
+import { samePath } from "./triage.ts";
 import { docsLookup, fileAliases, readFunctionTool, sourceSymbolBody, targetLookup, unitOfLegacy, unitState, whoCalls } from "../sessions/tools.ts";
 import { unitFacts } from "../sessions/taskcard.ts";
 
@@ -45,8 +46,10 @@ export interface ReviewInput {
 	ownerNote?: string;
 	/** The ported tests already passed before the implementer wrote any code (and still did after one retest). */
 	greenBefore?: string;
-	/** The ported tests (the tester's): weak ones go back to the tester, not the implementer. */
+	/** The unit's own ported tests (the tester's): weak ones go back to the tester, not the implementer. */
 	testFiles?: string[];
+	/** The area's other ported tests (other units'): listed by path only, never judged here; a weak-tests entry on one is dropped. */
+	otherTests?: string[];
 	/** The unit's code findings still open from its earlier reviews (kept in unit meta across attempts and runs). */
 	openFindings?: string[];
 	/** The implementer's final message of its last session (its claims, to check against the code). */
@@ -112,10 +115,16 @@ Judge only what this unit added or changed, against the facts below: the behavio
 		}
 		if (!verdict) return { ok: false, judged: false, costUsd: r.usage.cost, output: `not judged: the reviewer ended without a verdict${r.error ? ` (${r.error})` : ""}` };
 		const v = verdict as Verdict;
-		const weakTests = v.weakTests?.length ? v.weakTests.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
+		// other units' tests are not this unit's to fix: a weak-tests entry on one (and on none of the unit's own) is dropped;
+		// only those: the verdict is then fine. A unit with no own tests keeps every entry (weak there means nothing is pinned)
+		const ownTests = o.testFiles ?? [];
+		const isOther = (f: string) => o.otherTests?.some((p) => samePath(f, p)) && !ownTests.some((p) => samePath(f, p));
+		const weak = ownTests.length ? (v.weakTests ?? []).filter((t) => !isOther(t.file)) : (v.weakTests ?? []);
+		const othersOnly = !!v.weakTests?.length && !weak.length;
+		const weakTests = weak.length ? weak.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
 		const outOfScope = v.outOfScope?.length ? v.outOfScope.map((f) => `- ${f.problem} → ${f.fix}`).join("\n") : undefined;
 		const outOfScopeSetup = !!v.outOfScope?.some((f) => f.setup);
-		const ok = v.ok && !v.findings.length && !weakTests && !outOfScope;
+		const ok = (v.ok || othersOnly) && !v.findings.length && !weakTests && !outOfScope;
 		const findings = v.findings.map((f) => `- ${f.file}${f.line ? `:${f.line}` : ""}: ${f.problem} → ${f.fix}`);
 		const out = [
 			findings.length ? `reviewer findings:\n${findings.join("\n")}` : "",
@@ -147,7 +156,8 @@ function facts(o: ReviewInput): string {
 	return [
 		`Unit ${o.unitId}${unit ? ` (${unitFacts(o.ledger, unit, o.config.source.path).join("; ") || "no facts"})` : ""}, area module ${o.moduleDir}/ in ${o.adapter.id}.`,
 		`Legacy files: ${o.legacyFiles.join(", ") || "none"}`,
-		`Ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
+		`This unit's ported tests (the tester's): ${o.testFiles?.join(", ") || "none"}`,
+		...(o.otherTests?.length ? [`Other units' tests in the area (not yours to judge, never in weakTests): ${o.otherTests.join(", ")}`] : []),
 		...(o.writeGlobs?.length ? [`The implementer may write only: ${o.writeGlobs.join(", ")}. A fix anywhere else is an outOfScope item, not a finding.`] : []),
 		...(o.greenBefore ? [o.greenBefore] : []),
 		...(o.openFindings?.length ? [`\nYour earlier reviews of this unit found these, still open as far as the ledger knows. Check each against the code now: a fixed one goes in fixed, one still open goes in findings again (with any new ones), so findings is the whole open list. Raise a new one only when it is a real blocker, not a change of mind:\n${o.openFindings.join("\n")}`] : []),
