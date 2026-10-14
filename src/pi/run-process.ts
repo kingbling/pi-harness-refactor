@@ -5,6 +5,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { PromptOption } from "../init/init.ts";
 import { progress, type ProgressSnapshot } from "../progress.ts";
 
+/** How long an aborted run process gets to end before it is killed. */
+export const ABORT_KILL_MS = 60_000;
+
 /** What Pi hands the run process (src/run/run-child.ts). */
 export interface ChildArgs {
 	cwd: string;
@@ -33,7 +36,7 @@ export type ToChild = { type: "stop" } | { type: "abort" } | { type: "log"; line
  * this process's `progress` (the panel and footer read it unchanged), /br stop reaches the child, its decisions come
  * here as dialogs (`ask`). Resolves at the child's `done` (or its exit: an exit without `done` is an error). `progress.begin` comes first.
  */
-export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<string | undefined>; decisionsDone?: () => void } = {}): Promise<{ error?: string; lines?: string[] }> {
+export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<string | undefined>; decisionsDone?: () => void; abortKillMs?: number } = {}): Promise<{ error?: string; lines?: string[] }> {
 	const entry = fileURLToPath(new URL("../run/run-child.ts", import.meta.url));
 	// the package has no build step: the child loads its .ts through tsx, like bin/br.js does
 	const tsx = pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href;
@@ -54,9 +57,19 @@ export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<strin
 		progress.follow(undefined);
 		resolveRun(out);
 	};
-	progress.follow({ stop: (mode) => send({ type: mode === "drain" ? "stop" : "abort" }), log: (line) => send({ type: "log", line }) });
+	// an abort the child does not finish within a minute (a tool that never returns): the whole run process goes
+	let killTimer: NodeJS.Timeout | undefined;
+	const abort = () => {
+		send({ type: "abort" });
+		killTimer ??= setTimeout(() => {
+			progress.log("the run process did not end within a minute of the abort: killed");
+			child.kill("SIGKILL");
+		}, o.abortKillMs ?? ABORT_KILL_MS);
+		killTimer.unref();
+	};
+	progress.follow({ stop: (mode) => (mode === "drain" ? send({ type: "stop" }) : abort()), log: (line) => send({ type: "log", line }) });
 	// a /br stop that came while the child was being started
-	if (progress.stopping) send({ type: progress.aborting ? "abort" : "stop" });
+	if (progress.stopping) progress.aborting ? abort() : send({ type: "stop" });
 	child.on("message", (m: FromChild) => {
 		if (m.type === "progress") {
 			if (!over) progress.mirror(m.snap);
@@ -77,6 +90,6 @@ export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<strin
 	};
 	// a child that could not start has no exit to wait for
 	child.on("error", (e) => child.pid === undefined && gone(e.message));
-	child.on("exit", (code, signal) => gone(signal ? `signal ${signal}` : `exit code ${code}`));
+	child.on("exit", (code, signal) => (clearTimeout(killTimer), gone(signal ? `signal ${signal}` : `exit code ${code}`)));
 	return ended;
 }

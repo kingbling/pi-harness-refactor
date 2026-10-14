@@ -55,6 +55,7 @@ describe("migration run in its own process", () => {
 	afterEach(() => {
 		delete process.env["BR_RUN_CHILD_SCHEDULER"];
 		delete process.env["BR_FAKE_CRASH"];
+		delete process.env["BR_FAKE_HANG"];
 		if (progress.running) progress.end();
 	});
 
@@ -152,6 +153,20 @@ describe("migration run in its own process", () => {
 		progress.begin("migration run");
 		const out = await runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
 		expect(out.error).toMatch(/run process ended unexpectedly \(exit code 3\)/);
+		progress.end(out.error);
+	}, 60_000);
+
+	it("an aborted run process that does not end is killed", async () => {
+		process.env["BR_RUN_CHILD_SCHEDULER"] = fake;
+		process.env["BR_FAKE_HANG"] = "1";
+		progress.begin("migration run");
+		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" }, { abortKillMs: 500 });
+		await until("the unit step", () => progress.snapshot().steps.some((s) => s.name === "U1_fake"));
+		await progress.stop("drain");
+		await progress.stop("drain"); // the second stop aborts
+		const out = await run;
+		expect(out.error).toMatch(/run process ended unexpectedly \(signal SIGKILL\)/);
+		expect(progress.snapshot().activity.some((l) => l.includes("killed"))).toBe(true);
 		progress.end(out.error);
 	}, 60_000);
 
