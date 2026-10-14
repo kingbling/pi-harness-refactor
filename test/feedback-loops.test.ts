@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -272,6 +273,54 @@ describe("models fix each other's work", () => {
 		expect(roles.filter((x) => x !== "test")).toEqual(["implement", "implement"]);
 		expect(r).toMatchObject({ state: "review", attempts: 2 });
 		expect(ledger.db.prepare("SELECT role FROM attempts WHERE unit_id = 'u1' AND role NOT IN ('review', 'test') ORDER BY id").all()).toEqual([{ role: "implement" }, { role: "gate" }, { role: "gate" }, { role: "implement" }, { role: "gate" }]);
+	});
+
+	it("weak tests only after the tester rounds: triage's retry or escalation goes to the tester, never to an implementer with nothing to fix", async () => {
+		rmSync(join(ws, "migrated", SPEC));
+		ledger.db.prepare("DELETE FROM truth_cases").run();
+		ledger.addEvidence("u1", "truth_none", { reason: "only constants" });
+		const roles: string[] = [];
+		let retests = 0;
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => {
+					roles.push(opts.role);
+					if (opts.role === "test") write(join(ws, "migrated", SPEC), `it('pins the fee ${++retests}', () => {});\n`);
+					return { text: opts.role === "test" ? "TESTER DONE 0 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		let reviews = 0;
+		const reviewer = async () => {
+			const weak = `- src/features/agency/weak${++reviews}.spec.ts: nothing pins the fee`;
+			return { ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] };
+		};
+		let gates = 0;
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			if (++gates >= 5) return green(g);
+			return red(g, "wired_ok", (await g.review!([])).output);
+		};
+		// the decision model blames the code: its playbook says retry (then escalate)
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "impl_bug" } : undefined) });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, client, log: () => {} });
+		expect(roles.filter((x) => x !== "test")).toEqual(["implement", "implement"]);
+		expect(roles.filter((x) => x === "test").length).toBeGreaterThanOrEqual(4);
+		expect(r).toMatchObject({ state: "review", attempts: 2 });
+	});
+
+	it("the reviewer judges only the unit's own tests; the area's others it gets by path only", async () => {
+		const OTHER = "src/features/agency/other.service.spec.ts";
+		write(join(ws, "migrated", OTHER), "it('u9#1 lists', () => {});\n");
+		const git = (...a: string[]) => execFileSync("git", a, { cwd: join(ws, "migrated"), stdio: "pipe" });
+		git("init", "-q");
+		git("add", "-A");
+		git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+		ledger.db.prepare("UPDATE truth_cases SET ported_test_path = ? WHERE id = 'u1#1'").run(SPEC);
+		const seen: Array<{ testFiles?: string[]; otherTests?: string[] }> = [];
+		const reviewer = async (i: { testFiles?: string[]; otherTests?: string[] }) => (seen.push({ testFiles: i.testFiles, otherTests: i.otherTests }), { ok: true, judged: true, output: "fine" });
+		const gate = async (g: GateInput): Promise<GateReport> => ((await g.review!([])).ok ? green(g) : red(g, "wired_ok"));
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions([]), gate, reviewer, log: () => {} });
+		expect(seen[0]).toEqual({ testFiles: [SPEC], otherTests: [OTHER] });
 	});
 
 	it("a unit with no behaviour to pin and no tests is never passed on weak tests: the reviewer says it computes something", async () => {

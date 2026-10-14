@@ -174,6 +174,23 @@ describe("wired_ok: the reviewer model", () => {
 		expect(r.output).toMatch(/fixed since the earlier review:\n- changes\(\) returns \[\]/);
 	});
 
+	it("judges the unit's own tests; other units' tests are listed by path only, and calling only those weak is no weak verdict", async () => {
+		const { dir, ledger, config } = project();
+		const own = "src/features/campaign/campaign.service.spec.ts";
+		const other = "src/features/campaign/details-link.spec.ts";
+		const run = async (weakTests: Array<{ file: string; problem: string }>) => {
+			const prompts: string[] = [];
+			const r = await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: ["src/features/campaign/campaign.service.ts"], testFiles: [own], otherTests: [other], spawn: reviewerSession({ ok: false, findings: [], weakTests }, [], prompts) });
+			return { r, prompt: prompts[0]! };
+		};
+		const others = await run([{ file: other, problem: "tests DetailsLink, not this unit" }]);
+		expect(others.prompt).toContain(`This unit's ported tests (the tester's): ${own}`);
+		expect(others.prompt).toMatch(new RegExp(`Other units' tests in the area \\(not yours to judge[^)]*\\): ${other}`));
+		expect(others.r).toMatchObject({ ok: true, weakTests: undefined });
+		const mixed = await run([{ file: other, problem: "tests DetailsLink" }, { file: own, problem: "asserts nothing" }]);
+		expect(mixed.r).toMatchObject({ ok: false, weakTests: `- ${own}: asserts nothing` });
+	});
+
 	it("the review runs outside the CPU slot; the commands inside it", async () => {
 		const { dir, ledger } = project();
 		let inSlot = false;

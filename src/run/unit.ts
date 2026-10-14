@@ -38,7 +38,7 @@ import { sameFinding, samePath, triageGate, type LastRetest, type Triage } from 
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { filesNamed } from "./builder.ts";
-import { caseCoverage, checkTests, findTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
+import { caseCoverage, checkTests, findTests, onlyOwnTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
 /**
@@ -892,7 +892,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					// what the review judges: the changed code and the ported tests as they are now, and the tester's answers
 					// (a tester that kept every test and only answered gets a fresh review that reads them)
 					const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
-					const key = sha1(JSON.stringify([[...changedFiles].sort().map((f) => [f, read(f)]).concat(testFiles.map((t) => [t.path, read(t.path)])), unitMeta().testerKept ?? ""]));
+					// the reviewer judges the unit's own tests; the area's others it sees by path only (not its to judge)
+					const own = onlyOwnTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
+					const otherTests = testFiles.map((t) => t.path).filter((t) => !own.includes(t));
+					const key = sha1(JSON.stringify([[...changedFiles].sort().map((f) => [f, read(f)]).concat(own.map((t) => [t, read(t)])), otherTests, unitMeta().testerKept ?? ""]));
 					const seen = { files: Object.fromEntries(changedFiles.map((f) => [f, sha1(read(f))])), tests: sha1(JSON.stringify([testFiles.map((t) => [t.path, read(t.path)]), unitMeta().testerKept ?? ""])) };
 					const disputed = findingDisputes;
 					const changedTruth = truthChangedAfterCode();
@@ -907,7 +910,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
 					let r = reuse
 						? { ...lastReview!.r, costUsd: 0 }
-						: await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), implementerNote, findingDisputes: disputed, testerKept: unitMeta().testerKept, truthChanged, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra!) });
+						: await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir, legacyFiles: card.files, changedFiles, nearDuplicates, testFiles: own, otherTests, writeGlobs, ownerNote: o.retryNote, greenBefore, openFindings: openFindings(), implementerNote, findingDisputes: disputed, testerKept: unitMeta().testerKept, truthChanged, transcriptPath: transcriptPath(o.root, o.unitId, "review", ra!) });
 					if (!reuse && r.judged) lastReview = { key, r };
 					if (!reuse && r.judged && r.ok && o.approved) o.approved.review = { ...seen, r };
 					// a review that judged them has seen the changed truth: a wrong one is in its findings now
@@ -1053,6 +1056,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			const afterRetest = lastRetest;
 			if (!sameFinding(gate, previousGate)) lastRetest = undefined;
 			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo, afterRetest);
+			// only the tests were called weak (the code is fine): an implementer try has nothing to fix, so a retry or an
+			// escalation goes to the tester instead (its retest re-runs the gate on the same code)
+			if (weakOnly && (triage.action === "retry" || triage.action === "escalate")) triage = { ...triage, action: "retest", reason: `${triage.reason}; but only the tests are called weak: the tester re-checks them` };
 			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)}${triage.sure ? "" : ", unsure"})`));
 			if (triage.action === "quarantine") break;
 			// triage's retest (it never picks one after a retest that did not help)
@@ -1066,7 +1072,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				if (failed.failedStep === "wired_ok" && reviewWeakOnly && !regateOnly) regate = true;
 			};
 			// the same step failed again: another blind attempt rarely helps — find out why first (once per step)
-			const stuck = triage.action !== "ask_human" && previousGate?.failedStep === gate.failedStep && !diagnosed.has(gate.failedStep ?? "");
+			const stuck = triage.action !== "ask_human" && !weakOnly && previousGate?.failedStep === gate.failedStep && !diagnosed.has(gate.failedStep ?? "");
 			if (stuck) diagnosed.add(gate.failedStep ?? "");
 			if (triage.action === "ask_human" || stuck) {
 				// Before bothering a human: find out why. Certain/plausible code- or test-side causes are retried

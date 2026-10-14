@@ -72,6 +72,12 @@ export function checkTests(targetProjectDir: string, adapter: TargetAdapter, nam
  * or changed in its worktree (the tester's). The rest are other units' tests. No own file found (or no git): all of them count.
  */
 export function ownTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): string[] {
+	const own = onlyOwnTests(ledger, unitId, dir, tests, ignored);
+	return own.length ? own : tests;
+}
+
+/** As ownTests, but no own file found is none (what the reviewer judges: other units' tests are not this unit's). Not a git checkout: all of them count. */
+export function onlyOwnTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): string[] {
 	const linked = (ledger.db.prepare("SELECT DISTINCT ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(unitId) as Array<{ p: string }>).map((r) => r.p);
 	let changed: string[];
 	try {
@@ -80,8 +86,7 @@ export function ownTests(ledger: Ledger, unitId: string, dir: string, tests: str
 		return tests; // not a git checkout: all of them count
 	}
 	const mine = new Set([...linked, ...changed]);
-	const own = tests.filter((t) => mine.has(t));
-	return own.length ? own : tests;
+	return tests.filter((t) => mine.has(t));
 }
 
 type TestRun = { ok: boolean; output: string; exitCode?: number };
