@@ -418,6 +418,7 @@ interface JobOutcome {
 function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: () => Promise<JobOutcome>, onEnd?: () => void): void {
 	if (progress.running) return warn(ctx, `${progress.snapshot().job} is already running: /br progress to watch, /br stop to stop`);
 	progress.begin(job);
+	const shownAt = Date.now();
 	const width = () => Math.max(60, (process.stdout.columns ?? 100) - 4);
 	let pending: NodeJS.Timeout | undefined;
 	let footerAt = 0;
@@ -454,6 +455,8 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 			const key = `${st.name}\0${st.startedAt ?? i}`;
 			if (posted.get(key) === st.status) return;
 			posted.set(key, st.status);
+			// a run shown again after a /reload: the runtime before posted what ended before this job began (the chat keeps it)
+			if (st.endedAt !== undefined && st.endedAt < shownAt) return;
 			// a migration run has one step per unit: only outcomes, not every start
 			if (!s.plan.length && st.status === "running") return;
 			pi.appendEntry<BrEntry>("br", { title: s.job ?? "job", text: stepEntry(st, s), colored: true });

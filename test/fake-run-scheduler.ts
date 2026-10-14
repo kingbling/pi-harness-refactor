@@ -17,6 +17,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		setTimeout(() => process.exit(4), 100);
 		return new Promise(() => {});
 	}
+	// BR_FAKE_DONE_FIRST: one unit is accepted before the one that waits for the stop
+	if (process.env["BR_FAKE_DONE_FIRST"]) {
+		log("▶ U0_fake");
+		log("✓ U0_fake accepted  (fake)");
+	}
 	log("▶ U1_fake");
 	o.onLanes?.({ running: 1, max: 2, ready: 3, ahead: 0 });
 	if (process.env["BR_FAKE_CRASH"]) setTimeout(() => process.exit(3), 300);

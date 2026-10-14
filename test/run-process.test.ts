@@ -3,7 +3,7 @@ import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSourceAdapter, getTargetAdapter } from "../src/adapters/registry.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { applyDecision } from "../src/inventory/decisions.ts";
@@ -232,7 +232,7 @@ describe("a run that outlives plugin changes", () => {
 	}, 60_000);
 	beforeEach(() => Object.assign(process.env, env));
 	afterEach(() => {
-		for (const k of [...Object.keys(env), "BR_FAKE_DRAIN_MS", "BR_FAKE_FAIL_IF"]) delete process.env[k];
+		for (const k of [...Object.keys(env), "BR_FAKE_DRAIN_MS", "BR_FAKE_FAIL_IF", "BR_FAKE_DONE_FIRST"]) delete process.env[k];
 		// a failed test must not leave its run process (and its run lock) to the next one
 		(liveRunProcess() as { child?: { kill(s: string): void } } | undefined)?.child?.kill("SIGKILL");
 		detachRunProcess();
@@ -402,6 +402,65 @@ describe("a run that outlives plugin changes", () => {
 		expect(out.lines?.[0]).toMatch(/^1 accepted/);
 		expect(liveRunProcess()).toBeUndefined();
 		progress.end();
+	}, 60_000);
+
+	it("Pi's /reload through the extension: the next runtime shows the same run process without posting its ended units to the chat again, and /br stop ends it", async () => {
+		const ws5 = join(here, ".sim", "run-process-reload-ext");
+		await makeWorkspace(ws5);
+		process.env["BR_NEW_CODE_CHECK_MS"] = "600000";
+		process.env["BR_FAKE_DONE_FIRST"] = "1";
+		/** One extension runtime: its own module instances (a reload loads them fresh), a stub Pi and context. */
+		const runtime = async () => {
+			const handlers = new Map<string, Array<(e: unknown, ctx: unknown) => Promise<void> | void>>();
+			const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+			const entries: string[] = [];
+			const messages: string[] = [];
+			const pi = {
+				registerCommand: (n: string, def: any) => commands.set(n, def),
+				registerTool: () => {},
+				registerEntryRenderer: () => {},
+				registerMessageRenderer: () => {},
+				on: (ev: string, h: any) => handlers.set(ev, [...(handlers.get(ev) ?? []), h]),
+				appendEntry: (_t: string, e: { text: string }) => entries.push(e.text),
+				sendMessage: (m: { content: string }) => messages.push(m.content),
+			};
+			const ctx = { cwd: ws5, hasUI: true, ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {}, select: async () => undefined, input: async () => undefined, confirm: async () => false, custom: async () => undefined }, sessionManager: { getBranch: () => [] } };
+			vi.resetModules();
+			const ext = await import("../src/pi/extension.ts");
+			const prog = (await import("../src/progress.ts")).progress;
+			(ext.default as (p: unknown) => void)(pi);
+			const fire = async (ev: string) => {
+				for (const h of handlers.get(ev) ?? []) await h({}, ctx);
+			};
+			return { entries, messages, prog, fire, br: (a: string) => commands.get("br")!.handler(a, ctx) };
+		};
+		const runPids = (p: typeof progress) => [...new Set(p.snapshot().activity.flatMap((l) => /fake run process pid (\d+)/.exec(l)?.[1] ?? []))];
+		const one = await runtime();
+		await one.br("run");
+		await until("the first unit posted", () => one.entries.some((e) => e.includes("U0_fake")));
+		await until("the second unit running", () => one.prog.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		const pid = runPids(one.prog)[0];
+		expect(pid).toBeTruthy();
+		// /reload
+		await one.fire("session_shutdown");
+		expect(one.prog.running).toBe(false);
+		expect(one.messages).toEqual([]);
+		const two = await runtime();
+		await two.fire("session_start");
+		await until("the run shown again", () => two.prog.running && two.prog.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		expect(runPids(two.prog)).toEqual([pid]);
+		// a /br run typed now shows the same run, never a second one
+		await two.br("run");
+		await new Promise((r) => setTimeout(r, 300));
+		await two.br("stop");
+		await until("the summary", () => two.messages.length > 0);
+		expect(two.messages[0]).toMatch(/migration run (finished|stopped)/);
+		expect(runPids(two.prog)).toEqual([pid]);
+		// U0 ended before the reload: the first runtime posted it, the second does not again; U1 ended after: posted once
+		expect(two.entries.filter((e) => e.includes("U0_fake"))).toEqual([]);
+		expect(two.entries.filter((e) => e.includes("U1_fake"))).toHaveLength(1);
+		expect(liveRunProcess()).toBeUndefined();
+		delete process.env["BR_FAKE_DONE_FIRST"];
 	}, 60_000);
 
 	it("a run process that ended while no runtime listened ends the job of the next one", async () => {

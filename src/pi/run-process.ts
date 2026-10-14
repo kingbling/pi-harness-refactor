@@ -65,6 +65,8 @@ interface Live {
 	detach?: () => void;
 }
 const KEY = Symbol.for("bigrefactor.run-process");
+/** The child ended and all it sent was read (see startChild). */
+const GONE = "br-gone";
 const store = globalThis as { [KEY]?: Live };
 /** A run process a runtime before this one started (or this one), still going on. */
 export function liveRunProcess(): Pick<Live, "args"> | undefined {
@@ -86,8 +88,21 @@ function startChild(live: Live, head: string | undefined, again?: string): Child
 	// only the run process of the moment speaks for the run: one replaced by a restart still exits after its done
 	const mine = () => live.child === child;
 	child.on("message", (m: FromChild) => mine() && m.type === "done" && (live.done = m));
-	child.on("error", (e) => mine() && child.pid === undefined && (live.gone ??= e.message));
-	child.on("exit", (code, signal) => mine() && (live.gone ??= signal ? `signal ${signal}` : `exit code ${code}`));
+	// "gone" (an event of ours): the child ended and every message it sent is in. Its exit can come before its last
+	// message (its done) is read, so the exit waits for the message channel to close (a second at most).
+	const gone = (why: string) => {
+		if (mine()) live.gone ??= why;
+		child.emit(GONE);
+	};
+	child.on("error", (e) => child.pid === undefined && gone(e.message));
+	child.on("exit", (code, signal) => {
+		const why = signal ? `signal ${signal}` : `exit code ${code}`;
+		if (!child.connected) return gone(why);
+		let once = false;
+		const then = () => !once && ((once = true), gone(why));
+		child.once("disconnect", then);
+		setTimeout(then, 1000).unref();
+	});
 	return child;
 }
 
@@ -162,8 +177,7 @@ export async function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise
 				if (over) return;
 				over = true;
 				child.off("message", onMessage);
-				child.off("exit", onGone);
-				child.off("error", onError);
+				child.off(GONE, onGone);
 				for (const rl of rls) rl.close();
 				letGo = undefined;
 				resolve(out);
@@ -186,11 +200,8 @@ export async function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise
 				progress.log(error);
 				finish({ error });
 			};
-			// a child that could not start has no exit to wait for
-			const onError = () => child.pid === undefined && onGone();
 			child.on("message", onMessage);
-			child.on("exit", onGone);
-			child.on("error", onError);
+			child.on(GONE, onGone);
 			letGo = () => finish({ detached: true });
 			// it ended while no runtime listened (between a reload's two runtimes)
 			if (live.done) return finish(fromDone(live.done));
