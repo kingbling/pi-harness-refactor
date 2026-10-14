@@ -16,6 +16,7 @@ import { progress } from "../progress.ts";
 import { loadSpend, paidSince } from "../spend.ts";
 import { setStep, startWatchdog } from "./watchdog.ts";
 import { gateSlots, loadConfig, type Config } from "../config.ts";
+import { ensureLedgerIndexes } from "../ledger/indexes.ts";
 import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree, deleteBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
@@ -125,6 +126,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const { ledger, config } = o;
 	// the spend log (many MB) is read in slices up front: the budget check below then reads only new lines
 	await loadSpend(o.root).catch(() => undefined);
+	// an index build writes: it runs in a worker before the run's first write, so neither holds Pi's thread
+	if (!o.dry) await ensureLedgerIndexes(join(o.root, ".bigrefactor", "ledger.sqlite"));
 	// a long step with no unit running: the host shows it with a timer, so the run never looks frozen
 	const waitOn = async <T>(what: string, step: () => Promise<T>): Promise<T> => {
 		setStep(what);

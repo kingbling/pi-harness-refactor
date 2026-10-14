@@ -182,12 +182,6 @@ CREATE TABLE IF NOT EXISTS attempts (
   ended_at TEXT
 );
 CREATE INDEX IF NOT EXISTS attempts_unit ON attempts(unit_id);
--- the gate reports make attempts big (100+ MB): sums, intervals and open attempts read these small indexes, never the table
--- (the Pi footer and the run loop ask them every few seconds on the UI thread)
-CREATE INDEX IF NOT EXISTS attempts_unit_cost ON attempts(unit_id, role, cost_usd);
-CREATE INDEX IF NOT EXISTS attempts_model_cost ON attempts(model, role, cost_usd);
-CREATE INDEX IF NOT EXISTS attempts_time ON attempts(started_at, ended_at);
-CREATE INDEX IF NOT EXISTS attempts_open ON attempts(unit_id) WHERE ended_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS evidence (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,8 +219,6 @@ CREATE TABLE IF NOT EXISTS decisions (
   state TEXT,                         -- the input the model saw (capped), so a decision can be replayed
   created_at TEXT NOT NULL
 );
--- the spend sum reads this, not the big table (the inputs make decisions 100+ MB)
-CREATE INDEX IF NOT EXISTS decisions_unit_cost ON decisions(unit_id, cost_usd);
 
 -- Human questions. Asking is allowed, but only through here, and it never pauses unrelated work:
 -- "blocks" says exactly what waits (none = informational, unit, dependents = unit + everything downstream,
@@ -380,4 +372,17 @@ CREATE TABLE IF NOT EXISTS parity_diffs (
   note TEXT                           -- the judge's words
 );
 CREATE INDEX IF NOT EXISTS parity_diffs_slice ON parity_diffs(slice, status);
+`;
+
+/**
+ * Indexes over the big tables (gate reports and decision inputs make attempts and decisions 100+ MB): sums, intervals
+ * and open attempts read these small indexes, never the table. Building them on an old ledger takes seconds, so they
+ * are not part of DDL (every open would hold Pi's thread): ensureLedgerIndexes builds them in a worker thread.
+ */
+export const BIG_TABLE_INDEXES = `
+CREATE INDEX IF NOT EXISTS attempts_unit_cost ON attempts(unit_id, role, cost_usd);
+CREATE INDEX IF NOT EXISTS attempts_model_cost ON attempts(model, role, cost_usd);
+CREATE INDEX IF NOT EXISTS attempts_time ON attempts(started_at, ended_at);
+CREATE INDEX IF NOT EXISTS attempts_open ON attempts(unit_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS decisions_unit_cost ON decisions(unit_id, cost_usd);
 `;

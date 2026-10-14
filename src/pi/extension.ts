@@ -33,6 +33,7 @@ import { findConfigPath, loadConfig, STATE_DIR } from "../config.ts";
 import { renderStatus, renderWhy } from "../dashboard/status.ts";
 import type { InitPrompter, PromptOption } from "../init/init.ts";
 import { Ledger } from "../ledger/db.ts";
+import { ensureLedgerIndexes } from "../ledger/indexes.ts";
 import { liveRun } from "../run/run-lock.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { groupQuestions, optionFor } from "../jev/ask.ts";
@@ -1141,6 +1142,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_e, ctx) => {
 		// the spend log can be many MB: read in slices first, so the footer reads only what is new
 		const l = locateLedger(ctx.cwd);
+		// the big-table indexes build off Pi's thread now, so a run started later finds them ready
+		if ("path" in l) void ensureLedgerIndexes(l.path);
 		void ("path" in l ? loadSpend(dirname(dirname(l.path))) : Promise.resolve()).catch(() => undefined).then(() => refreshStatus(ctx)).catch(() => undefined);
 		// what this plugin needs (other Pi packages, logins, the stacks' tools): say at startup what is missing
 		void import("../requirements.ts")

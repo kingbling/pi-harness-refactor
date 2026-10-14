@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Ledger } from "../src/ledger/db.ts";
+import { BIG_TABLE_INDEXES } from "../src/ledger/schema.ts";
 import { forecast } from "../src/run/forecast.ts";
 
 describe("forecast", () => {
@@ -19,6 +20,8 @@ describe("forecast", () => {
 
 	it("active hours are the union of attempt intervals, and its sums read small indexes, never the big attempts and decisions tables", () => {
 		const l = new Ledger(":memory:");
+		// what ensureLedgerIndexes builds in its worker
+		l.db.exec(BIG_TABLE_INDEXES);
 		l.createUnit({ id: "U1", tier: "T0", symbolIds: [] });
 		const add = (s: string, e: string | null, usd: number) => l.db.prepare("INSERT INTO attempts(unit_id, role, cost_usd, started_at, ended_at) VALUES ('U1', 'implement', ?, ?, ?)").run(usd, s, e);
 		add("2026-10-01T10:00:00.000Z", "2026-10-01T11:00:00.000Z", 1);
