@@ -85,6 +85,8 @@ export function routeOwners(ledger: Ledger, slice: string): Array<{ id: string; 
 }
 
 /** Why these steps cannot be used, or undefined. Every slice route needs a step or a reason it has none. */
+const routeKey = (r: unknown) => String(r ?? "").trim().replace(/^[A-Z]+(?:\|[A-Z]+)*\s+/, "").replace(/^\/+/, "");
+
 export function stepsProblem(f: StepsFile, routes: string[], stacks: string[]): string | undefined {
 	if (!Array.isArray(f?.steps) || !f.steps.length) return "steps.json needs a non-empty steps array";
 	const ids = new Set<string>();
@@ -102,8 +104,9 @@ export function stepsProblem(f: StepsFile, routes: string[], stacks: string[]): 
 				return `step ${s.id}: save.${n} is not a valid regex`;
 			}
 	}
-	const covered = new Set([...f.steps.filter((s) => s.compare !== "none").map((s) => s.route), ...Object.keys(f.skipped ?? {})]);
-	const missing = routes.filter((r) => !covered.has(r));
+	// a route counts with or without its method word and leading slash ("ANY dashboard/ajax" = "dashboard/ajax")
+	const covered = new Set([...f.steps.filter((s) => s.compare !== "none").map((s) => s.route), ...Object.keys(f.skipped ?? {})].map(routeKey));
+	const missing = routes.filter((r) => !covered.has(routeKey(r)));
 	if (missing.length) return `these routes have no compared step and no reason in skipped: ${missing.join(", ")}`;
 	return undefined;
 }

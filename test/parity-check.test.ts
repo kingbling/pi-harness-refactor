@@ -91,6 +91,9 @@ describe("comparing the old and the new app", () => {
 		expect(stepsProblem({ steps: [step("a")], skipped: { "GET /b": "needs a payment provider" } }, ["GET /a", "GET /b"], ["nestjs"])).toBeUndefined();
 		// a login step does not cover a route
 		expect(stepsProblem({ steps: [step("a", "none")] }, ["GET /a"], ["nestjs"])).toMatch(/GET \/a/);
+		// a step may name its route without the method word or the leading slash
+		expect(stepsProblem({ steps: [{ ...step("a"), route: "dashboard/ajax" }, { ...step("b"), route: "/ssp/dashboard" }] }, ["ANY dashboard/ajax", "ANY ssp/dashboard"], ["nestjs"])).toBeUndefined();
+		expect(stepsProblem({ steps: [{ ...step("a"), route: "dashboard/ajax" }] }, ["ANY dashboard/ajax", "ANY ssp/dashboard"], ["nestjs"])).toMatch(/ANY ssp\/dashboard/);
 	});
 
 	it("a slice end to end: steps written once, the old app run twice, the new app in a worktree of main, differences in the ledger", async () => {
