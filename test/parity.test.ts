@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { appBootTools, bootApp, clipError, dumpData, LEGACY, loadApps, probeApp, saveApp, type AppFixer } from "../src/run/parity.ts";
+import { appBootTools, bootApp, clipError, dumpData, LEGACY, loadApps, MAX_DUMP_MB, probeApp, saveApp, type AppFixer } from "../src/run/parity.ts";
 
 /**
  * Differential parity starts with: can each app run here as a local server? The setup model saves a recipe;
@@ -120,6 +120,26 @@ describe("starting the apps for parity", () => {
 		// 70 MB on stdout: more than the 64 MB a buffer would take
 		const big = await dumpData({ ...asRecipe(serverRecipe(port)), dump: { cmd: process.execPath, args: ["-e", "process.stdout.write(JSON.stringify({ t: ['x'.repeat(70 * 1024 * 1024)] }))"] } }, legacy);
 		expect((big["t"]![0] as string).length).toBe(70 * 1024 * 1024);
+	});
+
+	it("a dump bigger than a comparison reads is refused by its size, never read into the run's thread, and says what to dump instead", async () => {
+		const { legacy } = workspace();
+		const port = await freePort();
+		const bytes = (MAX_DUMP_MB + 1) * 1024 * 1024;
+		// the run's event loop must stay live while the dump is judged (a whole-database dump held it 10 s per try)
+		let last = performance.now();
+		let worst = 0;
+		const tick = setInterval(() => ((worst = Math.max(worst, performance.now() - last)), (last = performance.now())), 10);
+		try {
+			const r = dumpData({ ...asRecipe(serverRecipe(port)), dump: { cmd: process.execPath, args: ["-e", `process.stdout.write(JSON.stringify({ t: ['x'.repeat(${bytes})] }))`] } }, legacy);
+			await expect(r).rejects.toThrow(new RegExp(`the dump printed ${MAX_DUMP_MB + 1} MB, more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables`));
+		} finally {
+			clearInterval(tick);
+		}
+		expect(worst).toBeLessThan(1000);
+		// the setup model is told the limit before it writes the dump
+		const set = tool(appBootTools(ConfigSchema.parse(workspace().config), workspace().root, LEGACY), "set_app_boot") as { parameters: { properties: { dumpCmd: { description: string } } } };
+		expect(set.parameters.properties.dumpCmd.description).toContain(`at most ${MAX_DUMP_MB} MB`);
 	});
 
 	it("an old app that only redirects to itself on https is probed again until plain http reaches it (3 times at most); the check sends that request again", async () => {
