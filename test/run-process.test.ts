@@ -185,6 +185,21 @@ describe("migration run in its own process", () => {
 		progress.end();
 	}, 60_000);
 
+	it("a freeze on Pi's side during a run is logged as Pi's", async () => {
+		process.env["BR_RUN_CHILD_SCHEDULER"] = fake;
+		rmSync(join(ws, ".bigrefactor", "blocked.log"), { force: true });
+		progress.begin("migration run");
+		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		await until("the unit step", () => progress.snapshot().steps.some((s) => s.name === "U1_fake"));
+		const t = Date.now();
+		while (Date.now() - t < 1500);
+		await new Promise((r) => setTimeout(r, 400));
+		await progress.stop("drain");
+		await run;
+		expect(readFileSync(join(ws, ".bigrefactor", "blocked.log"), "utf8")).toMatch(/Z Pi was blocked \d+\.\d s \(last step: Pi drawing the run\)/);
+		progress.end();
+	}, 60_000);
+
 	it("when Pi goes away the child stops its run and exits", async () => {
 		const tsx = pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href;
 		const child = fork(join(here, "src", "run", "run-child.ts"), [JSON.stringify({ cwd: ws, flags: [], hasUI: false, job: "migration run" })], { cwd: ws, execArgv: ["--import", tsx], stdio: ["ignore", "pipe", "pipe", "ipc"], env: { ...process.env, BR_RUN_CHILD: "1", BR_RUN_CHILD_SCHEDULER: fake } });

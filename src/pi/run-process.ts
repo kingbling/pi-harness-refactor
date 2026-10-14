@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { PromptOption } from "../init/init.ts";
 import { progress, type ProgressSnapshot } from "../progress.ts";
+import { startWatchdog } from "../run/watchdog.ts";
 
 /** How long an aborted run process gets to end before it is killed. */
 export const ABORT_KILL_MS = 60_000;
@@ -41,6 +42,8 @@ export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<strin
 	// the package has no build step: the child loads its .ts through tsx, like bin/br.js does
 	const tsx = pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href;
 	const child = fork(entry, [JSON.stringify(args)], { cwd: args.cwd, execArgv: ["--import", tsx], stdio: ["ignore", "pipe", "pipe", "ipc"], detached: false, env: { ...process.env, BR_RUN_CHILD: "1", FORCE_COLOR: "0" } });
+	// Pi's own freezes while the run goes on land in the same blocked.log as "Pi was blocked"
+	const stopWatchdog = startWatchdog(args.cwd, (l) => progress.log(l), { step: "Pi drawing the run" });
 	const send = (m: ToChild) => {
 		if (child.connected) child.send(m);
 	};
@@ -54,6 +57,7 @@ export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<strin
 	const end = (out: { error?: string; lines?: string[] }) => {
 		if (over) return;
 		over = true;
+		stopWatchdog();
 		progress.follow(undefined);
 		resolveRun(out);
 	};
