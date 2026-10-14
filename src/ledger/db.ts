@@ -517,7 +517,7 @@ export class Ledger {
 		return {
 			invariants: inv,
 			symbols: inv.counts,
-			unaccounted: this.unaccounted().length,
+			unaccounted: (this.db.prepare(`SELECT COUNT(*) n FROM symbols WHERE state NOT IN (${TERMINAL_SYMBOL_STATES.map(() => "?").join(",")})`).get(...TERMINAL_SYMBOL_STATES) as { n: number }).n,
 			files: { total: files, dead_code: dead, regenerated, framework },
 			units: unitsByState,
 			unitsByTier: byTier,

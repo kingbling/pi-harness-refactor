@@ -16,6 +16,7 @@ import { reopenUnit } from "./recheck.ts";
 import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { exec } from "../proc.ts";
 import { rm } from "node:fs/promises";
+import { setStep } from "./watchdog.ts";
 
 /**
  * The builder: whole-project checks (a type check of everything, a linter that cannot take files, all tests) do not run in
@@ -195,6 +196,7 @@ export function createBuilder(o: {
 	/** True when a code job made main better and the stack should be checked again right away. */
 	const buildStack = async (stackId: string, again = false): Promise<boolean> => {
 		const appDown = down.get(stackId);
+		setStep(`builder ${stackId}: whole-project check on main`);
 		down.delete(stackId);
 		const adapter = o.adapters.get(stackId);
 		if (!adapter) return false;
@@ -351,6 +353,7 @@ export function createMergeCheck(o: { config: Config; adapters: Map<string, Targ
 	return async (stackId, wt, draft = false) => {
 		const adapter = o.adapters.get(stackId);
 		if (!adapter) return undefined;
+		setStep(`merge check ${stackId}`);
 		const rel = relative(repo, projectDir(o.config, stackId));
 		const main = await mainBranch(repo, o.config.target.git.branch);
 		if (!draft) {

@@ -37,6 +37,7 @@ import { sameFinding, samePath, triageGate, type LastRetest, type Triage } from 
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { filesNamed } from "./builder.ts";
+import { setStep } from "./watchdog.ts";
 import { caseCoverage, checkTests, findTests, onlyOwnTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 import { exec } from "../proc.ts";
 export { mentionsCase } from "./ported.ts";
@@ -246,6 +247,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	 */
 	const runTruth = async (extra?: string, testsOnly = false, more: { codeWritten?: boolean; disputeText?: string } = {}): Promise<boolean> => {
 		if (!o.truthOnly && o.ledger.getUnit(o.unitId)!.state === "planned") o.ledger.transitionUnit(o.unitId, "truth", "tester session started");
+		setStep(`tester ${o.unitId}`);
 		const attempt = o.ledger.startAttempt(o.unitId, "test", o.config.models.test.id);
 		const t0 = Date.now();
 		const before = testsOnly ? readTruthFiles() : undefined;
@@ -795,6 +797,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		lastCheck = undefined;
 		const role = forceEscalate || attemptNo > maxImpl ? "escalate" : "implement";
 		const modelRole = o.config.models[role];
+		setStep(`${regateOnly ? "gate" : role} ${o.unitId}`);
 		const attempt = o.ledger.startAttempt(o.unitId, regateOnly ? "gate" : role, regateOnly ? undefined : modelRole.id);
 		let res: Awaited<ReturnType<LeafSession["run"]>> = { text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
 		if (!regateOnly) {
@@ -910,6 +913,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					if (approvedBefore) lastReview = { key, r: o.approved!.review!.r };
 					const reuse = !disputed.length && !truthChanged.length && lastReview?.key === key;
 					if (reuse) log(pc.dim(approvedBefore ? "  only clashing or wiring files changed since the approved review: its verdict stands (no new review)" : "  code and tests unchanged since the last review: its verdict stands (no new review)"));
+					setStep(`review ${o.unitId}`);
 					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
 					let r = reuse
 						? { ...lastReview!.r, costUsd: 0 }

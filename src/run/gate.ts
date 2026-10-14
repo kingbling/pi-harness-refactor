@@ -10,6 +10,7 @@ import type { EvidenceType } from "../ledger/schema.ts";
 import { activeRuleFiles } from "../rules/layout.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
+import { setStep } from "./watchdog.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 import { FAIL_ON_MAIN_TOO, runPortedTests } from "./ported.ts";
 import { exec } from "../proc.ts";
@@ -102,6 +103,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			}
 		});
 	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number; judged?: boolean }>) => {
+		setStep(`gate ${g.unitId}: ${name}`);
 		const t0 = Date.now();
 		slotMs = 0;
 		const r = await fn();

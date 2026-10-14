@@ -78,7 +78,8 @@ export function forecast(ledger: Ledger): Forecast {
 	const leftWork = work - doneWork;
 
 	// active hours: union of attempt intervals
-	const iv = (ledger.db.prepare("SELECT started_at s, COALESCE(ended_at, started_at) e FROM attempts ORDER BY started_at").all() as Array<{ s: string; e: string }>).map((r) => [Date.parse(r.s), Date.parse(r.e)] as [number, number]);
+	// times as numbers from SQLite (ms): parsing 50k+ ISO strings in JS took most of the forecast, which the Pi footer polls
+	const iv = (ledger.db.prepare("SELECT (julianday(started_at) - 2440587.5) * 86400000 s, (julianday(COALESCE(ended_at, started_at)) - 2440587.5) * 86400000 e FROM attempts ORDER BY started_at").all() as Array<{ s: number; e: number }>).map((r) => [r.s, r.e] as [number, number]);
 	let activeMs = 0;
 	let cur: [number, number] | undefined;
 	for (const [s, e] of iv) {

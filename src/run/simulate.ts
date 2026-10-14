@@ -105,6 +105,8 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 		gate: (g) => fakeGate(planFor(g.unitId), attemptsSeen)(g),
 	});
 	const rec = lastRun(ledger);
+	// the start: the lanes make their worktrees side by side, and each says where the batch is
+	if (!lines.some((l) => /preparing worktree \S+ \(2\/\d+\)/.test(l.replace(/\x1b\[[0-9;]*m/g, "")))) problems.push("start: no progress line while the lanes made their worktrees");
 	if (rec?.outcome !== "stopped" || !rec.stop) problems.push(`stop: run record should say stopped, got ${rec?.outcome}`);
 	else {
 		const extra = (ledger.db.prepare("SELECT DISTINCT entity_id u FROM transitions WHERE entity = 'unit' AND from_state = 'planned' AND created_at > ? AND created_at <= ?").all(rec.stop.at, rec.endedAt) as Array<{ u: string }>).map((r) => r.u).filter((u) => !rec.stop!.finishing.includes(u));
