@@ -442,7 +442,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
-	if (!o.dry) for (const n of sweepWorktrees(ledger, config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
+	if (!o.dry) for (const n of sweepWorktrees(config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
 	const branchNow = mainBranch(config.target.path, config.target.git.branch);
 	if (branchNow !== config.target.git.branch) log(pc.yellow(`target branch ${config.target.git.branch} is gone from ${config.target.path}; units merge into ${branchNow} (the checked-out branch). Set target.git.branch to "${branchNow}" to make it permanent.`));
 	if (!o.dry) {
@@ -791,18 +791,18 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				crash = msg;
 			} finally {
 				const st = ledger.getUnit(unitId)!.state;
-				if (st === "accepted" || st === "quarantined") {
-					// a quarantined unit's code stays on its branch: a self-heal requeue starts from it (an owner's requeue drops it)
-					const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? keepUnitWork(wt, unitId) : undefined;
-					if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
-					removeWorktree(config.target.path, wt);
-					if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
-					else {
-						try {
-							execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
-						} catch {
-							/* branch already gone */
-						}
+				// the worktree goes whatever the state: the next run of this unit starts from a fresh one anyway (fresh()),
+				// so a planned unit's would only hold disk space. A quarantined unit's code stays on its branch: a self-heal
+				// requeue starts from it (an owner's requeue drops it)
+				const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? keepUnitWork(wt, unitId) : undefined;
+				if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
+				removeWorktree(config.target.path, wt);
+				if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
+				else {
+					try {
+						execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+					} catch {
+						/* branch already gone */
 					}
 				}
 				ran.push({ unitId, state: st, attempts: res?.attempts ?? 0, gate: res?.gate, triage: res?.triage, costUsd: res?.costUsd ?? 0 });
@@ -1181,19 +1181,13 @@ export function freeDiskGb(dir: string): number | undefined {
 }
 
 /**
- * At the start nothing runs yet: a worktree of an accepted unit, a code job's or a builder's is left over from a
- * crash or a stop and only holds disk space (and its dependency copy). A planned or quarantined unit's stays: its work resumes there.
+ * At the start nothing runs yet: every worktree is left over from a crash or a stop (a unit's next run starts from a
+ * fresh one, jobs reset theirs) and only holds disk space and its dependency copy.
  */
-export function sweepWorktrees(ledger: Ledger, repo: string, dir: string): string[] {
+export function sweepWorktrees(repo: string, dir: string): string[] {
 	if (!existsSync(dir)) return [];
-	const gone: string[] = [];
-	for (const n of readdirSync(dir)) {
-		if (n.startsWith(".")) continue;
-		const unit = ledger.getUnit(n.replace(/-ahead$/, ""));
-		if (unit ? unit.state !== "accepted" : !n.startsWith("__")) continue;
-		removeWorktree(repo, join(dir, n));
-		gone.push(n);
-	}
+	const gone = readdirSync(dir).filter((n) => !n.startsWith("."));
+	for (const n of gone) removeWorktree(repo, join(dir, n));
 	return gone;
 }
 
