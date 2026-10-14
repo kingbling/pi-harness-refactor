@@ -36,7 +36,7 @@ import { askPendingQuirks, markQuirksApplied, quirkList, quirkRetestNote, quirkS
 import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
-import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { caseCoverage, checkTests, findTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
@@ -351,7 +351,20 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
 		// type the results in) and load the cases; read-not-run cases are only checked for shape.
-		const verified = currentTruth();
+		let verified = currentTruth();
+		// the script did not run: when the probe that ran green before does not run either, the old code's runtime is
+		// down, not this script. It is waited for; back up, the same script is checked again; still down, no truth is
+		// decided from it (no read truth, no question): the unit is tested again later
+		if ((!verified.ok && verified.madeBy === "run") || ("runError" in verified && verified.runError)) {
+			const outage = await legacyEnvOutage(o.root, o.config, sourceAdapter);
+			if (outage === "over") verified = currentTruth();
+			if (outage === "down") {
+				legacyDown = true;
+				o.ledger.endAttempt(attempt, { outcome: "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, legacyDown: true, error: ("runError" in verified && verified.runError) || verified.error } });
+				log(pc.yellow(`  the old code's runtime is down (the probe does not run either); this unit is tested again later`));
+				return false;
+			}
+		}
 		const runError = "runError" in verified ? verified.runError : undefined;
 		if (runError) lastRunError = runError;
 		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, cases: verified.cases.length, error: verified.error, ...(runError ? { runError } : {}) } });
@@ -365,6 +378,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return true;
 	};
 	let linkedOnce = false;
+	// the last truth run found the old code's runtime down (legacyEnvOutage)
+	let legacyDown = false;
 	// in read mode: why the tester's script did not run green on the old code (the last time it was tried)
 	let lastRunError: string | undefined;
 	// cases go to the ledger with how they were made; each one must be a ported test (coverTruth checks).
@@ -419,10 +434,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		let truthOk = false;
 		let lastErr: string | undefined;
 		const truthFile = () => (truthMode === "run" ? sourceAdapter.truth.scriptName : READ_CASES_FILE);
-		for (let t = 1; t <= 2 && !truthOk; t++) {
+		// the last try found the old code's runtime down: no tester session is paid for until it runs again
+		const lastTest = o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string | null } | undefined;
+		if (lastTest?.gate_report && (JSON.parse(lastTest.gate_report) as { legacyDown?: boolean }).legacyDown && (await legacyEnvOutage(o.root, o.config, sourceAdapter)) === "down") {
+			log(pc.yellow(`  the old code's runtime is still down; this unit is tested again later`));
+			return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 0, costUsd: cost };
+		}
+		for (let t = 1; t <= 2 && !truthOk && !legacyDown; t++) {
 			truthOk = await runTruth(lastErr ? `Your previous ${truthFile()} was rejected by the orchestrator${truthMode === "run" ? " (run from the legacy root)" : ""}. Fix it:\n${lastErr}` : undefined);
 			if (!truthOk) lastErr = (o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string } | undefined)?.gate_report ?? "";
 		}
+		// the old code's runtime is down: no setup fix, no read truth, no question; the unit is picked up again
+		if (legacyDown) return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 1, costUsd: cost };
 		// still red: maybe the old code cannot run here (packages never installed, a runtime only in docker). The
 		// setup model prepares its environment once for all units; code re-runs this script to decide it worked.
 		const legacyFixer = o.legacyFixer === false ? undefined : (o.legacyFixer ?? (o.spawn ? undefined : fixLegacyEnvWithModel));
@@ -453,11 +476,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (!truthOk && truthMode === "run") {
 			truthMode = "read";
 			log(pc.yellow(`  truth does not run green on the old code; the tester writes it from reading the code (marked: read, not run)`));
-			for (let t = 1; t <= 2 && !truthOk; t++) {
+			for (let t = 1; t <= 2 && !truthOk && !legacyDown; t++) {
 				truthOk = await runTruth(`Running ${sourceAdapter.truth.scriptName} on the old code failed${runErr ? `:\n${runErr.slice(-1500)}` : ""}\nWrite ${join(truthDirAbs, READ_CASES_FILE)} instead (see step 3).${t > 1 && lastErr ? `\nYour previous ${READ_CASES_FILE} was rejected:\n${lastErr}` : ""}`);
 				if (!truthOk) lastErr = (o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string } | undefined)?.gate_report ?? "";
 			}
 		}
+		if (legacyDown) return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 1, costUsd: cost };
 		if (!truthOk) {
 			const q = await ask({
 				point: "truth_env",

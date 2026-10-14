@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { SourceAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
-import { describeTruthRun, fixLegacyEnv, legacyCopyTool, legacyRunTool, loadLegacyEnv, MAX_LEGACY_FIXES_PER_PROBLEM, notFromOldCode, probeLegacyEnv, verifyTruthOnOld, type LegacyFixer } from "../src/run/legacy-env.ts";
+import { describeTruthRun, fixLegacyEnv, legacyCopyTool, legacyEnvOutage, legacyRunTool, loadLegacyEnv, MAX_LEGACY_FIXES_PER_PROBLEM, notFromOldCode, probeLegacyEnv, verifyTruthOnOld, type LegacyFixer } from "../src/run/legacy-env.ts";
 
 /**
  * The old code runs for truth in its own environment: when its packages are missing, the setup model makes a
@@ -224,5 +224,22 @@ describe("truth that changes from run to run", () => {
 		expect(r.error).not.toMatch(/total/);
 		writeFileSync(join(legacy, "app.sh"), `echo '[{"symbol":"a::b","inputs":[],"expected":{"total":5}}]'\n`);
 		expect(verifyTruthOnOld(truthDir, config, source, root).ok).toBe(true);
+	});
+
+	it("a probe that ran green and fails now means the runtime is down: waited for, over once it runs again, down when it stays red", async () => {
+		const { root, legacy, config, source } = workspace();
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: legacy, mode: "run", run: { cmd: "sh", args: ["-c", 'test ! -e down && sh "$0"', "{script}"] } }));
+		mkdirSync(join(root, ".bigrefactor", "legacy-env", "probe"), { recursive: true });
+		writeFileSync(join(root, ".bigrefactor", "legacy-env", "probe", "cases.sh"), "echo '[]'\n");
+		const wait = { tries: 3, waitMs: 50 };
+		expect(await legacyEnvOutage(root, config, source, wait)).toBe("none");
+		writeFileSync(join(legacy, "down"), "");
+		expect(await legacyEnvOutage(root, config, source, wait)).toBe("down");
+		setTimeout(() => rmSync(join(legacy, "down")), 20);
+		expect(await legacyEnvOutage(root, config, source, wait)).toBe("over");
+		// a workspace that never ran the old code has nothing to compare with
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: legacy, mode: "read" }));
+		writeFileSync(join(legacy, "down"), "");
+		expect(await legacyEnvOutage(root, config, source, wait)).toBe("none");
 	});
 });
