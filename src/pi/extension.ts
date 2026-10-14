@@ -406,6 +406,8 @@ interface JobOutcome {
 	lines?: string[];
 	/** What to offer next (a dialog), run after the summary is posted. */
 	next?: () => Promise<void>;
+	/** The job goes on, shown by the next extension runtime (Pi's /reload): nothing to post here. */
+	detached?: boolean;
 }
 
 /**
@@ -413,7 +415,7 @@ interface JobOutcome {
  * progress, /br stop stops it (drain for runs, abort for onboarding). Console output of the job is routed
  * into the activity feed (raw writes corrupt the TUI).
  */
-function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: () => Promise<JobOutcome>): void {
+function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: () => Promise<JobOutcome>, onEnd?: () => void): void {
 	if (progress.running) return warn(ctx, `${progress.snapshot().job} is already running: /br progress to watch, /br stop to stop`);
 	progress.begin(job);
 	const width = () => Math.max(60, (process.stdout.columns ?? 100) - 4);
@@ -476,11 +478,20 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 		} finally {
 			Object.assign(console, orig);
 			clearInterval(tick);
+			// this runtime let go of a run that goes on (Pi's /reload): the screen is the next runtime's now
+			if (out.detached) {
+				unsub();
+				clearTimeout(pending);
+			}
 			progress.end(out.error);
-			postSteps(progress.snapshot());
-			unsub();
-			paint();
+			if (!out.detached) {
+				postSteps(progress.snapshot());
+				unsub();
+				paint();
+			}
+			onEnd?.();
 		}
+		if (out.detached) return;
 		const snap = progress.snapshot();
 		const summary = [
 			out.error ? `${job} stopped: ${out.error}` : `${job} finished in ${ELAPSED(Date.now() - (snap.startedAt ?? Date.now()))}, ${fmtUsage(snap, 3)}`,
@@ -490,7 +501,13 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 		if (!ctx.hasUI) return orig.log(summary);
 		ctx.ui.notify(out.error ? `bigrefactor: ${out.error}` : `bigrefactor: ${job} finished`, out.error ? "error" : "info");
 		pi.sendMessage({ customType: "br", content: summary, display: true });
-		setTimeout(() => !progress.running && ctx.ui.setWidget("br-progress", undefined), out.error ? 120_000 : 20_000);
+		setTimeout(() => {
+			try {
+				if (!progress.running) ctx.ui.setWidget("br-progress", undefined);
+			} catch {
+				/* the ctx went stale (a /reload since): the panel went with it */
+			}
+		}, out.error ? 120_000 : 20_000);
 		refreshStatus(ctx);
 		await out.next?.().catch((e) => warn(ctx, String(e?.message ?? e)));
 	})();
@@ -545,8 +562,15 @@ function startOnboarding(pi: ExtensionAPI, ctx: ExtensionContext, sub: string, f
 	});
 }
 
-/** `/br run [--limit N] [--slice S] [--units a,b] [--dry]`: the migration scheduler as a background job. */
-function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): void {
+/** The run job of this runtime ends (after a detach too): session_shutdown waits for it before the next runtime shows the run. */
+let runJobEnded: Promise<void> | undefined;
+
+/**
+ * `/br run [--limit N] [--slice S] [--units a,b] [--dry]`: the migration scheduler as a background job. `again`: the
+ * run process a runtime before this one started (Pi's /reload) is shown again with its own flags and job name.
+ */
+function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[], again?: { flags: string[]; job: string }): void {
+	if (again) flags = again.flags;
 	const flag = (n: string) => {
 		const i = flags.indexOf(n);
 		return i >= 0 ? flags[i + 1] : undefined;
@@ -555,8 +579,11 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 	// `/br run 24`: run with 24 lanes (saved, same as `/br lanes 24`)
 	const n = runLanesArg(flags);
 	const cp = findConfigPath(ctx.cwd);
-	if (n !== undefined && cp) pi.appendEntry<BrEntry>("br", { title: "lanes", text: lanes(cp, { lanes: n }).split("\n")[0] ?? "" });
-	const job = limit ? `pilot run (${limit} units)` : "migration run";
+	if (n !== undefined && cp && !again) pi.appendEntry<BrEntry>("br", { title: "lanes", text: lanes(cp, { lanes: n }).split("\n")[0] ?? "" });
+	const job = again?.job ?? (limit ? `pilot run (${limit} units)` : "migration run");
+	if (progress.running) return warn(ctx, `${progress.snapshot().job} is already running: /br progress to watch, /br stop to stop`);
+	let ended!: () => void;
+	runJobEnded = new Promise((r) => (ended = r));
 	startJob(pi, ctx, job, async () => {
 		// The run lives in its own process (src/run/run-child.ts): its ledger work and model tool calls never hold
 		// Pi's thread. This side shows its progress, its decision dialogs and the question cards.
@@ -600,10 +627,12 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 		runActive = true;
 		try {
 			// the child works out the next decision; the dialog is shown here and the answer goes back to it.
-			// Question cards start once the decisions are through (one dialog at a time).
+			// Question cards start once the decisions are through (one dialog at a time). A run process still going
+			// on from before a /reload is shown again (attach) instead of starting a second one.
 			return await runInChild(
 				{ cwd: ctx.cwd, flags, hasUI: ctx.hasUI, job },
 				{
+					attach: true,
 					ask: (q) => piPrompter(ctx, []).select(q.prompt, q.options, q.recommended),
 					decisionsDone: () => void answerOnTheSide().catch((e) => progress.log(`question dialog failed: ${e?.message ?? e}`)),
 				},
@@ -612,7 +641,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			runDone = true;
 			runActive = false;
 		}
-	});
+	}, () => ended());
 }
 
 /** Footer status: refreshed on session start and after every /br command, cleared when there is no ledger. A run's repaints pass `maxAgeMs` to share the panel's cached totals. */
@@ -1071,8 +1100,23 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Pi's /reload (or a session switch) replaces this runtime: a run going on stays, the next runtime shows it again.
+	pi.on("session_shutdown", async () => {
+		if (!runJobEnded) return;
+		const { detachRunProcess } = await import("./run-process.ts");
+		detachRunProcess();
+		await runJobEnded;
+	});
+
 	// Keep the ledger in view: a one-line footer status, refreshed when a session starts.
 	pi.on("session_start", async (_e, ctx) => {
+		// a run process started before a /reload goes on: show it again (panel, footer, /br stop, its dialogs)
+		void import("./run-process.ts")
+			.then(({ liveRunProcess }) => {
+				const live = liveRunProcess();
+				if (live && live.args.cwd === ctx.cwd && ctx.hasUI && !progress.running) startRun(pi, ctx, [], live.args);
+			})
+			.catch((e) => warn(ctx, `the running migration could not be shown again: ${e?.message ?? e}`));
 		// the spend log can be many MB: read in slices first, so the footer reads only what is new
 		const l = locateLedger(ctx.cwd);
 		// the big-table indexes build off Pi's thread now, so a run started later finds them ready

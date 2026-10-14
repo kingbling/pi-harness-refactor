@@ -1,15 +1,15 @@
-import { fork } from "node:child_process";
+import { execFileSync, fork } from "node:child_process";
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getSourceAdapter, getTargetAdapter } from "../src/adapters/registry.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { applyDecision } from "../src/inventory/decisions.ts";
 import { inventory } from "../src/inventory/run.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { runInChild, type Ask } from "../src/pi/run-process.ts";
+import { detachRunProcess, liveRunProcess, runInChild, type Ask } from "../src/pi/run-process.ts";
 import { progress, type ProgressSnapshot } from "../src/progress.ts";
 import { decisionGate } from "../src/run/decisions-gate.ts";
 
@@ -209,6 +209,172 @@ describe("migration run in its own process", () => {
 		await until("the unit step", () => started);
 		child.disconnect();
 		expect(await exited).toBe(0);
+	}, 60_000);
+});
+
+/**
+ * New plugin code while a run goes on: the run process drains and Pi starts a new one on the new code (the owner does
+ * not restart Pi). Pi's /reload: the run process stays, the next runtime shows it again.
+ */
+describe("a run that outlives plugin changes", () => {
+	const repo = join(here, ".sim", "plugin-head");
+	const commit = (msg: string) => {
+		writeFileSync(join(repo, "f.txt"), msg);
+		execFileSync("git", ["add", "."], { cwd: repo });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", msg], { cwd: repo });
+	};
+	const pids = () => [...new Set(progress.snapshot().activity.flatMap((l) => /fake run process pid (\d+)/.exec(l)?.[1] ?? []))];
+	const has = (s: string) => progress.snapshot().activity.some((l) => l.includes(s));
+	const env = { BR_RUN_CHILD_SCHEDULER: fake, BR_PLUGIN_HEAD_DIR: repo, BR_NEW_CODE_CHECK_MS: "100", BR_NEW_CODE_QUIET_MS: "300" };
+	beforeAll(async () => {
+		await makeWorkspace(ws);
+		rmSync(repo, { recursive: true, force: true });
+		mkdirSync(repo, { recursive: true });
+		execFileSync("git", ["init", "-q"], { cwd: repo });
+		commit("one");
+	}, 60_000);
+	beforeEach(() => Object.assign(process.env, env));
+	afterEach(() => {
+		for (const k of [...Object.keys(env), "BR_FAKE_DRAIN_MS", "BR_FAKE_FAIL_IF"]) delete process.env[k];
+		// a failed test must not leave its run process (and its run lock) to the next one
+		(liveRunProcess() as { child?: { kill(s: string): void } } | undefined)?.child?.kill("SIGKILL");
+		detachRunProcess();
+		if (progress.running) progress.end();
+	});
+
+	it("a new plugin commit drains the run process and starts a new one; a stop during that drain cancels the restart", async () => {
+		process.env["BR_FAKE_DRAIN_MS"] = "1500";
+		progress.begin("migration run");
+		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		await until("the first run process", () => pids().length === 1 && progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		commit("two");
+		await until("the new code line", () => has("the plugin has new code"));
+		// the job goes on: a second run process, the first one's feed kept
+		await until("the second run process", () => pids().length === 2 && has("run started again on the new code"), 30_000);
+		expect(progress.running).toBe(true);
+		expect(progress.stopping).toBe(false);
+		expect(has("stop requested (the plugin has new code)") || has("fake: stop (the plugin has new code)")).toBe(true);
+		// another commit; the owner stops while that run process drains for it: no third one
+		const lines = progress.snapshot().activity.filter((l) => l.includes("the plugin has new code (")).length;
+		commit("three");
+		await until("the second new code line", () => progress.snapshot().activity.filter((l) => l.includes("the plugin has new code (")).length > lines);
+		await progress.stop("drain");
+		const out = await run;
+		expect(out.error).toBeUndefined();
+		expect(out.lines?.[0]).toMatch(/^1 accepted/);
+		expect(has("stopped: the run will not start again on the new code")).toBe(true);
+		expect(pids()).toHaveLength(2);
+		expect(liveRunProcess()).toBeUndefined();
+		progress.end();
+	}, 60_000);
+
+	it("a run process started again that fails at start waits for the next commit, then starts again", async () => {
+		const marker = join(repo, "..", "plugin-broken");
+		process.env["BR_FAKE_FAIL_IF"] = marker;
+		rmSync(marker, { force: true });
+		progress.begin("migration run");
+		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		await until("the first run process", () => progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		// broken code lands
+		writeFileSync(marker, "");
+		commit("broken");
+		await until("the failed start", () => has("the run on the new code failed at start"), 30_000);
+		expect(progress.running).toBe(true);
+		expect(progress.snapshot().waiting?.what).toMatch(/next plugin commit/);
+		// the fix lands
+		rmSync(marker);
+		commit("fixed");
+		await until("the run on the fix", () => pids().length === 3 && progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"), 30_000);
+		await progress.stop("drain");
+		const out = await run;
+		expect(out.error).toBeUndefined();
+		expect(out.lines?.[0]).toMatch(/^1 accepted/);
+		progress.end();
+	}, 60_000);
+
+	it("a /br stop while it waits for a fix ends the run with the start error", async () => {
+		const marker = join(repo, "..", "plugin-broken");
+		process.env["BR_FAKE_FAIL_IF"] = marker;
+		rmSync(marker, { force: true });
+		progress.begin("migration run");
+		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		await until("the first run process", () => progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		writeFileSync(marker, "");
+		commit("broken again");
+		await until("the failed start", () => has("the run on the new code failed at start"), 30_000);
+		await progress.stop("drain");
+		const out = await run;
+		expect(out.error).toMatch(/exit code 4/);
+		rmSync(marker);
+		progress.end(out.error);
+	}, 60_000);
+
+	it("a pilot (--limit) keeps the code it started on", async () => {
+		progress.begin("pilot run (5 units)");
+		const run = runInChild({ cwd: ws, flags: ["--limit", "5"], hasUI: false, job: "pilot run (5 units)" });
+		await until("the run process", () => progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		commit("for the pilot");
+		await new Promise((r) => setTimeout(r, 1200));
+		expect(has("the plugin has new code")).toBe(false);
+		await progress.stop("drain");
+		await run;
+		progress.end();
+	}, 60_000);
+
+	it("a reload lets go of the run process and the next runtime shows it again: progress, its open dialog, stop and done", async () => {
+		const ws3 = join(here, ".sim", "run-process-reload");
+		await makeWorkspace(ws3);
+		process.env["BR_WORKSPACE"] = ws;
+		// a plugin folder that does not change here
+		process.env["BR_NEW_CODE_CHECK_MS"] = "600000";
+		progress.begin("migration run");
+		let firstAsked: Ask | undefined;
+		let answerFirst!: (v: string | undefined) => void;
+		const first = runInChild({ cwd: ws3, flags: [], hasUI: true, job: "migration run" }, { ask: (q) => ((firstAsked = q), new Promise((r) => (answerFirst = r))) });
+		await until("the dialog in the first runtime", () => firstAsked !== undefined);
+		await until("the unit step", () => progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		const pid = pids()[0];
+		// /reload: the old runtime lets go; the run process stays
+		detachRunProcess();
+		expect(await first).toEqual({ detached: true });
+		expect(liveRunProcess()?.args.cwd).toBe(ws3);
+		progress.end();
+		// the new runtime (a fresh panel) shows it again
+		progress.begin("migration run");
+		const asked: Ask[] = [];
+		let decisionsDone = false;
+		const again = runInChild({ cwd: ws3, flags: [], hasUI: true, job: "migration run" }, { attach: true, ask: async (q) => (asked.push(q), q.recommended ?? q.options[0]!.value), decisionsDone: () => (decisionsDone = true) });
+		await until("the run shown again", () => progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		expect(pids()).toEqual([pid]);
+		// the dialog open during the reload is asked again here and answered; the old runtime's late answer goes nowhere
+		await until("the dialog asked again", () => asked.some((q) => q.id === firstAsked!.id));
+		answerFirst("something else");
+		await until("the decision applied", () => has(`decided ${firstAsked!.id} = `));
+		await until("the decisions through", () => decisionsDone);
+		expect(progress.snapshot().activity.filter((l) => l.startsWith(`decided ${firstAsked!.id}`))).toHaveLength(1);
+		await progress.stop("drain");
+		const out = await again;
+		expect(out.error).toBeUndefined();
+		expect(out.lines?.[0]).toMatch(/^1 accepted/);
+		expect(liveRunProcess()).toBeUndefined();
+		progress.end();
+	}, 60_000);
+
+	it("a run process that ended while no runtime listened ends the job of the next one", async () => {
+		process.env["BR_NEW_CODE_CHECK_MS"] = "600000";
+		progress.begin("migration run");
+		const first = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		await until("the unit step", () => progress.snapshot().steps.some((s) => s.name === "U1_fake" && s.status === "running"));
+		await progress.stop("drain");
+		detachRunProcess();
+		await first;
+		await new Promise((r) => setTimeout(r, 1500));
+		progress.end();
+		progress.begin("migration run");
+		const out = await runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" }, { attach: true });
+		expect(out.error).toBeUndefined();
+		expect(out.lines?.[0]).toMatch(/^1 accepted/);
+		progress.end();
 	}, 60_000);
 });
 

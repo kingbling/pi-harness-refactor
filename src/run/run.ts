@@ -76,8 +76,8 @@ export interface SchedulerOptions {
 	onWait?: (what: string | undefined) => void;
 	/** Fill idle lanes with truth-ahead work (tester only) for units still waiting on deps. Default: on unless a limit is set. */
 	truthAhead?: boolean;
-	/** Host-driven drain (Pi's /br stop): when true, running units finish and no new ones start. */
-	shouldStop?: () => boolean;
+	/** Host-driven drain (Pi's /br stop): when true (or a reason), running units finish and no new ones start. */
+	shouldStop?: () => boolean | string;
 	/** Install the ctrl-c drain handler (CLI). A host with its own ctrl-c (Pi) passes false. Default true. */
 	handleSigint?: boolean;
 	/**
@@ -1023,7 +1023,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "budget", facts: `Paid model spend today (subscription calls are not counted): $${spentToday().toFixed(2)}; the daily cap run.budgetUsdPerDay is $${config.run.budgetUsdPerDay}. Running units finish; no new ones start today. ${ledger.listUnits({ state: "planned" }).length} units are still planned.`, options: [{ value: "raise", facts: "raise run.budgetUsdPerDay in bigrefactor.config.json and br run again" }, { value: "tomorrow", facts: "leave the cap; br run again tomorrow" }], recommended: "tomorrow", blocks: "none", askedBy: "orchestrator" }).catch((e) => log(pc.yellow(`budget question failed: ${e?.message ?? e}`)));
 				log(pc.red(`daily budget cap reached ($${spentToday().toFixed(2)}); not starting new units`));
 			}
-			if (!stopRecord && o.shouldStop?.()) requestStop("/br stop");
+			const stopWhy = o.shouldStop?.();
+			if (!stopRecord && stopWhy) requestStop(typeof stopWhy === "string" ? stopWhy : "/br stop");
 			// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
 			const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
 			if (!stop && !dayCapHit) tidyJobs.next();
