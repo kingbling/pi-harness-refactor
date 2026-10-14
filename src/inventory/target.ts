@@ -15,13 +15,18 @@ export async function indexTarget(ledger: Ledger, adapter: TargetAdapter, projec
 	// several stacks share one ledger with project-relative paths: rows carry a stack tag (see stackTagLike)
 	const del = ledger.db.prepare("DELETE FROM index_symbols WHERE side = 'target' AND path = ? AND (tags IS NULL OR tags NOT LIKE '%\"stack:%' OR tags LIKE ?)");
 	const ins = ledger.db.prepare("INSERT OR REPLACE INTO index_symbols(id, side, path, kind, name, line, signature, exported, ast_hash, doc, tags) VALUES (?, 'target', ?, ?, ?, ?, ?, 1, ?, ?, ?)");
+	// the files are parsed first (the adapter's parser awaits): a write transaction left open across those awaits held
+	// the ledger's write lock for the whole index, so another connection's write waited on it (up to the 10 s busy
+	// timeout, holding its thread), and a ROLLBACK here would have undone other lanes' writes made meanwhile
+	const indexFile = adapter.indexFile.bind(adapter);
+	const found: Array<{ rel: string; symbols: Awaited<ReturnType<typeof indexFile>> }> = [];
+	for (const rel of rels) found.push({ rel, symbols: existsSync(join(projectDir, rel)) ? await indexFile(projectDir, rel) : [] });
 	let n = 0;
 	ledger.db.exec("BEGIN");
 	try {
-		for (const rel of rels) {
+		for (const { rel, symbols } of found) {
 			del.run(rel, stackTagLike(adapter.id));
-			if (!existsSync(join(projectDir, rel))) continue;
-			for (const s of await adapter.indexFile(projectDir, rel)) {
+			for (const s of symbols) {
 				if (s.tags.includes("internal")) continue; // non-exported bodies: the gate's copy check only
 				ins.run(s.id, s.path, s.kind, s.name, s.line, s.signature ?? null, s.bodyHash ?? null, s.doc ?? null, JSON.stringify([...s.tags, `stack:${adapter.id}`]));
 				n++;
