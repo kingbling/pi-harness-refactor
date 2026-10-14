@@ -23,7 +23,7 @@ import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
-import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, runGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
+import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
@@ -937,11 +937,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// repeat that test run, so the disputes go straight to the tester (the next attempt runs the whole gate)
 		const check = lastCheck as CheckResult | undefined;
 		// only when no file changed after that check: a fix made after it (DONE without checking again) needs the real gate
-		const straight = !!check && !check.ok && check.failed === "tests" && !check.timedOut && disputes.length > 0 && disputeRounds < 2 && checkedTree !== undefined && checkedTree === treeKey();
+		const sameTree = !!check && checkedTree !== undefined && checkedTree === treeKey();
+		const straight = !!check && !check.ok && check.failed === "tests" && !check.timedOut && disputes.length > 0 && disputeRounds < 2 && sameTree;
 		if (straight) log(pc.dim("  ported tests still red and disputed: straight to the tester"));
+		const cleanCheck = reusableCheck(check, sameTree);
 		gate = straight
 			? { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 0, output: check!.text }], changedFiles: check!.files, failedStep: "ported_tests_green", testFiles: testFiles.map((t) => t.path) }
-			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot });
+			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot, cleanCheck });
 		// only the tests were called weak: the code was fine, so this is not an implementer failure
 		const weakOnly = !gate.ok && gate.failedStep === "wired_ok" && reviewWeakOnly;
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : weakOnly ? "gate_tests_weak" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });

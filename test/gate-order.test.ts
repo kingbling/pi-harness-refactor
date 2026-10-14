@@ -8,12 +8,13 @@ import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
 import { NEST_LAYOUT } from "../src/adapters/target/ts-structure.ts";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { clipOutput, runGate, type GateReport } from "../src/run/gate.ts";
+import { clipOutput, reusableCheck, runGate, type GateReport } from "../src/run/gate.ts";
 import { checkLayoutRules, normalize } from "../src/rules/layout-rules.ts";
 
 /**
  * The gate does not contradict the unit's own scope (its ported tests, the stubs it was told to replace), runs the
- * ported tests before the review model, keeps the start and the end of long output, and records slot time apart.
+ * ported tests before the review model, keeps the start and the end of long output, records slot time apart, and
+ * takes build, lint and the tests from a green check_my_code on the same tree.
  */
 const tick = { cmd: "true", args: [] as string[] };
 const adapter: TargetAdapter = { ...nestjsAdapter, build: () => tick, lint: () => tick, test: () => tick };
@@ -143,7 +144,8 @@ describe("gate: order and output", () => {
 	it("records only the time a step held a gate slot, not the wait for it or the review", async () => {
 		write("src/features/agency/agency.service.spec.ts", "it('x', () => {});\n");
 		const testFiles = [{ path: "src/features/agency/agency.service.spec.ts", sha1: sha1("src/features/agency/agency.service.spec.ts") }];
-		const slot = async <T>(fn: () => Promise<T>) => (await new Promise((r) => setTimeout(r, 300)), fn());
+		let slots = 0;
+		const slot = async <T>(fn: () => Promise<T>) => (slots++, await new Promise((r) => setTimeout(r, 300)), fn());
 		const review = async () => (await new Promise((r) => setTimeout(r, 300)), { ok: true, output: "fine", judged: true });
 		const r = await gate({ testFiles, review, slot });
 		const tests = step(r, "ported_tests_green")!;
@@ -151,6 +153,42 @@ describe("gate: order and output", () => {
 		expect(tests.slotMs!).toBeLessThan(tests.ms - 200);
 		expect(step(r, "wired_ok")!.slotMs).toBe(0);
 		expect(step(r, "antigaming_ok")!.slotMs).toBe(0);
+		// build, lint and rules share one slot (one wait, outside their steps); the test run takes its own
+		expect(slots).toBe(2);
+		for (const n of ["build_ok", "lint_ok", "rules_ok"]) expect(step(r, n)!.slotMs).toBe(step(r, n)!.ms);
+		expect(step(r, "build_ok")!.ms).toBeLessThan(200);
+	});
+
+	it("a green check_my_code on the same tree stands for build, lint and the tests; the other steps still run", async () => {
+		const spec = "src/features/agency/agency.service.spec.ts";
+		write(spec, "it('x', () => {});\n");
+		const testFiles = [{ path: spec, sha1: sha1(spec) }];
+		// every command fails: a step that ran its command is red
+		const fail = (_d: string, files: string[]) => ({ cmd: "false", args: files });
+		const red = { ...adapter, build: fail, lint: fail, test: fail };
+		const green = { ok: true, ran: ["build", "lint", "tests"], tests: [spec], text: "TESTS green" };
+		let reviewed = 0;
+		const review = async () => (reviewed++, { ok: true, output: "fine", judged: true });
+		const r = await gate({ testFiles, review, adapter: red, cleanCheck: reusableCheck(green, true) });
+		expect(r.ok).toBe(true);
+		for (const n of ["build_ok", "lint_ok", "ported_tests_green"]) expect(step(r, n)!.output).toMatch(/^from check_my_code on the same tree/);
+		expect(r.steps.map((s) => s.name)).toEqual(["symbolproof_ok", "antigaming_ok", "structure_ok", "build_ok", "lint_ok", "rules_ok", "ported_tests_green", "wired_ok"]);
+		expect(reviewed).toBe(1);
+		// the check ran other test files: build and lint stand, the gate runs the tests itself
+		const other = await gate({ testFiles, review, adapter: red, cleanCheck: reusableCheck({ ...green, tests: ["src/features/agency/other.spec.ts"] }, true) });
+		expect(other.failedStep).toBe("ported_tests_green");
+		// no check: the gate runs build itself
+		expect((await gate({ testFiles, review, adapter: red })).failedStep).toBe("build_ok");
+	});
+
+	it("a red check, a changed tree or a skipped command is never reused", () => {
+		const green = { ok: true, ran: ["build", "lint", "tests"], tests: ["a.spec.ts"], text: "TESTS green" };
+		expect(reusableCheck(green, true)).toEqual({ tests: ["a.spec.ts"], text: "TESTS green" });
+		expect(reusableCheck({ ...green, ok: false }, true)).toBeUndefined();
+		expect(reusableCheck(green, false)).toBeUndefined();
+		expect(reusableCheck({ ...green, timedOut: true }, true)).toBeUndefined();
+		expect(reusableCheck({ ...green, ran: ["lint", "tests"] }, true)).toBeUndefined();
+		expect(reusableCheck(undefined, true)).toBeUndefined();
 	});
 
 	it("clipOutput keeps the start and the end and collapses repeated lines", () => {

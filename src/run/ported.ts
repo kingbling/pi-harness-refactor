@@ -101,14 +101,17 @@ function onMain<T>(fn: () => Promise<T>): Promise<T> {
  * then run too: one that fails counts against this unit only if it passes on main (this unit broke it), so a test red
  * on main already never blocks it. Main (`mainDir`, main's project checkout) runs only when a neighbour fails here,
  * and its answer is kept per main's tree. Without `mainDir` every neighbour failure counts.
+ * `slot`: the gate pool slot, taken around each test run only, never while waiting for main's turn.
  */
-export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapter: TargetAdapter; dir: string; tests: string[]; mainDir?: string; timeoutMs: number }): Promise<TestRun> {
-	if (o.tests.length < 2) return runTests(o.adapter, o.dir, o.tests, o.timeoutMs);
+export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapter: TargetAdapter; dir: string; tests: string[]; mainDir?: string; timeoutMs: number; slot?: <T>(fn: () => Promise<T>) => Promise<T> }): Promise<TestRun> {
+	const slot = o.slot ?? (<T>(fn: () => Promise<T>) => fn());
+	const test = (dir: string, files: string[]) => slot(() => runTests(o.adapter, dir, files, o.timeoutMs));
+	if (o.tests.length < 2) return test(o.dir, o.tests);
 	const own = ownTests(o.ledger, o.unitId, o.dir, o.tests, o.adapter.toolchain.ignoredPaths);
-	const mine = await runTests(o.adapter, o.dir, own, o.timeoutMs);
+	const mine = await test(o.dir, own);
 	const others = o.tests.filter((t) => !own.includes(t));
 	if (!mine.ok || !others.length) return mine;
-	const n = await runTests(o.adapter, o.dir, others, o.timeoutMs);
+	const n = await test(o.dir, others);
 	if (n.ok) return { ...mine, output: `${mine.output}\n\nThe area's other ported tests (${others.length} file(s)) still pass.` };
 	const main = o.mainDir && existsSync(o.mainDir) && realpathSync(o.mainDir) !== realpathSync(o.dir) ? o.mainDir : undefined;
 	if (!main) return { ...n, output: `Your own tests pass; the area's other ported tests fail with your code:\n${n.output}` };
@@ -128,8 +131,8 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 		for (const t of others) if (!green.has(t) && !existsSync(join(main, t))) green.set(t, false);
 		const present = others.filter((t) => !green.has(t));
 		// all of them at once first; only when main is red too, file by file to find the ones it passes
-		if (present.length && (await runTests(o.adapter, main, present, o.timeoutMs)).ok) for (const t of present) green.set(t, true);
-		else for (const t of present) green.set(t, (await runTests(o.adapter, main, [t], o.timeoutMs)).ok);
+		if (present.length && (await test(main, present)).ok) for (const t of present) green.set(t, true);
+		else for (const t of present) green.set(t, (await test(main, [t])).ok);
 		if (tree && treeOf() === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
 		return green;
 	});
@@ -137,7 +140,7 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	const redThere = others.filter((t) => !greenThere.includes(t));
 	const note = redThere.length ? `\nwarning: ${redThere.length} test file(s) of other units fail on main too, not counted against this unit: ${redThere.join(", ")}` : "";
 	if (!greenThere.length) return { ...mine, output: `${mine.output}${note}` };
-	const broke = await runTests(o.adapter, o.dir, greenThere, o.timeoutMs);
+	const broke = await test(o.dir, greenThere);
 	if (broke.ok) return { ...mine, output: `${mine.output}${note}` };
 	// name only the files on the runner's failure lines (it may list passing files too), so the failing test still fits in a clipped report
 	const fails = failureLines(broke.output);

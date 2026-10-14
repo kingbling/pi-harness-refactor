@@ -42,7 +42,9 @@ describe("check_my_code", () => {
 		expect(out).not.toContain("old.ts");
 		expect(out).toMatch(/LINT clean/);
 		expect(out).toContain(`TESTS green (${SPEC})`);
-		expect(slots).toBe(3);
+		// one slot for build and lint, one for the test run (not one per command); the check says what ran
+		expect(slots).toBe(2);
+		expect(r.details).toMatchObject({ tests: [SPEC] });
 	});
 
 	it("stops at a failed build and shows its output", async () => {

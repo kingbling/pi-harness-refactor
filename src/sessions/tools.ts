@@ -42,7 +42,7 @@ export interface ToolDeps {
 	/** Implementer: a reviewer finding it believes is wrong goes back to the reviewer, who keeps it with a reason or drops it (see dispute_finding). */
 	onDisputeFinding?: (d: { finding: string; why: string; evidence: string }) => void;
 	/** Implementer: every check_my_code result, so the orchestrator knows when DONE comes after a red check. Tester (codeWritten): every check_ported_tests result (`failed: "tests"` when its test run was red). */
-	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[] }) => void;
+	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[]; ran?: Array<"build" | "lint" | "tests">; tests?: string[] }) => void;
 	/** Implementer: false when the unit's tester has no dispute re-check left (dispute_test then says so). */
 	disputeRecheck?: boolean;
 	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
@@ -61,7 +61,7 @@ export interface ToolDeps {
 	testFiles?: () => string[];
 	/** Main's checkout of the unit's project: another unit's test that fails counts only if it passes there (as in the gate). */
 	mainDir?: string;
-	/** The gate's CPU slot: check_my_code runs its commands inside it, like the gate. */
+	/** The gate's CPU slot: check_my_code runs its commands inside it, like the gate (tests take it per run). */
 	slot?: <T>(fn: () => Promise<T>) => Promise<T>;
 	/** Tester: earlier units' test files this unit may change (tidy, disputed), as the gate allows them. */
 	sanctioned?: string[];
@@ -510,8 +510,7 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			if (d.wholeCheck) out.push(whole ? `WHOLE-PROJECT check FAILED (the unit was not merged for these; errors main has too are left out). Fix the errors in your test files, behaviour unchanged; errors in code files are the implementer's:\n${whole.slice(-4000)}` : "WHOLE-PROJECT check: no errors main does not have.");
 			// after the implementer worked, the tests run against its code (the same run as check_my_code)
 			if (d.codeWritten && cov.files.length) {
-				const slot = d.slot ?? (<T>(fn: () => Promise<T>) => fn());
-				const r = await slot(() => runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir: d.targetProjectDir, tests: cov.files, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS }));
+				const r = await runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir: d.targetProjectDir, tests: cov.files, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS, slot: d.slot });
 				const full = join(d.root, ".bigrefactor", "sessions", `${d.unitId}.check_ported_tests.log`);
 				out.push(r.ok ? `TESTS green against the implementer's code (${cov.files.join(", ")}).` : `TESTS FAILED: the implementer's code is in place: a test that fails here is either wrong (check it against the legacy code and fix it) or catches a real bug in the code (keep it and say why in your final line):\n${clipOutput(r.output, 4000, full)}`);
 				// the orchestrator knows when TESTER DONE comes after a red run (or tests changed after it)
@@ -550,41 +549,49 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 			const secs = CHECK_MY_CODE_TIMEOUT_MS / 1000;
 			const files = buildFiles(dir, d.adapter, changedFiles(dir, d.adapter.toolchain.ignoredPaths));
 			const out = [`Changed files checked: ${files.length ? files.join(", ") : "none"}.`];
+			// what really ran (not skipped): a green check that ran all three on the gate's tree spares the gate those runs
+			const ran: Array<"build" | "lint" | "tests"> = [];
 			// every result reaches the orchestrator: DONE after a red check gets one more turn
-			const done = (r: { ok: boolean; failed?: string; files: string[] }, timedOut?: boolean) => {
-				d.onCheck?.({ ...r, text: out.join("\n"), timedOut });
+			const done = (r: { ok: boolean; failed?: string; files: string[]; tests?: string[] }, timedOut?: boolean) => {
+				d.onCheck?.({ ...r, ran, text: out.join("\n"), timedOut });
 				return text(out.join("\n"), r);
 			};
-			for (const name of ["build", "lint"] as const) {
-				const r = await slot(() => checkTests(dir, d.adapter, name, files, CHECK_MY_CODE_TIMEOUT_MS));
-				const NAME = name.toUpperCase();
-				if (r.skipped) out.push(`${NAME} not run per unit (${r.skipped}).`);
-				else if (!r.error) out.push(`${NAME} clean (\`${r.command}\`).`);
-				else {
-					out.push(`${NAME} FAILED (\`${r.command}\`, run in ${dir}${r.error.endsWith("[timed out]") ? `, stopped after ${secs} s: the gate runs it again with more time` : ""}); fix it and call check_my_code again:\n${r.error}`);
-					return done({ ok: false, failed: name, files }, r.error.endsWith("[timed out]"));
+			// build, lint and the whole-project check in one slot: one wait in the queue, not one per command
+			const failed = await slot(async () => {
+				for (const name of ["build", "lint"] as const) {
+					const r = await checkTests(dir, d.adapter, name, files, CHECK_MY_CODE_TIMEOUT_MS);
+					const NAME = name.toUpperCase();
+					if (r.skipped) out.push(`${NAME} not run per unit (${r.skipped}).`);
+					else if (!r.error) (out.push(`${NAME} clean (\`${r.command}\`).`), ran.push(name));
+					else {
+						out.push(`${NAME} FAILED (\`${r.command}\`, run in ${dir}${r.error.endsWith("[timed out]") ? `, stopped after ${secs} s: the gate runs it again with more time` : ""}); fix it and call check_my_code again:\n${r.error}`);
+						return done({ ok: false, failed: name, files }, r.error.endsWith("[timed out]"));
+					}
 				}
-			}
-			// the last pass was not merged for whole-project errors: the same check the merge runs, so DONE comes after they are gone
-			if (d.wholeCheck) {
-				const whole = await slot(() => d.wholeCheck!());
-				if (whole) {
-					out.push(`WHOLE-PROJECT check FAILED (your last pass was not merged for these; errors main has too are left out); fix them and call check_my_code again:\n${whole.slice(-4000)}`);
-					return done({ ok: false, failed: "whole", files });
+				// the last pass was not merged for whole-project errors: the same check the merge runs, so DONE comes after they are gone
+				if (d.wholeCheck) {
+					const whole = await d.wholeCheck();
+					if (whole) {
+						out.push(`WHOLE-PROJECT check FAILED (your last pass was not merged for these; errors main has too are left out); fix them and call check_my_code again:\n${whole.slice(-4000)}`);
+						return done({ ok: false, failed: "whole", files });
+					}
+					out.push("WHOLE-PROJECT check clean: no errors main does not have.");
 				}
-				out.push("WHOLE-PROJECT check clean: no errors main does not have.");
-			}
+				return undefined;
+			});
+			if (failed) return failed;
 			const tests = (d.testFiles?.() ?? []).filter((f) => existsSync(join(dir, f)));
 			if (!tests.length) {
 				out.push("TESTS not run: this unit has no ported test files.");
 				return done({ ok: true, files });
 			}
-			const r = await slot(() => runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir, tests, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS }));
+			const r = await runPortedTests({ ledger: d.ledger, unitId: d.unitId, adapter: d.adapter, dir, tests, mainDir: d.mainDir, timeoutMs: CHECK_MY_CODE_TIMEOUT_MS, slot });
+			if (r.ok) ran.push("tests");
 			// the failing tests first; the whole output is saved in the unit's sessions folder when it is cut
 			const full = join(d.root, ".bigrefactor", "sessions", `${d.unitId}.check_my_code.log`);
 			const warned = r.ok ? r.output.split("\n").filter((l) => l.startsWith("warning:")).map((l) => ` ${l}`).join("") : "";
 			out.push(r.ok ? `TESTS green (${tests.join(", ")}).${warned}` : `TESTS FAILED${r.output.endsWith("[timed out]") ? ` (stopped after ${secs} s: the gate runs them again with more time)` : ""}; fix the code, not the tests (or call dispute_test with evidence):\n${clipOutput(r.output, 4000, full)}`);
-			return done({ ok: r.ok, failed: r.ok ? undefined : "tests", files }, r.output.endsWith("[timed out]"));
+			return done({ ok: r.ok, failed: r.ok ? undefined : "tests", files, tests }, r.output.endsWith("[timed out]"));
 		},
 	});
 }

@@ -1,0 +1,43 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { ConfigSchema } from "../src/config.ts";
+import { Ledger } from "../src/ledger/db.ts";
+import { lanes } from "../src/run/lanes.ts";
+import { Semaphore } from "../src/run/pool.ts";
+
+/**
+ * The gate pool counts how long work waited for a slot and held one; `br lanes` reads the run's totals and asks for
+ * more gate slots, not more lanes, when work waits long for one.
+ */
+describe("gate slots", () => {
+	it("the pool adds up wait and hold time per slot", async () => {
+		const pool = new Semaphore(1);
+		const hold = () => pool.run(() => new Promise((r) => setTimeout(r, 100)));
+		await Promise.all([hold(), hold()]);
+		expect(pool.totals.grants).toBe(2);
+		expect(pool.totals.heldMs).toBeGreaterThanOrEqual(190);
+		// the second one waited for the first
+		expect(pool.totals.waitedMs).toBeGreaterThanOrEqual(90);
+	});
+
+	it("br lanes shows the run's slot totals and says to raise the gate slots when work waits long", () => {
+		const dir = mkdtempSync(join(tmpdir(), "br-slots-"));
+		try {
+			const f = join(dir, "bigrefactor.config.json");
+			writeFileSync(f, JSON.stringify(ConfigSchema.parse({ source: { path: dir, stack: "php" }, target: { path: dir, stacks: ["nestjs"] }, models: {} })));
+			mkdirSync(join(dir, ".bigrefactor"), { recursive: true });
+			const ledger = new Ledger(join(dir, ".bigrefactor", "ledger.sqlite"));
+			ledger.db.prepare("INSERT INTO attempts(role, started_at, ended_at) VALUES ('implement', datetime('now', '-60 seconds'), datetime('now'))").run();
+			const since = Date.now() - 3_600_000;
+			ledger.setMeta("gate_slots", JSON.stringify({ grants: 100, waitedMs: 100 * 40_000, heldMs: 3_600_000, since, at: since + 3_600_000, limit: 2 }));
+			ledger.close();
+			const out = lanes(f, {});
+			expect(out).toMatch(/gate slots this run: 50% busy \(2 slot\(s\)\), a wait for one ~40\.0 s on average over 100 run\(s\)/);
+			expect(out).toMatch(/raise --gates before adding lanes/);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});

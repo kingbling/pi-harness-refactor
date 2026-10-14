@@ -6,6 +6,8 @@ export class Semaphore {
 	private queue: Array<{ resolve: () => void; priority: number; seq: number }> = [];
 	private seq = 0;
 	private active = 0;
+	/** Since the pool was made: slots granted, time work waited for one and time it held one (`br lanes` reads them). */
+	readonly totals = { grants: 0, waitedMs: 0, heldMs: 0, since: Date.now() };
 	constructor(public limit: number) {}
 
 	/** Change the size mid-flight: growing grants waiting work at once; shrinking lets running work finish. */
@@ -22,13 +24,18 @@ export class Semaphore {
 	}
 
 	acquire(priority = 0): Promise<() => void> {
+		const asked = Date.now();
 		return new Promise((resolve) => {
 			const grant = () => {
 				this.active++;
+				const got = Date.now();
+				this.totals.grants++;
+				this.totals.waitedMs += got - asked;
 				let released = false;
 				resolve(() => {
 					if (released) return;
 					released = true;
+					this.totals.heldMs += Date.now() - got;
 					this.active--;
 					this.next();
 				});

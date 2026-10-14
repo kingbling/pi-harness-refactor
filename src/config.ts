@@ -1,4 +1,5 @@
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { cpus } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 
@@ -102,7 +103,8 @@ export const ConfigSchema = z.object({
 	run: z
 		.object({
 			agentConcurrency: z.number().int().min(1).default(8),
-			gateConcurrency: z.number().int().min(1).default(2),
+			/** Gate slots from the machine: a third of the cores (a test run starts worker threads of its own), at least 2. */
+			gateConcurrency: z.number().int().min(1).default(Math.max(2, Math.floor(cpus().length / 3))),
 			maxImplementAttempts: z.number().int().min(1).default(3),
 			maxEscalateAttempts: z.number().int().min(0).default(2),
 			budgetUsdPerDay: z.number().positive().default(200),

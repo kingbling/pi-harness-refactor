@@ -305,6 +305,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 	};
 	reloadLanes();
+	// the gate slots' totals go to the ledger now and then: `br lanes` (another process) judges the slot count by them
+	let slotsSaved = 0;
+	const saveSlotTotals = () => {
+		if (Date.now() - slotsSaved < 10_000) return;
+		slotsSaved = Date.now();
+		ledger.setMeta("gate_slots", JSON.stringify({ ...gates.totals, at: slotsSaved, limit: gates.limit }));
+	};
 	const merge = new Semaphore(1);
 	// target.git.push "on": main goes to the target repo's remote after merges, on the side
 	const pusher = createPusher({ config, root: o.root, log });
@@ -955,6 +962,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	for (;;) {
 		try {
 			reloadLanes();
+			saveSlotTotals();
 			if (Date.now() - lastResubmitCheck > 5000) {
 				resubmitParked();
 				lastResubmitCheck = Date.now();

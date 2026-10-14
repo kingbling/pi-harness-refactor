@@ -27,6 +27,14 @@ export function lanes(configPath: string, set: { lanes?: number; gates?: number 
 		L.push(`measured: a unit holds a lane ~${Math.round(m.unitS)} s (tester + implementer), a gate ~${m.gateS.toFixed(1)} s · gate slots ${Math.round(gateLoad * 100)}% busy at this lane count · rate-limited calls so far: ${m.rateLimited}`);
 		L.push(`gates would saturate around ${maxByGates} lanes; past that, raise --gates (each gate is a build + test process: ~1 core, more memory as the project grows)`);
 	}
+	// what the running (or last) run measured on its slots: gates, check_my_code and check_ported_tests all wait there
+	const s = m?.slots;
+	if (s && s.grants) {
+		const waitS = s.waitedMs / s.grants / 1000;
+		const busy = s.heldMs / (Math.max(1, s.at - s.since) * s.limit);
+		L.push(`gate slots this run: ${Math.round(busy * 100)}% busy (${s.limit} slot(s)), a wait for one ~${waitS.toFixed(1)} s on average over ${s.grants} run(s)`);
+		if (waitS > 10) L.push(`work waits ~${Math.round(waitS)} s for a gate slot: raise --gates before adding lanes`);
+	}
 	L.push("change: br lanes <n> [--gates <m>]  ·  in Pi: /br lanes <n> [gates <m>]");
 	return L.join("\n");
 }
@@ -45,7 +53,9 @@ export function runLanesArg(args: string[]): number | undefined {
 	return n !== undefined ? Number(n) : undefined;
 }
 
-function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimited: number } | undefined {
+type SlotTotals = { grants: number; waitedMs: number; heldMs: number; since: number; at: number; limit: number };
+
+function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimited: number; slots?: SlotTotals } | undefined {
 	if (!existsSync(ledgerPath) || !existsSync(dirname(ledgerPath))) return undefined;
 	const db = new DatabaseSync(ledgerPath, { readOnly: true });
 	try {
@@ -55,7 +65,9 @@ function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimite
 		// slotMs was recorded count as nothing measured (NULL), not as gate time
 		const gate = db.prepare("SELECT AVG((SELECT SUM(json_extract(s.value,'$.slotMs')) FROM json_each(json_extract(gate_report,'$.steps')) s)) ms FROM attempts WHERE gate_report IS NOT NULL").get() as { ms: number | null };
 		const rateLimited = (db.prepare("SELECT COUNT(*) n FROM attempts WHERE outcome LIKE '%429%' OR outcome LIKE '%rate%'").get() as { n: number }).n;
-		return { unitS: sess.reduce((a, r) => a + r.s, 0), gateS: (gate.ms ?? 0) / 1000, rateLimited };
+		// the run's gate pool totals (every check that took a slot, not only the gate), saved every few seconds
+		const row = db.prepare("SELECT value FROM meta WHERE key = 'gate_slots'").get() as { value: string } | undefined;
+		return { unitS: sess.reduce((a, r) => a + r.s, 0), gateS: (gate.ms ?? 0) / 1000, rateLimited, slots: row ? (JSON.parse(row.value) as SlotTotals) : undefined };
 	} finally {
 		db.close();
 	}
