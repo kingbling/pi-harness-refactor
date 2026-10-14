@@ -115,8 +115,11 @@ Judge only what this unit added or changed, against the facts below: the behavio
 		}
 		if (!verdict) return { ok: false, judged: false, costUsd: r.usage.cost, output: `not judged: the reviewer ended without a verdict${r.error ? ` (${r.error})` : ""}` };
 		const v = verdict as Verdict;
-		// other units' tests are not this unit's to fix: a weak-tests entry on one is dropped (only those: the verdict is then fine)
-		const weak = (v.weakTests ?? []).filter((t) => !o.otherTests?.some((p) => samePath(t.file, p)));
+		// other units' tests are not this unit's to fix: a weak-tests entry on one (and on none of the unit's own) is dropped;
+		// only those: the verdict is then fine. A unit with no own tests keeps every entry (weak there means nothing is pinned)
+		const ownTests = o.testFiles ?? [];
+		const isOther = (f: string) => o.otherTests?.some((p) => samePath(f, p)) && !ownTests.some((p) => samePath(f, p));
+		const weak = ownTests.length ? (v.weakTests ?? []).filter((t) => !isOther(t.file)) : (v.weakTests ?? []);
 		const othersOnly = !!v.weakTests?.length && !weak.length;
 		const weakTests = weak.length ? weak.map((t) => `- ${t.file}: ${t.problem}`).join("\n") : undefined;
 		const outOfScope = v.outOfScope?.length ? v.outOfScope.map((f) => `- ${f.problem} → ${f.fix}`).join("\n") : undefined;

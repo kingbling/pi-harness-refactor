@@ -1057,8 +1057,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			if (!sameFinding(gate, previousGate)) lastRetest = undefined;
 			triage = await triageGate({ ledger: o.ledger, config: o.config, client: o.client, root: o.root }, o.unitId, gate, previousGate, attemptNo, afterRetest);
 			// only the tests were called weak (the code is fine): an implementer try has nothing to fix, so a retry or an
-			// escalation goes to the tester instead (its retest re-runs the gate on the same code)
-			if (weakOnly && (triage.action === "retry" || triage.action === "escalate")) triage = { ...triage, action: "retest", reason: `${triage.reason}; but only the tests are called weak: the tester re-checks them` };
+			// escalation goes to the tester instead (its retest re-runs the gate on the same code). Not after a retest that
+			// changed nothing: another one would not help either, so triage's choice stands
+			const toTester = weakOnly && !(afterRetest && !afterRetest.progress) && (triage.action === "retry" || triage.action === "escalate");
+			if (toTester) triage = { ...triage, action: "retest", cause: "test_bug", reason: `${triage.reason}; but only the tests are called weak: the tester re-checks them` };
 			log(pc.dim(`  triage: ${triage.cause} → ${triage.action} (${triage.reason}; conf ${triage.confidence.toFixed(2)}${triage.sure ? "" : ", unsure"})`));
 			if (triage.action === "quarantine") break;
 			// triage's retest (it never picks one after a retest that did not help)
@@ -1072,7 +1074,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				if (failed.failedStep === "wired_ok" && reviewWeakOnly && !regateOnly) regate = true;
 			};
 			// the same step failed again: another blind attempt rarely helps — find out why first (once per step)
-			const stuck = triage.action !== "ask_human" && !weakOnly && previousGate?.failedStep === gate.failedStep && !diagnosed.has(gate.failedStep ?? "");
+			const stuck = triage.action !== "ask_human" && !toTester && previousGate?.failedStep === gate.failedStep && !diagnosed.has(gate.failedStep ?? "");
 			if (stuck) diagnosed.add(gate.failedStep ?? "");
 			if (triage.action === "ask_human" || stuck) {
 				// Before bothering a human: find out why. Certain/plausible code- or test-side causes are retried

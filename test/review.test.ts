@@ -191,6 +191,23 @@ describe("wired_ok: the reviewer model", () => {
 		expect(mixed.r).toMatchObject({ ok: false, weakTests: `- ${own}: asserts nothing` });
 	});
 
+	it("a weak entry that also matches one of the unit's own tests is kept (same file name in two folders)", async () => {
+		const { dir, ledger, config } = project();
+		const own = "src/features/campaign/list.spec.ts";
+		const other = "src/features/agency/list.spec.ts";
+		const run = async (file: string) => reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: ["src/features/campaign/campaign.service.ts"], testFiles: [own], otherTests: [other], spawn: reviewerSession({ ok: false, findings: [], weakTests: [{ file, problem: "asserts nothing" }] }, [], []) });
+		expect(await run("list.spec.ts")).toMatchObject({ ok: false, weakTests: "- list.spec.ts: asserts nothing" });
+		expect(await run(other)).toMatchObject({ ok: true, weakTests: undefined });
+	});
+
+	it("a unit with no own tests is never passed on weak entries that name other units' tests", async () => {
+		const { dir, ledger, config } = project();
+		const other = "src/features/campaign/details-link.spec.ts";
+		ledger.addEvidence("u1", "truth_none", { reason: "only constants" });
+		const r = await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: ["src/features/campaign/campaign.service.ts"], testFiles: [], otherTests: [other], spawn: reviewerSession({ ok: false, findings: [], weakTests: [{ file: other, problem: "nothing pins this unit's fee" }] }, [], []) });
+		expect(r).toMatchObject({ ok: false, weakTests: `- ${other}: nothing pins this unit's fee` });
+	});
+
 	it("the review runs outside the CPU slot; the commands inside it", async () => {
 		const { dir, ledger } = project();
 		let inSlot = false;

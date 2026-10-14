@@ -280,11 +280,13 @@ describe("models fix each other's work", () => {
 		ledger.db.prepare("DELETE FROM truth_cases").run();
 		ledger.addEvidence("u1", "truth_none", { reason: "only constants" });
 		const roles: string[] = [];
+		const tasks: string[] = [];
 		let retests = 0;
 		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
 			({
-				run: async () => {
+				run: async (task: string) => {
 					roles.push(opts.role);
+					tasks.push(task);
 					if (opts.role === "test") write(join(ws, "migrated", SPEC), `it('pins the fee ${++retests}', () => {});\n`);
 					return { text: opts.role === "test" ? "TESTER DONE 0 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
 				},
@@ -306,6 +308,30 @@ describe("models fix each other's work", () => {
 		expect(roles.filter((x) => x !== "test")).toEqual(["implement", "implement"]);
 		expect(roles.filter((x) => x === "test").length).toBeGreaterThanOrEqual(4);
 		expect(r).toMatchObject({ state: "review", attempts: 2 });
+		// the tester is told only the tests were called weak, never the code's cause
+		const forced = tasks.filter((t) => t.includes("Jev judged the cause"));
+		expect(forced.length).toBeGreaterThan(0);
+		expect(forced.every((t) => t.includes("cause as test_bug") && !t.includes("impl_bug"))).toBe(true);
+	});
+
+	it("weak tests only, and the tester changes nothing: no retest after one that did not help, triage's choice stands (no endless tester loop)", async () => {
+		rmSync(join(ws, "migrated", SPEC));
+		ledger.db.prepare("DELETE FROM truth_cases").run();
+		ledger.addEvidence("u1", "truth_none", { reason: "only constants" });
+		const roles: string[] = [];
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => (roles.push(opts.role), { text: opts.role === "test" ? "TESTER DONE 0 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }),
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		const weak = "- src/features/agency/agency.service.spec.ts: nothing pins the fee";
+		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
+		const gate = async (g: GateInput): Promise<GateReport> => red(g, "wired_ok", (await g.review!([])).output);
+		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "impl_bug" } : undefined) });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, client, log: () => {} });
+		// the 2 weak-tests rounds (regates), then triage's own retries and escalations (as before): the attempt cap ends it
+		expect(roles).toEqual(["implement", "test", "test", "implement", "implement", "escalate", "escalate"]);
+		expect(r).toMatchObject({ state: "quarantined", attempts: 5 });
 	});
 
 	it("the reviewer judges only the unit's own tests; the area's others it gets by path only", async () => {
