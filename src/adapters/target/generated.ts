@@ -80,6 +80,8 @@ export interface AdapterManifest {
 	platform: Record<string, string>;
 	stackChoices: StackChoice[];
 	protectedGlobs: string[];
+	/** The files that decide how the checks run (older manifests have none; healCheckConfig asks once). */
+	checkConfigGlobs?: string[];
 	patternKinds: string[];
 	/** A minimal test proving the toolchain works on a fresh project; `failing` is the same test with a wrong expected value (older manifests have none). */
 	probeTest: { path: string; content: string; failing?: string };
@@ -178,6 +180,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 		...(m.migrateFresh?.cmd ? { migrateFresh: (root: string) => expand(m.migrateFresh!, { dir: root }) } : {}),
 		...(m.boot?.cmd ? { boot: (root: string) => expand(m.boot!, { dir: root }) } : {}),
 		protectedGlobs: m.protectedGlobs,
+		...(m.checkConfigGlobs ? { checkConfigGlobs: m.checkConfigGlobs } : {}),
 		generatedFiles: [],
 		patternKinds: m.patternKinds,
 		...(layoutRules ? { layoutRules } : {}),
@@ -351,6 +354,7 @@ export const MANIFEST_SCHEMA = obj({
 	platform: MAP,
 	stackChoices: { type: "array", items: obj({ key: S, question: S, default: S, options: { type: "array", items: OPTION } }) },
 	protectedGlobs: SA,
+	checkConfigGlobs: SA,
 	patternKinds: SA,
 	probeTest: obj({ path: S, content: S, failing: S }),
 	detect: obj({ file: S, contains: S }),
@@ -372,6 +376,7 @@ const SYSTEM = [
 	"- layout.suppressMarker: a regex matching a comment or annotation that silences this stack's type checker, compiler warnings or linter for a line or a file (every such form the tools have, from their docs), so code that hides an error instead of fixing it is caught.",
 	"- migrateFresh: one command that applies every migration of the project, in order, to a NEW EMPTY throwaway database (in-memory, or a temporary one the command itself points at; never the dev, legacy or production database), and fails when a migration cannot be applied. {cmd: \"\", args: []} when the stack has no migrations.",
 	"- boot: one command that loads the whole app the way it starts and then exits (the framework's own start, config or container check from its docs), and fails when the app cannot start (a missing folder in config, a service or route that cannot be built). Never a server, watch mode or database. {cmd: \"\", args: []} when the stack has no such check.",
+	"- checkConfigGlobs: the files (project-relative paths or globs) that decide how the build, lint, test and boot commands run and what they check: the tools' own config files, the dependency manifests and lock files, env files. Not the app's own config or entry files that new code is registered in: a model writing app code may change those, never these.",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up. failing: the same file with only the expected value made wrong (e.g. 1 + 1 expected to equal 3), so the test runs and FAILS; the tool checks that the test command fails on it.",
@@ -507,6 +512,42 @@ export async function healWiringFiles(root: string, opts: { client: ModelClient;
 		}
 		saveManifest(root, m);
 		opts.log?.(`  adapter ${m.id}: wiring files ${wiring.join(", ") || "none"}${!wiring.length && require.length ? ` (required ${require.join(", ")} dropped: nothing registers them)` : ""}`);
+		done.push(m.id);
+	}
+	return done;
+}
+
+/**
+ * A saved manifest written before checkConfigGlobs was asked for: one question to the model, which files of the
+ * project decide how the checks run. Code jobs may then change the rest of the protected files (app config, entry
+ * files) and never these. Only checkConfigGlobs changes. Returns the stack ids healed.
+ */
+export async function healCheckConfig(root: string, opts: { client: ModelClient; model: string; dirOf?: (stackId: string) => string; log?: (l: string) => void }): Promise<string[]> {
+	const done: string[] = [];
+	for (const m of loadManifests(root)) {
+		if (m.checkConfigGlobs) continue;
+		const dir = opts.dirOf?.(m.id);
+		const cmd = (c?: Cmd) => (c?.cmd ? [c.cmd, ...c.args].join(" ") : "none");
+		// the files near the project root, where tools keep their config
+		const files = dir && existsSync(dir) ? await exec("git", ["-C", dir, "ls-files", "--", "."]).then((o) => o.split("\n").filter((f) => f && f.split("/").length <= 3), () => [] as string[]) : [];
+		const res = await opts.client.chat({
+			model: opts.model,
+			effort: "medium",
+			schema: obj({ checkConfigGlobs: SA }),
+			messages: [
+				{ role: "system", content: SYSTEM },
+				{ role: "user", content: `The ${m.id} manifest has no checkConfigGlobs yet. Its commands: build ${cmd(m.build)}; lint ${cmd(m.lint)}; test ${cmd(m.test)}; boot ${cmd(m.boot)}. Its protectedGlobs: ${m.protectedGlobs.join(", ")}. Dependency manifests: ${m.toolchain.manifestFiles.join(", ") || "none"}.\nThe project's tracked files near its root:\n${files.slice(0, 400).join("\n") || "(none)"}${files.length > 400 ? `\n… ${files.length - 400} more` : ""}\n\nAnswer only checkConfigGlobs, as the rule above says.` },
+			],
+		});
+		const globs = (((res.json ?? {}) as { checkConfigGlobs?: string[] }).checkConfigGlobs ?? []).filter((p) => p && !p.startsWith("/") && !p.includes(".."));
+		// no answer: the protected list stays the lock, asked again at the next start
+		if (!globs.length) {
+			opts.log?.(`  adapter ${m.id}: the model named no files that decide how the checks run; the protected list stays the lock`);
+			continue;
+		}
+		m.checkConfigGlobs = globs;
+		saveManifest(root, m);
+		opts.log?.(`  adapter ${m.id}: files that decide how the checks run: ${globs.join(", ")}`);
 		done.push(m.id);
 	}
 	return done;

@@ -409,6 +409,12 @@ export interface TargetAdapter {
 	migrateFresh?(root: string): { cmd: string; args: string[] };
 	/** Paths the implementer may never write (protected). */
 	protectedGlobs: string[];
+	/**
+	 * The files that decide how the build, lint, test and boot commands run (their config files, the dependency
+	 * manifests, env files): a code job may change app config and entry files, never these. Absent (an older
+	 * manifest not healed yet): protectedGlobs.
+	 */
+	checkConfigGlobs?: string[];
 	/** Registration files generated from the ledger, never agent-edited. */
 	generatedFiles: string[];
 	/**

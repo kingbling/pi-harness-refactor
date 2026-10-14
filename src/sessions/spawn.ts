@@ -34,6 +34,11 @@ export interface SpawnOptions {
 	protectedGlobs?: string[];
 	/** A protected path the globs cannot say (config, but not the tests and wiring files a job may write). */
 	isProtected?: (rel: string) => boolean;
+	/**
+	 * Run after each bash command: a write through the shell is not seen by the write gate. A returned note is added
+	 * to the command's output (what was put back and why).
+	 */
+	afterBash?: () => Promise<string | undefined>;
 	/** Globs where NEW files may be created but existing ones never edited (shared helpers used by other units). */
 	appendOnlyGlobs?: string[];
 	systemPrompt: string;
@@ -68,6 +73,13 @@ export function bashTouchesReadOnly(command: string, sourceRoot: string, cwd: st
 	if (mentions && (WRITE_VERBS.test(harmless) || mutating?.test(harmless))) return "the legacy source repo is read-only: no writes, moves, deletes, redirects or git operations there";
 	if (/\bgit\s+(commit|push|rebase|merge|reset|checkout|clean|stash)\b/.test(command)) return "git is driven by the orchestrator (commits per accepted unit); do not run git mutations";
 	return undefined;
+}
+
+/** A bash result with the session's afterBash note added (what was put back after the command), or undefined: unchanged. */
+export async function afterBashResult(event: { content?: Array<{ type: string; text?: string }>; isError?: boolean; result?: { details?: unknown } }, afterBash: () => Promise<string | undefined>): Promise<{ content: any[]; isError?: boolean; details: any } | undefined> {
+	const note = await afterBash().catch(() => undefined);
+	if (!note) return undefined;
+	return { content: [...(event.content ?? []), { type: "text", text: note }], isError: event.isError, details: event.result?.details ?? {} };
 }
 
 const DELETES = /^(rm|rmdir|unlink|mv)$/;
@@ -385,6 +397,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 		});
 		// Post-write syntax check for edits too (write is validated before it lands; edit cannot be, so check the result on disk).
 		pi.on("tool_result", async (event) => {
+			if (event.toolName === "bash" && opts.afterBash) return afterBashResult(event as any, opts.afterBash);
 			// a failed edit is a tool slip, not a reason to give up: say how to get it through
 			if (event.toolName === "edit" && event.isError) {
 				const text = (event.content ?? []).map((c) => ("text" in c ? c.text : "")).join("\n");

@@ -463,7 +463,11 @@ async function toolchainProblem(config: Config, adapter: TargetAdapter): Promise
  * Checked at setup, and again after every setup fix during the run (a fix may change the command or its config).
  */
 export async function testCannotFail(config: Config, adapter: TargetAdapter): Promise<string | undefined> {
-	const dir = projectDir(config, adapter.id);
+	return probeStillFails(adapter, projectDir(config, adapter.id));
+}
+
+/** The same in any checkout of the project (a code job's worktree): undefined when the test command fails the probe's failing variant. */
+export async function probeStillFails(adapter: TargetAdapter, dir: string): Promise<string | undefined> {
 	const probe = adapter.probeTest?.(dir);
 	if (!probe) return undefined;
 	if (!probe.failing) {

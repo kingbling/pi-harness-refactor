@@ -35,6 +35,28 @@ export function retryRefused(q: QuestionRow, answer: string, hint?: string): str
   return undefined;
 }
 
+/**
+ * A unit that this many units wait on (directly or through others, not accepted yet) is not parked quietly: when the
+ * models find nothing more to try, the owner is asked once, with what the last code job wrote.
+ */
+export const ASK_OWNER_BLOCKS = 20;
+
+/** Units not accepted yet that wait on `unitId`, directly or through others. */
+export function blockedBehind(ledger: Ledger, unitId: string): number {
+  const rows = ledger.db.prepare("SELECT id, deps FROM units WHERE state != 'accepted'").all() as Array<{ id: string; deps: string }>;
+  const needs = new Map<string, string[]>();
+  for (const r of rows) for (const dep of JSON.parse(r.deps) as string[]) needs.set(dep, [...(needs.get(dep) ?? []), r.id]);
+  const seen = new Set<string>();
+  const stack = [...(needs.get(unitId) ?? [])];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (seen.has(id) || id === unitId) continue;
+    seen.add(id);
+    stack.push(...(needs.get(id) ?? []));
+  }
+  return seen.size;
+}
+
 /** A parked or waiting unit's question (quarantine, an environment it fails on): its "leave" keeps it parked without asking the owner. */
 const parks = (q: QuestionRow) => q.point === "quarantine" || q.point === "gate_env";
 
@@ -46,7 +68,7 @@ export const FIX_JOB = "setup model (fix job)";
  * A code job: a model writes app code a unit needs but may not write (an endpoint, wiring, a shared fixture) on main, with tests.
  * { refused }: it wrote code that the check would not merge, and why.
  */
-export type CodeJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | { refused: string } | undefined>;
+export type CodeJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | { refused: string; diff?: string } | undefined>;
 export const CODE_JOB = "code model (code job)";
 /** A layout job: the stack's folder layout gets the slot the gate keeps refusing; applied when it only allows more, else the owner decides. */
 export type LayoutJob = (q: QuestionRow, what: string, stack?: string) => Promise<{ applied: string } | { owner: string } | undefined>;
@@ -89,8 +111,20 @@ export async function resolveOpenQuestions(d: {
     // what only a person can do, in those words: not "retry or leave"
     const askOwnerTo = (why: string) =>
       d.ledger.db.prepare("UPDATE questions SET question = ?, options = ? WHERE id = ?").run(`${q.unit_id} is parked until you do this: ${why}`, JSON.stringify(["retry — done, run it again", "leave — leave it parked"]), q.id);
-    // a parked unit stays parked, quietly: br status lists it, the owner is not asked "retry or leave"
+    // a parked unit stays parked, quietly: br status lists it, the owner is not asked "retry or leave". Unless many units
+    // wait on it: then the owner gets one question, with what the last code job for this unit wrote
     const park = (why: string) => {
+      const blocks = q.unit_id ? blockedBehind(d.ledger, q.unit_id) : 0;
+      if (blocks >= ASK_OWNER_BLOCKS) {
+        const diff = (d.ledger.db.prepare("SELECT json_extract(context, '$.jobDiff') diff FROM questions WHERE unit_id = ? AND json_extract(context, '$.jobDiff') IS NOT NULL ORDER BY id DESC LIMIT 1").get(q.unit_id) as { diff: string } | undefined)?.diff;
+        d.ledger.db
+          .prepare("UPDATE questions SET question = ?, options = ? WHERE id = ?")
+          .run(`${q.unit_id} is parked and ${blocks} units wait on it. The models found nothing more to try: ${why}${diff ? `\nWhat the last code job for it wrote (not merged):\n${diff}` : ""}`, JSON.stringify(["retry — run it again (after you changed what it needs, or with a hint)", "leave — leave it parked"]), q.id);
+        d.ledger.markForOwner(q.id, `${blocks} units wait on ${q.unit_id}: ${why}`);
+        d.log?.(`question #${q.id} (${q.point} ${q.unit_id}): ${blocks} units wait on it, so the owner is asked — ${why.slice(0, 160)}`);
+        forOwner++;
+        return;
+      }
       d.ledger.answerQuestion(q.id, optionFor(q, "leave", why), RESOLVER);
       d.log?.(`question #${q.id} (${q.point} ${q.unit_id}): stays parked, the owner is not asked — ${why.slice(0, 160)}`);
       answered++;
@@ -159,6 +193,8 @@ export async function resolveOpenQuestions(d: {
         : undefined;
       if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
       const fixed = typeof done === "string" ? done : undefined;
+      // what a refused job wrote stays with the question: an owner asked about this unit later sees it
+      if (typeof done === "object" && done.diff) d.ledger.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.jobDiff', ?) WHERE id = ?").run(done.diff.slice(0, 8000), q.id);
       // a refused job did write something: the resolver sees why it stayed off main, not "changed nothing"
       const why = typeof done === "object" ? `a ${kind} wrote it but was not merged: ${done.refused.slice(0, 1500)} (asked for: ${what})` : `a ${kind} was tried and changed nothing: ${what}`;
       if (!fixed && parks(q)) {

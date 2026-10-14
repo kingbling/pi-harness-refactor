@@ -115,6 +115,76 @@ describe("a red main", () => {
 	});
 });
 
+describe("a red main the builder cannot hand to a code job", () => {
+	// the check names the file its error is in, like a type checker does
+	async function red(file: string, o: { codeJob?: (s: string, w: string) => Promise<string | undefined>; fixSetup?: (s: string, p: string) => Promise<string | undefined>; ledger?: Ledger } = {}) {
+		const s = await setup("bad\n");
+		writeFileSync(join(s.target, "src", "Kernel.txt"), "kernel\n");
+		mkdirSync(join(s.target, "config"), { recursive: true });
+		writeFileSync(join(s.target, "config", "lint.txt"), "rules\n");
+		await commitAll(s.target, "kernel and lint config");
+		const adapter = { ...s.adapter, protectedGlobs: ["config/**", "src/Kernel.txt"], checkConfigGlobs: ["config/lint.txt"], build: () => ({ cmd: "sh", args: ["-c", `grep -q ok src/a.txt || { echo "${file}:12 error: $(cat src/a.txt)"; exit 1; }`] }) } as unknown as TargetAdapter;
+		const ledger = o.ledger ?? new Ledger(":memory:");
+		const mk = () => createBuilder({ config: s.config, root: s.root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix: async () => undefined, repair: false, codeJob: o.codeJob, fixSetup: o.fixSetup, every: { units: 1, minutes: 60 } });
+		return { ...s, ledger, mk };
+	}
+
+	it("errors only in files that decide how the checks run go to the setup model, not to a code job", async () => {
+		const jobs: string[] = [];
+		const setups: string[] = [];
+		const { mk } = await red("config/lint.txt", { codeJob: async (_s, w) => (jobs.push(w), undefined), fixSetup: async (_s, p) => (setups.push(p), undefined) });
+		const b = mk();
+		b.afterMerge("fake");
+		await b.finish();
+		expect(jobs).toEqual([]);
+		expect(setups).toHaveLength(1);
+		expect(setups[0]).toMatch(/config\/lint\.txt:12 error/);
+		// the setup model changed nothing: parked, no paid job on the next cycle either
+		b.afterMerge("fake");
+		await b.finish();
+		expect(jobs).toEqual([]);
+		expect(setups).toHaveLength(1);
+	});
+
+	it("errors in app files a code job may change (the kernel) still go to a code job", async () => {
+		const jobs: string[] = [];
+		const { mk } = await red("src/Kernel.txt", { codeJob: async (_s, w) => (jobs.push(w), undefined), fixSetup: async () => undefined });
+		const b = mk();
+		b.afterMerge("fake");
+		await b.finish();
+		expect(jobs).toHaveLength(1);
+	});
+
+	it("the job count is in the ledger: a restart (a new builder) keeps the park while main fails the same way", async () => {
+		const jobs: string[] = [];
+		const { mk, ledger, target } = await red("src/Kernel.txt", { codeJob: async (_s, w) => (jobs.push(w), undefined) });
+		const first = mk();
+		for (let i = 0; i < MAX_BUILD_CODE_JOBS + 1; i++) {
+			first.afterMerge("fake");
+			await first.finish();
+		}
+		expect(jobs).toHaveLength(MAX_BUILD_CODE_JOBS);
+		expect(ledger.getMeta(buildParkedKey("fake"))).toBeTruthy();
+		const restarted = mk();
+		restarted.afterMerge("fake");
+		await restarted.finish();
+		expect(jobs).toHaveLength(MAX_BUILD_CODE_JOBS); // still parked
+		// main changed, but it fails the same way: still parked
+		writeFileSync(join(target, "src", "Kernel.txt"), "kernel 2\n");
+		await commitAll(target, "unrelated change");
+		restarted.afterMerge("fake");
+		await restarted.finish();
+		expect(jobs).toHaveLength(MAX_BUILD_CODE_JOBS);
+		// main changed where it matters (it now fails with other errors): the park is lifted, a code job tries again
+		writeFileSync(join(target, "src", "a.txt"), "worse\n");
+		await commitAll(target, "other change");
+		restarted.afterMerge("fake");
+		await restarted.finish();
+		expect(jobs).toHaveLength(MAX_BUILD_CODE_JOBS + 1);
+		expect(ledger.getMeta(buildParkedKey("fake"))).toBe("");
+	});
+});
+
 describe("the builder's code job", () => {
 	async function job(fix: string) {
 		const s = await setup("bad\n");

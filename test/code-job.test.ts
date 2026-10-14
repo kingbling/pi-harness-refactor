@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -13,27 +13,33 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean } = {}) {
+	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean; checkConfigGlobs?: string[]; test?: (dir: string, files: string[]) => { cmd: string; args: string[] }; probeTest?: { path: string; content: string; failing?: string }; unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> } } = {}) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
 		writeFileSync(join(target, "src", "a.test.txt"), "expects ok\n");
 		writeFileSync(join(target, "tsconfig.json"), "{}\n");
-		for (const [f, text] of Object.entries(o.main ?? {})) writeFileSync(join(target, f), text);
+		for (const [f, text] of Object.entries(o.main ?? {})) mkdirSync(join(target, f, ".."), { recursive: true }), writeFileSync(join(target, f), text);
 		await ensureRepo(target, "migration/main", []);
 		await commitAll(target, "init");
 		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
 		const adapter = {
 			id: "fake",
 			protectedGlobs,
+			...(o.checkConfigGlobs ? { checkConfigGlobs: o.checkConfigGlobs } : {}),
+			...(o.probeTest ? { probeTest: () => o.probeTest } : {}),
 			toolchain: { ignoredPaths: [] },
 			generatedFiles: [],
 			layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], ignoreDirs: [], isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree, wiringFiles },
 			build: () => o.build ?? { cmd: "true", args: [] },
-			test: () => ({ cmd: "true", args: [] }),
+			test: (dir: string, files: string[]) => o.test?.(dir, files) ?? { cmd: "true", args: [] },
 		} as unknown as TargetAdapter;
 		let merged = false;
 		let refused: string | undefined;
+		let diff: string | undefined;
+		let locked: { files: string[]; diff: string } | undefined;
+		// what main gets: the worktree as the job leaves it
+		let onMain: Record<string, string> = {};
 		const said = await runCodeJob({
 			config,
 			root,
@@ -43,12 +49,18 @@ describe("the code job", () => {
 			label: o.whole ? "build-fake-1" : "q1",
 			whole: o.whole,
 			linkAll: () => {},
-			mergeFix: async () => ((merged = true), undefined),
+			mergeFix: async (wt) => {
+				merged = true;
+				onMain = Object.fromEntries(git(wt, ["ls-files", "-mo", "--exclude-standard"]).split("\n").filter(Boolean).map((f) => [f, readFileSync(join(wt, f), "utf8")]));
+				return undefined;
+			},
 			log: () => {},
 			worker: async ({ dir }) => worker(dir),
-			onRefused: (p) => (refused = p),
+			onRefused: (p, d) => ((refused = p), (diff = d)),
+			onLocked: (l) => (locked = l),
+			unitWork: o.unitWork,
 		});
-		return { said, merged, target, refused };
+		return { said, merged, target, refused, diff, locked, onMain };
 	}
 
 	it("a deleted test fails the check: nothing is merged", async () => {
@@ -60,17 +72,56 @@ describe("the code job", () => {
 	});
 
 	const code = (dir: string) => (writeFileSync(join(dir, "src", "b.txt"), "code\n"), writeFileSync(join(dir, "src", "b.test.txt"), "test\n"));
-	it("changed protected config fails the check: it holds the checks", async () => {
+	it("a changed file that decides how the checks run is put back, the rest of the job is judged and merged; the caller gets the change", async () => {
 		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "tsconfig.json"), '{"strict":false}\n'), "added b"), ["**/tsconfig*.json"]);
+		expect(r.merged).toBe(true);
+		expect(r.onMain["src/b.txt"]).toBe("code\n");
+		expect(r.onMain["tsconfig.json"]).toBeUndefined(); // put back: main keeps {}
+		expect(r.locked?.files).toEqual(["tsconfig.json"]);
+		expect(r.locked?.diff).toMatch(/strict":false/);
+	});
+	it("a job that changed only such files is refused, with the diff for the setup model", async () => {
+		const r = await job((dir) => (writeFileSync(join(dir, "tsconfig.json"), '{"strict":false}\n'), "loosened tsconfig"), ["**/tsconfig*.json"]);
 		expect(r.merged).toBe(false);
+		expect(r.refused).toMatch(/^only files that decide how the checks run were changed/);
+		expect(r.diff).toMatch(/strict":false/);
+		expect(r.locked?.files).toEqual(["tsconfig.json"]);
 	});
 	it("a protected wiring file (bundle list, route table) may change: a new feature folder is registered there", async () => {
 		const wire = (dir: string) => (code(dir), mkdirSync(join(dir, "config"), { recursive: true }), writeFileSync(join(dir, "config", "bundles.txt"), "B\n"), "added b");
-		expect((await job(wire, ["config/**"], undefined, ["config/bundles.txt"])).merged).toBe(true);
+		expect((await job(wire, ["config/**"], undefined, ["config/bundles.txt"])).onMain["config/bundles.txt"]).toBe("B\n");
+		// an older manifest (no checkConfigGlobs): every protected file is locked, it is put back
 		const r = await job(wire, ["config/**"]);
-		expect(r.merged).toBe(false);
-		// the caller learns why: the resolver says "wrote it but was not merged", not "changed nothing"
-		expect(r.refused).toBe("protected config was changed: config/bundles.txt");
+		expect(r.onMain["config/bundles.txt"]).toBeUndefined();
+		expect(r.locked?.files).toEqual(["config/bundles.txt"]);
+	});
+	describe("app config (protected, but not what decides how the checks run)", () => {
+		// the test command fails a file with WRONG in it, unless config/skip exists (an app config that turns the checks off)
+		const test = (_dir: string, files: string[]) => ({ cmd: "sh", args: ["-c", 'test -f config/skip || ! grep -q WRONG "$0" "$@"', ...files] });
+		const o = { checkConfigGlobs: ["tsconfig.json"], test, probeTest: { path: "src/probe.test.txt", content: "fine\n", failing: "WRONG\n" } };
+		const app = (file: string) => (dir: string) => (code(dir), mkdirSync(join(dir, "config"), { recursive: true }), writeFileSync(join(dir, "config", file), "on\n"), "added b and its login wiring");
+		it("may change: the login wiring a code job writes lands", async () => {
+			const r = await job(app("security.yaml"), ["config/**", "tsconfig.json"], undefined, [], o);
+			expect(r.merged).toBe(true);
+			expect(r.onMain["config/security.yaml"]).toBe("on\n");
+			expect(r.locked).toBeUndefined();
+		});
+		it("that turns the checks off is refused: the test command must still fail a failing test", async () => {
+			const r = await job(app("skip"), ["config/**", "tsconfig.json"], undefined, [], o);
+			expect(r.merged).toBe(false);
+			expect(r.refused).toMatch(/with the changed app config \(config\/skip\) the checks no longer work/);
+		});
+	});
+	it("a job for a waiting unit starts from main plus that unit's work, may replace that unit's stubs, and merges both", async () => {
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "u179", tier: "T1", symbolIds: [] });
+		let seen = "";
+		const unitWork = { unitId: "u179", apply: async (wt: string) => (writeFileSync(join(wt, "src", "renderer.txt"), "class StatusMailRenderer\n"), true) };
+		const r = await job((dir) => ((seen = readFileSync(join(dir, "src", "renderer.txt"), "utf8")), code(dir), writeFileSync(join(dir, "src", "stub.txt"), "real\n"), "added b"), [], undefined, [], { main: { "src/stub.txt": "// TODO(br:u179) stand-in\n" }, ledger, unitWork });
+		expect(seen).toBe("class StatusMailRenderer\n");
+		expect(r.merged).toBe(true);
+		expect(r.onMain["src/renderer.txt"]).toBe("class StatusMailRenderer\n");
+		expect(r.onMain["src/b.txt"]).toBe("code\n");
 	});
 	it("no code at all fails the check: the job was to write code", async () => {
 		const r = await job((dir) => (writeFileSync(join(dir, "notes.md"), "todo\n"), "wrote notes"));
