@@ -11,7 +11,8 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
-import { changedFiles, wholeProjectSteps } from "./gate.ts";
+import { changedFiles, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { findTests } from "./ported.ts";
 import { checkTree } from "./layout-check.ts";
 import { endTidyTask, onlyCase, tidyMissing, tidyTasks, type TidyTask } from "./tidy.ts";
 import { exec } from "../proc.ts";
@@ -107,7 +108,10 @@ export function createTidyJobs(o: {
 			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t }).finally(() => overrides.restore() && o.log(pc.yellow(`tidy ${t.id}: the job changed the gate commands file; put back`)))) || "";
 			const changed = await changedFiles(dir, adapter.toolchain.ignoredPaths);
 			const message = `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`;
-			let problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
+			// files new to the project, from before the commit below: the second check must see them as added too
+			const before = new Set(await trackedFiles(dir));
+			const added = new Set(changed.filter((f) => existsSync(join(dir, f)) && !before.has(f)));
+			let problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack), added);
 			// main moved while the job ran: a unit merged since may use the old names, so the check runs again on top of it
 			if (!problem && await headOf(o.config.target.path) !== base) {
 				await commitAll(wt, message);
@@ -117,7 +121,7 @@ export function createTidyJobs(o: {
 					// the half-done rebase goes with the worktree below; the task fails with git's reason
 					throw new Error(`could not rebase onto main: ${String(e?.stderr ?? e?.message).trim().slice(0, 400)}`);
 				}
-				problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
+				problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack), added);
 			}
 			if (problem) {
 				endTidyTask(o.ledger, t.id, "failed", problem);
@@ -157,10 +161,11 @@ export function createTidyJobs(o: {
 
 /**
  * Code's check of a tidy job: the task is done in the tree, the moved files follow the layout, the build passes (the whole project when the build
- * cannot take files, else the changed code files) and the tests among the changed files pass. Undefined = green.
+ * cannot take files, else the changed code files) and the tests among the changed files pass; when source files were
+ * added or moved, also the app's boot check and the area's ported tests. Undefined = green.
  * A failing step runs again on main (`mainDir`), like a code job's: it fails only when green on main or with error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[], mainDir: string): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[], mainDir: string, newFiles: Set<string>): Promise<string | undefined> {
 	const missing = tidyMissing(dir, t);
 	if (missing.length) return `the change is not complete: ${missing.join("; ")}`;
 	// a delete removes only the files it names
@@ -172,12 +177,16 @@ async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: 
 	const drift = moved.length ? await checkTree(dir, adapter, moved) : [];
 	if (drift.length) return `the layout check failed: ${drift.slice(0, 10).join("\n")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
-	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const whole = wholeProjectSteps(adapter, dir).some((s) => s.step === "build");
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
+	// source files added or moved: the app may no longer load (a service folder its config scans, a class at an old
+	// path), which no test among the changed files shows. The app's boot check and the area's ported tests run too
+	const addedOrMoved = changed.some((f) => adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && (newFiles.has(f) || !existsSync(join(dir, f))));
+	const boot = addedOrMoved && !!adapter.boot?.(dir)?.cmd;
+	const tests = [...new Set([...present.filter((f) => adapter.layout.isTestFile(f)), ...(addedOrMoved ? areaTests(adapter, dir, t.area) : [])])];
 	// each step with the files it checks (none: the whole project), so the same step can run on main
-	const steps: Array<{ step: string; files?: string[] }> = [...(whole ? [{ step: "build" }] : code.length ? [{ step: "build", files: code }] : []), ...(tests.length ? [{ step: "test", files: tests }] : [])];
-	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === "build")!);
+	const steps: Array<{ step: string; files?: string[] }> = [...(whole ? [{ step: "build" }] : code.length ? [{ step: "build", files: code }] : []), ...(boot ? [{ step: "boot" }] : []), ...(tests.length ? [{ step: "test", files: tests }] : [])];
+	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.step === "boot" ? adapter.boot!(d)! : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === s.step)!);
 	const added: string[] = [];
 	for (const s of steps) {
 		const c = cmd(dir, s);
@@ -192,4 +201,13 @@ async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: 
 		added.push(...newErrorLines(err, dir, was, mainDir));
 	}
 	return added.length ? `the checks fail with ${added.length} error line(s) main does not have:\n${added.join("\n").slice(-6000)}` : undefined;
+}
+
+/** The ported tests of an area (where its units' tests live in the stack's layout); none when the layout cannot say. */
+function areaTests(adapter: TargetAdapter, dir: string, area: string): string[] {
+	try {
+		return findTests(dir, adapter.layout.moduleDir(area), adapter.layout);
+	} catch {
+		return [];
+	}
 }

@@ -46,6 +46,30 @@ describe("gate slots", () => {
 		}
 	});
 
+	it("br lanes shows how long gates waited for main's answer on other units' tests, which no slot measures", () => {
+		const dir = mkdtempSync(join(tmpdir(), "br-mainwait-"));
+		try {
+			const f = join(dir, "bigrefactor.config.json");
+			writeFileSync(f, JSON.stringify(ConfigSchema.parse({ source: { path: dir, stack: "php" }, target: { path: dir, stacks: ["nestjs"] }, models: {} })));
+			mkdirSync(join(dir, ".bigrefactor"), { recursive: true });
+			const ledger = new Ledger(join(dir, ".bigrefactor", "ledger.sqlite"));
+			ledger.db.prepare("INSERT INTO attempts(role, started_at, ended_at) VALUES ('implement', datetime('now', '-60 seconds'), datetime('now'))").run();
+			const report = (mainWaitMs?: number) => JSON.stringify({ ok: false, steps: [{ name: "build_ok", ok: true, ms: 3000, slotMs: 3000, output: "" }, { name: "ported_tests_green", ok: false, ms: 900_000, slotMs: 30_000, ...(mainWaitMs ? { mainWaitMs } : {}), output: "" }] });
+			const add = ledger.db.prepare("INSERT INTO attempts(role, started_at, ended_at, gate_report) VALUES ('implement', ?, ?, ?)");
+			const now = new Date().toISOString();
+			add.run(now, now, report(800_000));
+			add.run(now, now, report(600_000));
+			add.run(now, now, report()); // main not asked
+			add.run("2020-01-01T00:00:00.000Z", "2020-01-01T00:01:00.000Z", report(5_000)); // long ago
+			ledger.close();
+			const out = lanes(f, {});
+			expect(out).toMatch(/other units' tests on main \(last day\): a gate waited ~700 s for main's answer on average over 2 gate\(s\)/);
+			expect(out).toMatch(/work waits on main's test runs, not on gate slots/);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("gate slots follow the lanes unless the owner picks a number; new lanes alone hand them back to the lanes", () => {
 		const run = (lanes: number, gates?: number) => ConfigSchema.parse({ source: { path: "/x", stack: "php" }, target: { path: "/x", stacks: ["nestjs"] }, models: {}, run: { agentConcurrency: lanes, gateConcurrency: gates } }).run;
 		expect(gateSlots(run(20), 12)).toBe(4);

@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { cp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -510,6 +511,60 @@ export async function healWiringFiles(root: string, opts: { client: ModelClient;
 		done.push(m.id);
 	}
 	return done;
+}
+
+/**
+ * A saved manifest written before boot was asked for (or whose model named none) gets that one question: the command
+ * that loads the whole app and exits, which the builder and the tidy and code-job checks run so a change that keeps
+ * the app from starting does not land. The model names it from the project's files; code runs it on main's project
+ * (`dirOf`). A command that fails there goes back to the model once with the output: it fixes the command, or answers
+ * the same one when the app itself does not start (main is broken, and the check should say so). No command: an empty
+ * one is saved, so it is asked once. A stack whose workspace already sets a boot command (`hasOwn`, the setup fixer's)
+ * or whose project is not there yet is left alone. Returns the ids changed.
+ */
+export async function healBoot(root: string, opts: { client: ModelClient; model: string; dirOf: (stackId: string) => string; hasOwn?: (stackId: string) => boolean; log?: (l: string) => void }): Promise<string[]> {
+	const done: string[] = [];
+	for (const m of loadManifests(root)) {
+		const dir = opts.dirOf(m.id);
+		if ("boot" in m || opts.hasOwn?.(m.id) || !existsSync(dir)) continue;
+		const files = await exec("git", ["-C", dir, "ls-files"]).then(
+			(out) => out.split("\n").filter((f) => f && f.split("/").length <= 2),
+			() => readdirSync(dir),
+		);
+		const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+			{ role: "system", content: SYSTEM },
+			{ role: "user", content: `The ${m.id} manifest has no boot command yet (build: ${[m.build.cmd, ...m.build.args].join(" ")}; test: ${[m.test.cmd, ...m.test.args].join(" ")}). The project's tracked files, two folders deep:\n${files.slice(0, 400).join("\n")}${files.length > 400 ? `\n… ${files.length - 400} more` : ""}\n\nAnswer only boot, as the rule above says.` },
+		];
+		let boot: Cmd = { cmd: "", args: [] };
+		for (let round = 0; round < 2; round++) {
+			const res = await opts.client.chat({ model: opts.model, effort: "medium", schema: obj({ boot: CMD }), messages });
+			const said = ((res.json ?? {}) as { boot?: Cmd }).boot;
+			const c: Cmd = said?.cmd ? { cmd: said.cmd, args: said.args ?? [] } : { cmd: "", args: [] };
+			// the same command again after its failure: the model says the app itself does not start
+			if (!c.cmd || (round > 0 && c.cmd === boot.cmd && c.args.join("\0") === boot.args.join("\0"))) {
+				boot = c;
+				break;
+			}
+			boot = c;
+			const bad = validateManifest({ ...m, boot: c }).filter((p) => p.startsWith("boot"));
+			const failed = bad.length ? bad.join("\n") : await bootFails(fromManifest({ ...m, boot: c }).boot!(dir)!, dir);
+			if (failed === undefined) break;
+			if (round > 0) boot = { cmd: "", args: [] }; // still failing with a new command: none rather than a wrong one
+			messages.push({ role: "assistant", content: JSON.stringify({ boot: c }) }, { role: "user", content: `That command failed in the project (${dir}):\n${failed.slice(-3000)}\nFix the command, or answer the same one if it is right and the app itself does not start.` });
+		}
+		m.boot = boot;
+		saveManifest(root, m);
+		opts.log?.(`  adapter ${m.id}: boot ${boot.cmd ? [boot.cmd, ...boot.args].join(" ") : "none"}`);
+		done.push(m.id);
+	}
+	return done;
+}
+
+/** Runs a boot command in `dir`: undefined when it exits 0, else its output (it must exit by itself within minutes). */
+function bootFails(c: Cmd, dir: string): Promise<string | undefined> {
+	return new Promise((res) =>
+		execFile(c.cmd, c.args, { cwd: dir, timeout: 5 * 60_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, CI: "1" } }, (e, out, err) => res(e ? `${String(out)}\n${String(err)}${e.killed ? "\n[timed out]" : ""}`.trim() || String(e.message) : undefined)),
+	);
 }
 
 /** git has a commit that touched `file` in the project dir (false without git). */

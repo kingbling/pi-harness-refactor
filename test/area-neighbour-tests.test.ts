@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { ownTests, runPortedTests } from "../src/run/ported.ts";
+import { catchUpWithMain, failingFiles, ownTests, runPortedTests, STALE_NOT_COUNTED, warmMainCache } from "../src/run/ported.ts";
 
 /**
  * The gate runs the unit's own ported tests; another unit's test in the same area counts against the unit only when it
@@ -147,5 +147,177 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect(r.output).toMatch(/pass on main and fail with your code \(tests\/m3\.spec\)/);
 		expect(r.output).toMatch(/fail on main too.*tests\/n2\.spec/);
 		expect(runsIn(main)).toBe(2); // all at once (n2 named red), then the other 9 together
+	});
+
+	it("a runner's 'Failed <file>' line and a numbered failure's trace name the failing files; notice lists and longer paths do not", () => {
+		const dir = "/w/symfony";
+		const out = [
+			"Running tests/AOkTest.php",
+			"2 tests triggered 2 PHPUnit notices:",
+			"",
+			"1) App\\Tests\\AOkTest::testA",
+			"No expectations were configured for the mock object.",
+			"",
+			`${dir}/tests/AOkTest.php:17`,
+			"",
+			"OK, but there were issues!",
+			"There were 2 errors:",
+			"",
+			"1) App\\Tests\\BTest::testB",
+			"Symfony\\Component\\Config\\Exception\\LoaderLoadException: Expected to find class",
+			"",
+			`${dir}/vendor/symfony/config/Loader/FileLoader.php:190`,
+			`${dir}/tests/BTest.php:15`,
+			"",
+			"ERRORS!",
+			"Failed tests/CTest.php (exit 2)",
+			"Failed src/tests/DTest.php (exit 2)",
+		].join("\n");
+		expect(failingFiles(out, ["tests/AOkTest.php", "tests/BTest.php", "tests/CTest.php", "tests/DTest.php"], dir)).toEqual(["tests/BTest.php", "tests/CTest.php"]);
+	});
+
+	it("main red too, with a runner that says 'Failed <file> (exit 2)': no run file by file", async () => {
+		const many = Array.from({ length: 6 }, (_, i) => `tests/m${i}.spec`);
+		for (const f of many) write(join(main, f), "pass\n");
+		git(main, "add", "-A");
+		git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "many");
+		git(wt, "pull", "-q");
+		write(join(wt, "broken.txt"), "tests/m3.spec\n");
+		// a per-file wrapper: runs every file and lists the failing ones at the end
+		const wrapper = { ...adapter, test: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", `echo "$PWD $*" >> ${log}; rc=0; for f; do echo "Running $f"; if ! grep -q pass "$f" || grep -qx "$f" broken.txt 2>/dev/null; then echo "Failed $f (exit 2)"; rc=1; fi; done; exit $rc`, "sh", ...files] }) } as unknown as TargetAdapter;
+		const r = await runPortedTests({ ledger, unitId: "u1", adapter: wrapper, dir: wt, tests: [...TESTS, ...many], mainDir: main, timeoutMs: 30_000 });
+		expect(r.ok).toBe(false);
+		expect(r.output).toMatch(/pass on main and fail with your code \(tests\/m3\.spec\)/);
+		expect(runsIn(main)).toBe(2);
+	});
+
+	it("lanes that ask main while it is busy are answered by one run together, and the wait is reported", async () => {
+		const extra = ["tests/n3.spec", "tests/n4.spec", "tests/n5.spec"];
+		for (const f of extra) write(join(main, f), "pass\n");
+		git(main, "add", "-A");
+		git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "three more");
+		const lanes = extra.map((_, i) => join(root, `lane${i}`));
+		for (const [i, d] of lanes.entries()) {
+			git(root, "clone", "-q", main, d);
+			write(join(d, "broken.txt"), `${extra[i]}\n`);
+		}
+		const slow = { ...adapter, test: (d: string, files: string[]) => (d === main ? { ...adapter.test(d, files), args: [adapter.test(d, files).args[0]!, `sleep 0.3; ${adapter.test(d, files).args[1]}`, ...adapter.test(d, files).args.slice(2)] } : adapter.test(d, files)) } as TargetAdapter;
+		const runs = await Promise.all(lanes.map((dir, i) => runPortedTests({ ledger, unitId: "u1", adapter: slow, dir, tests: ["tests/own.spec", extra[i]!], mainDir: main, timeoutMs: 30_000 })));
+		expect(runs.map((r) => r.ok)).toEqual([false, false, false]);
+		// the first lane's run, then one run for the two lanes that waited meanwhile
+		expect(runsIn(main)).toBe(2);
+		expect(Math.max(...runs.map((r) => r.mainWaitMs ?? 0))).toBeGreaterThanOrEqual(250);
+	});
+
+	it("after a merge the neighbour files lanes asked about run on main's new tree on the side; the next gate finds the answer", async () => {
+		write(join(wt, "broken.txt"), "tests/n1.spec\n");
+		expect((await run()).ok).toBe(false);
+		write(join(main, "merged.txt"), "another unit\n");
+		git(main, "add", "-A");
+		git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "merge");
+		await warmMainCache();
+		const warmed = runsIn(main);
+		expect(warmed).toBeGreaterThan(0);
+		expect((await run()).ok).toBe(false);
+		expect(runsIn(main)).toBe(warmed);
+	});
+});
+
+describe("ported tests: main's warm-up after a merge stays out of the lanes' way", () => {
+	const commitMain = (m: string) => (write(join(main, `${m}.txt`), m), git(main, "add", "-A"), git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", m));
+	const mainLines = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith(`${main} `)) : []);
+
+	it("a warm-up whose run is red and names no file does not run file by file", async () => {
+		// a runner that fails without saying which file
+		const quiet = { ...adapter, test: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", `echo "$PWD $*" >> ${log}; for f; do grep -q pass "$f" || exit 1; grep -qx "$f" broken.txt 2>/dev/null && exit 1; done; exit 0`, "sh", ...files] }) } as unknown as TargetAdapter;
+		write(join(wt, "broken.txt"), "tests/n1.spec\n");
+		expect((await runPortedTests({ ledger, unitId: "u1", adapter: quiet, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 30_000 })).ok).toBe(false);
+		commitMain("merge");
+		const before = mainLines().length;
+		await warmMainCache();
+		expect(mainLines().length - before).toBe(1);
+	});
+
+	it("a lane that asks while a warm-up waits for main's turn gets a run of its own files only", async () => {
+		const extra = ["tests/n3.spec", "tests/n4.spec"];
+		for (const f of extra) write(join(main, f), "pass\n");
+		commitMain("two more");
+		const lanes = extra.map((_, i) => join(root, `wlane${i}`));
+		for (const [i, d] of lanes.entries()) {
+			git(root, "clone", "-q", main, d);
+			write(join(d, "broken.txt"), `${extra[i]}\n`);
+		}
+		const slow = { ...adapter, test: (d: string, files: string[]) => (d === main ? { ...adapter.test(d, files), args: [adapter.test(d, files).args[0]!, `touch ${join(root, "main-busy")}; sleep 1; ${adapter.test(d, files).args[1]}`, ...adapter.test(d, files).args.slice(2)] } : adapter.test(d, files)) } as TargetAdapter;
+		const ask = (i: number) => runPortedTests({ ledger, unitId: "u1", adapter: slow, dir: lanes[i]!, tests: ["tests/own.spec", extra[i]!], mainDir: main, timeoutMs: 30_000 });
+		const first = ask(0);
+		for (let i = 0; i < 100 && !existsSync(join(root, "main-busy")); i++) await new Promise((r) => setTimeout(r, 20));
+		// main is busy with the first lane: a warm-up and a second lane wait for the same turn
+		const warm = warmMainCache();
+		const second = ask(1);
+		expect((await Promise.all([first, second])).map((r) => r.ok)).toEqual([false, false]);
+		await warm;
+		expect(mainLines().filter((l) => l.includes("tests/n4.spec"))).toEqual([`${main} tests/n4.spec`]);
+	});
+});
+
+/**
+ * A unit's worktree is made from main once; main moves on (other units, setup fixes). A neighbour test that fails in
+ * the worktree only because main fixed it since must not count against the unit: the gate brings main's new commits
+ * in under the unit's work first.
+ */
+describe("ported tests: a worktree on an older main", () => {
+	const lane = join(root, "lane");
+	const commit = (m: string) => git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", m);
+	beforeEach(() => {
+		// main is broken for n1 when the worktree is made; a setup fix lands on main after
+		write(join(main, "broken.txt"), "tests/n1.spec\n");
+		write(join(main, "app.txt"), "app\n");
+		git(main, "add", "-A");
+		commit("n1 broken");
+		git(main, "worktree", "add", "-q", "-b", "unit/u1", lane);
+		rmSync(join(main, "broken.txt"));
+		commit("setup fix: n1 works again");
+		// the unit's work, uncommitted: a new file and a changed one
+		write(join(lane, "tests/own.spec"), "pass # u1#1\n");
+		write(join(lane, "src/mine.txt"), "mine\n");
+	});
+	const head = (d: string) => execFileSync("git", ["-C", d, "rev-parse", "HEAD"]).toString().trim();
+	const status = (d: string) => execFileSync("git", ["-C", d, "status", "--porcelain"]).toString();
+	const gate = (catchUp: boolean) => runPortedTests({ ledger, unitId: "u1", adapter, dir: lane, tests: TESTS, mainDir: main, timeoutMs: 30_000, catchUp });
+
+	it("the gate brings main's new commits in under the unit's work, uncommitted as before, and the neighbour passes", async () => {
+		const r = await gate(true);
+		expect(r.ok).toBe(true);
+		expect(r.output).not.toMatch(/fail with your code/);
+		expect(head(lane)).toBe(head(main));
+		expect(existsSync(join(lane, "broken.txt"))).toBe(false);
+		expect(status(lane)).toMatch(/ M tests\/own\.spec/);
+		expect(status(lane)).toMatch(/\?\? src\//);
+	});
+
+	it("the session's own check does not move the worktree and does not count the neighbour; the gate does not take that check", async () => {
+		const before = head(lane);
+		const r = await gate(false);
+		expect(r.ok).toBe(true);
+		expect(r.output).toContain(STALE_NOT_COUNTED);
+		expect(head(lane)).toBe(before);
+	});
+
+	it("work that clashes with main's new commits: the worktree stays as it was and the neighbour is left to the merge", async () => {
+		write(join(main, "app.txt"), "main's change\n");
+		commit("main changes app.txt");
+		write(join(lane, "app.txt"), "the unit's change\n");
+		const before = head(lane);
+		const r = await gate(true);
+		expect(r.ok).toBe(true);
+		expect(r.output).toMatch(/clashes with main's new commits in app\.txt/);
+		expect(head(lane)).toBe(before);
+		expect(readFileSync(join(lane, "app.txt"), "utf8")).toBe("the unit's change\n");
+		expect(status(lane)).toMatch(/\?\? src\//);
+	});
+
+	it("catchUpWithMain: nothing to bring in when the worktree already holds main", async () => {
+		expect(await catchUpWithMain(lane, main)).toEqual({ commits: 1 });
+		expect(await catchUpWithMain(lane, main)).toBeUndefined();
 	});
 });

@@ -1,6 +1,7 @@
 import pc from "picocolors";
 import { getSourceAdapter, registerGeneratedTargets } from "../adapters/registry.ts";
-import { healWiringFiles } from "../adapters/target/generated.ts";
+import { loadCommandOverrides } from "../adapters/command-overrides.ts";
+import { healBoot, healWiringFiles } from "../adapters/target/generated.ts";
 import type { Config } from "../config.ts";
 import { projectDir } from "../init/init.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
@@ -18,6 +19,8 @@ import { requeueUnits } from "./run.ts";
  *   started there that merged nothing go back to planned first, so they drop out too.
  * - A generated adapter without wiringFiles, or naming one the project no longer has (a setup fix moved it): one
  *   question to the model (healWiringFiles); the rest stays.
+ * - A generated adapter without a boot command (the app's own start check): one question to the model, the command
+ *   tried on main's project (healBoot), so the builder and the tidy and code-job checks catch an app that no longer starts.
  */
 const NOT_APP_PENDING = "not_app_heal_pending";
 
@@ -54,6 +57,7 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 	}
 	if (o.client) {
 		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });
-		if (changed.length) registerGeneratedTargets(o.root);
+		const booted = await healBoot(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), hasOwn: (id) => !!loadCommandOverrides(o.root, id).boot, log: (l) => o.log(pc.dim(l)) });
+		if (changed.length || booted.length) registerGeneratedTargets(o.root);
 	}
 }

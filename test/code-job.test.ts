@@ -13,7 +13,7 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean } = {}) {
+	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; boot?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean } = {}) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
@@ -30,6 +30,7 @@ describe("the code job", () => {
 			generatedFiles: [],
 			layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], ignoreDirs: [], isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree, wiringFiles },
 			build: () => o.build ?? { cmd: "true", args: [] },
+			...(o.boot ? { boot: () => o.boot } : {}),
 			test: () => ({ cmd: "true", args: [] }),
 		} as unknown as TargetAdapter;
 		let merged = false;
@@ -101,6 +102,15 @@ describe("the code job", () => {
 		expect((await job((dir) => (code(dir), "added b"), [], undefined, [], red)).merged).toBe(true);
 		const worse = (dir: string) => (code(dir), writeFileSync(join(dir, "src", "c.txt"), "BROKEN\n"), "added b and c");
 		expect((await job(worse, [], undefined, [], red)).merged).toBe(false);
+	});
+	it("a new source file runs the app's boot check too: an app that no longer starts is refused", async () => {
+		// the app loads every source file its config lists (a service folder scan)
+		const boot = { cmd: "sh", args: ["-c", 'for f in $(find src -name "*.txt" ! -name "*.test.txt"); do grep -qx "$f" app.txt || { echo "app cannot load $f"; exit 1; }; done'] };
+		const r = await job((dir) => (code(dir), "added b"), [], undefined, [], { boot, main: { "app.txt": "\n" } });
+		expect(r.merged).toBe(false);
+		expect(r.refused).toMatch(/\(boot\)\napp cannot load src\/b\.txt/);
+		const ok = await job((dir) => (code(dir), writeFileSync(join(dir, "app.txt"), "src/b.txt\n"), "added b"), [], undefined, [], { boot, main: { "app.txt": "\n" } });
+		expect(ok.merged).toBe(true);
 	});
 	it("a build red here and green on main is refused", async () => {
 		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "b.txt"), "BROKEN\n"), "added b"), [], undefined, [], { build: { cmd: "sh", args: ["-c", "! grep -rn BROKEN src"] } });

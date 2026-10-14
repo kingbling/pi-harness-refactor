@@ -54,6 +54,27 @@ describe("gate output", () => {
 		expect(c).toMatch(/deprecation or notice line\(s\) left out/);
 	});
 
+	it("clipOutput puts each distinct error message with its count first and keeps it after every failed test; notice lists go first", () => {
+		const wt = "/w/worktrees/U1/symfony";
+		const trace = Array.from({ length: 25 }, (_, i) => `${wt}/vendor/symfony/config/Loader/FileLoader.php:${100 + i}`).join("\n");
+		const msg = `Symfony\\Component\\Config\\Exception\\LoaderLoadException: Expected to find class "App\\Targeting\\AirlineCodes" in file "${wt}/src/Targeting/AirlineCodes.php"`;
+		// a notice list: numbered entries that look like failed tests, many of them
+		const notices = ["12 tests triggered 24 PHPUnit notices:", "", ...Array.from({ length: 60 }, (_, i) => [`${i + 1}) App\\Tests\\AccessTest::testVoter#${i}`, "* No expectations were configured for the mock object for App\\Security\\Subject.", "", `${wt}/tests/AccessTest.php:38`, ""]).flat()].join("\n");
+		const file = (f: string, n: number) => [`Running ${f}`, "PHPUnit 13.4.1", "", "EE", "", `There were ${n} errors:`, "", ...Array.from({ length: n }, (_, i) => [`${i + 1}) App\\Tests\\${f.replace(/\W/g, "")}::test${i}`, msg, "", trace, ""]).flat(), "ERRORS!", `Tests: ${n}, Errors: ${n}.`].join("\n");
+		const out = [notices, ...Array.from({ length: 8 }, (_, i) => file(`tests/T${i}Test.php`, 3)), "Failed tests/T0Test.php (exit 2)"].join("\n");
+		const c = clipOutput(out, 6000);
+		expect(c.length).toBeLessThanOrEqual(6300);
+		// the shared cause, once with its count, before anything else of the output
+		expect(c).toMatch(/error messages \(each distinct one, × the failed tests with it\):\n24 × Symfony\\Component\\Config\\Exception\\LoaderLoadException: Expected to find class/);
+		// after each failed test its message stays, though it repeats
+		const failures = c.slice(c.indexOf("failures:"));
+		expect(failures).toMatch(/1\) App\\Tests\\testsT0TestphP?::test0\n.*LoaderLoadException/i);
+		expect((failures.match(/LoaderLoadException/g) ?? []).length).toBeGreaterThan(2);
+		// the notice list is gone, not shown as failures
+		expect(c).not.toContain("No expectations were configured");
+		expect(c).not.toContain("AccessTest::testVoter");
+	});
+
 	// a per-file wrapper (like tools/run-phpunit.php): every arg is a test file, so flags may never be added to it
 	const runner = (body: string) => {
 		const dir = mkdtempSync(join(tmpdir(), "br-runner-"));

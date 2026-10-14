@@ -17,17 +17,18 @@ import { createTidyJobs, type TidyWorker } from "../src/run/tidy-job.ts";
  */
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
-async function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
+async function setup(checkTree?: (dir: string, only?: string[]) => string[], over: { adapter?: (a: TargetAdapter) => TargetAdapter; files?: Record<string, string> } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "br-tidy-job-")));
 	const target = join(root, "new");
 	mkdirSync(join(target, "src", "A"), { recursive: true });
 	writeFileSync(join(target, "src", "A", "Old.txt"), "class Old\n");
 	// an earlier unit's test imports the old path
 	writeFileSync(join(target, "src", "A", "Old.test.txt"), "import src/A/Old.txt\nexpects Old\n");
+	for (const [f, s] of Object.entries(over.files ?? {})) writeFileSync(join(target, f), s);
 	await ensureRepo(target, "migration/main", []);
 	await commitAll(target, "init");
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
-	const adapter = {
+	const base = {
 		id: "fake",
 		protectedGlobs: [],
 		toolchain: { ignoredPaths: [] },
@@ -38,6 +39,7 @@ async function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
 		// a test passes when its import resolves
 		test: (_r: string, files: string[]) => ({ cmd: "sh", args: ["-c", 'for f in "$@"; do i=$(head -1 "$f" | cut -d" " -f2); test -f "$i" || exit 1; done', "sh", ...files] }),
 	} as unknown as TargetAdapter;
+	const adapter = over.adapter ? over.adapter(base) : base;
 	const ledger = new Ledger(":memory:");
 	const task: TidyTask = { id: "T7", stack: "fake", area: "a", op: "move", from: ["src/A/Old.txt"], to: ["src/B/New.txt"], why: "B is where it belongs", questionId: 7, status: "approved" };
 	ledger.setMeta("tidy_tasks", JSON.stringify([task]));
@@ -200,5 +202,54 @@ describe("the tidy job", () => {
 		expect(calls).toBe(0);
 		expect(tidyTasks(ledger)[0]!.status).toBe("approved");
 		expect(jobs(false).holds("fake", "a")).toBe(false);
+	});
+
+	it("a move that keeps the app from starting fails on the app's boot check, though the build and the changed tests pass", async () => {
+		// the app loads every source file its config lists (a service folder scan); the build checks nothing
+		const boot = { cmd: "sh", args: ["-c", 'for f in $(find src -name "*.txt" ! -name "*.test.txt"); do grep -qx "$f" app.txt || { echo "app cannot load $f"; exit 1; }; done'] };
+		const { target, ledger, jobs } = await setup(undefined, { files: { "app.txt": "src/A/Old.txt\n" }, adapter: (a) => ({ ...a, build: () => ({ cmd: "true", args: [] }), boot: () => boot }) as TargetAdapter });
+		const j = jobs(mover(true));
+		j.next();
+		await j.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/\(boot\)\napp cannot load src\/B\/New\.txt/);
+		expect(existsSync(join(target, "src", "A", "Old.txt"))).toBe(true);
+	});
+
+	it("a split's new source file still runs the boot check when main moved during the job and the check runs again on top of it", async () => {
+		// the app no longer starts once main's new commit and the job's new file meet
+		const boot = { cmd: "sh", args: ["-c", 'test -f merged.txt && test -f src/B/Extra.txt && { echo "app cannot load src/B/Extra.txt"; exit 1; }; exit 0'] };
+		const { target, ledger, jobs } = await setup(undefined, { adapter: (a) => ({ ...a, build: () => ({ cmd: "true", args: [] }), boot: () => boot }) as TargetAdapter });
+		// a split keeps its source file: only the new file says the job added code
+		ledger.setMeta("tidy_tasks", JSON.stringify([{ ...tidyTasks(ledger)[0]!, op: "split", to: ["src/A/Old.txt", "src/B/Extra.txt"] }]));
+		const adder: TidyWorker = async ({ dir }) => {
+			mkdirSync(join(dir, "src", "B"), { recursive: true });
+			writeFileSync(join(dir, "src", "B", "Extra.txt"), "class Extra\n");
+			writeFileSync(join(target, "merged.txt"), "another unit\n");
+			await commitAll(target, "another unit merged");
+			return "added Extra";
+		};
+		const j = jobs(adder);
+		j.next();
+		await j.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/app cannot load src\/B\/Extra\.txt/);
+	});
+
+	it("a move also runs the area's ported tests, not only the changed ones", async () => {
+		// another unit's test of the area uses the old path; nothing changed it, so only the area's tests find it
+		const { target, ledger, jobs } = await setup(undefined, {
+			files: { "src/A/Area.test.txt": "import src/A/Old.txt\n" },
+			adapter: (a) => ({ ...a, build: () => ({ cmd: "true", args: [] }), layout: { ...a.layout, moduleDir: () => "src/A", testFileGlobs: (m: string) => [`${m}/**/*.test.txt`] } }) as unknown as TargetAdapter,
+		});
+		const j = jobs(mover(true));
+		j.next();
+		await j.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/\(test\)/);
+		expect(existsSync(join(target, "src", "A", "Old.txt"))).toBe(true);
 	});
 });

@@ -29,6 +29,12 @@ export function lanes(configPath: string, set: { lanes?: number; gates?: number 
 		L.push(`measured: a unit holds a lane ~${Math.round(m.unitS)} s (tester + implementer), a gate ~${m.gateS.toFixed(1)} s · gate slots ${Math.round(gateLoad * 100)}% busy at this lane count · rate-limited calls so far: ${m.rateLimited}`);
 		L.push(`gates would saturate around ${maxByGates} lanes; past that, raise --gates (each gate is a build + test process: ~1 core, more memory as the project grows)`);
 	}
+	// other units' tests run on main one at a time for all lanes: that wait holds no slot, so the slot numbers miss it
+	if (m?.mainWait) {
+		const waitS = m.mainWait.ms / 1000;
+		L.push(`other units' tests on main (last day): a gate waited ~${Math.round(waitS)} s for main's answer on average over ${m.mainWait.n} gate(s) (one run on main at a time; no slot is held meanwhile)`);
+		if (waitS > 60) L.push("work waits on main's test runs, not on gate slots: more gates or lanes do not shorten it");
+	}
 	// what the running (or last) run measured on its slots: gates, check_my_code and check_ported_tests all wait there
 	const s = m?.slots;
 	if (s && s.grants) {
@@ -60,7 +66,7 @@ export function runLanesArg(args: string[]): number | undefined {
 
 type SlotTotals = { grants: number; waitedMs: number; heldMs: number; since: number; at: number; limit: number };
 
-function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimited: number; slots?: SlotTotals } | undefined {
+function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimited: number; slots?: SlotTotals; mainWait?: { ms: number; n: number } } | undefined {
 	if (!existsSync(ledgerPath) || !existsSync(dirname(ledgerPath))) return undefined;
 	const db = new DatabaseSync(ledgerPath, { readOnly: true });
 	try {
@@ -72,7 +78,9 @@ function measure(ledgerPath: string): { unitS: number; gateS: number; rateLimite
 		const rateLimited = (db.prepare("SELECT COUNT(*) n FROM attempts WHERE outcome LIKE '%429%' OR outcome LIKE '%rate%'").get() as { n: number }).n;
 		// the run's gate pool totals (every check that took a slot, not only the gate), saved every few seconds
 		const row = db.prepare("SELECT value FROM meta WHERE key = 'gate_slots'").get() as { value: string } | undefined;
-		return { unitS: sess.reduce((a, r) => a + r.s, 0), gateS: (gate.ms ?? 0) / 1000, rateLimited, slots: row ? (JSON.parse(row.value) as SlotTotals) : undefined };
+		// the ported-test step's wait for main's answer (mainWaitMs), over the last day's gates that asked main
+		const main = db.prepare("SELECT AVG(json_extract(s.value,'$.mainWaitMs')) ms, COUNT(*) n FROM attempts a, json_each(json_extract(a.gate_report,'$.steps')) s WHERE a.gate_report IS NOT NULL AND julianday(a.started_at) > julianday('now', '-1 day') AND json_extract(s.value,'$.mainWaitMs') IS NOT NULL").get() as { ms: number | null; n: number };
+		return { unitS: sess.reduce((a, r) => a + r.s, 0), gateS: (gate.ms ?? 0) / 1000, rateLimited, slots: row ? (JSON.parse(row.value) as SlotTotals) : undefined, mainWait: main.n ? { ms: main.ms ?? 0, n: main.n } : undefined };
 	} finally {
 		db.close();
 	}
