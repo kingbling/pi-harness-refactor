@@ -28,9 +28,9 @@ export function setCommandTool(root: string, stackId: string): ToolDefinition {
 	return {
 		name: "set_gate_command",
 		label: "Set gate command",
-		description: `Replace the ${stackId} gate's build, lint or test command for this workspace, when the built-in one does not fit the installed tools. Use "{files}" as one arg where the unit's files go (build/lint: the files to check; test: the test files to run): each unit's gate then checks only its own files. A build or lint command without "{files}" checks the whole project: it is not run per unit but by the builder after merges, now and then. testLenient: the test command with the test runner's own flags (check its --help) so deprecations and notices alone do not fail a run; the flags must reach the runner itself, not a wrapper script that reads every arg as a test file. The gate runs it only after a red test run that mentions deprecations or notices. It must really build/lint/test: commands that cannot fail are refused.`,
-		promptSnippet: "set_gate_command: replace the stack's build/lint/test command for this workspace",
-		parameters: Type.Object({ step: Type.Union([Type.Literal("build"), Type.Literal("lint"), Type.Literal("test"), Type.Literal("testLenient")]), cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
+		description: `Replace the ${stackId} gate's build, lint or test command for this workspace, when the built-in one does not fit the installed tools. Use "{files}" as one arg where the unit's files go (build/lint: the files to check; test: the test files to run): each unit's gate then checks only its own files. A build or lint command without "{files}" checks the whole project: it is not run per unit but by the builder after merges, now and then. testLenient: the test command with the test runner's own flags (check its --help) so deprecations and notices alone do not fail a run; the flags must reach the runner itself, not a wrapper script that reads every arg as a test file. The gate runs it only after a red test run that mentions deprecations or notices. boot: one command that loads the whole app the way it starts and exits (the framework's own start or container check, from its docs; never a server, watch mode or database), failing when the app cannot start; the builder and the merge check run it on the whole project. It must really build/lint/test/boot: commands that cannot fail are refused.`,
+		promptSnippet: "set_gate_command: replace the stack's build/lint/test/boot command for this workspace",
+		parameters: Type.Object({ step: Type.Union([Type.Literal("build"), Type.Literal("lint"), Type.Literal("test"), Type.Literal("testLenient"), Type.Literal("boot")]), cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
 		execute: async (_id: string, p: { step: CommandStep; cmd: string; args: string[]; why: string }) => {
 			const out = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 			if (NO_OP.test(p.cmd.trim()) || /\|\|\s*(true|exit 0)|--passWithNoTests/.test(p.args.join(" "))) return out("refused: the command must be able to fail");
@@ -67,11 +67,13 @@ function checkDoc(adapter: TargetAdapter, projectDir: string): string {
 	const b = adapter.build(projectDir);
 	const t = adapter.test(projectDir, ["{files}"]);
 	const l = adapter.lint(projectDir, ["{files}"]);
+	const boot = adapter.boot?.(projectDir);
 	const probe = adapter.probeTest?.(projectDir);
 	return `The migration tool checks the project with these commands (run in ${projectDir}):
 - build: ${[b.cmd, ...b.args].join(" ")}
 - lint: ${[l.cmd, ...l.args].join(" ")}
 - test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the test files to run)
+- boot: ${boot?.cmd ? [boot.cmd, ...boot.args].join(" ") : "none (set_gate_command boot sets one)"}
 When a test run where every test passed is still red on deprecations or notices alone, set testLenient (set_gate_command) instead of changing the test command.
 ${probe ? `The check writes ${probe.path} with this content, runs build, then lint and test with {files} = ${probe.path}:\n${probe.content}\n${probe.failing ? `It also writes this version (wrong expected value) and checks that the test command FAILS on it:\n${probe.failing}\n` : ""}To try it, write that file yourself and delete it afterwards.\n` : ""}When a command is wrong for the installed version (an option removed or renamed, a different runner), replace it with set_gate_command — check the tool's --help first.`;
 }

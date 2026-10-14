@@ -349,6 +349,31 @@ function runError(env: LegacyEnv, source: SourceAdapter, script: string, sourceP
 	}
 }
 
+/** How often, and how far apart, a probe that went red is run again before the old code's runtime counts as down. */
+export const LEGACY_DOWN = { tries: 6, waitMs: 30_000 };
+
+/**
+ * Whether a truth script that did not run failed for a reason outside it: the probe, green when this workspace was
+ * set up, is run again. Green → "none" (the script's own failure). Red → the old code's runtime is down for every
+ * script (a container daemon that stopped); it is waited for, a few tries apart: "over" once it runs again, "down"
+ * when it stays red. A workspace that never ran the old code (read mode, no probe) has nothing to compare: "none".
+ */
+export async function legacyEnvOutage(root: string, config: Config, source: SourceAdapter, wait = LEGACY_DOWN): Promise<"none" | "over" | "down"> {
+	for (let i = 0; i < wait.tries; i++) {
+		if (i) await new Promise((r) => setTimeout(r, wait.waitMs));
+		if (probeRunsNow(root, config, source) !== false) return i ? "over" : "none";
+	}
+	return "down";
+}
+
+/** Whether the probe, green when this workspace was set up, runs now; undefined when there is none (read mode, no probe). */
+export function probeRunsNow(root: string, config: Config, source: SourceAdapter): boolean | undefined {
+	const env = loadLegacyEnv(root, config);
+	const probe = join(root, ".bigrefactor", "legacy-env", "probe", source.truth.scriptName);
+	if (env.mode !== "run" || !existsSync(probe)) return undefined;
+	return !runError(env, source, probe, config.source.path);
+}
+
 /**
  * Why a run command reaches the probe but not the units' truth scripts (a container that mounts only the probe's
  * folder), or undefined. The probe that runs green is copied into the truth folder and run from there.

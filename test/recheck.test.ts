@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -198,6 +198,26 @@ describe("truth read from the old code, run once it can", () => {
 		expect(JSON.parse(ledger.getUnit("stub")!.meta).retryNote).toMatch(/the old code returns 99/);
 		// the same environment: the red one is not run again
 		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} }).red).toBe(0);
+	});
+
+	it("while the old code's runtime is down (the probe does not run either) no unit counts as tried: the next upgrade runs them", async () => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		// the runtime: down while the file "down" is there (a container daemon that stopped)
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "run", run: { cmd: "sh", args: ["-c", 'test ! -e down && sh "$0"', "{script}"] } }));
+		mkdirSync(join(root, ".bigrefactor", "legacy-env", "probe"), { recursive: true });
+		writeFileSync(join(root, ".bigrefactor", "legacy-env", "probe", "cases.sh"), `echo '[{"symbol":"probe","inputs":null,"expected":1}]'\n`);
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = 'fine'").run();
+		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 0 WHERE unit_id = 'fine'").run();
+		ledger.addEvidence("fine", "truth_read", { runError: "failed to connect to the runtime" });
+		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"$(printf %s.%s 123 45)"'}]'\n`);
+		writeFileSync(join(config.source.path, "down"), "");
+		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} })).toMatchObject({ upgraded: [], red: 0 });
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).truthUpgradeEnv).toBeUndefined();
+		rmSync(join(config.source.path, "down"));
+		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} }).upgraded).toEqual(["fine"]);
 	});
 });
 

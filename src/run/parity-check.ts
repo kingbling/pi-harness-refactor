@@ -329,6 +329,8 @@ export interface SliceCheck {
 	diffs: Diff[];
 	compared: number;
 	note: string;
+	/** The new app of this stack did not start on main: a main problem for the builder, not only a parity error. */
+	down?: { stack: string; error: string };
 }
 
 /**
@@ -385,7 +387,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		try {
 			for (const [s, r] of recipes) {
 				const b = await bootApp(r, appRoot(o.config, o.root, s));
-				if (!b.ok) return fail(`the new ${s} app did not start: ${b.error}`);
+				if (!b.ok) return { ...fail(`the new ${s} app did not start: ${b.error}`), down: { stack: s, error: b.error } };
 				stops.push(b.stop);
 			}
 			const withDump = [...recipes].find(([, r]) => r.dump);

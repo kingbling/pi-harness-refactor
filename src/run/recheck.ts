@@ -6,7 +6,7 @@ import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import type { Ledger } from "../ledger/db.ts";
-import { describeTruthRun, loadLegacyEnv, notFromOldCode, verifyTruthOnOld, type TruthCase } from "./legacy-env.ts";
+import { describeTruthRun, loadLegacyEnv, notFromOldCode, probeRunsNow, verifyTruthOnOld, type TruthCase } from "./legacy-env.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { createHash } from "node:crypto";
@@ -224,6 +224,11 @@ export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: stri
 		}
 		if (meta.truthUpgradeEnv === env) continue;
 		const ran = verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		// red, and the probe does not run either: the old code's runtime is down, so no unit counts as tried
+		if (!ran.ok && probeRunsNow(o.root, o.config, source) === false) {
+			log(pc.yellow(`truth upgrade: the old code's runtime is down (the probe does not run either); tried again at the next run`));
+			break;
+		}
 		o.ledger.updateUnit(id, { meta: { truthUpgradeEnv: env } });
 		if (!ran.ok) {
 			red++;

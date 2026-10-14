@@ -135,6 +135,8 @@ export function errorKeys(output: string, dir: string): Array<{ key: string; lin
 export interface Builder {
 	/** A unit of this stack was merged into main. */
 	afterMerge(stackId: string): void;
+	/** The stack's new app did not start on main (parity found it): a main problem, built once per main tree. */
+	appDown(stackId: string, error: string): void;
 	/** At the end of the run: one last build of what was merged since the last one. */
 	finish(): Promise<void>;
 }
@@ -163,6 +165,9 @@ export function createBuilder(o: {
 	const jobs = new Map<string, number>();
 	// how many error lines main had when the stack's last code job started: the next job in the same cycle needs fewer
 	const jobFrom = new Map<string, number>();
+	// the new app did not start on main, per stack; and the main trees that was already handed over for
+	const down = new Map<string, string>();
+	const downTrees = new Set<string>();
 	const ignored = (sig: string) =>
 		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND json_extract(context, '$.sameAs') = ? AND status IN ('answered', 'auto') ORDER BY id DESC LIMIT 1").get(sig) as { answer: string } | undefined)?.answer === "ignore";
 	let last = Date.now();
@@ -180,11 +185,15 @@ export function createBuilder(o: {
 		})().finally(() => {
 			running = undefined;
 			last = Date.now();
+			// a new app that did not start, reported while this build ran
+			if (down.size) start(true);
 		});
 	};
 
 	/** True when a code job made main better and the stack should be checked again right away. */
 	const buildStack = async (stackId: string, again = false): Promise<boolean> => {
+		const appDown = down.get(stackId);
+		down.delete(stackId);
 		const adapter = o.adapters.get(stackId);
 		if (!adapter) return false;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__builder__${stackId}`);
@@ -208,7 +217,7 @@ export function createBuilder(o: {
 			// list, and "no tests ran" would pass
 			const tests = trackedFiles(dir).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
-			if (!steps.length) return false;
+			if (!steps.length && !appDown) return false;
 			const check = async () => {
 				const out: string[] = [];
 				for (const s of steps) {
@@ -219,6 +228,8 @@ export function createBuilder(o: {
 			};
 			o.log(pc.dim(`builder ${stackId}: whole-project ${steps.map((s) => s.step).join(" + ")} on main`));
 			let problem = await check();
+			// a boot step shows a new app that does not start itself; without one, what parity saw is the problem
+			if (appDown && !steps.some((s) => s.step === "boot")) problem = [problem, `$ (the new ${stackId} app, started for the parity check)   (boot)\n${appDown}`].filter(Boolean).join("\n\n");
 			const green = () => {
 				jobs.delete(stackId);
 				o.ledger.setMeta(buildParkedKey(stackId), "");
@@ -294,6 +305,14 @@ export function createBuilder(o: {
 		afterMerge(stackId) {
 			merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
 			start(false);
+		},
+		appDown(stackId, error) {
+			const tree = execFileSync("git", ["-C", o.config.target.path, "rev-parse", `${mainBranch(o.config.target.path, o.config.target.git.branch)}^{tree}`], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+			if (downTrees.has(`${stackId} ${tree}`)) return;
+			downTrees.add(`${stackId} ${tree}`);
+			down.set(stackId, error);
+			merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
+			start(true);
 		},
 		async finish() {
 			await running;

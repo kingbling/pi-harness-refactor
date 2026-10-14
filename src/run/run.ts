@@ -41,7 +41,7 @@ import { runCodeJob } from "./code-job.ts";
 import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
-import { conflictMarkers } from "./gate.ts";
+import { conflictMarkers, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 
@@ -374,6 +374,16 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			showParity(`comparing ${slice} with the old app`);
 			const { checkSlice } = await import("./parity-check.ts");
 			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log });
+			// the new app does not start on main: a red main the builder fixes, not only a parity error. A stack with no
+			// boot check gets one from the setup model first, so the merge check and the builder see it from now on
+			if (r.down && adapters.has(r.down.stack)) {
+				const adapter = adapters.get(r.down.stack)!;
+				if (!o.dry && o.setupFixer !== false && !wholeProjectSteps(adapter, projectDir(config, r.down.stack)).some((s) => s.step === "boot")) {
+					showParity(`asking the ${r.down.stack} setup for a boot check: the new app does not start`);
+					await fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, r.down.stack), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: "boot check", problem: `The new ${r.down.stack} app does not start on main (the parity check started it):\n${r.down.error.slice(-3000)}\nNo whole-project check notices this: the stack has no boot command. Set one with set_gate_command (step boot): the framework's own start or container check, one command that exits, and run it to see that it fails on this now. Do not fix the app's code for it: the builder hands that to a code job.` }).catch((e) => log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)));
+				}
+				builder.appDown(r.down.stack, r.down.error);
+			}
 			// the old app only redirected to itself on https: its setup is asked once to fix that, then the slice runs again
 			const old = loadApps(o.root)["legacy"];
 			if (old?.selfRedirect && !old.redirectProbed) {

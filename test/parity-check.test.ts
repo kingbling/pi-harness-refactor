@@ -169,5 +169,11 @@ describe("comparing the old and the new app", () => {
 		const h = await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer: hop, rewrite: true, log: () => {} });
 		expect(h).toMatchObject({ outcome: "error", compared: 0, diffs: [] });
 		expect(loadApps(root)[LEGACY]!.selfRedirect).toBe("GET /invoices → 301 https://(this app)/invoices");
+		// a new app that does not start on main: said as such, so the run hands it to the builder as a main problem
+		const broken = { dir: ".", start: { cmd: process.execPath, args: ["-e", "console.error('no such mapping dir'); process.exit(1)"] }, ready: `http://localhost:${newPort}/invoices` };
+		writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: broken } }));
+		const d = await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer, log: () => {} });
+		expect(d.outcome).toBe("error");
+		expect(d.down).toMatchObject({ stack: "nestjs", error: expect.stringMatching(/no such mapping dir/) });
 	}, 60_000);
 });
