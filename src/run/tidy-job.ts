@@ -108,7 +108,10 @@ export function createTidyJobs(o: {
 			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t }).finally(() => overrides.restore() && o.log(pc.yellow(`tidy ${t.id}: the job changed the gate commands file; put back`)))) || "";
 			const changed = await changedFiles(dir, adapter.toolchain.ignoredPaths);
 			const message = `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`;
-			let problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
+			// files new to the project, from before the commit below: the second check must see them as added too
+			const before = new Set(await trackedFiles(dir));
+			const added = new Set(changed.filter((f) => existsSync(join(dir, f)) && !before.has(f)));
+			let problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack), added);
 			// main moved while the job ran: a unit merged since may use the old names, so the check runs again on top of it
 			if (!problem && await headOf(o.config.target.path) !== base) {
 				await commitAll(wt, message);
@@ -118,7 +121,7 @@ export function createTidyJobs(o: {
 					// the half-done rebase goes with the worktree below; the task fails with git's reason
 					throw new Error(`could not rebase onto main: ${String(e?.stderr ?? e?.message).trim().slice(0, 400)}`);
 				}
-				problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
+				problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack), added);
 			}
 			if (problem) {
 				endTidyTask(o.ledger, t.id, "failed", problem);
@@ -162,7 +165,7 @@ export function createTidyJobs(o: {
  * added or moved, also the app's boot check and the area's ported tests. Undefined = green.
  * A failing step runs again on main (`mainDir`), like a code job's: it fails only when green on main or with error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[], mainDir: string): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: string[], mainDir: string, newFiles: Set<string>): Promise<string | undefined> {
 	const missing = tidyMissing(dir, t);
 	if (missing.length) return `the change is not complete: ${missing.join("; ")}`;
 	// a delete removes only the files it names
@@ -178,8 +181,7 @@ async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: 
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
 	// source files added or moved: the app may no longer load (a service folder its config scans, a class at an old
 	// path), which no test among the changed files shows. The app's boot check and the area's ported tests run too
-	const tracked = new Set(await trackedFiles(dir));
-	const addedOrMoved = changed.some((f) => adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && (!tracked.has(f) || !existsSync(join(dir, f))));
+	const addedOrMoved = changed.some((f) => adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && (newFiles.has(f) || !existsSync(join(dir, f))));
 	const boot = addedOrMoved && !!adapter.boot?.(dir)?.cmd;
 	const tests = [...new Set([...present.filter((f) => adapter.layout.isTestFile(f)), ...(addedOrMoved ? areaTests(adapter, dir, t.area) : [])])];
 	// each step with the files it checks (none: the whole project), so the same step can run on main

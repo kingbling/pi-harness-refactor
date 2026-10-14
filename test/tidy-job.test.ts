@@ -217,6 +217,27 @@ describe("the tidy job", () => {
 		expect(existsSync(join(target, "src", "A", "Old.txt"))).toBe(true);
 	});
 
+	it("a split's new source file still runs the boot check when main moved during the job and the check runs again on top of it", async () => {
+		// the app no longer starts once main's new commit and the job's new file meet
+		const boot = { cmd: "sh", args: ["-c", 'test -f merged.txt && test -f src/B/Extra.txt && { echo "app cannot load src/B/Extra.txt"; exit 1; }; exit 0'] };
+		const { target, ledger, jobs } = await setup(undefined, { adapter: (a) => ({ ...a, build: () => ({ cmd: "true", args: [] }), boot: () => boot }) as TargetAdapter });
+		// a split keeps its source file: only the new file says the job added code
+		ledger.setMeta("tidy_tasks", JSON.stringify([{ ...tidyTasks(ledger)[0]!, op: "split", to: ["src/A/Old.txt", "src/B/Extra.txt"] }]));
+		const adder: TidyWorker = async ({ dir }) => {
+			mkdirSync(join(dir, "src", "B"), { recursive: true });
+			writeFileSync(join(dir, "src", "B", "Extra.txt"), "class Extra\n");
+			writeFileSync(join(target, "merged.txt"), "another unit\n");
+			await commitAll(target, "another unit merged");
+			return "added Extra";
+		};
+		const j = jobs(adder);
+		j.next();
+		await j.busy;
+		const t = tidyTasks(ledger)[0]!;
+		expect(t.status).toBe("failed");
+		expect(t.failure).toMatch(/app cannot load src\/B\/Extra\.txt/);
+	});
+
 	it("a move also runs the area's ported tests, not only the changed ones", async () => {
 		// another unit's test of the area uses the old path; nothing changed it, so only the area's tests find it
 		const { target, ledger, jobs } = await setup(undefined, {
