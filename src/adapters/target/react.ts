@@ -24,8 +24,8 @@ export const reactAdapter: TargetAdapter = {
 		fileFindings: tsFileFindings,
 		testFileGlobs: (dir) => [`${dir}/**/*.test.tsx`, `${dir}/**/*.test.ts`],
 		testHint: "*.test.tsx files (vitest + @testing-library/react) next to the component",
-		// the app's route table and the component that mounts it: each unit adds its area's routes there
-		wiringFiles: ["src/routes.tsx", "src/App.tsx"],
+		// no wiringFiles here: where the app's route table lives is the project's fact; a model finds it in the
+		// project at run start and it is saved per workspace (src/adapters/wiring.ts)
 	},
 	layoutRules: REACT_LAYOUT,
 	indexFile: (root, rel) => indexTsFile(root, rel, { sharedDirs: tsLayoutBase().sharedDirs, nameKinds: [[/Page$/, "page"], [/^use[A-Z]/, "hook"]] }),

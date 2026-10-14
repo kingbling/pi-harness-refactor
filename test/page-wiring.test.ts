@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { reactAdapter } from "../src/adapters/target/react.ts";
+// the wiring files a model found for this workspace (src/adapters/wiring.ts)
+const react = { ...reactAdapter, layout: { ...reactAdapter.layout, wiringFiles: ["src/App.tsx"] } };
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { implementerSystemPrompt } from "../src/run/prompts.ts";
@@ -74,9 +76,9 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 
 	it("the implementer gets the owner's stack choices and the stack's wiring files as its own write paths", () => {
 		const { config } = setup("planned");
-		const p = implementerSystemPrompt(config, { area: "offers", stackId: "react", moduleDir: "src/features/offers", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, writeGlobs: ["src/features/offers/**", ...reactAdapter.layout.wiringFiles!], source: { id: "php" } as never, target: reactAdapter });
+		const p = implementerSystemPrompt(config, { area: "offers", stackId: "react", moduleDir: "src/features/offers", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, writeGlobs: ["src/features/offers/**", ...react.layout.wiringFiles!], source: { id: "php" } as never, target: react });
 		expect(p).toMatch(/owner's stack choices[\s\S]*- Styling: CSS Modules/);
-		for (const f of reactAdapter.layout.wiringFiles!) expect(p).toContain(f);
+		for (const f of react.layout.wiringFiles!) expect(p).toContain(f);
 		expect(p).toMatch(/wiring files are in your write paths/);
 		expect(p).toMatch(/caller's unit is on react too and not accepted yet[^\n]*TODO\(br:<that unit>\)/);
 		expect(p).toMatch(/A caller's unit on another stack can never write these files: then you register it here yourself/);
@@ -84,8 +86,8 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 	});
 
 	it("the binding layout section names the wiring files every unit may edit", () => {
-		const s = renderLayoutSection(reactAdapter);
-		for (const f of reactAdapter.layout.wiringFiles!) expect(s).toContain(`\`${f}\``);
+		const s = renderLayoutSection(react);
+		for (const f of react.layout.wiringFiles!) expect(s).toContain(`\`${f}\``);
 		expect(s).toMatch(/every unit may edit them/);
 	});
 

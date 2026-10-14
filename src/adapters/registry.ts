@@ -4,6 +4,7 @@ import { fromManifest, loadManifests, restoreManifest } from "./target/generated
 import { fromSourceManifest, loadSourceManifests } from "./source/generated.ts";
 import { learnGeneratorDirs, withLayoutRules } from "../rules/layout-rules.ts";
 import { withCommandOverrides } from "./command-overrides.ts";
+import { withWiringFiles } from "./wiring.ts";
 
 const sources: Record<string, SourceAdapter> = { php: phpAdapter };
 /** Source adapters a model wrote, with the workspace each belongs to (a long-lived Pi may serve several). */
@@ -53,7 +54,7 @@ export async function getTargetAdapter(id: string): Promise<TargetAdapter> {
 	if (!f) throw new Error(`unknown target adapter "${id}" (have: ${Object.keys(targets).join(", ")})`);
 	const adapter = await f();
 	await learnGeneratorDirs(adapter, process.env["BR_WORKSPACE"]);
-	return offerable(withCommandOverrides(withLayoutRules(adapter, process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]));
+	return offerable(withCommandOverrides(withLayoutRules(withWiringFiles(adapter, process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]));
 }
 
 /** Options setup cannot produce (`unavailable`) are never offered, recommended or resolved: a choice must be installable. */
@@ -90,6 +91,11 @@ export function registerGeneratedSources(root: string): string[] {
 	return added;
 }
 export const knownTargets = () => Object.keys(targets);
+/** A target adapter written by hand, as written (no workspace layers), or undefined for a generated or unknown one. */
+export async function builtinTarget(id: string): Promise<TargetAdapter | undefined> {
+	const m = targetManifest[id];
+	return m && !m.generated ? m.load() : undefined;
+}
 
 /**
  * Adapters a model wrote for this workspace (`.bigrefactor/adapters/*.json`, verified before they were saved)
