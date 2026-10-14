@@ -120,6 +120,14 @@ describe("the code job", () => {
 		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'billing'").run();
 		expect((await job(unmark, [], undefined, [], main)).merged).toBe(true);
 	});
+	it("a removed SQL comment stub mark (-- TODO(br:u)) counts as removed, though its diff line starts with ---", async () => {
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "u", tier: "T1", symbolIds: [] });
+		const main = { main: { "src/stub.sql": "select 1;\n-- TODO(br:u) stand-in\n" }, ledger };
+		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "stub.sql"), "select 1;\n"), "replaced the stub"), [], undefined, [], main);
+		expect(r.merged).toBe(false);
+		expect(r.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:u\)/);
+	});
 	it("the builder's job has its own turn: a question's job does not wait behind it", async () => {
 		let release = () => {};
 		const builderHolds = new Promise<void>((r) => (release = r));

@@ -147,8 +147,12 @@ function removedMarks(dir: string, changed: string[]): string[] {
 	const removed = new Set<string>();
 	const added = new Set<string>();
 	const diff = execFileSync("git", ["diff", "-U0", "HEAD", "--", ...changed], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+	// a file's header lines (--- a/x, +++ b/x) come before its first @@; after it, "--- TODO" is a removed "-- TODO" comment
+	let header = false;
 	for (const l of diff.split("\n")) {
-		if (l.startsWith("---") || l.startsWith("+++")) continue;
+		if (l.startsWith("diff --git ")) header = true;
+		else if (l.startsWith("@@")) header = false;
+		if (header) continue;
 		const into = l.startsWith("-") ? removed : l.startsWith("+") ? added : undefined;
 		for (const m of into ? l.matchAll(mark) : []) into!.add(m[1]!);
 	}
