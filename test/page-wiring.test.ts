@@ -1,6 +1,6 @@
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { reactAdapter } from "../src/adapters/target/react.ts";
 // the wiring files a model found for this workspace (src/adapters/wiring.ts)
@@ -12,6 +12,7 @@ import { legacyFacts, reviewWithModel } from "../src/run/review.ts";
 import { renderLayoutSection } from "../src/rules/layout.ts";
 import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
 import { unitOfLegacy, whoCalls } from "../src/sessions/tools.ts";
+import { buildTaskCard, renderTaskCard } from "../src/sessions/taskcard.ts";
 
 /**
  * A page (template unit) is reached through its controller by view name, not by a class name: the reviewer and
@@ -28,6 +29,8 @@ function setup(controllerState: "planned" | "accepted", controllerStack = "react
 	for (const [unit, file, name, kind] of [["U1482", tpl, "list.tpl.php", "template"], ["U2210", ctl, "SalesController", "class"]] as const) {
 		const id = `${file}::${kind === "template" ? "template" : name}`;
 		ledger.upsertFile({ path: file, hash: "h", lang: "php", loc: 10 });
+		mkdirSync(dirname(join(dir, file)), { recursive: true });
+		writeFileSync(join(dir, file), "<?php\n");
 		ledger.upsertSymbol({ id, path: file, kind, name });
 		const stack = unit === "U2210" ? controllerStack : "react";
 		ledger.createUnit({ id: unit, tier: "T1", deps: [], meta: { files: [file], place: { stack, area: "offers", shared: false, source: "code" } }, symbolIds: [id] });
@@ -53,6 +56,24 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 		expect(facts).toMatch(/A caller's unit on another stack can never write react's wiring files: registering the page or handler here[^\n]*is this unit's own job/);
 		const out = await whoCalls({ ledger, config } as never).execute("t", { symbolId: `${tpl}::template` }, undefined as never, undefined as never, undefined as never);
 		expect((out.content[0] as { text: string }).text).toMatch(/names "offers\/list", unit U2210 planned on symfony/);
+	});
+
+	it("the implementer's card lists the controller that renders the page by view name, with its unit, state and stack, next to the wiring rule", async () => {
+		const { dir, ledger, config } = setup("planned", "symfony");
+		const card = renderTaskCard(await buildTaskCard(ledger, config, "U1482", { targetProjectDir: dir, writeGlobs: ["src/features/offers/**", "src/App.tsx"], adapter: react }), config);
+		expect(card).toMatch(/## Legacy callers[^\n]*\n- app\/controller\/sales\.controller\.php names "offers\/list" in a string \([^)]*unit U2210 planned on symfony\)/);
+		expect(card).toMatch(/Wiring: a caller whose unit is on another stack than react can never register this unit's code, so register it yourself in src\/App\.tsx/);
+		// the same caller lines as the reviewer's
+		const facts = (await legacyFacts({ ledger, config, unitId: "U1482", legacyFiles: ["app/view/templates/default/offers/list.tpl.php"], adapter: react, targetProjectDir: dir })).join("\n");
+		expect(facts).toContain('- app/controller/sales.controller.php names "offers/list" in a string (maybe a factory, dynamic call or rendered view, unit U2210 planned on symfony)');
+		expect(card).toContain('- app/controller/sales.controller.php names "offers/list" in a string (maybe a factory, dynamic call or rendered view, unit U2210 planned on symfony)');
+	});
+
+	it("a unit nobody calls: the card says so, with no wiring line", async () => {
+		const { dir, ledger, config } = setup("planned");
+		const card = renderTaskCard(await buildTaskCard(ledger, config, "U2210", { targetProjectDir: dir, writeGlobs: ["src/features/offers/**"], adapter: react }), config);
+		expect(card).toMatch(/## Legacy callers[^\n]*\n- none in the index/);
+		expect(card).not.toMatch(/^Wiring:/m);
 	});
 
 	it("who_calls on a template finds its controller by view name and says the controller unit's state", async () => {

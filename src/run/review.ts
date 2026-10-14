@@ -12,7 +12,7 @@ import { spawnLeaf } from "../sessions/spawn.ts";
 import { behaviourPolicy, choicesText } from "./prompts.ts";
 import { quirksOf } from "./quirks.ts";
 import { samePath } from "./triage.ts";
-import { docsLookup, fileAliases, findCapabilityTool, readFunctionTool, sourceSymbolBody, targetLookup, unitOfLegacy, unitState, whoCalls } from "../sessions/tools.ts";
+import { docsLookup, findCapabilityTool, legacyCallerLines, readFunctionTool, sourceSymbolBody, targetLookup, whoCalls } from "../sessions/tools.ts";
 import { unitFacts } from "../sessions/taskcard.ts";
 import { exec } from "../proc.ts";
 
@@ -205,25 +205,10 @@ export async function legacyFacts(o: Pick<ReviewInput, "ledger" | "config" | "un
 		) e JOIN symbols t ON t.id = e.to_id JOIN units u ON u.id = t.unit_id WHERE t.unit_id != ? AND u.state != 'accepted' ORDER BY t.unit_id, t.id`)
 		.all(o.unitId, o.unitId, o.unitId) as Array<{ id: string; unit_id: string; path: string; state: string }>;
 	if (planned.length) out.push(`\nLegacy code this unit calls that other units still own (not migrated yet): a minimal stub marked TODO(br:<the owning unit>) for these is expected, not a finding; porting them here is wrong:\n${capped(planned.map((p) => `- ${p.id} (unit ${p.unit_id}, ${p.state}, ${p.path})`), "callees").join("\n")}`);
-	const own = new Set(o.legacyFiles);
-	const outside = (id: string) => !own.has(id.split("::")[0]!);
-	const callers = (
-		db
-			.prepare(`SELECT DISTINCT e.from_id, e.how, f.unit_id FROM (
-				SELECT c.from_id, c.kind || ' call' AS how FROM code_calls c JOIN symbols s ON s.id = c.to_id WHERE s.unit_id = ? AND c.resolution = 'code'
-				UNION SELECT d.from_id, d.kind AS how FROM index_deps d JOIN symbols s ON s.id = d.to_id WHERE s.unit_id = ?
-			) e LEFT JOIN symbols f ON f.id = e.from_id ORDER BY e.from_id`)
-			.all(o.unitId, o.unitId) as Array<{ from_id: string; how: string; unit_id: string | null }>
-	).filter((c) => c.unit_id !== o.unitId && outside(c.from_id));
-	// names the code is reached by: its classes/functions, plus the names the framework knows a file by (a template's view name)
-	const names = [...new Set([...(db.prepare("SELECT DISTINCT name FROM symbols WHERE unit_id = ? AND kind IN ('class','function')").all(o.unitId) as Array<{ name: string }>).map((r) => r.name), ...o.legacyFiles.flatMap((f) => fileAliases(o.config, f))])];
-	const literal = names.length ? (db.prepare(`SELECT DISTINCT name, path FROM index_literal_refs WHERE name IN (${names.map(() => "?").join(",")}) ORDER BY path`).all(...names) as Array<{ name: string; path: string }>).filter((l) => !own.has(l.path)) : [];
-	if (callers.length || literal.length)
+	const callers = legacyCallerLines(o.ledger, o.config, o.unitId, o.legacyFiles);
+	if (callers.length)
 		out.push(
-			`\nLegacy callers of this unit's code (who_calls for more). Can the new code be reached the way these callers reached the old code? A caller whose unit is not accepted yet and is on ${o.adapter.id} too is not migrated: the new code need not be reached from it yet (an unregistered page or handler, or a seam marked TODO(br:<that unit>), is fine); that unit wires it. A caller's unit on another stack can never write ${o.adapter.id}'s wiring files: registering the page or handler here (route, menu entry) is this unit's own job, with only its data access behind the project's shared data seam, marked TODO(br:<that unit>), while that unit is not accepted.\n${capped(
-				[...callers.map((c) => `- ${c.from_id} (${c.how}${unitState(o.ledger, c.unit_id ?? unitOfLegacy(o.ledger, c.from_id))})`), ...literal.map((l) => `- ${l.path} names "${l.name}" in a string (maybe a factory, dynamic call or rendered view${unitState(o.ledger, unitOfLegacy(o.ledger, l.path))})`)],
-				"callers",
-			).join("\n")}`,
+			`\nLegacy callers of this unit's code (who_calls for more). Can the new code be reached the way these callers reached the old code? A caller whose unit is not accepted yet and is on ${o.adapter.id} too is not migrated: the new code need not be reached from it yet (an unregistered page or handler, or a seam marked TODO(br:<that unit>), is fine); that unit wires it. A caller's unit on another stack can never write ${o.adapter.id}'s wiring files: registering the page or handler here (route, menu entry) is this unit's own job, with only its data access behind the project's shared data seam, marked TODO(br:<that unit>), while that unit is not accepted.\n${capped(callers, "callers").join("\n")}`,
 		);
 	else out.push(`\nLegacy callers of this unit's code: none in the index (who_calls to check; an entry point is reached by the framework).`);
 	const plan = o.ledger.getMeta("framework_plan");
