@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
@@ -25,7 +26,8 @@ import { setStep } from "./watchdog.ts";
  * model fixes the code there, code re-runs the checks, and the fix is merged like a unit. Lanes never wait for it.
  * What it cannot fix goes to a code job (which may fix test code too; it merges when main gets fewer errors and no new
  * ones); after MAX_BUILD_CODE_JOBS of those in a row that merged nothing the stack is parked quietly (br status shows
- * it), never a "fix or ignore" question to the owner.
+ * it), never a "fix or ignore" question to the owner. Errors only in files a code job may not change (those that decide
+ * how the checks run) go to the setup model instead.
  */
 
 /** Returns the model's one-sentence account of what it changed. */
@@ -45,10 +47,26 @@ export function brief(problem: string, perStep = 1500): string {
 }
 /** How often the builder may send one accepted unit back for its own failing tests before it asks instead. */
 export const MAX_BUILD_REOPENS = 2;
-/** Code jobs without progress a red main gets in a row before the builder stops paying for it (until it is green again or the run restarts). */
+/** Code jobs without progress a red main gets in a row before the builder stops paying for it (until it is green again or fails with other errors; a restart keeps it). */
 export const MAX_BUILD_CODE_JOBS = 3;
 /** Ledger meta: why a stack's main stays red with nobody working on it; br status shows it, cleared once it is green. */
 export const buildParkedKey = (stackId: string) => `build_parked:${stackId}`;
+/**
+ * Ledger meta: the code jobs paid on a red main without progress, with the errors main had then. A restart keeps the
+ * count; a main whose check fails with other errors (its code changed where it matters) starts a new count.
+ */
+export const buildJobsKey = (stackId: string) => `build_jobs:${stackId}`;
+
+/** Files of the project (tracked, relative to `dir`) the error lines of a check name. */
+export function errorFiles(output: string, dir: string, tracked: string[]): string[] {
+	const known = new Set(tracked);
+	const out = new Set<string>();
+	for (const { line } of errorKeys(output, dir)) for (const [t] of line.matchAll(/[^\s'"`(),]+/g)) {
+		const f = t.replace(/^\.\//, "").replace(/(:\d+)+:?$/, "");
+		if (known.has(f)) out.add(f);
+	}
+	return [...out];
+}
 
 /** Accepted units whose ported tests (named by their case id) fail in `problem`: back to planned, code kept. */
 export function reopenBroken(ledger: Ledger, problem: string): string[] {
@@ -166,14 +184,23 @@ export function createBuilder(o: {
 	repair?: Repairer | false;
 	/** Hands a red main to a code job (writes app and test code on main); returns what it changed, undefined when nothing merged. */
 	codeJob?: (stackId: string, what: string) => Promise<string | undefined>;
+	/** Hands a red main whose errors are all in files a code job may not change to the setup model; returns what changed. */
+	fixSetup?: (stackId: string, problem: string) => Promise<string | undefined>;
 	every?: { units: number; minutes: number };
 }): Builder {
 	const every = o.every ?? { units: o.config.run.buildEveryUnits, minutes: o.config.run.buildEveryMinutes };
 	const merged = new Map<string, number>();
 	// repairs paid per problem: the same problem is not repaired again on every build cycle
 	const tried = new Map<string, number>();
-	// code jobs per stack since main was last green
-	const jobs = new Map<string, number>();
+	// code jobs per stack since main was last green or a job made progress, kept in the ledger (a restart keeps the park)
+	const jobs = {
+		get: (stackId: string, errors: string) => {
+			const j = JSON.parse(o.ledger.getMeta(buildJobsKey(stackId)) || "{}") as { n?: number; errors?: string };
+			return j.errors === errors ? (j.n ?? 0) : 0;
+		},
+		set: (stackId: string, errors: string, n: number) => o.ledger.setMeta(buildJobsKey(stackId), JSON.stringify({ n, errors })),
+		delete: (stackId: string) => o.ledger.setMeta(buildJobsKey(stackId), ""),
+	};
 	// how many error lines main had when the stack's last code job started: the next job in the same cycle needs fewer
 	const jobFrom = new Map<string, number>();
 	// the new app did not start on main, per stack; and the main trees that was already handed over for
@@ -256,7 +283,10 @@ export function createBuilder(o: {
 			const errors = errorKeys(problem, dir).length;
 			if (again && errors >= (jobFrom.get(stackId) ?? Infinity)) return o.log(pc.yellow(`builder ${stackId}: main has no fewer errors after the last code job (${errors}); the next one after the next merges`)), false;
 			const sig = errorSignature(`build:${stackId}`, problem);
-			const parked = (jobs.get(stackId) ?? 0) >= MAX_BUILD_CODE_JOBS;
+			// main's errors as a key (numbers left out): the park holds while main fails the same way
+			const errorsKey = createHash("sha1").update([...new Set(errorKeys(problem, dir).map((e) => e.key))].sort().join("\n")).digest("hex").slice(0, 16);
+			const parked = jobs.get(stackId, errorsKey) >= MAX_BUILD_CODE_JOBS;
+			if (!parked && o.ledger.getMeta(buildParkedKey(stackId))) o.ledger.setMeta(buildParkedKey(stackId), "");
 			// a problem already with the owner (open, or answered "leave it"), parked, or already repaired in vain: no more paid repairs
 			const skip = parked || o.ledger.openQuestionFor("build", sig) !== undefined || ignored(sig) || (tried.get(sig) ?? 0) >= MAX_REPAIRS;
 			// with a code job the repair is skipped: it may not touch tests, and errors in test files are most of a red main
@@ -299,10 +329,27 @@ export function createBuilder(o: {
 			if (reopened.length) o.log(pc.yellow(`builder ${stackId}: re-opened ${reopened.join(", ")}, whose tests fail on main`));
 			if (reopened.length) return false;
 			if (parked) return false;
+			const first = problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? problem.split("\n")[0]!;
+			const park = (why: string) => {
+				jobs.set(stackId, errorsKey, MAX_BUILD_CODE_JOBS);
+				o.ledger.setMeta(buildParkedKey(stackId), `${new Date().toISOString()} main fails its whole-project checks; ${why}, the builder stops until main fails differently or is green: ${first.slice(0, 200)}`);
+				o.log(pc.yellow(`builder ${stackId}: whole project still fails; parked, no question (br status)`));
+				return false;
+			};
+			// every error is in files a code job may not change (those that decide how the checks run): no code job can fix
+			// it, the setup model can
+			const { lockedForCodeJobs } = await import("./code-job.ts");
+			const named = errorFiles(problem, dir, await trackedFiles(dir));
+			if (named.length && named.every((f) => lockedForCodeJobs(adapter, f))) {
+				o.log(pc.cyan(`builder ${stackId}: every error is in files that decide how the checks run (${named.slice(0, 5).join(", ")}); the setup model fixes it`));
+				const fixed = o.fixSetup ? await o.fixSetup(stackId, problem).catch((e) => (o.log(pc.yellow(`builder ${stackId}: setup fix failed: ${e?.message ?? e}`)), undefined)) : undefined;
+				if (fixed) return jobs.delete(stackId), o.log(pc.cyan(`builder ${stackId}: the setup model changed main: ${fixed.split("\n")[0]!.slice(0, 160)}; checked again now`)), true;
+				return park("its errors are in files only the setup model may change, and it changed nothing");
+			}
 			// a code job fixes it on main (it may change test code, the repair may not); the owner is never asked
 			// "fix or ignore": after MAX_BUILD_CODE_JOBS jobs in a row main stays red quietly, br status says so
-			const n = (jobs.get(stackId) ?? 0) + 1;
-			jobs.set(stackId, n);
+			const n = jobs.get(stackId, errorsKey) + 1;
+			jobs.set(stackId, errorsKey, n);
 			jobFrom.set(stackId, errors);
 			const changedMain = o.codeJob
 				? await o.codeJob(stackId, `The whole ${stackId} project fails its checks on main after merges of units that each passed their own checks. Fix the code so these commands pass: types, imports, signatures and calls between modules, also in test files (type errors there), without changing what a test checks. Never weaken the checks (no excluded paths, ignore comments, config changes). Fixing part of the errors is fine: it is merged when main has fewer errors and no new ones, and the next job goes on from there. Run the failing commands again before you stop.\n${brief(problem)}`).catch((e) => (o.log(pc.yellow(`builder ${stackId}: code job failed: ${e?.message ?? e}`)), undefined))
@@ -311,11 +358,7 @@ export function createBuilder(o: {
 			if (changedMain) return jobs.delete(stackId), o.log(pc.cyan(`builder ${stackId}: a code job changed main: ${changedMain.split("\n")[0]!.slice(0, 160)}; checked again now`)), true;
 			if (o.codeJob) o.log(pc.yellow(`builder ${stackId}: code job ${n}/${MAX_BUILD_CODE_JOBS} merged nothing; tried again after the next merges`));
 			if (n < MAX_BUILD_CODE_JOBS && o.codeJob) return false;
-			jobs.set(stackId, MAX_BUILD_CODE_JOBS);
-			const first = problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? problem.split("\n")[0]!;
-			o.ledger.setMeta(buildParkedKey(stackId), `${new Date().toISOString()} main fails its whole-project checks; ${o.codeJob ? `${n} code job(s) did not make it green` : "no code job to fix it"}, the builder stops until it is green or the run restarts: ${first.slice(0, 200)}`);
-			o.log(pc.yellow(`builder ${stackId}: whole project still fails; parked, no question (br status)`));
-			return false;
+			return park(o.codeJob ? `${n} code job(s) did not make it green` : "no code job to fix it");
 		} finally {
 			await reset();
 		}

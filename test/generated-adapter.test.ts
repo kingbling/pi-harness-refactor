@@ -291,6 +291,29 @@ describe("stack knowledge is checked when the adapter is written", () => {
 		expect(own.calls.length).toBe(0);
 	});
 
+	it("run start: a saved manifest without checkConfigGlobs gets that one question; code jobs may then change the other protected files", async () => {
+		const { healCheckConfig, loadManifests } = await import("../src/adapters/target/generated.ts");
+		const { lockedForCodeJobs } = await import("../src/run/code-job.ts");
+		const ws = join(here, ".sim", "heal-check-config");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+		const m = php();
+		const old = { ...m, protectedGlobs: ["config/**", "src/Kernel.php", "phpunit.xml.dist"] };
+		writeFileSync(join(ws, ".bigrefactor", "adapters", `${m.id}.json`), JSON.stringify(old));
+		// before the answer: every protected file is locked for code jobs
+		expect(lockedForCodeJobs(fromManifest(old), "config/packages/security.yaml")).toBe(true);
+		const client = new FakeModelClient({ chat: () => ({ json: { checkConfigGlobs: ["phpunit.xml.dist", "phpstan.neon", "composer.json", "/etc/passwd", "../x"] } }) });
+		expect(await healCheckConfig(ws, { client, model: "m" })).toEqual([m.id]);
+		const healed = loadManifests(ws).find((x) => x.id === m.id)!;
+		expect(healed.checkConfigGlobs).toEqual(["phpunit.xml.dist", "phpstan.neon", "composer.json"]); // nothing outside the project
+		const a = fromManifest(healed);
+		expect(lockedForCodeJobs(a, "config/packages/security.yaml")).toBe(false);
+		expect(lockedForCodeJobs(a, "src/Kernel.php")).toBe(false);
+		expect(lockedForCodeJobs(a, "phpunit.xml.dist")).toBe(true);
+		expect(await healCheckConfig(ws, { client, model: "m" })).toEqual([]); // asked once
+		expect(client.calls.length).toBe(1);
+	});
+
 	it("the implementer is never told the stack needs no registration when the adapter never said so", async () => {
 		const { implementerSystemPrompt } = await import("../src/run/prompts.ts");
 		const { ConfigSchema } = await import("../src/config.ts");

@@ -1,10 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { addWorktree, deleteBranch, removeWorktree } from "../git.ts";
-import { projectDir } from "../init/init.ts";
+import { probeStillFails, projectDir } from "../init/init.ts";
 import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
@@ -24,7 +24,7 @@ import { exec } from "../proc.ts";
  */
 
 /** Returns the model's reply; its last paragraph (what it added, how to call it) is the waiting units' hint. */
-export type CodeWorker = (o: { config: Config; root: string; adapter: TargetAdapter; dir: string; what: string; label: string }) => Promise<string | void>;
+export type CodeWorker = (o: { config: Config; root: string; adapter: TargetAdapter; dir: string; what: string; label: string; onLocked?: (l: { files: string[]; diff: string }) => void }) => Promise<string | void>;
 
 export const codeWithModel: CodeWorker = async (o) => {
 	const b = o.adapter.build(o.dir, ["{files}"]);
@@ -35,12 +35,15 @@ export const codeWithModel: CodeWorker = async (o) => {
 		config: o.config,
 		writeGlobs: ["**"],
 		protectedGlobs: [".git/**"],
-		// told at the write, not after the whole job: the check throws away a job that changed protected config
-		isProtected: (rel) => protectedConfig(o.adapter, rel),
+		// told at the write, not after the whole job: the check puts back what decides how the checks run
+		isProtected: (rel) => lockedForCodeJobs(o.adapter, rel),
+		// a write through bash is not seen by the write gate: after each command those files are put back and the model told
+		afterBash: putBackLocked(o.adapter, o.dir, o.onLocked),
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__code__.${o.label}.jsonl`),
 		systemPrompt: `You write one piece of missing app code in a ${o.adapter.id} project under migration, so the units waiting on it can finish. The legacy code is at ${o.config.source.path} (read it for the behaviour to keep).
 - Read the project first and follow its layout and conventions (RULES.md, the existing modules); reuse what exists, add nothing the task does not need. A new feature folder gets the files every feature folder has, and their wiring.
 - Write tests for what you add. Never change what an existing test checks; never skip or delete tests.
+- App config and entry files are yours to change where the code needs it; the files that decide how the checks run (${(o.adapter.checkConfigGlobs ?? o.adapter.protectedGlobs).join(", ")}) are not.
 - Build: ${[b.cmd, ...b.args].join(" ")}   Test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the files to check). Run them on what you changed before you stop.
 - Write no notes or docs files for other units: the units waiting on this get your final reply as their hint.
 Never interactive prompts or servers; do not commit. End with a short paragraph (a few sentences) saying what you added and how callers use it (route, method, fields).\n\nBinding layout:\n${o.adapter.layout.structureDoc}\n\n${PLAIN_LANGUAGE}`,
@@ -54,12 +57,55 @@ Never interactive prompts or servers; do not commit. End with a short paragraph 
 };
 
 /**
- * Protected config (tsconfig, test and lint config, manifests) holds the checks: changing it could turn them green.
- * Tests are the job's to write; the stack's wiring files (bundle list, route table) are where new code is registered, as a unit may when nothing generates them.
+ * The files that decide how the checks run (test and lint config, dependency manifests, env files; the adapter's
+ * checkConfigGlobs) hold the checks: changing them could turn them green. App config and entry files a code job may
+ * change (an older manifest without checkConfigGlobs: none of the protected files). Tests are the job's to write; the
+ * stack's wiring files (bundle list, route table) are where new code is registered, as a unit may when nothing generates them.
  */
-function protectedConfig(adapter: TargetAdapter, f: string): boolean {
+export function lockedForCodeJobs(adapter: TargetAdapter, f: string): boolean {
 	const wiring = adapter.generateRegistration ? [] : adapter.layout.wiringFiles;
-	return !adapter.layout.isTestFile(f) && !isWiringFile(f, wiring) && adapter.protectedGlobs.some((g) => globToRegExp(g).test(f));
+	return !adapter.layout.isTestFile(f) && !isWiringFile(f, wiring) && (adapter.checkConfigGlobs ?? adapter.protectedGlobs).some((g) => globToRegExp(g).test(f));
+}
+
+/** A protected file a code job may change (app config, an entry file): the check then proves the test command still fails a failing test. */
+function appConfig(adapter: TargetAdapter, f: string): boolean {
+	return !adapter.layout.isTestFile(f) && !lockedForCodeJobs(adapter, f) && adapter.protectedGlobs.some((g) => globToRegExp(g).test(f));
+}
+
+/**
+ * Puts back the files a code job changed that decide how the checks run (in `dir`, its project dir): an edited one
+ * from git, a new one deleted. Returns them with their diff (what the job wanted there), for the setup model.
+ */
+export async function undoLocked(adapter: TargetAdapter, dir: string): Promise<{ files: string[]; diff: string }> {
+	const files = (await changedFiles(dir, adapter.toolchain.ignoredPaths)).filter((f) => lockedForCodeJobs(adapter, f));
+	if (!files.length) return { files, diff: "" };
+	const tracked = new Set(await trackedFiles(dir));
+	const old = files.filter((f) => tracked.has(f) && existsSync(join(dir, f)));
+	const gone = files.filter((f) => tracked.has(f) && !existsSync(join(dir, f)));
+	const added = files.filter((f) => !tracked.has(f));
+	const diff = [old.length || gone.length ? await exec("git", ["diff", "HEAD", "--", ...old, ...gone], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }) : "", ...added.map((f) => `new file ${f}:\n${readFileSync(join(dir, f), "utf8").slice(0, 4000)}`)].filter(Boolean).join("\n");
+	if (old.length || gone.length) await exec("git", ["checkout", "HEAD", "--", ...old, ...gone], { cwd: dir });
+	for (const f of added) rmSync(join(dir, f), { recursive: true, force: true });
+	return { files, diff };
+}
+
+/** After a code job's bash command: the files that decide how the checks run are put back, and the model is told. */
+export function putBackLocked(adapter: TargetAdapter, dir: string, onLocked?: (l: { files: string[]; diff: string }) => void): () => Promise<string | undefined> {
+	return async () => {
+		const l = await undoLocked(adapter, dir);
+		if (!l.files.length) return undefined;
+		onLocked?.(l);
+		return `${l.files.join(", ")} decide${l.files.length === 1 ? "s" : ""} how the checks run: a code job may not change ${l.files.length === 1 ? "it" : "them"}, so the change was put back. If the code needs it, say in your final reply what must change there (the setup model is handed it).`;
+	};
+}
+
+/** What the job changed, as a diff (new files in full), capped: what the owner sees when a model gives up on it. */
+async function jobDiff(dir: string, changed: string[]): Promise<string> {
+	const tracked = new Set(await trackedFiles(dir));
+	const old = changed.filter((f) => tracked.has(f));
+	const diff = old.length ? await exec("git", ["diff", "HEAD", "--", ...old], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).catch(() => "") : "";
+	const added = changed.filter((f) => !tracked.has(f) && existsSync(join(dir, f))).map((f) => `new file ${f}:\n${readFileSync(join(dir, f), "utf8").slice(0, 2000)}`);
+	return [diff, ...added].filter(Boolean).join("\n").slice(0, 8000);
 }
 
 /** Code jobs for one question at a time per stack: two would change main at once. The builder's job has its own turn
@@ -82,8 +128,15 @@ export async function runCodeJob(o: {
 	worker?: CodeWorker;
 	/** the builder's job (main fails its whole-project checks): green means those pass; a fix needs no new test */
 	whole?: boolean;
-	/** told why the check refused what the job wrote (it returns undefined then) */
-	onRefused?: (problem: string) => void;
+	/** told why the check refused what the job wrote (it returns undefined then), with the job's diff */
+	onRefused?: (problem: string, diff: string) => void;
+	/** told what the job wanted to change in the files that decide how the checks run (put back): the setup model's to judge */
+	onLocked?: (l: { files: string[]; diff: string }) => void;
+	/**
+	 * The job serves a waiting unit: its worktree starts from main plus that unit's current work (`apply` puts it on
+	 * top, false when it does not apply), and the job merges both. The unit's own stub marks are then its to remove.
+	 */
+	unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> };
 }): Promise<string | undefined> {
 	const key = o.whole ? `${o.adapter.id}:build` : o.adapter.id;
 	while (busy.has(key)) await busy.get(key)!.catch(() => undefined);
@@ -112,18 +165,31 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	await addWorktree(repo, wt, branch);
 	const attempt = o.ledger.startAttempt("__code__", `code:${o.adapter.id}`, o.config.models.escalate.id);
 	o.log(pc.cyan(`code job ${o.label} (${o.adapter.id}): ${o.what.split("\n")[0]!.slice(0, 160)}`));
+	// what the job wanted in the files that decide how the checks run, put back during the session and before the check
+	const locked = { files: new Set<string>(), diffs: [] as string[] };
+	const onLocked = (l: { files: string[]; diff: string }) => (l.files.forEach((f) => locked.files.add(f)), l.diff && locked.diffs.push(l.diff));
 	try {
+		// the waiting unit's current work goes under the job's (before the dependency dirs are linked in)
+		const withUnit = o.unitWork ? await o.unitWork.apply(wt).catch(() => false) : false;
+		if (o.unitWork) o.log(pc.dim(`code job ${o.label}: ${withUnit ? `starts from main plus ${o.unitWork.unitId}'s current work` : `${o.unitWork.unitId}'s work does not apply on main; starts from main`}`));
 		await o.linkAll(wt);
 		const dir = join(wt, relative(repo, projectDir(o.config, o.adapter.id)));
-		const reply = (await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what: o.what, label: o.label })) || "";
+		const what = withUnit ? `${o.what}\n\nThe worktree already holds the current work of unit ${o.unitWork!.unitId} (uncommitted, on top of main): use it and keep it. It is checked and merged together with your code.` : o.what;
+		const reply = (await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what, label: o.label, onLocked })) || "";
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
 		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
+		// only the files that decide how the checks run are put back; the rest is judged as it is
+		onLocked(await undoLocked(o.adapter, dir));
+		if (locked.files.size) o.log(pc.yellow(`code job ${o.label}: put back what it changed in files that decide how the checks run: ${[...locked.files].slice(0, 5).join(", ")}`));
+		if (locked.diffs.length) o.onLocked?.({ files: [...locked.files], diff: locked.diffs.join("\n").slice(0, 8000) });
 		const changed = await changedFiles(dir, o.adapter.toolchain.ignoredPaths);
-		const problem = changed.length ? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger) : "nothing was changed";
+		const problem = changed.length
+			? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger, withUnit ? o.unitWork!.unitId : undefined)
+			: locked.files.size ? `only files that decide how the checks run were changed (put back): ${[...locked.files].slice(0, 5).join(", ")}` : "nothing was changed";
 		if (problem) {
-			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
+			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, lockedFiles: [...locked.files], problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
-			if (changed.length) o.onRefused?.(problem);
+			if (changed.length || locked.files.size) o.onRefused?.(problem, [await jobDiff(dir, changed), ...locked.diffs].filter(Boolean).join("\n").slice(0, 8000));
 			return undefined;
 		}
 		const sha = await o.mergeFix(wt, branch, `feat(${o.adapter.id}): ${(said || o.what).split("\n")[0]!.slice(0, 120)}\n\ncode job ${o.label}`);
@@ -171,16 +237,20 @@ async function removedMarks(dir: string, changed: string[]): Promise<string[]> {
  * than main and none main does not have: a job that fixes part of a big red main is not thrown away. Any other job's
  * failing steps run again on main (`mainDir`): it fails only on a step green on main or error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean, ledger: Ledger): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean, ledger: Ledger, servedUnit?: string): Promise<string | undefined> {
 	// a deleted test checks nothing: the job may not make the check green by removing what was red
 	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
 	// a stub's TODO(br:<unit>) mark tells that unit which files it may edit to replace the stub: it is the unit's to
 	// remove, not a question's job (the builder's job may: it only makes main build)
-	const marks = whole ? [] : (await removedMarks(dir, changed)).filter((u) => (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
+	const marks = whole ? [] : (await removedMarks(dir, changed)).filter((u) => u !== servedUnit && (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
 	if (marks.length) return `stub marks of units not accepted yet were removed: ${marks.slice(0, 5).map((u) => `TODO(br:${u})`).join(", ")}; leave the stubs and their marks to those units`;
-	const config = changed.filter((f) => protectedConfig(adapter, f));
-	if (config.length) return `protected config was changed: ${config.slice(0, 5).join(", ")}`;
+	// app config the job may change, but no check setting: the test command must still fail a failing test
+	const app = changed.filter((f) => appConfig(adapter, f));
+	if (app.length) {
+		const lost = await probeStillFails(adapter, dir);
+		if (lost) return `with the changed app config (${app.slice(0, 5).join(", ")}) the checks no longer work: ${lost}`;
+	}
 	// the same drift check a unit's gate runs on its files: a note or a misplaced file stays off main. A new file in a
 	// folder outside the layout (src/api/ next to the feature root) too: there the gate's "outside the feature folder" says it
 	const tracked = new Set(await trackedFiles(dir));

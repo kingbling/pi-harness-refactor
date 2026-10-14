@@ -90,6 +90,8 @@ export const reactAdapter: TargetAdapter = {
 		tests: "vitest + Testing Library",
 	},
 	protectedGlobs: ["**/*.test.tsx", "**/*.test.ts", "**/__goldens__/**", "vite.config.*", "vitest.config.*", "package.json", "pnpm-lock.yaml", "tsconfig*.json", "src/main.tsx"],
+	// what decides how build, lint and test run: a code job may change the rest (src/main.tsx), never these
+	checkConfigGlobs: ["vite.config.*", "vitest.config.*", "package.json", "pnpm-lock.yaml", "tsconfig*.json", "eslint.config.*", ".oxlintrc.json"],
 	generatedFiles: [],
 	patternKinds: ["page", "component", "hook", "api-client", "test"],
 

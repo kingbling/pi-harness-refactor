@@ -112,6 +112,31 @@ describe("resolver model before the owner", () => {
 		expect(answer).not.toMatch(/changed nothing/);
 	});
 
+	it("a unit many units wait on is not parked quietly: the owner gets one question with what the last code job wrote", async () => {
+		const { ASK_OWNER_BLOCKS } = await import("../src/jev/resolve.ts");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["symfony"] }, models: {} });
+		const run = async (waiting: number) => {
+			const ledger = new Ledger(":memory:");
+			ledger.createUnit({ id: "u1708", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+			// half wait on it directly, the rest through those (dependents of dependents count); accepted ones do not
+			for (let i = 0; i < waiting; i++) ledger.createUnit({ id: `d${i}`, tier: "T1", deps: [i % 2 ? `d${i - 1}` : "u1708"], meta: {}, symbolIds: [] });
+			ledger.createUnit({ id: "done", tier: "T1", deps: ["u1708"], meta: {}, symbolIds: [] });
+			ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'done'").run();
+			const a = ledger.askQuestion({ unitId: "u1708", point: "gate_env", question: "the login wiring is missing", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
+			const resolver: Resolver = async () => ({ code: "wire the login", then: "retry" });
+			const r = await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: async () => ({ refused: "the build fails", diff: "+++ b/config/packages/security.yaml\n+  firewalls: main" }) });
+			return { r, q: ledger.getQuestion(a)! };
+		};
+		const few = await run(ASK_OWNER_BLOCKS - 1);
+		expect(few.q).toMatchObject({ status: "answered", answered_by: RESOLVER });
+		const many = await run(ASK_OWNER_BLOCKS);
+		expect(many.r).toEqual({ answered: 0, forOwner: 1 });
+		expect(many.q.status).toBe("open");
+		expect(JSON.parse(many.q.context!).forOwner).toMatch(new RegExp(`^${ASK_OWNER_BLOCKS} units wait on u1708`));
+		expect(many.q.question).toMatch(/security\.yaml\n\+  firewalls: main/);
+		expect(JSON.parse(many.q.options!)[0]).toMatch(/^retry/);
+	});
+
 	it("a path the layout has no slot for runs a layout job: applied → answered; it would break code on main → the owner", async () => {
 		const { LAYOUT_JOB } = await import("../src/jev/resolve.ts");
 		const ledger = new Ledger(":memory:");

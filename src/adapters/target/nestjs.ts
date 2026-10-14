@@ -112,6 +112,8 @@ export const nestjsAdapter: TargetAdapter = {
 		tests: "vitest",
 	},
 	protectedGlobs: ["**/*.spec.ts", "**/*.test.ts", "**/*.e2e-spec.ts", "test/**", "**/__goldens__/**", "**/truth/**", "jest.config.*", "vitest.config.*", "**/package.json", "pnpm-lock.yaml", "**/tsconfig*.json", "nest-cli.json", "eslint.config.*", ".oxlintrc.json", "src/app.module.ts", "src/main.ts"],
+	// what decides how build, lint and test run: a code job may change the rest (src/main.ts, src/app.module.ts), never these
+	checkConfigGlobs: ["jest.config.*", "vitest.config.*", "**/package.json", "pnpm-lock.yaml", "**/tsconfig*.json", "nest-cli.json", "eslint.config.*", ".oxlintrc.json"],
 	async generateRegistration(root) {
 		// app.module.ts is owned by the orchestrator: import every feature module found under src/<dir>/*.module.ts.
 		const appModule = join(root, "src", "app.module.ts");

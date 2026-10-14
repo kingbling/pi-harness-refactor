@@ -234,12 +234,23 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const adapter = stackId ? adapters.get(stackId) : undefined;
 		if (!adapter) return undefined;
 		let merged: string | undefined;
-		let refused: string | undefined;
-		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, onRefused: (p) => (refused = p), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		let refused: { refused: string; diff: string } | undefined;
+		let locked: { files: string[]; diff: string } | undefined;
+		// the waiting unit's kept code (its last try, kept when it parked): the job starts from it and merges both
+		const keptWork = unit ? (JSON.parse(unit.meta) as { keptWork?: string }).keptWork : undefined;
+		const unitWork = unit && keptWork ? { unitId: unit.id, apply: (wt: string) => applyCleanly(wt, keptWork) } : undefined;
+		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, unitWork, onRefused: (p, diff) => (refused = { refused: p, diff }), onLocked: (l) => (locked = l), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		// main holds the unit's kept code now: its next try starts from main
+		if (said && unitWork && merged) ledger.updateUnit(unitWork.unitId, { meta: { keptWork: undefined } });
 		// a fix on main may unblock quarantined units too, not only the ones waiting on this question
 		if (said && stackId) noteFix(o.root, stackId, merged, `code job q${q.id}: ${said}`);
-		return said ?? (refused ? { refused } : undefined);
+		// what the job wanted in the files that decide how the checks run: the setup model's to judge, with the same diff
+		const setup = locked ? await lockedToSetup(adapter, stackId!, `question #${q.id}`, locked) : undefined;
+		return said ?? setup ?? refused;
 	};
+	/** A code job changed files that decide how the checks run (put back): the setup model gets the same change to judge. */
+	const lockedToSetup = (adapter: TargetAdapter, stackId: string, why: string, l: { files: string[]; diff: string }) =>
+		fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, stackId), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: `code job wanted: ${l.files.slice(0, 5).join(", ")}`, problem: `A code job for ${why} needed a change in files that decide how the checks run (${l.files.join(", ")}). A code job may not change them, so it was put back. Judge it: make the change (or the part of it the project needs) if it is a setup change that keeps every check as strict as it is, else leave it.\nWhat the code job wrote there:\n${l.diff}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined));
 	let resolving: Promise<unknown> | undefined;
 	/** The resolver answered something since the run last looked: parked units may run again. */
 	let resolvedSome = false;
@@ -354,10 +365,15 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// a main the repair could not fix goes to a code job (it may fix test code too), never to the owner
 		codeJob: o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (stackId, what) => {
 			let merged: string | undefined;
-			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log, what, whole: true, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+			let locked: { files: string[]; diff: string } | undefined;
+			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log, what, whole: true, onLocked: (l) => (locked = l), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 			if (said) noteFix(o.root, stackId, merged, `builder code job: ${said}`);
-			return said;
+			const setup = locked ? await lockedToSetup(adapters.get(stackId)!, stackId, `the red ${stackId} main`, locked) : undefined;
+			return said ?? setup;
 		},
+		// errors only in files a code job may not change: the setup model fixes them
+		fixSetup: o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : (stackId, problem) =>
+			fixRunSetup({ config, root: o.root, adapter: adapters.get(stackId)!, projectDir: projectDir(config, stackId), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: errorSignature(`build:${stackId}`, problem), problem: `The whole ${stackId} project fails its checks on main, and every error is in files that decide how the checks run (a code job may not change them). Fix them there, keeping every check as strict as it is.\n${problem.slice(-4000)}` }).catch((e) => (log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)), undefined)),
 		mergeFix: (wt, branch, what) =>
 			merge.run(async () => await mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => {
 				pusher.afterMerge();
@@ -850,9 +866,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				const st = ledger.getUnit(unitId)!.state;
 				// the worktree goes whatever the state: the next run of this unit starts from a fresh one anyway (fresh()),
 				// so a planned unit's would only hold disk space. A quarantined unit's code stays on its branch: a self-heal
-				// requeue starts from it (an owner's requeue drops it)
-				// a unit the stop sent back to planned keeps its code the same way: its next run goes on from it
-				const kept = (st === "quarantined" && mayKeepCode(ledger, unitId)) || (st === "planned" && res?.stopped) ? await keepUnitWork(wt, unitId) : undefined;
+				// requeue starts from it (an owner's requeue drops it). So does the code of a unit waiting on a question (a
+				// code job for that question starts from it, and the unit goes on from it once answered) and of a unit the
+				// stop sent back to planned: its next run goes on from it
+				const kept = keepsCode(ledger, unitId) || (st === "planned" && res?.stopped) ? await keepUnitWork(wt, unitId) : undefined;
 				if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
 				await removeWorktree(config.target.path, wt);
 				if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
@@ -1781,6 +1798,17 @@ export async function keepUnitWork(wt: string, unitId: string): Promise<string |
 }
 
 /**
+ * Whether a unit's code stays on its branch when its lane ends: it is quarantined (a self-heal goes on from it) or
+ * waits on a question (a code job for that question starts from it, and so does the unit once answered), and its
+ * code is worth keeping (mayKeepCode).
+ */
+export function keepsCode(ledger: Ledger, unitId: string): boolean {
+	const u = ledger.getUnit(unitId)!;
+	const waits = !!(JSON.parse(u.meta) as { parked?: { question?: number } }).parked?.question;
+	return (u.state === "quarantined" || (waits && u.state !== "accepted")) && mayKeepCode(ledger, unitId);
+}
+
+/**
  * Whether a quarantined unit's code is worth keeping: not when its last gate failed antigaming_ok, as the kept files
  * (outside its scope, edited shared ones) would fail it the same way on every self-heal.
  */
@@ -1832,6 +1860,17 @@ export async function restoreUnitWork(wt: string, sha: string): Promise<string[]
 		}
 		return undefined;
 	}
+}
+
+/** Kept code put back on top of main only when it applies without a clash (a code job's start); else the worktree is left clean. */
+export async function applyCleanly(wt: string, sha: string): Promise<boolean> {
+	const clash = await restoreUnitWork(wt, sha);
+	if (clash?.length === 0) return true;
+	if (clash) {
+		await gitIn(wt, ["checkout", "-q", "--", "."]).catch(() => undefined);
+		await gitIn(wt, ["clean", "-fdq"]).catch(() => undefined);
+	}
+	return false;
 }
 
 /** Clashes only in wiring files resolved without an implement pass, per unit run (main can keep moving). */
