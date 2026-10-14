@@ -87,9 +87,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const steps: GateStep[] = [];
 	// structure_ok: its failing paths a protected test imports (set by that step)
 	let testImported: string[] | undefined;
-	const changed = await changedFiles(g.targetProjectDir, g.adapter.toolchain.ignoredPaths);
-	const tracked = new Set(await trackedFiles(g.targetProjectDir));
-	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
+	const files = await gateFiles(g);
+	const { changed, prodFiles } = files;
 	const timeout = g.timeoutMs ?? 240_000;
 	const slot = g.slot ?? (<T>(fn: () => Promise<T>) => fn());
 	let slotMs = 0;
@@ -125,63 +124,15 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	if (!proofOk) return done();
 
 	// 2. anti-gaming, cheap part: scope + tests untouched + no skipped tests + a non-trivial change
-	const agOk = await step("antigaming_ok", async () => {
-		const problems: string[] = [];
-		const allow = g.writeGlobs.map(globToRegExp);
-		const appendOnly = (g.appendOnlyGlobs ?? []).map(globToRegExp);
-		// the unit's own ported tests are the tester's (a re-port edits one already on main): the hash check below covers them
-		const own = new Set(g.testFiles.map((t) => t.path));
-		for (const f of changed) {
-			if (own.has(f) || allow.some((r) => r.test(f))) continue;
-			if (appendOnly.some((r) => r.test(f))) {
-				if (tracked.has(f)) problems.push(`edited an existing shared file (add-only zone): ${f}`);
-				continue;
-			}
-			problems.push(`write outside unit scope: ${f}`);
-		}
-		for (const t of g.testFiles) {
-			const p = join(g.targetProjectDir, t.path);
-			if (!existsSync(p)) problems.push(`test file removed: ${t.path}`);
-			else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
-			else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
-		}
-		for (const f of await othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
-		// a comment that silences the type check or the linter hides an error instead of fixing it (only lines this unit added)
-		const silence = g.adapter.layout.suppressMarker;
-		if (silence) for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
-		// a merge conflict restored into the worktree: no marker line may reach main (build and tests do not read every file)
-		for (const f of conflictMarkers(g.targetProjectDir, changed)) problems.push(`unresolved merge conflict in ${f}: keep the changes of both sides and remove the <<<<<<< ======= >>>>>>> lines`);
-		// a stub mark names the unit that replaces it when it runs: a name that is no unit still to come is a stub nobody replaces
-		for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) for (const m of l.text.matchAll(/TODO\(br:([^)]*)\)/g)) {
-			const why = stubOwnerProblem(g.ledger, g.unitId, m[1]!.trim());
-			if (why) problems.push(`${f}:${l.line}: TODO(br:${m[1]}) ${why}`);
-		}
-		// stubs earlier units left for this unit (the task card listed them): once it is accepted nobody replaces them
-		for (const hit of await stubsLeftFor(g.targetProjectDir, g.unitId)) if (!problems.some((p) => p.startsWith(`${hit.file}:${hit.line}:`))) problems.push(`${hit.file}:${hit.line}: ${STUB_LEFT}`);
-		// no code written but ported tests to run: existing code may already do it (reuse); the tests and the reviewer decide
-		const reuse = prodFiles.length === 0 && g.testFiles.length > 0;
-		if (prodFiles.length === 0 && !reuse && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
-		return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : reuse ? "no production file changed (reuse): the ported tests and the reviewer decide" : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
-	});
-	if (!agOk) return done();
+	if (!(await step("antigaming_ok", () => antigamingCheck(g, files)))) return done();
 
-	// 3. structure + reuse: files follow the stack layout (one module per area, no per-legacy-file folders) and
-	//    nothing re-creates a class or function body that already exists in the target
-	//    (deleted files are not checked: a sanctioned tidy move removes a misnamed file; the write scope covers deletes)
+	// 3. structure + reuse (see structureCheck)
 	let nearDuplicates: string[] = [];
 	const structureOk = await step("structure_ok", async () => {
-		const present = changed.filter((f) => existsSync(join(g.targetProjectDir, f)));
-		const ctx = { isNew: (f: string) => !tracked.has(f), sanctioned: g.sanctioned ?? [], legacyWords: g.legacyWords };
-		const lines = g.moduleDir && g.adapter.layout.checkStructure ? await g.adapter.layout.checkStructure(present, g.moduleDir, g.area ?? "", g.targetProjectDir, ctx) : [];
-		const warnings = lines.filter((l) => l.startsWith("warning:"));
-		// drift checks (size cap, one class per responsibility …) on the touched files; drift elsewhere is reported, not failed
-		const tree = await checkTree(g.targetProjectDir, g.adapter, present);
-		const reuse = await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed);
-		nearDuplicates = reuse.near;
-		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(reuse.problems);
-		// only path findings (checkStructure) need a renamed import; size and class findings (checkTree) are about the file's content
-		testImported = importedByTests(g.targetProjectDir, g.testFiles.map((t) => t.path), lines.filter((l) => !l.startsWith("warning:")));
-		return { ok: problems.length === 0, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings, ...reuse.near.map((n) => `note: ${n} (the reviewer judges it)`)].join("\n") };
+		const r = await structureCheck(g, files);
+		nearDuplicates = r.near;
+		testImported = r.testImported;
+		return r;
 	});
 	if (!structureOk) return done();
 
@@ -230,6 +181,81 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const failed = steps.find((s) => !s.ok);
 		return { ok: !failed, steps, changedFiles: changed, failedStep: failed?.name, testFiles: g.testFiles.map((t) => t.path), ...(testImported?.length ? { testImported } : {}) };
 	}
+}
+
+/** The worktree's changed files, the ones git tracks, and the changed production files: what the cheap checks read. */
+export interface GateFiles {
+	changed: string[];
+	tracked: Set<string>;
+	prodFiles: string[];
+}
+export async function gateFiles(g: Pick<GateInput, "targetProjectDir" | "adapter">): Promise<GateFiles> {
+	const changed = await changedFiles(g.targetProjectDir, g.adapter.toolchain.ignoredPaths);
+	return { changed, tracked: new Set(await trackedFiles(g.targetProjectDir)), prodFiles: changed.filter((f) => !g.adapter.layout.isTestFile(f)) };
+}
+
+/**
+ * antigaming_ok: writes within scope, tests untouched and not skipped, no silenced check, no conflict marker, every
+ * stub mark naming a unit still to come. Code only (no command), so check_my_code runs it too; `early` (check_my_code
+ * during the session) leaves out "nothing written yet".
+ */
+export async function antigamingCheck(g: GateInput, { changed, tracked, prodFiles }: GateFiles, early = false): Promise<{ ok: boolean; output: string }> {
+	const problems: string[] = [];
+	const allow = g.writeGlobs.map(globToRegExp);
+	const appendOnly = (g.appendOnlyGlobs ?? []).map(globToRegExp);
+	// the unit's own ported tests are the tester's (a re-port edits one already on main): the hash check below covers them
+	const own = new Set(g.testFiles.map((t) => t.path));
+	for (const f of changed) {
+		if (own.has(f) || allow.some((r) => r.test(f))) continue;
+		if (appendOnly.some((r) => r.test(f))) {
+			if (tracked.has(f)) problems.push(`edited an existing shared file (add-only zone): ${f}`);
+			continue;
+		}
+		problems.push(`write outside unit scope: ${f}`);
+	}
+	for (const t of g.testFiles) {
+		const p = join(g.targetProjectDir, t.path);
+		if (!existsSync(p)) problems.push(`test file removed: ${t.path}`);
+		else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
+		else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
+	}
+	for (const f of await othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
+	// a comment that silences the type check or the linter hides an error instead of fixing it (only lines this unit added)
+	const silence = g.adapter.layout.suppressMarker;
+	if (silence) for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
+	// a merge conflict restored into the worktree: no marker line may reach main (build and tests do not read every file)
+	for (const f of conflictMarkers(g.targetProjectDir, changed)) problems.push(`unresolved merge conflict in ${f}: keep the changes of both sides and remove the <<<<<<< ======= >>>>>>> lines`);
+	// a stub mark names the unit that replaces it when it runs: a name that is no unit still to come is a stub nobody replaces
+	for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) for (const m of l.text.matchAll(/TODO\(br:([^)]*)\)/g)) {
+		const why = stubOwnerProblem(g.ledger, g.unitId, m[1]!.trim());
+		if (why) problems.push(`${f}:${l.line}: TODO(br:${m[1]}) ${why}`);
+	}
+	// stubs earlier units left for this unit (the task card listed them): once it is accepted nobody replaces them
+	for (const hit of await stubsLeftFor(g.targetProjectDir, g.unitId)) if (!problems.some((p) => p.startsWith(`${hit.file}:${hit.line}:`))) problems.push(`${hit.file}:${hit.line}: ${STUB_LEFT}`);
+	// no code written but ported tests to run: existing code may already do it (reuse); the tests and the reviewer decide
+	const reuse = prodFiles.length === 0 && g.testFiles.length > 0;
+	if (prodFiles.length === 0 && !reuse && !early && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
+	return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : reuse ? "no production file changed (reuse): the ported tests and the reviewer decide" : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
+}
+
+/**
+ * structure_ok: files follow the stack layout (one module per area, no per-legacy-file folders) and nothing re-creates
+ * a class or function body that already exists in the target (deleted files are not checked: a sanctioned tidy move
+ * removes a misnamed file; the write scope covers deletes). Code only, so check_my_code runs it too.
+ * `testImported`: its failing paths a protected test imports; `near`: look-alike classes for the reviewer.
+ */
+export async function structureCheck(g: GateInput, { changed, tracked, prodFiles }: GateFiles): Promise<{ ok: boolean; output: string; near: string[]; testImported: string[] }> {
+	const present = changed.filter((f) => existsSync(join(g.targetProjectDir, f)));
+	const ctx = { isNew: (f: string) => !tracked.has(f), sanctioned: g.sanctioned ?? [], legacyWords: g.legacyWords };
+	const lines = g.moduleDir && g.adapter.layout.checkStructure ? await g.adapter.layout.checkStructure(present, g.moduleDir, g.area ?? "", g.targetProjectDir, ctx) : [];
+	const warnings = lines.filter((l) => l.startsWith("warning:"));
+	// drift checks (size cap, one class per responsibility …) on the touched files; drift elsewhere is reported, not failed
+	const tree = await checkTree(g.targetProjectDir, g.adapter, present);
+	const reuse = await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed);
+	const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(reuse.problems);
+	// only path findings (checkStructure) need a renamed import; size and class findings (checkTree) are about the file's content
+	const testImported = importedByTests(g.targetProjectDir, g.testFiles.map((t) => t.path), lines.filter((l) => !l.startsWith("warning:")));
+	return { ok: problems.length === 0, near: reuse.near, testImported, output: [...(problems.length ? problems : ["layout ok; nothing duplicated"]), ...warnings, ...reuse.near.map((n) => `note: ${n} (the reviewer judges it)`)].join("\n") };
 }
 
 /**

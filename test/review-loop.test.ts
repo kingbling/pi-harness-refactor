@@ -52,6 +52,9 @@ beforeEach(() => {
 	write(join(ws, "migrated", "package.json"), "{}");
 	write(join(ws, "migrated", SPEC), "it('u1#1 creates', () => {});\n");
 	execFileSync("git", ["init", "-q"], { cwd: join(ws, "migrated") });
+	// the project as main has it (check_my_code's scope check reads the worktree's changes against it)
+	execFileSync("git", ["add", "package.json"], { cwd: join(ws, "migrated") });
+	execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"], { cwd: join(ws, "migrated") });
 	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
 	ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
 	ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: { files: ["app/agency/create.cmd.php"], place: { stack: "nestjs", area: "agency", shared: false, source: "code" } }, symbolIds: [] });

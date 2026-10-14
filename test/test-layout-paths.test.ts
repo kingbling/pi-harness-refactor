@@ -9,7 +9,7 @@ import { FakeModelClient } from "../src/models/fake.ts";
 import { importedByTests } from "../src/run/gate.ts";
 import { triageGate } from "../src/run/triage.ts";
 import { checkLayoutRules, normalize } from "../src/rules/layout-rules.ts";
-import { checkPortedTestsTool, portedLayout } from "../src/sessions/tools.ts";
+import { checkPortedTestsTool, missingTestImports, portedLayout } from "../src/sessions/tools.ts";
 
 /**
  * Tests that contradict the layout: the tester checks its test paths and the code paths its tests import against the
@@ -43,6 +43,29 @@ describe("the tester checks its paths with the layout", () => {
 		const r = await (tool as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }>; details: { layout: string[] } }> }).execute("x", { code_files: [`${MOD}/pages/OfferEditPage.tsx`, `${MOD}/pages/OfferListPage.tsx`] });
 		expect(r.content[0]!.text).toMatch(/LAYOUT FAILED/);
 		expect(r.details.layout).toEqual([expect.stringMatching(/^src\/features\/offers\/pages\/OfferEditPage\.tsx:/)]);
+		ledger.close();
+	});
+
+	it("check_ported_tests checks what the tests really import, not only the code_files the tester lists", async () => {
+		const ws = mkdtempSync(join(tmpdir(), "br-tl-"));
+		const target = join(ws, "migrated");
+		// the renamed test is right; the one left over from the earlier name still imports the name the layout forbids
+		write(join(target, `${MOD}/pages/OffersEditPage.test.tsx`), "import { OffersEditPage } from './OffersEditPage';\nit('u1#1 edits', () => {});\n");
+		write(join(target, `${MOD}/pages/OfferEditPage.test.tsx`), "import { OfferEditPage } from \"./OfferEditPage\";\nimport { api } from '../api/client';\nit('edits', () => {});\n");
+		write(join(target, `${MOD}/api/client.ts`)); // exists: not a new path
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const adapter = { ...nestjsAdapter, layout: { ...nestjsAdapter.layout, testFileGlobs: (m: string) => [`${m}/**/*.test.tsx`] }, lint: () => ({ cmd: "true", args: [] }), build: () => ({ cmd: "true", args: [] }) } as never;
+		expect([...missingTestImports(target, [`${MOD}/pages/OffersEditPage.test.tsx`, `${MOD}/pages/OfferEditPage.test.tsx`], [".ts", ".tsx"])]).toEqual([
+			[`${MOD}/pages/OffersEditPage.tsx`, `${MOD}/pages/OffersEditPage.test.tsx`],
+			[`${MOD}/pages/OfferEditPage.tsx`, `${MOD}/pages/OfferEditPage.test.tsx`],
+		]);
+		const tool = checkPortedTestsTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: target, adapter, moduleDir: MOD, currentTruth: () => ({ ok: true, cases: [{ symbol: "s", inputs: [], expected: 1 }] }), checkLayout: check(target) });
+		const r = await (tool as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }>; details: { layout: string[] } }> }).execute("x", { code_files: [`${MOD}/pages/OffersEditPage.tsx`] });
+		expect(r.content[0]!.text).toMatch(/LAYOUT FAILED/);
+		expect(r.details.layout).toEqual([expect.stringMatching(/^src\/features\/offers\/pages\/OfferEditPage\.tsx: .*\(imported by src\/features\/offers\/pages\/OfferEditPage\.test\.tsx\)$/)]);
 		ledger.close();
 	});
 });
