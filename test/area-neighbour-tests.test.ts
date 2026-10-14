@@ -223,6 +223,43 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 	});
 });
 
+describe("ported tests: main's warm-up after a merge stays out of the lanes' way", () => {
+	const commitMain = (m: string) => (write(join(main, `${m}.txt`), m), git(main, "add", "-A"), git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", m));
+	const mainLines = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter((l) => l.startsWith(`${main} `)) : []);
+
+	it("a warm-up whose run is red and names no file does not run file by file", async () => {
+		// a runner that fails without saying which file
+		const quiet = { ...adapter, test: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", `echo "$PWD $*" >> ${log}; for f; do grep -q pass "$f" || exit 1; grep -qx "$f" broken.txt 2>/dev/null && exit 1; done; exit 0`, "sh", ...files] }) } as unknown as TargetAdapter;
+		write(join(wt, "broken.txt"), "tests/n1.spec\n");
+		expect((await runPortedTests({ ledger, unitId: "u1", adapter: quiet, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 30_000 })).ok).toBe(false);
+		commitMain("merge");
+		const before = mainLines().length;
+		await warmMainCache();
+		expect(mainLines().length - before).toBe(1);
+	});
+
+	it("a lane that asks while a warm-up waits for main's turn gets a run of its own files only", async () => {
+		const extra = ["tests/n3.spec", "tests/n4.spec"];
+		for (const f of extra) write(join(main, f), "pass\n");
+		commitMain("two more");
+		const lanes = extra.map((_, i) => join(root, `wlane${i}`));
+		for (const [i, d] of lanes.entries()) {
+			git(root, "clone", "-q", main, d);
+			write(join(d, "broken.txt"), `${extra[i]}\n`);
+		}
+		const slow = { ...adapter, test: (d: string, files: string[]) => (d === main ? { ...adapter.test(d, files), args: [adapter.test(d, files).args[0]!, `touch ${join(root, "main-busy")}; sleep 1; ${adapter.test(d, files).args[1]}`, ...adapter.test(d, files).args.slice(2)] } : adapter.test(d, files)) } as TargetAdapter;
+		const ask = (i: number) => runPortedTests({ ledger, unitId: "u1", adapter: slow, dir: lanes[i]!, tests: ["tests/own.spec", extra[i]!], mainDir: main, timeoutMs: 30_000 });
+		const first = ask(0);
+		for (let i = 0; i < 100 && !existsSync(join(root, "main-busy")); i++) await new Promise((r) => setTimeout(r, 20));
+		// main is busy with the first lane: a warm-up and a second lane wait for the same turn
+		const warm = warmMainCache();
+		const second = ask(1);
+		expect((await Promise.all([first, second])).map((r) => r.ok)).toEqual([false, false]);
+		await warm;
+		expect(mainLines().filter((l) => l.includes("tests/n4.spec"))).toEqual([`${main} tests/n4.spec`]);
+	});
+});
+
 /**
  * A unit's worktree is made from main once; main moves on (other units, setup fixes). A neighbour test that fails in
  * the worktree only because main fixed it since must not count against the unit: the gate brings main's new commits

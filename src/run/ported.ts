@@ -110,7 +110,7 @@ function onMain<T>(fn: () => Promise<T>): Promise<T> {
 /** What main says about neighbour test files: pass (true) or not, and the commit it ran on. */
 type MainAnswer = { green: Map<string, boolean>; head: string; waitedMs: number };
 type How = { adapter: TargetAdapter; timeoutMs: number; slot: Slot };
-type Ask = How & { files: string[]; at: number; res: (a: MainAnswer) => void; rej: (e: unknown) => void };
+type Ask = How & { files: string[]; at: number; warm: boolean; res: (a: MainAnswer) => void; rej: (e: unknown) => void };
 /** Questions to main waiting for its turn, per main dir: one turn answers all of them with one run. */
 const asks = new Map<string, Ask[]>();
 /** Neighbour files lanes asked main about lately (when, and how to run them), per main dir: run again after a merge. */
@@ -131,15 +131,19 @@ function askMain(main: string, files: string[], how: How, warm = false): Promise
 		asked.set(main, seen);
 	}
 	return new Promise((res, rej) => {
-		asks.set(main, [...(asks.get(main) ?? []), { ...how, files, at: Date.now(), res, rej }]);
+		asks.set(main, [...(asks.get(main) ?? []), { ...how, files, at: Date.now(), warm, res, rej }]);
 		void onMain(async () => {
 			const batch = asks.get(main) ?? [];
 			if (!batch.length) return; // an earlier turn answered it
 			asks.delete(main);
-			const timeoutMs = Math.max(...batch.map((a) => a.timeoutMs));
-			const test = (dir: string, f: string[]) => batch[0]!.slot(() => runTests(batch[0]!.adapter, dir, f, timeoutMs));
+			// a lane waiting: its files only (a warm-up's many files would make the lane wait for all of them); the
+			// warm-up is answered by that run too, its other files wait for the next merge
+			const lanes = batch.filter((a) => !a.warm);
+			const run = lanes.length ? lanes : batch;
+			const timeoutMs = Math.max(...run.map((a) => a.timeoutMs));
+			const test = (dir: string, f: string[]) => run[0]!.slot(() => runTests(run[0]!.adapter, dir, f, timeoutMs));
 			try {
-				const r = await greenThere(main, [...new Set(batch.flatMap((a) => a.files))], test);
+				const r = await greenThere(main, [...new Set(run.flatMap((a) => a.files))], test, !lanes.length);
 				for (const a of batch) a.res({ ...r, waitedMs: Date.now() - a.at });
 			} catch (e) {
 				for (const a of batch) a.rej(e);
@@ -162,7 +166,7 @@ export async function warmMainCache(): Promise<void> {
 }
 
 /** Which of `files` pass on main (its checkout at `main`), from the kept answers for main's tree or a run there. */
-async function greenThere(main: string, files: string[], test: (dir: string, files: string[]) => Promise<TestRun>): Promise<{ green: Map<string, boolean>; head: string }> {
+async function greenThere(main: string, files: string[], test: (dir: string, files: string[]) => Promise<TestRun>, warm = false): Promise<{ green: Map<string, boolean>; head: string }> {
 	const headOf = async () => {
 		try {
 			return (await exec("git", ["-C", main, "rev-parse", "HEAD", "HEAD^{tree}"])).trim().split("\n");
@@ -185,7 +189,8 @@ async function greenThere(main: string, files: string[], test: (dir: string, fil
 		for (const t of red) green.set(t, false);
 		const rest = present.filter((t) => !red.includes(t));
 		if (red.length && rest.length && (await test(main, rest)).ok) for (const t of rest) green.set(t, true);
-		else for (const t of rest) green.set(t, (await test(main, [t])).ok);
+		// a warm-up never runs file by file (it would hold main's turn for minutes): those files stay unanswered
+		else if (!warm) for (const t of rest) green.set(t, (await test(main, [t])).ok);
 	}
 	// a result is kept only when main did not move during the run
 	if (tree && (await headOf())[1] === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
