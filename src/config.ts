@@ -118,6 +118,8 @@ export const ConfigSchema = z.object({
 			compactAt: z.number().gt(0).lt(1).default(0.65),
 			/** A model session with no model or tool activity for this long is stopped (idle_timeout). */
 			idleMs: z.number().int().default(600_000),
+			/** No new unit starts while the disk holding the workspace has less free space than this (GB); running ones finish. 0 = off. */
+			minFreeDiskGb: z.number().min(0).default(10),
 			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
 			sampleSize: z.number().int().min(0).default(10),
 			/** Accepted units with truth only read from the old code get a script that runs it, this many per run (0 = off). */

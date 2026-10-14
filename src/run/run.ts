@@ -1,6 +1,6 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
 import { execFile, execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { cp } from "node:fs/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -432,6 +432,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
+	if (!o.dry) for (const n of sweepWorktrees(ledger, config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
 	const branchNow = mainBranch(config.target.path, config.target.git.branch);
 	if (branchNow !== config.target.git.branch) log(pc.yellow(`target branch ${config.target.git.branch} is gone from ${config.target.path}; units merge into ${branchNow} (the checked-out branch). Set target.git.branch to "${branchNow}" to make it permanent.`));
 	if (!o.dry) {
@@ -932,6 +933,15 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let passErrorAt = 0;
 	/** When the error now repeating first came (a broken placement.json or areas.json fails every pass the same way). */
 	let passErrorSince = 0;
+	// a full disk breaks the ledger, git and installs in odd ways: below run.minFreeDiskGb no new unit starts (said once)
+	let diskLow = false;
+	const diskReason = (): string | undefined => {
+		const gb = freeDiskGb(o.root);
+		const low = gb !== undefined && gb < config.run.minFreeDiskGb;
+		if (low !== diskLow) log(low ? pc.red(`only ${gb!.toFixed(1)} GB free on the disk (run.minFreeDiskGb ${config.run.minFreeDiskGb}): no new units start until there is more`) : pc.cyan(`disk space back (${gb!.toFixed(1)} GB free): units start again`));
+		diskLow = low;
+		return low ? `only ${gb!.toFixed(1)} GB free on the disk; new units wait (run.minFreeDiskGb)` : undefined;
+	};
 	for (;;) {
 		try {
 			reloadLanes();
@@ -953,7 +963,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
 			const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
 			if (!stop && !dayCapHit) tidyJobs.next();
-			const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : await samplePause();
+			const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : (diskReason() ?? (await samplePause()));
 			let readyNow = 0;
 			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
 				const candidates = ready();
@@ -1150,6 +1160,33 @@ export function excludeFromGit(repo: string, patterns: string[]): void {
 }
 
 /** Dependency dirs into a unit's worktree: linked, or copied (copy-on-write clone where the disk can) when the workspace learned that a link breaks the stack's tools. */
+/** Free space on the disk holding `dir`, in GB (undefined where it cannot be read). */
+export function freeDiskGb(dir: string): number | undefined {
+	try {
+		const s = statfsSync(dir);
+		return (s.bavail * s.bsize) / 1e9;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * At the start nothing runs yet: a worktree of an accepted unit, a code job's or a builder's is left over from a
+ * crash or a stop and only holds disk space (and its dependency copy). A planned or quarantined unit's stays: its work resumes there.
+ */
+export function sweepWorktrees(ledger: Ledger, repo: string, dir: string): string[] {
+	if (!existsSync(dir)) return [];
+	const gone: string[] = [];
+	for (const n of readdirSync(dir)) {
+		if (n.startsWith(".")) continue;
+		const unit = ledger.getUnit(n.replace(/-ahead$/, ""));
+		if (unit ? unit.state !== "accepted" : !n.startsWith("__")) continue;
+		removeWorktree(repo, join(dir, n));
+		gone.push(n);
+	}
+	return gone;
+}
+
 export async function linkDependencies(mainProject: string, wtProject: string, dirs: string[], copy: string[] = []): Promise<void> {
 	for (const d of dirs) {
 		const src = join(mainProject, d);

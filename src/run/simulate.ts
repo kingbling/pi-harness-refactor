@@ -69,7 +69,7 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 	// the registration commit after a merge fails (a hook refuses it): the merged unit must stay accepted
 	writeFileSync(join(target, ".git", "hooks", "commit-msg"), "#!/bin/sh\ngrep -q 'regenerate registration' \"$1\" && { echo 'simulated: registration commit refused' >&2; exit 1; }\nexit 0\n", { mode: 0o755 });
 
-	const config: Config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {}, run: { maxImplementAttempts: 2, maxEscalateAttempts: 1, agentConcurrency: 4, gateConcurrency: 1 } });
+	const config: Config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {}, run: { maxImplementAttempts: 2, maxEscalateAttempts: 1, agentConcurrency: 4, gateConcurrency: 1, minFreeDiskGb: 0 } });
 	writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
 	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
 	const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));

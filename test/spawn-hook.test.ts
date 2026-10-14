@@ -108,6 +108,20 @@ describe("runaway control inside a model session (run.maxUnitTokens, run.idleMs)
 		expect(stops).toHaveLength(1);
 	});
 
+	it("a running tool is no idleness: a check waiting 30 min for a gate slot is not stopped", () => {
+		vi.useFakeTimers();
+		const { stops, l } = limits(250_000, 60_000);
+		l.toolStart();
+		vi.advanceTimersByTime(30 * 60_000);
+		expect(stops).toEqual([]);
+		l.toolEnd(); // the clock starts when the last running tool ends
+		vi.advanceTimersByTime(59_000);
+		expect(stops).toEqual([]);
+		vi.advanceTimersByTime(2_000);
+		expect(stops).toEqual(["idle_timeout: no model or tool activity for 60s"]);
+		l.end();
+	});
+
 	it("a session that ended never stops later", () => {
 		vi.useFakeTimers();
 		const { stops, l } = limits(250_000, 1_000);

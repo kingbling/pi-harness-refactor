@@ -299,15 +299,16 @@ export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "gl
 	return `${reason}. ${where} Otherwise ${report}.`;
 }
 
-/**
- * Runaway control inside one model session: fresh tokens (input + output, cache reads excluded) over `maxTokens`, or
- * no model or tool activity for `idleMs`, stops it once (`onStop` with the reason). What it wrote still goes to the gate.
- */
 /** Pi compacts when the context passes the window minus this reserve: the reserve that makes it compact at `share` of the window. */
 export function compactionReserve(contextWindow: number, share: number): number {
 	return Math.max(16_384, Math.round(contextWindow * (1 - share)));
 }
 
+/**
+ * Runaway control inside one model session: fresh tokens (input + output, cache reads excluded) over `maxTokens`, or
+ * no model or tool activity for `idleMs`, stops it once (`onStop` with the reason). What it wrote still goes to the gate.
+ * A running tool is activity: a check waiting for a gate slot or a long test run is not an idle session.
+ */
 export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (why: string) => void }) {
 	let stopped: string | undefined;
 	const stop = (why: string) => {
@@ -316,14 +317,18 @@ export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (w
 		o.onStop(why);
 	};
 	let idle: ReturnType<typeof setTimeout> | undefined;
+	let tools = 0;
 	const active = () => {
 		clearTimeout(idle);
-		if (!stopped) idle = setTimeout(() => stop(`idle_timeout: no model or tool activity for ${Math.round(o.idleMs / 1000)}s`), o.idleMs);
+		if (!stopped && !tools) idle = setTimeout(() => stop(`idle_timeout: no model or tool activity for ${Math.round(o.idleMs / 1000)}s`), o.idleMs);
 	};
 	active();
 	return {
 		/** Any session event: the idle clock starts over. */
 		active,
+		/** A tool call starts or ends: no idle clock while one runs. */
+		toolStart: () => (tools++, active()),
+		toolEnd: () => ((tools = Math.max(0, tools - 1)), active()),
 		/** The session's fresh tokens so far. */
 		used: (tokens: number) => {
 			if (o.maxTokens > 0 && tokens > o.maxTokens) stop(`budget: the session used ${tokens} tokens, over run.maxUnitTokens (${o.maxTokens})`);
@@ -444,7 +449,9 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				onStop: (why) => (record({ type: "session_stopped", why }), session.abort()),
 			});
 			const unsub = session.subscribe((ev: any) => {
-				limits.active();
+				if (ev.type === "tool_execution_start") limits.toolStart();
+				else if (ev.type === "tool_execution_end") limits.toolEnd();
+				else limits.active();
 				if (ev.type === "message_end" && ev.message?.role === "assistant") {
 					const m = ev.message;
 					text = (m.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
