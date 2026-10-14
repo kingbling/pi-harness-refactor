@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
-import { caseCoverage, checkTests, ownTests, runPortedTests } from "../run/ported.ts";
+import { catchUpWithMain, caseCoverage, checkTests, holds, ownTests, runPortedTests, sameAsAt } from "../run/ported.ts";
 import { buildFiles, changedFiles, clipOutput, othersTestsChanged } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
@@ -490,8 +490,19 @@ export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 			if (reopens >= MAX_REPORT_REOPENS) return text(`${owner} was already re-opened ${reopens} times by reports: not again. Finish this unit with what exists and describe the gap in your final message.`, { error: true });
 			// this unit would wait for the owner while the owner (re-opened) waits for this unit: neither would ever start
 			if (dependsOn(d.ledger, owner, d.unitId)) return text(`${owner} itself depends on this unit, so it cannot be fixed first. Finish this unit with what exists and describe the gap in ${p.target} in your final message.`, { error: true });
-			// this unit changed the file itself: what looks wrong may be its own change, not the owner's code
 			const file = p.target.split("::")[0]!.replace(/^\.\//, "");
+			// the owner's accepted code was merged after this worktree last took main's commits: what looks missing or old
+			// here is on main. Main's commits are brought in once; when they clash with this unit's work, no re-open
+			const commit = (JSON.parse(d.ledger.getUnit(owner)!.meta) as { commit?: string }).commit;
+			if (commit && !(await holds(d.targetProjectDir, commit))) {
+				const caught = d.mainDir ? await catchUpWithMain(d.targetProjectDir, d.mainDir) : undefined;
+				if (await holds(d.targetProjectDir, commit)) return text(`${owner}'s accepted code was merged into main after your worktree was made, so you did not see it. Main's new commits are now in your worktree: read ${file} again and report only a bug that is still there. Nothing was reported.`, { error: true });
+				const clash = caught && "clash" in caught ? ` because main's new commits clash with your changes in ${caught.clash.join(", ") || "some files"}` : "";
+				// the file is here as the owner left it (or missing in both): the bug is in the owner's code, report it
+				if (!(await sameAsAt(d.targetProjectDir, commit, file)))
+					return text(`${owner}'s accepted code is on main but not in your worktree${clash}, so ${file} here is older than ${owner}'s. Read it as merged (git show ${commit.slice(0, 12)}:${file}), keep your change compatible with it, and report only a bug that is in that code. Nothing was reported; the merge of this unit brings ${owner}'s code in. A report about ${file} goes through only once it is here as ${owner} left it, so for a bug in that code describe the gap in your final message instead of reporting it again.`, { error: true });
+			}
+			// this unit changed the file itself: what looks wrong may be its own change, not the owner's code
 			const mine = await changedFiles(d.targetProjectDir, d.adapter.toolchain.ignoredPaths).catch(() => [] as string[]);
 			if (mine.includes(file)) return text(`${file} is changed in this unit's own worktree, so the problem may come from that change, not from ${owner}'s code. Look at your change (git diff -- ${file}); undo it if it is not yours to make, and report only a bug that is in the code as ${owner} left it.`, { error: true });
 			// a unit that already waited on reports this run finishes with what exists: each round costs a re-open and a wait
