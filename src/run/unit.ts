@@ -12,7 +12,7 @@ import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { commitAll, mainBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
-import { syntaxErrors } from "../inventory/treesitter.ts";
+import { addedSyntaxErrors } from "../inventory/treesitter.ts";
 import { describeCapabilities } from "../inventory/capabilities.ts";
 import { indexTarget } from "../inventory/target.ts";
 import { askViaModel } from "../jev/ask.ts";
@@ -35,7 +35,7 @@ import { askPendingQuirks, markQuirksApplied, quirkList, quirkRetestNote, quirkS
 import { completeTidyTasks, tidyTasks } from "./tidy.ts";
 import { sameFinding, samePath, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
-import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyDeclaredTool, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, truthBrokenKey, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { filesNamed } from "./builder.ts";
 import { setStep } from "./watchdog.ts";
 import { catchUpWithMain, caseCoverage, checkTests, findTests, onlyOwnTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
@@ -226,8 +226,22 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastTesterText = "";
 	// the writes the last tester session was refused (a quarantine's red attempt carries them)
 	let lastTesterBlocked: string[] = [];
-	// earlier units' tests the implementer disputed and the tester then fixed: kept, and the gate allows them
-	const disputedOthers: string[] = [];
+	// earlier units' tests the implementer disputed and the tester then fixed, or the tester disputed itself with
+	// evidence: kept, and the gate allows them. Saved, so a restart that keeps the unit's work keeps them allowed too.
+	const disputedKey = `tests_disputed:${o.unitId}`;
+	const disputedOthers: string[] = (() => {
+		try {
+			return JSON.parse(o.ledger.getMeta(disputedKey) ?? "[]") as string[];
+		} catch {
+			return [];
+		}
+	})();
+	const allowDisputed = (files: string[]) => {
+		const add = files.filter((f) => !disputedOthers.includes(f));
+		if (!add.length) return;
+		disputedOthers.push(...add);
+		o.ledger.setMeta(disputedKey, JSON.stringify(disputedOthers));
+	};
 	const envMode: TruthMode = loadLegacyEnv(o.root, o.config).mode ?? "run";
 	let truthMode: TruthMode = envMode;
 	// the tester runs in the workspace (truth dir + the target's test folders); it is told these exact globs, absolute
@@ -283,7 +297,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
-			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onCheck: more.codeWritten ? (c) => void (testerCheck = { c, key: testsKey() }) : undefined }),
+			customTools: [
+				...testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onDispute: (dsp) => {
+					// an earlier unit's test the tester had to change, with its evidence: kept instead of undone
+					if (!sanctioned.includes(dsp.test)) sanctioned.push(dsp.test);
+					allowDisputed([dsp.test]);
+					log(pc.yellow(`  tester disputes an earlier unit's test, change kept: ${dsp.test}: ${dsp.why} (evidence: ${dsp.evidence})`));
+				}, onCheck: more.codeWritten ? (c) => void (testerCheck = { c, key: testsKey() }) : undefined }),
+				// what the old code's start-up already declares, so the truth script loads or stubs only what is missing
+				...[legacyDeclaredTool(o.root, o.config, sourceAdapter, truthDirAbs)].filter((t) => t !== undefined),
+			],
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => {
 				if (e.toolName === "no_behaviour_to_pin" && !e.blocked) declaredNone = true;
@@ -320,17 +343,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		cost += res.usage.cost;
 		lastTesterText = res.text;
-		// tests of earlier units prove accepted behaviour: the tester may not rewrite them (undone, and it is told)
+		// tests of earlier units prove accepted behaviour: the tester may add to them, but a changed or removed line it
+		// did not dispute with evidence is undone (and it is told)
 		const changedOthers = await othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);
 		// one the implementer disputed is kept: the tester re-checked it against the legacy code
 		const kept = changedOthers.filter(disputed);
 		if (kept.length) log(pc.yellow(`  tester fixed ${kept.length} disputed test(s) of earlier units; kept: ${kept.join(", ")}`));
-		disputedOthers.push(...kept.filter((f) => !disputedOthers.includes(f)));
+		allowDisputed(kept);
 		const others = changedOthers.filter((f) => !kept.includes(f));
 		if (others.length) {
 			await exec("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir });
 			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
-			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. If one is wrong, say which and why in your final answer.)` };
+			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. Adding new tests or fixtures to them is fine; to change or remove an existing line there, call dispute_test with the file and evidence from the legacy code first.)` };
 			lastTesterText = res.text;
 		}
 		if (overridesChanged) {
@@ -446,7 +470,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const ahead = !o.truthOnly && o.ledger.hasEvidence(o.unitId, "truth_ahead") && existsSync(portedDir);
 	// read truth from when the old code could not run here is not reused once it can: the tester runs it now
 	const readTruthOk = () => o.ledger.evidenceOf(o.unitId).some((e) => e.type === "truth_read" && (envMode !== "run" || JSON.parse(e.payload).why !== NOT_RUN_HERE));
-	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || readTruthOk() || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
+	// a setup fix for the old code made this unit's truth script, green before, fail (rerunTruthScripts): the
+	// tester fixes it with that error instead of the broken script being reused
+	const brokenBySetup = o.ledger.getMeta(truthBrokenKey(o.unitId)) || undefined;
+	if (brokenBySetup) log(pc.yellow(`  a setup fix for the old code broke this unit's truth script; the tester fixes it`));
+	const hasTruth = !brokenBySetup && (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || readTruthOk() || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
 	if (!hasTruth) {
 		// Playbook: a red truth script gets one more tester pass with the exact error; then a human question (only this unit waits).
 		let truthOk = false;
@@ -459,7 +487,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 0, costUsd: cost };
 		}
 		for (let t = 1; t <= 2 && !truthOk && !legacyDown; t++) {
-			truthOk = await runTruth(lastErr ? `Your previous ${truthFile()} was rejected by the orchestrator${truthMode === "run" ? " (run from the legacy root)" : ""}. Fix it:\n${lastErr}` : undefined);
+			truthOk = await runTruth(lastErr ? `Your previous ${truthFile()} was rejected by the orchestrator${truthMode === "run" ? " (run from the legacy root)" : ""}. Fix it:\n${lastErr}` : brokenBySetup && truthMode === "run" ? `${sourceAdapter.truth.scriptName} ran green on the old code before, but a setup fix changed what it runs on (the start-up the run command loads first, or the run command itself), and now it fails:\n${brokenBySetup.slice(-1500)}\nFix it: load or stub only what the start-up does not already declare.` : undefined);
 			if (!truthOk) lastErr = (o.ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND role = 'test' ORDER BY id DESC LIMIT 1").get(o.unitId) as { gate_report: string } | undefined)?.gate_report ?? "";
 		}
 		// the old code's runtime is down: no setup fix, no read truth, no question; the unit is picked up again
@@ -468,7 +496,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// setup model prepares its environment once for all units; code re-runs this script to decide it worked.
 		const legacyFixer = o.legacyFixer === false ? undefined : (o.legacyFixer ?? (o.spawn ? undefined : fixLegacyEnvWithModel));
 		if (!truthOk && truthMode === "run" && legacyFixer && lastErr) {
-			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: lastErr, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(lastErr)), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
+			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: lastErr, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(lastErr)), fixer: legacyFixer, ledger: o.ledger, log }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
 			const verified = fixed ? await verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 			if (fixed && verified?.ok) {
 				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
@@ -482,7 +510,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// environment with that error (once for all units, capped); green → the cases come from running it after all
 		if (truthOk && envMode === "read" && legacyFixer && lastRunError && !o.ledger.hasEvidence(o.unitId, "truth_green_on_old")) {
 			const err = lastRunError;
-			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: err, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(err)), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
+			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: err, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(err)), fixer: legacyFixer, ledger: o.ledger, log }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
 			const verified = fixed ? await verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 			if (fixed && verified?.ok) {
 				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
@@ -500,6 +528,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			}
 		}
 		if (legacyDown) return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 1, costUsd: cost };
+		if (truthOk && brokenBySetup) o.ledger.setMeta(truthBrokenKey(o.unitId), "");
 		if (!truthOk) {
 			const q = await ask({
 				point: "truth_env",
@@ -857,10 +886,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					checkedTree = await treeKey();
 				}, onReport: (r) => reports.push(r) }),
 				transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
-				validateWrite: async (path, content) => {
+				validateWrite: async (path, content, before) => {
 					const lang = adapter.layout.lang(path);
 					if (!lang) return undefined;
-					const errs = await syntaxErrors(lang, content);
+					const errs = await addedSyntaxErrors(lang, before, content);
 					return errs.length ? `syntax error at line ${errs[0]!.line}: ${errs[0]!.text}` : undefined;
 				},
 				onToolCall: (e) => e.blocked && log(pc.dim(`  implementer blocked: ${e.blocked}`)),

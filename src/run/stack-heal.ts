@@ -1,6 +1,7 @@
 import pc from "picocolors";
-import { getSourceAdapter, registerGeneratedTargets } from "../adapters/registry.ts";
+import { builtinTarget, getSourceAdapter, registerGeneratedTargets } from "../adapters/registry.ts";
 import { loadCommandOverrides } from "../adapters/command-overrides.ts";
+import { healBuiltinWiring } from "../adapters/wiring.ts";
 import { healBoot, healCheckConfig, healWiringFiles } from "../adapters/target/generated.ts";
 import type { Config } from "../config.ts";
 import { projectDir } from "../init/init.ts";
@@ -62,5 +63,10 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		const booted = await healBoot(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), hasOwn: (id) => !!loadCommandOverrides(o.root, id).boot, log: (l) => o.log(pc.dim(l)) });
 		const checks = await healCheckConfig(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });
 		if (changed.length || booted.length || checks.length) registerGeneratedTargets(o.root);
+		// a built-in stack that registers features by hand: the project's wiring files, found once by a model
+		for (const id of config.target.stacks) {
+			const adapter = await builtinTarget(id);
+			if (adapter) await healBuiltinWiring(o.root, adapter, projectDir(config, id), { client: o.client, model: config.models.escalate.id, log: (l) => o.log(pc.dim(l)) });
+		}
 	}
 }

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -5,6 +6,7 @@ import { getTargetAdapter } from "../src/adapters/registry.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
+import { truthBrokenKey } from "../src/run/legacy-env.ts";
 import { keepPortedTests, requeueUnits } from "../src/run/run.ts";
 import { runUnit } from "../src/run/unit.ts";
 import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
@@ -16,6 +18,14 @@ import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
 const here = resolve(import.meta.dirname, "..");
 const write = (p: string, s = "x\n") => (mkdirSync(dirname(p), { recursive: true }), writeFileSync(p, s));
 const SPEC = "src/features/agency/agency.service.spec.ts";
+const hasPhp = (() => {
+	try {
+		execFileSync("php", ["-v"], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+})();
 
 describe("a requeue keeps the truth", () => {
 	it("the quarantined worktree's tests are kept; the next run uses them and the truth cases, without a tester session", async () => {
@@ -57,6 +67,44 @@ describe("a requeue keeps the truth", () => {
 		expect(readFileSync(join(fresh, SPEC), "utf8")).toContain("u1#1 creates an agency");
 		expect(ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = 'u1'").all()).toEqual([{ id: "u1#1" }]);
 		expect(existsSync(join(ws, ".bigrefactor", "truth", "u1", "ported", SPEC))).toBe(true);
+		ledger.close();
+	});
+
+	it.skipIf(!hasPhp)("a truth script a setup fix broke is not reused: the tester gets the error and the start-up check, and green again clears the mark", async () => {
+		const ws = join(here, ".sim", "requeue-truth-broken");
+		rmSync(ws, { recursive: true, force: true });
+		write(join(ws, "legacy", "app", "agency", "create.cmd.php"), "<?php\nfunction agency_code($n) { return strtoupper($n); }\n");
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		write(join(ws, "migrated", "package.json"), "{}");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: { files: ["app/agency/create.cmd.php"], place: { stack: "nestjs", area: "agency", shared: false, source: "code" } }, symbolIds: [] });
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		write(join(truthDir, "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		ledger.setMeta(truthBrokenKey("u1"), "PHP Fatal error: Cannot declare class Kernel, because the name is already in use");
+		const fresh = join(ws, "worktrees", "u1");
+		write(join(fresh, "package.json"), "{}");
+		const seen: Array<{ role: string; prompt: string; tools: string[] }> = [];
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (prompt: string) => {
+					seen.push({ role: opts.role, prompt, tools: (opts.customTools ?? []).map((t) => t.name) });
+					if (opts.role === "test") {
+						write(join(truthDir, "cases.php"), "<?php\nif (!function_exists('agency_code')) require_once 'app/agency/create.cmd.php';\necho json_encode([['symbol' => 'agency_code', 'inputs' => ['ab'], 'expected' => agency_code('ab')]]);\n");
+						write(join(fresh, SPEC), "it('u1#1 codes an agency', () => {});\n");
+					}
+					return { text: opts.role === "test" ? "TESTER DONE" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", workDir: fresh, reuseTruth: true, spawn, gate, legacyFixer: false, log: () => {} });
+		expect(seen[0]!.role).toBe("test");
+		expect(seen[0]!.prompt).toMatch(/a setup fix changed what it runs on[\s\S]*Cannot declare class Kernel/);
+		expect(seen[0]!.tools).toContain("legacy_declared");
+		expect(ledger.getMeta(truthBrokenKey("u1"))).toBe("");
+		expect(ledger.db.prepare("SELECT expected FROM truth_cases WHERE unit_id = 'u1'").all()).toEqual([{ expected: '"AB"' }]);
 		ledger.close();
 	});
 

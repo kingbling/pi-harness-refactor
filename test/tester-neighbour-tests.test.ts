@@ -65,7 +65,12 @@ describe("check_ported_tests", () => {
 	it("names an earlier unit's test file the tester changed, unless the run sanctioned it", async () => {
 		write(join(target, LIST), "it('u0#1 lists', () => {}); it('u1#1 creates', () => {});\n");
 		const out = await exec(tool());
-		expect(out).toContain(`${LIST} holds tests of earlier units; your changes to it are undone when you finish`);
+		expect(out).toContain(`${LIST} holds tests of earlier units; you changed or removed lines there, and that is undone when you finish`);
+		expect(out).toMatch(/Adding new tests or fixtures to it is fine[^\n]*call dispute_test/);
+		// only added lines: nothing to undo, nothing named
+		write(join(target, LIST), "it('u0#1 lists', () => {});\nit('u1#1 creates', () => {});\n");
+		expect(await exec(tool())).not.toContain(`${LIST} holds tests of earlier units`);
+		write(join(target, LIST), "it('u0#1 lists', () => {}); it('u1#1 creates', () => {});\n");
 		expect(out).toMatch(/new test file next to it that the layout allows/);
 		expect(await exec(tool({ sanctioned: [LIST] }))).not.toContain(`${LIST} holds tests of earlier units`);
 	});
@@ -123,6 +128,52 @@ describe("tests of earlier units in a retest", () => {
 		expect(readFileSync(join(target, OTHER), "utf8")).toContain("u9#1 other");
 		expect(sanctioned).toContain(LIST);
 		expect(flagged).toEqual([]);
+	});
+
+	it("lines only added to an earlier unit's file are kept; a changed line the tester disputes with evidence is kept too; one it does not is undone", async () => {
+		write(join(target, SPEC), "it('u1#1 creates', () => {});\n");
+		git("add", "-A");
+		git("commit", "-qm", "own");
+		const third = "src/features/agency/agency.third.spec.ts";
+		write(join(target, third), "it('u7#1 third', () => {});\n");
+		git("add", "-A");
+		git("commit", "-qm", "third");
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
+		let implementer = 0;
+		let testerRounds = 0;
+		const dispute = (opts: SpawnOptions) => opts.customTools!.find((x) => x.name === "dispute_test") as unknown as { execute: (i: string, p: object) => Promise<unknown> };
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => {
+					if (opts.role === "test") {
+						testerRounds++;
+						write(join(target, LIST), "it('u0#1 lists', () => {});\nit('u1#1 lists with the new partner', () => {});\n");
+						write(join(target, OTHER), "it('u9#1 other, fixture builds a concrete partner', () => {});\n");
+						write(join(target, third), "it('u7#1 rewritten', () => {});\n");
+						await dispute(opts).execute("x", { test: OTHER, why: "its fixture is an anonymous class the new final partner cannot be", evidence: "LocationPartner.php:12 is a concrete class" });
+					} else if (++implementer === 1) {
+						// the implementer disputes its own unit's test: that sends the tester in (it names no earlier unit's file)
+						await dispute(opts).execute("x", { test: "agency.service.spec.ts #1", why: "expects 1", evidence: "create.cmd.php returns 2" });
+					}
+					return { text: opts.role === "test" ? "TESTER DONE" : "IMPLEMENTER DONE", ...ok };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		let flagged: string[] | undefined;
+		let n = 0;
+		const log: string[] = [];
+		// the first gate is red on the tests, so the tester gets a round
+		const gate = async (g: GateInput) => (++n === 1 ? red(g) : ((flagged = await othersTestsChanged(target, "u1", (f) => nestjsAdapter.layout.isTestFile(f), g.sanctioned)), green(g)));
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate, log: (l) => log.push(l) });
+		expect(testerRounds).toBeGreaterThan(0);
+		expect(readFileSync(join(target, LIST), "utf8")).toContain("with the new partner");
+		expect(readFileSync(join(target, OTHER), "utf8")).toContain("concrete partner");
+		expect(readFileSync(join(target, third), "utf8")).toContain("u7#1 third");
+		expect(flagged).toEqual([]);
+		expect(log.join("\n")).toMatch(/tester disputes an earlier unit's test, change kept: src\/features\/agency\/agency\.other\.spec\.ts/);
+		// a restart keeps it allowed
+		expect(JSON.parse(ledger.getMeta("tests_disputed:u1")!)).toEqual([OTHER]);
 	});
 
 	it("a coverage retest is told the ids it wrote into an earlier unit's file were undone", async () => {

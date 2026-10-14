@@ -47,12 +47,21 @@ export interface SpawnOptions {
 	tools?: string[];
 	modelOverride?: ModelRole;
 	onToolCall?: (e: { toolName: string; blocked?: string }) => void;
-	/** Validate content before a write/edit lands (syntax check). Return a reason to block. */
-	validateWrite?: (path: string, content: string) => Promise<string | undefined>;
+	/** Validate content before a write/edit lands (syntax check). `before` is the file as it was (undefined for a new file), so only problems the change added count. Return a reason to block. */
+	validateWrite?: (path: string, content: string, before?: string) => Promise<string | undefined>;
 	/** JSONL transcript path: every session event is appended (checkpoint, replay, `br why`). */
 	transcriptPath?: string;
 	/** Terminate the session after this many blocked tool calls (runaway control). Default 5. */
 	maxBlocked?: number;
+}
+
+/** A file's text, or undefined when it does not exist yet (or cannot be read). */
+function fileText(abs: string): string | undefined {
+	try {
+		return readFileSync(abs, "utf8");
+	} catch {
+		return undefined;
+	}
 }
 
 const WRITE_VERBS = /(^|[\s;&|(])(rm|mv|cp|tee|sed\s+-i|truncate|chmod|chown|ln|mkdir|touch|git\s+(add|commit|checkout|reset|clean|push|rm|mv|stash|rebase|merge|apply))\b|>{1,2}\s*\S/;
@@ -364,6 +373,8 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	const gate = makeWriteGate({ cwd: opts.cwd, globRoot: opts.globRoot, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], isProtected: opts.isProtected, appendOnlyGlobs: opts.appendOnlyGlobs });
 	let toolCalls = 0;
 	let blocked = 0;
+	// the file as it was before each edit, so the syntax check after it reports only errors the edit added
+	const beforeEdit = new Map<string, string | undefined>();
 	// one agent per session in the live panel: label = unit (from the transcript name "<unit>.<role>.<attempt>.jsonl")
 	const agentLabel = opts.transcriptPath ? basename(opts.transcriptPath).split(".")[0]! : opts.role;
 	const roleName = opts.transcriptPath ? (basename(opts.transcriptPath).split(".")[1] ?? opts.role) : opts.role;
@@ -378,7 +389,8 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				const path = String(input["path"] ?? "");
 				reason = gate(path);
 				if (!reason && event.toolName === "rename_file") reason = gate(String(input["destination"] ?? ""));
-				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""));
+				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""), fileText(resolve(opts.cwd, path)));
+				if (!reason && event.toolName === "edit" && opts.validateWrite) beforeEdit.set(event.toolCallId, fileText(resolve(opts.cwd, path)));
 			} else if (event.toolName === "bash") {
 				const command = String(input["command"] ?? "");
 				reason = ROLE_TOOLS[opts.role].includes("bash") ? (bashTouchesReadOnly(command, opts.config.source.path, opts.cwd, findSourceAdapter(opts.config.source.stack)?.traits?.mutatingCommands) ?? bashDeletesOutside(command, opts.cwd, (abs) => opts.writeGlobs.length > 0 && !gate(abs))) : "bash is not available to this role";
@@ -403,11 +415,13 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 				const text = (event.content ?? []).map((c) => ("text" in c ? c.text : "")).join("\n");
 				return { content: [{ type: "text", text: `${text}\nTo get the edit through: read the file again and quote the exact text with enough surrounding lines to be unique, or write the whole file with write.` }], isError: true, details: (event as any).result?.details ?? {} };
 			}
+			const before = beforeEdit.get(event.toolCallId);
+			beforeEdit.delete(event.toolCallId);
 			if (event.toolName !== "edit" || event.isError || !opts.validateWrite) return undefined;
 			const path = String((event.input as Record<string, unknown>)["path"] ?? "");
 			try {
 				const abs = resolve(opts.cwd, path);
-				const problem = await opts.validateWrite(abs, readFileSync(abs, "utf8"));
+				const problem = await opts.validateWrite(abs, readFileSync(abs, "utf8"), before);
 				if (problem) return { content: [{ type: "text", text: `Edit applied but the file no longer parses: ${problem}. Fix it before you finish.` }], isError: true, details: (event as any).result?.details ?? {} };
 			} catch {
 				/* unreadable → nothing to add */

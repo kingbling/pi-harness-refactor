@@ -690,7 +690,20 @@ export const phpAdapter: SourceAdapter = {
 	truth: {
 		scriptName: "cases.php",
 		run: (_sourceRoot, scriptPath) => ({ cmd: "php", args: [scriptPath] }),
-		instructions: "a PHP script that require()s the legacy files (paths relative to the legacy root, never absolute: it is executed from there, which may be a copy or a container), executes each case and prints ONE JSON array via echo json_encode(...). Run it with bash (php <script>) and iterate until it exits 0 and prints valid JSON.",
+		instructions: "a PHP script that require()s the legacy files (paths relative to the legacy root, never absolute: it is executed from there, which may be a copy or a container), executes each case and prints ONE JSON array via echo json_encode(...). The run command may load a start-up file first that already declares framework and app classes and functions, and that file can grow later: require a legacy file or declare a stub only behind a check (if (!class_exists('X', false)) require_once '...'; the same with function_exists), never unconditionally (\"Cannot declare class\" means the start-up already has it). Run it with bash (php <script>) and iterate until it exits 0 and prints valid JSON.",
+		declared: (names) =>
+			[
+				"<?php",
+				`$names = json_decode(base64_decode('${Buffer.from(JSON.stringify(names)).toString("base64")}'), true);`,
+				"$out = [];",
+				"foreach ($names as $n) {",
+				"  if (class_exists($n, false) || interface_exists($n, false) || trait_exists($n, false)) $out[$n] = 'class declared';",
+				"  elseif (function_exists($n)) $out[$n] = 'function declared';",
+				"  elseif (defined($n)) $out[$n] = 'constant defined';",
+				"  else $out[$n] = 'not declared';",
+				"}",
+				"echo json_encode(['names' => $out, 'loaded_files' => array_values(array_filter(get_included_files(), function ($f) { return realpath($f) !== realpath(__FILE__); }))], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), \"\\n\";",
+			].join("\n"),
 	},
 
 	oldTestCommand(root) {
