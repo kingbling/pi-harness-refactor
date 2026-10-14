@@ -377,7 +377,10 @@ CREATE INDEX IF NOT EXISTS parity_diffs_slice ON parity_diffs(slice, status);
 
 /**
  * Indexes over the big tables (gate reports and decision inputs make attempts and decisions 100+ MB): sums, intervals
- * and open attempts read these small indexes, never the table. Building them on an old ledger takes seconds, so they
+ * and open attempts read these small indexes, never the table. A run's start reads transitions by time; the task card
+ * a unit starts with looks up moves, truth cases, callers, files and look-alike code by unit, target, path and hash:
+ * without these indexes each lookup reads its whole table (a unit start held the run 0.5-1 s on a ledger of 2000
+ * units, test/ledger-lookups.test.ts). Building them on an old ledger takes seconds, so they
  * are not part of DDL (every open would hold Pi's thread): ensureLedgerIndexes builds them in a worker thread.
  */
 export const BIG_TABLE_INDEXES = `
@@ -386,4 +389,10 @@ CREATE INDEX IF NOT EXISTS attempts_model_cost ON attempts(model, role, cost_usd
 CREATE INDEX IF NOT EXISTS attempts_time ON attempts(started_at, ended_at);
 CREATE INDEX IF NOT EXISTS attempts_open ON attempts(unit_id) WHERE ended_at IS NULL;
 CREATE INDEX IF NOT EXISTS decisions_unit_cost ON decisions(unit_id, cost_usd);
+CREATE INDEX IF NOT EXISTS transitions_time ON transitions(created_at);
+CREATE INDEX IF NOT EXISTS moves_unit ON moves(unit_id);
+CREATE INDEX IF NOT EXISTS truth_cases_unit ON truth_cases(unit_id);
+CREATE INDEX IF NOT EXISTS index_deps_to ON index_deps(to_id);
+CREATE INDEX IF NOT EXISTS index_symbols_path ON index_symbols(path);
+CREATE INDEX IF NOT EXISTS index_symbols_hash ON index_symbols(ast_hash);
 `;

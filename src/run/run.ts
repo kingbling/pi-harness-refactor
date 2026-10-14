@@ -142,6 +142,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 
 	{
 		// a run that never got to its end (Pi closed, the run process killed) is written down from the ledger now
+		setStep("writing down the last run");
 		const lost = o.dry ? undefined : recordLostRun(ledger, o.root);
 		const prev = lastRun(ledger);
 		if ((prev?.outcome === "stopped" || lost) && !o.dry) log(pc.dim(renderLastRun(prev!)));
@@ -2055,9 +2056,12 @@ export function recordLostRun(ledger: Ledger, root: string): RunRecord | undefin
 	const since = open.startedAt;
 	const one = <T>(sql: string, ...a: string[]) => ledger.db.prepare(sql).get(...a) as T;
 	const last = one<{ t: string | null }>("SELECT MAX(t) t FROM (SELECT MAX(created_at) t FROM transitions WHERE created_at >= ? UNION ALL SELECT MAX(COALESCE(ended_at, started_at)) FROM attempts WHERE started_at >= ?)", since, since).t;
-	const into = (state: string) => one<{ n: number }>("SELECT COUNT(DISTINCT entity_id) n FROM transitions WHERE entity = 'unit' AND to_state = ? AND created_at >= ?", state, since).n;
+	// by time (transitions_time, attempts_time), never by unit or entity ("+" keeps SQLite off those indexes): read by
+	// unit, the whole attempts table (gate reports, 100+ MB) was read and held the run's start for seconds
+	const into = (state: string) => one<{ n: number }>("SELECT COUNT(DISTINCT entity_id) n FROM transitions WHERE +entity = 'unit' AND to_state = ? AND created_at >= ?", state, since).n;
 	const stateOf = (id: string) => ledger.getUnit(id)?.state ?? "?";
-	const units = (ledger.db.prepare("SELECT DISTINCT unit_id FROM attempts WHERE unit_id IS NOT NULL AND started_at >= ?").all(since) as Array<{ unit_id: string }>).map((r) => ({ unit: r.unit_id, state: stateOf(r.unit_id) }));
+	const ran = (ledger.db.prepare("SELECT unit_id FROM attempts WHERE started_at >= ? AND +unit_id IS NOT NULL").all(since) as Array<{ unit_id: string }>).map((r) => r.unit_id);
+	const units = [...new Set(ran)].sort().map((id) => ({ unit: id, state: stateOf(id) }));
 	const r: RunRecord = {
 		startedAt: since,
 		endedAt: last ?? since,
