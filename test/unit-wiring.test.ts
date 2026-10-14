@@ -564,6 +564,8 @@ describe("runUnit prompt and truth routing", () => {
 		// a per-file build: red for a file holding BAD
 		saveCommandOverride(ws, "nestjs", "build", { cmd: "sh", args: ["-c", 'for f; do grep -q BAD "$f" && echo "$f:1:1 - error TS2304: Cannot find name BAD." && exit 1; done; exit 0', "sh", "{files}"] }, "fixture build");
 		saveCommandOverride(ws, "nestjs", "lint", { cmd: "sh", args: ["-c", "exit 0", "sh", "{files}"] }, "fixture lint");
+		// a red fixture runner: the stack's own (npx jest) reaches the npm registry when jest is not installed here
+		saveCommandOverride(ws, "nestjs", "test", { cmd: "sh", args: ["-c", "echo '1 failing'; exit 1", "sh", "{files}"] }, "fixture runner");
 		const runOnce = async () => {
 			const tasks: string[] = [];
 			const spawnTasks = async (opts: { role: string }): Promise<LeafSession> => ({ run: async (task: string) => (opts.role === "test" && tasks.push(task), { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
