@@ -84,10 +84,10 @@ export const repairWithModel: Repairer = async (o) => {
 	}
 };
 
-/** `max`: the output's tail kept; comparing two outputs line by line needs all of it. */
-export function runCmd(cmd: string, args: string[], cwd: string, max = 8000): Promise<string | undefined> {
+/** `max`: the output's tail kept; comparing two outputs line by line needs all of it. `signal` kills the command. */
+export function runCmd(cmd: string, args: string[], cwd: string, max = 8000, signal?: AbortSignal): Promise<string | undefined> {
 	return new Promise((res) => {
-		execFile(cmd, args, { cwd, timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => res(err ? `${stdout}\n${stderr}`.trim().slice(-max) || String(err.message) : undefined));
+		execFile(cmd, args, { cwd, timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024, signal }, (err, stdout, stderr) => res(err ? `${stdout}\n${stderr}`.trim().slice(-max) || String(err.message) : undefined));
 	});
 }
 /** All of a check's output, for comparing it with main's line by line. */
@@ -142,7 +142,15 @@ export interface Builder {
 	appDown(stackId: string, error: string): Promise<void>;
 	/** At the end of the run: one last build of what was merged since the last one. */
 	finish(): Promise<void>;
+	/**
+	 * At a stop: nothing new starts, a running check is killed (the next run checks main again), a running repair or
+	 * code job finishes and is merged as usual. Resolves when the builder is done, so the run ends after it.
+	 */
+	stop(): Promise<void>;
 }
+
+/** Thrown inside the builder when a stop killed its check. */
+class BuilderStopped extends Error {}
 
 export function createBuilder(o: {
 	config: Config;
@@ -175,16 +183,18 @@ export function createBuilder(o: {
 		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND json_extract(context, '$.sameAs') = ? AND status IN ('answered', 'auto') ORDER BY id DESC LIMIT 1").get(sig) as { answer: string } | undefined)?.answer === "ignore";
 	let last = Date.now();
 	let running: Promise<void> | undefined;
+	let stopped = false;
+	const kill = new AbortController();
 
 	const start = (force: boolean) => {
-		if (running) return;
+		if (running || stopped) return;
 		const total = [...merged.values()].reduce((a, b) => a + b, 0);
 		if (!total || (!force && total < every.units && Date.now() - last < every.minutes * 60_000)) return;
 		const stacks = [...merged.keys()];
 		merged.clear();
 		running = (async () => {
 			// a code job that made progress is followed by the next one at once, until main is green or a job makes none
-			for (const s of stacks) for (let i = 0; i < MAX_JOBS_PER_CYCLE && (await buildStack(s, i > 0).catch((e) => (o.log(pc.yellow(`builder ${s}: ${e?.message ?? e}`)), false))); i++);
+			for (const s of stacks) for (let i = 0; i < MAX_JOBS_PER_CYCLE && !stopped && (await buildStack(s, i > 0).catch((e) => (e instanceof BuilderStopped || o.log(pc.yellow(`builder ${s}: ${e?.message ?? e}`)), false))); i++);
 		})().finally(() => {
 			running = undefined;
 			last = Date.now();
@@ -222,16 +232,19 @@ export function createBuilder(o: {
 			const tests = (await trackedFiles(dir)).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
 			if (!steps.length && !appDown) return false;
-			const check = async () => {
+			// `killable`: a stop kills it; the check after a repair is part of that repair and runs to its end
+			const check = async (killable = false) => {
 				const out: string[] = [];
 				for (const s of steps) {
-					const err = await runCmd(s.cmd, s.args, dir);
+					if (killable && stopped) throw new BuilderStopped();
+					const err = await runCmd(s.cmd, s.args, dir, undefined, killable ? kill.signal : undefined);
+					if (killable && stopped) throw new BuilderStopped();
 					if (err !== undefined) out.push(`$ ${[s.cmd, ...s.args].join(" ")}   (${s.step})\n${err}`);
 				}
 				return out.length ? out.join("\n\n") : undefined;
 			};
 			o.log(pc.dim(`builder ${stackId}: whole-project ${steps.map((s) => s.step).join(" + ")} on main`));
-			let problem = await check();
+			let problem = await check(true);
 			// a boot step shows a new app that does not start itself; without one, what parity saw is the problem
 			if (appDown && !steps.some((s) => s.step === "boot")) problem = [problem, `$ (the new ${stackId} app, started for the parity check)   (boot)\n${appDown}`].filter(Boolean).join("\n\n");
 			const green = () => {
@@ -250,7 +263,7 @@ export function createBuilder(o: {
 			const protectedRes = adapter.protectedGlobs.map(globToRegExp);
 			const isProtected = (rel: string) => protectedRes.some((r) => r.test(rel));
 			let said = "";
-			for (let i = 1; problem && repair && i <= MAX_REPAIRS; i++) {
+			for (let i = 1; problem && repair && !stopped && i <= MAX_REPAIRS; i++) {
 				tried.set(sig, i);
 				o.log(pc.cyan(`builder ${stackId}: whole-project check fails; the big model fixes it (try ${i})`));
 				const overrides = keepOverrides(o.root, stackId);
@@ -278,6 +291,7 @@ export function createBuilder(o: {
 				o.log(pc.green(`builder ${stackId}: fixed and merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said}`));
 				return false;
 			}
+			if (stopped) return false;
 			// a failing test names its case id: that accepted unit's behaviour broke on main, so it goes back to work
 			// (its code stays) instead of a vague question. Capped per unit: its own gate runs only its area's tests
 			const reopened = reopenBroken(o.ledger, problem);
@@ -322,6 +336,11 @@ export function createBuilder(o: {
 		async finish() {
 			await running;
 			start(true);
+			await running;
+		},
+		async stop() {
+			stopped = true;
+			kill.abort();
 			await running;
 		},
 	};

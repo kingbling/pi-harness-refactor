@@ -1130,6 +1130,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
 	if (!o.dry && !stopRecord) await waitOn("whole-project check of what was merged", () => builder.finish()).catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
+	// a stop kills the builder's running check and waits for a running repair or code job: nothing of it outlives the run
+	if (!o.dry && stopRecord) await waitOn("stopping the builder", () => builder.stop()).catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
 	if (!o.dry) await waitOn("pushing to the target repo's remote", () => pusher.finish());
 
 	const quarantined = ran.filter((r) => r.state === "quarantined").length;

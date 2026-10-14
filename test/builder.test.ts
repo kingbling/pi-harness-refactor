@@ -238,4 +238,22 @@ describe("the builder", () => {
 		expect(jobs).toHaveLength(2);
 		expect(jobs[1]).toMatch(/down on the new main/);
 	});
+	it("a stop kills the running check, starts no repair or code job, and leaves no worktree", async () => {
+		const { root, config, adapter, ledger, mergeFix } = await setup();
+		// the whole-project check takes a minute
+		const slow = { ...adapter, build: () => ({ cmd: "sleep", args: ["60"] }) } as unknown as TargetAdapter;
+		let repairs = 0;
+		let jobs = 0;
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", slow]]), log: () => {}, linkAll: () => {}, mergeFix, repair: async () => (repairs++, ""), codeJob: async () => (jobs++, undefined), every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await new Promise((r) => setTimeout(r, 300));
+		const t0 = Date.now();
+		await b.stop();
+		expect(Date.now() - t0).toBeLessThan(10_000);
+		expect(repairs + jobs).toBe(0);
+		expect(existsSync(join(root, ".bigrefactor", "worktrees", "__builder__fake"))).toBe(false);
+		b.afterMerge("fake"); // nothing new starts after a stop
+		await b.finish();
+		expect(repairs + jobs).toBe(0);
+	});
 });
