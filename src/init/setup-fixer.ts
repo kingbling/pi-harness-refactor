@@ -322,10 +322,11 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 					return { sha: undefined, undone, changed: [], cannotFail };
 				}
 				removeProbe(o.adapter, o.projectDir);
-				// another stack's project is never committed by this fix: its changes there are put back unless that
-				// stack's own fix is running (whose edits they may be)
+				// another stack's project is never committed by this fix: its changes there are put back. Under the merge
+				// lock one fix runs at a time, so another stack's queued fix has made no edits yet: always put back. Only
+				// without a lock (the start-up call) may that stack's own fix be running now, whose edits they may be
 				const others = o.config.target.stacks.filter((s) => s !== key).map((s) => ({ s, dir: relative(repo, stackDir(o.config, s)) })).filter((x) => x.dir && !x.dir.startsWith(".."));
-				for (const x of others.filter((x) => !fixing.has(x.s))) {
+				for (const x of others.filter((x) => o.lock || !fixing.has(x.s))) {
 					const there = (await exec("git", ["-C", repo, "status", "--porcelain", "-uall", "--", x.dir])).split("\n").filter(Boolean).map((l) => l.slice(3));
 					if (!there.length) continue;
 					try {

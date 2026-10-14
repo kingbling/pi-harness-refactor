@@ -413,6 +413,43 @@ describe("setup fixes during the run: one stack's fix stays in its own project",
 		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
 		expect(existsSync(join(target, "api", "app.en.yaml"))).toBe(false);
 	});
+	it("under the merge lock, another stack's folder is put back even while that stack's fix waits for the lock", async () => {
+		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { execFileSync } = await import("node:child_process");
+		const { root, target, adapter: web } = stack({ id: "web2" } as never);
+		const api = { ...web, id: "api2" } as TargetAdapter;
+		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["web2", "api2"] }, models: {} });
+		for (const d of ["web2", "api2"]) (mkdirSync(join(target, d), { recursive: true }), writeFileSync(join(target, d, "keep"), ""));
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "scaffold");
+		// one session at a time, like the run's merge lock
+		let chain: Promise<unknown> = Promise.resolve();
+		const lock = <T>(fn: () => Promise<T>) => {
+			const r = chain.then(fn);
+			chain = r.catch(() => undefined);
+			return r;
+		};
+		const webFixer: SetupFixer = async (o) => {
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
+			writeFileSync(join(target, "api2", "stray.yaml"), "x: y\n");
+			return "added the vitest config";
+		};
+		let apiSawStatus: string | undefined;
+		const apiFixer: SetupFixer = async (o) => {
+			apiSawStatus = execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" });
+			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
+			return "added the api vitest config";
+		};
+		const first = fixRunSetup({ config, root, adapter: web, projectDir: join(target, "web2"), problem: "vitest: no config", fixer: webFixer, lock });
+		const second = fixRunSetup({ config, root, adapter: api, projectDir: join(target, "api2"), problem: "vitest: no config", fixer: apiFixer, lock });
+		expect(await first).toBe("added the vitest config");
+		expect(await second).toBe("added the api vitest config");
+		// the web fix's edit in api2/ was put back, not left on main for the api fix to start on and commit as its own
+		expect(apiSawStatus).toBe("");
+		expect(execFileSync("git", ["-C", target, "log", "--name-only", "--format=", "-2"], { encoding: "utf8" }).split("\n").filter(Boolean).sort()).toEqual(["api2/vitest.config.ts", "web2/vitest.config.ts"]);
+		expect(execFileSync("git", ["-C", target, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+	});
 });
 
 describe("setup fixes during the run: main stays mergeable and startable", () => {
