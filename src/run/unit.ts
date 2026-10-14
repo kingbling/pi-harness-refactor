@@ -214,7 +214,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return r.id;
 	};
 
-	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck, mainDir };
+	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck, mainDir, runStartedAt: o.runStartedAt };
 	const card = await buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
@@ -907,7 +907,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				o.ledger.db.prepare("UPDATE units SET deps = ? WHERE id = ?").run(JSON.stringify([...new Set([...unitDeps, ...owners])]), o.unitId);
 				o.ledger.endAttempt(attempt, { outcome: "waits_on_fix", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { reports } });
 				savePorted();
-				o.ledger.updateUnit(o.unitId, { meta: { retryNote: `This unit waited for ${owners.join(", ")} to fix what it reported (${reports.map((r) => r.target).join(", ")}). That code is fixed now: use it.` } });
+				// the wait is no fresh set of tries: its next run goes on counting from here
+				o.ledger.updateUnit(o.unitId, { meta: { triesUsed: attemptNo, retryNote: `This unit waited for ${owners.join(", ")} to fix what it reported (${reports.map((r) => r.target).join(", ")}). That code is fixed now: use it.` } });
 				o.ledger.transitionUnit(o.unitId, "planned", `waits for ${owners.join(", ")} to fix a reported bug`);
 				log(pc.yellow(`  reported a bug in ${owners.join(", ")}: re-opened; this unit waits for the fix`));
 				return { unitId: o.unitId, state: "planned", attempts: attemptNo, costUsd: cost };
