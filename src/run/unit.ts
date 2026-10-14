@@ -38,7 +38,7 @@ import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-f
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { filesNamed } from "./builder.ts";
 import { setStep } from "./watchdog.ts";
-import { caseCoverage, checkTests, findTests, onlyOwnTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
+import { catchUpWithMain, caseCoverage, checkTests, findTests, onlyOwnTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 import { exec } from "../proc.ts";
 export { mentionsCase } from "./ported.ts";
 
@@ -791,6 +791,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		regateOnly = regate;
 		regate = false;
 		if (!regateOnly) attemptNo++;
+		// main moved on since the worktree was made (other units, setup fixes): its new commits come in under the
+		// unit's work before each attempt, so the attempt and its gate run on the main it will merge into
+		if (mainDir) {
+			const caught = await catchUpWithMain(targetProjectDir, mainDir);
+			if (caught && "commits" in caught) log(pc.dim(`  main's ${caught.commits} new commit(s) brought in under the unit's work`));
+			else if (caught) log(pc.dim(`  main's new commits clash with the unit's work in ${caught.clash.join(", ") || "some files"}: the merge resolves them`));
+		}
 		// the tests as they are on disk now: the tester (it has a shell) may have renamed or removed one since they
 		// were listed; the implementer cannot write tests, so the gate still catches any change during this attempt
 		testFiles = loadTests();
