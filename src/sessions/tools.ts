@@ -296,26 +296,39 @@ export function ledgerProve(d: ToolDeps): ToolDefinition {
 		name: "ledger_prove",
 		label: "Ledger prove",
 		description:
-			"Record what happened to ONE legacy symbol of this unit. Required for every symbol in the task card before you finish. op: moved (1:1 port), extracted (split into several target symbols), merged_into (deduplicated into an existing/another target symbol), inlined (body folded into its caller), split, dropped (not needed in the new system — say why). targetSymbols are target ids `<project-relative file>::<symbol>` as target_lookup prints them.",
-		promptSnippet: "ledger_prove: account for each legacy symbol (moved/extracted/merged_into/inlined/split/dropped + why)",
-		promptGuidelines: ["Call ledger_prove once per legacy symbol in the task card; the unit cannot pass the gate with unproven symbols."],
+			"Record what happened to legacy symbols of this unit: a list, one entry per symbol (prove them all in one call when you can). Required for every symbol in the task card before you finish. op: moved (1:1 port), extracted (split into several target symbols), merged_into (deduplicated into an existing/another target symbol), inlined (body folded into its caller), split, dropped (not needed in the new system — say why). targetSymbols are target ids `<project-relative file>::<symbol>` as target_lookup prints them. A symbol proven before keeps its proof; prove it again only when what it points to changed.",
+		promptSnippet: "ledger_prove: account for the legacy symbols, a list in one call (moved/extracted/merged_into/inlined/split/dropped + why)",
+		promptGuidelines: ["Call ledger_prove with every legacy symbol of the task card (a list, one call); the unit cannot pass the gate with unproven symbols."],
 		parameters: Type.Object({
-			srcSymbol: Type.String(),
-			op: Type.Union(MOVE_OPS.map((o) => Type.Literal(o))),
-			targetSymbols: Type.Optional(Type.Array(Type.String())),
-			why: Type.String({ description: "one sentence a reviewer can verify" }),
+			proofs: Type.Array(
+				Type.Object({
+					srcSymbol: Type.String(),
+					op: Type.Union(MOVE_OPS.map((o) => Type.Literal(o))),
+					targetSymbols: Type.Optional(Type.Array(Type.String())),
+					why: Type.String({ description: "one sentence a reviewer can verify" }),
+				}),
+				{ minItems: 1 },
+			),
 		}),
 		execute: async (_id, p) => {
-			const sym = d.ledger.getSymbol(p.srcSymbol);
-			if (!sym) return text(`unknown symbol ${p.srcSymbol}; use the exact ids from the task card`, { error: true });
-			if (sym.unit_id !== d.unitId) return text(`${p.srcSymbol} belongs to unit ${sym.unit_id}, not ${d.unitId}; only prove your own symbols`, { error: true });
-			try {
-				d.ledger.prove({ unitId: d.unitId, srcSymbol: p.srcSymbol, op: p.op as MoveOp, targetSymbols: p.targetSymbols, why: p.why, attemptId: d.attemptId });
-			} catch (e: any) {
-				return text(`rejected: ${e?.message ?? e}`, { error: true });
+			const lines: string[] = [];
+			let refused = 0;
+			// each entry on its own: a refused one is named, the others are recorded
+			for (const q of p.proofs) {
+				const sym = d.ledger.getSymbol(q.srcSymbol);
+				let problem = !sym ? "unknown symbol; use the exact ids from the task card" : sym.unit_id !== d.unitId ? `belongs to unit ${sym.unit_id}, not ${d.unitId}; only prove your own symbols` : undefined;
+				if (!problem)
+					try {
+						d.ledger.prove({ unitId: d.unitId, srcSymbol: q.srcSymbol, op: q.op as MoveOp, targetSymbols: q.targetSymbols, why: q.why, attemptId: d.attemptId });
+					} catch (e: any) {
+						problem = `rejected: ${e?.message ?? e}`;
+					}
+				if (problem) refused++;
+				lines.push(problem ? `${q.srcSymbol}: ${problem}` : `recorded ${q.op} for ${q.srcSymbol}`);
 			}
-			const left = d.ledger.db.prepare("SELECT COUNT(*) n FROM symbols WHERE unit_id = ? AND state IN ('clustered','in_progress')").get(d.unitId) as { n: number };
-			return text(`recorded ${p.op} for ${p.srcSymbol}. ${left.n} symbol(s) of this unit still unproven.`, { left: left.n });
+			const left = (d.ledger.db.prepare("SELECT id FROM symbols WHERE unit_id = ? AND state IN ('clustered','in_progress') ORDER BY id").all(d.unitId) as Array<{ id: string }>).map((r) => r.id);
+			lines.push(left.length ? `${left.length} symbol(s) of this unit still unproven: ${left.slice(0, 40).join(", ")}${left.length > 40 ? " …" : ""}` : "every symbol of this unit is proven.");
+			return text(lines.join("\n"), { left: left.length, ...(refused ? { error: refused === p.proofs.length } : {}) });
 		},
 	});
 }

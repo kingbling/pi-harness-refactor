@@ -680,6 +680,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastGateText = "";
 	// the reviewer's code findings still open: kept in unit meta, so every attempt and every later run of the unit sees all of them
 	const openFindings = () => (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { reviewFindings?: string[] }).reviewFindings ?? [];
+	// the reviewer's earlier findings it called fixed since: shown to the implementer as what to keep working
+	const fixedFindings = () => (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { reviewFixed?: string[] }).reviewFixed ?? [];
 	// what other models said about the TESTS during an attempt: the implementer disputes one, the reviewer finds some weak
 	let disputes: Array<{ test: string; why: string; evidence: string }> = [];
 	// open reviewer findings the implementer disputes: the next review keeps each with a reason or drops it
@@ -839,17 +841,27 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				others.length ? `\n## Other tests in this area (read-only, must stay green; read one if you need it)\n${others.map((p) => `- ${p}`).join("\n")}` : "",
 				lastGateText ? `\n## Previous attempt failed the gate\n${lastGateText}` : "",
 				open.length ? `\n## Open reviewer findings for this unit (from all its reviews so far: fix every one; one you are sure is wrong: dispute_finding with evidence, the reviewer answers it)\n${open.join("\n")}` : "",
+				fixedFindings().length ? `\n## Fixed before: keep these working (the reviewer confirmed each fix; a change that undoes one is a finding again)\n${fixedFindings().map((f) => `- ${f}`).join("\n")}` : "",
 				// every attempt reads it: each is a new session, and a later (stronger) one needs the hint as much as the first
 				o.retryNote ? `\n## Note from the orchestrator\n${o.retryNote}` : "",
 			].join("\n");
 			try {
 				res = await impl.run(prompt);
+				const oneMore = async (ask: string) => {
+					const more = await impl.run(ask);
+					res = { ...more, toolCalls: res.toolCalls + more.toolCalls, blocked: res.blocked + more.blocked, usage: { input: res.usage.input + more.usage.input, output: res.usage.output + more.usage.output, cost: res.usage.cost + more.usage.cost } };
+				};
 				// DONE while its own last check_my_code was red: the gate would fail the same way, so one more turn
 				const red = lastCheck as CheckResult | undefined; // set by the tool during run()
 				if (red && !red.ok && !red.timedOut && !res.error && !reports.length) {
 					log(pc.dim(`  ${role} said DONE after a red check_my_code (${red.failed}): one more turn`));
-					const more = await impl.run(`Your last check_my_code was red (${red.failed}), so the gate fails the same way. Fix it and call check_my_code again until it is clean.${red.failed === "tests" ? " A red test you are sure is wrong (it expects what the legacy code does not do): call dispute_test for it by name, with evidence from the legacy code. Every red test must be fixed or disputed." : ""} Then end with your final line as before.\n\nThe red check:\n${red.text.slice(0, 5000)}`);
-					res = { ...more, toolCalls: res.toolCalls + more.toolCalls, blocked: res.blocked + more.blocked, usage: { input: res.usage.input + more.usage.input, output: res.usage.output + more.usage.output, cost: res.usage.cost + more.usage.cost } };
+					await oneMore(`Your last check_my_code was red (${red.failed}), so the gate fails the same way. Fix it and call check_my_code again until it is clean.${red.failed === "tests" ? " A red test you are sure is wrong (it expects what the legacy code does not do): call dispute_test for it by name, with evidence from the legacy code. Every red test must be fixed or disputed." : ""} Then end with your final line as before.\n\nThe red check:\n${red.text.slice(0, 5000)}`);
+				}
+				// DONE with symbols the ledger still shows unproven: the gate's first step fails on them, so one more turn
+				const unproven = o.ledger.symbolsOfUnit(o.unitId).filter((s) => !["mapped", "dropped", "tested", "accepted"].includes(s.state));
+				if (unproven.length && !res.error && !reports.length) {
+					log(pc.dim(`  ${role} said DONE with ${unproven.length} unproven symbol(s): one more turn`));
+					await oneMore(`${unproven.length} legacy symbol(s) of this unit are still unproven, so the gate fails on them. Call ledger_prove once with all of them as a list (moved / extracted / merged_into / inlined / split / dropped + why):\n${unproven.map((s) => `- ${s.id}`).join("\n")}\nThen end with your final line as before.`);
 				}
 			} finally {
 				impl.dispose();
@@ -938,6 +950,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					reviewJudged = r.judged;
 					// the reviewer lists every open finding each time: its list replaces the kept one (a pass clears it)
 					if (r.judged && (r.ok || r.findings)) o.ledger.updateUnit(o.unitId, { meta: { reviewFindings: r.ok ? [] : r.findings } });
+					// what the reviewer called fixed: the implementer keeps it working (a rewrite must not undo it)
+					if (r.judged && r.fixed?.length) o.ledger.updateUnit(o.unitId, { meta: { reviewFixed: [...new Set([...fixedFindings(), ...r.fixed])].slice(-30) } });
 					if (ra !== undefined) o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : reviewWeakOnly ? "review_weak_tests" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					return r;
 				}
@@ -1020,11 +1034,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// another model says the TESTS are wrong: the tester re-checks them against the legacy code first, and its
 		// answer goes into the implementer's next prompt (disputes and weak tests twice per unit each; then triage decides as usual)
 		const disputeNote = disputes.length && gate.failedStep === "ported_tests_green" && disputeRounds < 2 ? `The implementer disputes these tests:\n${disputes.map((d) => `- ${d.test}: ${d.why}\n  evidence: ${d.evidence}`).join("\n")}` : "";
-		const weakDrove = !!reviewWeak && testRounds < 2;
-		const testsNote = [
-			disputeNote,
-			weakDrove ? `The reviewer finds these tests too weak (they do not really check the legacy behaviour):\n${reviewWeak}${!reviewWeakOnly && openFindings().length ? `\n\nThe same review says the code must change this way; do not pin the opposite in a test:\n${openFindings().join("\n")}` : ""}` : "",
-		].filter(Boolean).join("\n\n");
+		// the weak-tests note waits while the same review has code findings: the implementer changes the code first, and a
+		// later review that finds only weak tests sends it (the tester and the implementer never change things in one round)
+		const weakDrove = !!reviewWeak && reviewWeakOnly && testRounds < 2;
+		if (reviewWeak && !reviewWeakOnly && testRounds < 2) log(pc.dim("  weak tests held back: the code findings come first"));
+		const testsNote = [disputeNote, weakDrove ? `The reviewer finds these tests too weak (they do not really check the legacy behaviour):\n${reviewWeak}` : ""].filter(Boolean).join("\n\n");
 		disputes = [];
 		reviewWeak = undefined;
 		// weak tests only: the implementer's code was fine and is kept; after the retest the gate re-runs on it (no new attempt)

@@ -168,9 +168,14 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 	return { checked: units.length, reopened, notJudged, restored };
 }
 
-/** An accepted unit back to planned with its code kept: symbols re-open, `note` is its next run's note; bad truth is redone. */
+/**
+ * An accepted unit back to planned with its code kept, `note` is its next run's note; bad truth is redone. A symbol
+ * whose move is still in the ledger stays proven (mapped: the code it points to stays on the branch, the implementer
+ * re-proves only what it changes); one without a move re-opens.
+ */
 export function reopenUnit(ledger: Ledger, unitId: string, note: string, reason: string, badTruth = false): void {
-	for (const s of ledger.symbolsOfUnit(unitId)) if (s.state === "accepted") ledger.transitionSymbol(s.id, "clustered", reason.slice(0, 200));
+	const moved = new Set((ledger.db.prepare("SELECT src_symbol FROM moves WHERE unit_id = ? AND op != 'dropped'").all(unitId) as Array<{ src_symbol: string }>).map((m) => m.src_symbol));
+	for (const s of ledger.symbolsOfUnit(unitId)) if (s.state === "accepted") ledger.transitionSymbol(s.id, moved.has(s.id) ? "mapped" : "clustered", reason.slice(0, 200));
 	if (badTruth) {
 		ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(unitId);
 		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_read', 'truth_none', 'truth_ahead')").run(unitId);

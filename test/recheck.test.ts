@@ -48,7 +48,8 @@ describe("br recheck", () => {
 		expect(ledger.getUnit("fine")!.state).toBe("accepted");
 		expect(ledger.getUnit("stub")!.state).toBe("planned");
 		expect(JSON.parse(ledger.getUnit("stub")!.meta).retryNote).toMatch(/code stays on the branch[\s\S]*port the discount rules/);
-		expect(ledger.getSymbol("app/offer.php::stub")!.state).toBe("clustered");
+		// its move is still in the ledger: the symbol stays proven (the implementer re-proves only what it changes)
+		expect(ledger.getSymbol("app/offer.php::stub")!.state).toBe("mapped");
 		// typed-in truth is redone; truth of a unit that only failed the review is kept
 		expect(ledger.hasEvidence("typed", "truth_green_on_old")).toBe(false);
 		expect(ledger.hasEvidence("stub", "truth_green_on_old")).toBe(true);
@@ -90,7 +91,7 @@ describe("br recheck", () => {
 		for (const id of ["fine", "stub"]) for (const t of REQUIRED_FOR_ACCEPTED) ledger.addEvidence(id, t, {});
 		for (const id of ["fine", "stub"]) reopenUnit(ledger, id, "old note: ported tests are gone from the main branch", "recheck: ported tests are gone from the main branch: x");
 		ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.rechecked', 't') WHERE id IN ('fine', 'stub')").run();
-		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("clustered");
+		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("mapped");
 		const reviewer: Reviewer = async (o) => (o.unitId === "stub" ? { ok: false, judged: true, output: "reviewer findings:\n- net() returns 0" } : { ok: true, judged: true, output: "fine" });
 		const r = await recheckAccepted({ ledger, config, root, reviewer, runTests: green, log: () => {} });
 		expect(r.restored).toEqual(["fine"]);
@@ -119,6 +120,16 @@ describe("br recheck", () => {
 		// no version stamp: the next recheck picks it up again
 		const again = await recheckAccepted({ ledger, config, root, reviewer: async () => ({ ok: true, judged: true, output: "fine" }), runTests: green, log: () => {} });
 		expect(again.restored).toEqual(["fine"]);
+	});
+
+	it("a re-opened unit keeps the proofs of symbols whose move is still in the ledger; one without a move must be proven again", async () => {
+		const { ledger } = workspace();
+		const { reopenUnit } = await import("../src/run/recheck.ts");
+		ledger.db.prepare("INSERT INTO symbols(id, path, kind, name, state, unit_id, updated_at) VALUES ('app/offer.php::extra', 'app/offer.php', 'function', 'extra', 'accepted', 'fine', 't')").run();
+		reopenUnit(ledger, "fine", "a bug report", "bug reported by u9: x");
+		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("mapped");
+		expect(ledger.getSymbol("app/offer.php::extra")!.state).toBe("clustered");
+		expect(ledger.getUnit("fine")!.state).toBe("planned");
 	});
 
 	it("bad truth is redone whatever kind it was: no truth evidence is left to skip the tester", async () => {

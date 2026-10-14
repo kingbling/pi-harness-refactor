@@ -295,7 +295,7 @@ export function scopedFileTools(opts: Pick<SpawnOptions, "cwd" | "globRoot" | "w
 export function blockedHint(reason: string, opts: Pick<SpawnOptions, "cwd" | "globRoot" | "writeGlobs" | "appendOnlyGlobs" | "customTools">): string {
 	const abs = (g: string) => resolve(opts.globRoot ?? opts.cwd, g).split(sep).join("/");
 	const where = opts.writeGlobs.length ? `You may write only: ${opts.writeGlobs.map(abs).join(", ")}${opts.appendOnlyGlobs?.length ? `; new files (never edits) in: ${opts.appendOnlyGlobs.map(abs).join(", ")}` : ""}.` : "This session may not write files.";
-	const report = opts.customTools?.some((t) => t.name === "ledger_prove") ? `record anything you cannot do via ledger_prove(op="dropped", why=...) or in your final message` : "say in your final message what you could not do and why";
+	const report = opts.customTools?.some((t) => t.name === "ledger_prove") ? `record anything you cannot do via ledger_prove (op "dropped" with why) or in your final message` : "say in your final message what you could not do and why";
 	return `${reason}. ${where} Otherwise ${report}.`;
 }
 

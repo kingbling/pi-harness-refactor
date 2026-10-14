@@ -83,6 +83,31 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 		expect(p).toMatch(/data or asset file you cannot write by hand/);
 	});
 
+	it("template data seam: the implementer finds the project's one shared data seam with its tools and never designs its own; stack choices only where the legacy code has that concern", () => {
+		const { config } = setup("planned");
+		const p = implementerSystemPrompt(config, { area: "offers", stackId: "react", moduleDir: "src/features/offers", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, writeGlobs: ["src/features/offers/**", ...reactAdapter.layout.wiringFiles!], source: { id: "php" } as never, target: reactAdapter });
+		expect(p).toMatch(/project's one shared data seam: find it with target_lookup \/ find_capability[^\n]*?use it as it is; never design a new one per page/);
+		expect(p).toMatch(/has none yet[^.]*say in your final line that the project has no shared data seam/);
+		expect(p).toMatch(/A choice applies only when the legacy code has that concern/);
+	});
+
+	it("the reviewer: a registered page that gets its data through the shared seam behind TODO(br:…) is connected; a missing seam is one outOfScope item; a stack choice applies only where the legacy code has that concern", async () => {
+		const { dir, ledger, config, tpl } = setup("planned");
+		let system = "";
+		let tools: string[] = [];
+		const spawn = (async (opts: SpawnOptions) => {
+			system = opts.systemPrompt ?? "";
+			tools = (opts.customTools ?? []).map((t) => t.name);
+			return { run: async () => ({ text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} } as unknown as LeafSession;
+		}) as never;
+		await reviewWithModel({ ledger, config, root: dir, unitId: "U1482", adapter: reactAdapter, targetProjectDir: dir, moduleDir: "src/features/offers", legacyFiles: [tpl], changedFiles: [], spawn });
+		expect(tools).toEqual(expect.arrayContaining(["target_lookup", "find_capability"]));
+		expect(system).toMatch(/a registered page that gets its data through that seam, marked TODO\(br:<that unit>\), is connected, and the seam's shape, name or typing is never a finding/);
+		expect(system).toMatch(/no shared data seam yet[^.]*put it in outOfScope \(setup = false\)/);
+		expect(system).toMatch(/A choice applies only when the unit's legacy code has that concern/);
+		expect(system).toMatch(/Asking for a choice where the legacy code has no such concern is not a finding/);
+	});
+
 	it("the binding layout section names the wiring files every unit may edit", () => {
 		const s = renderLayoutSection(reactAdapter);
 		for (const f of reactAdapter.layout.wiringFiles!) expect(s).toContain(`\`${f}\``);
