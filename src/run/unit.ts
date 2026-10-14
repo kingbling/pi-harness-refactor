@@ -34,9 +34,10 @@ import { reopenUnit } from "./recheck.ts";
 import { implementerSystemPrompt, rulesText, testerSystemPrompt } from "./prompts.ts";
 import { askPendingQuirks, markQuirksApplied, quirkList, quirkRetestNote, quirkSummary } from "./quirks.ts";
 import { completeTidyTasks, tidyTasks } from "./tidy.ts";
-import { sameFinding, triageGate, type LastRetest, type Triage } from "./triage.ts";
+import { sameFinding, samePath, triageGate, type LastRetest, type Triage } from "./triage.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
+import { filesNamed } from "./builder.ts";
 import { caseCoverage, checkTests, findTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
 export { mentionsCase } from "./ported.ts";
 
@@ -138,6 +139,8 @@ type CheckResult = Parameters<NonNullable<ToolDeps["onCheck"]>>[0];
 
 /** Review rounds per run that give their try back because fewer findings are open than at the review before. */
 export const MAX_PROGRESS_ROUNDS = 5;
+/** Tests-only retests for build/lint errors only in the unit's own test files: each gives its try back. */
+export const MAX_TESTS_ONLY_ROUNDS = 2;
 
 /** Why read truth was written while the legacy env mode was "read" (the old code could not run anywhere here). */
 const NOT_RUN_HERE = "the old code does not run here";
@@ -382,6 +385,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const old = o.ledger.db.prepare("SELECT id, symbol_id, inputs, expected, verified_on_old, ported_test_path FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(o.unitId) as Array<{ id: string; symbol_id: string; inputs: string; expected: string; verified_on_old: number; ported_test_path: string | null }>;
 		const same = old.length === cases.length && cases.every((c, i) => old[i]!.symbol_id === c.symbol && old[i]!.inputs === JSON.stringify(c.inputs) && old[i]!.expected === JSON.stringify(c.expected) && old[i]!.verified_on_old === (mode === "run" ? 1 : 0));
 		if (same && o.ledger.hasEvidence(o.unitId, mode === "run" ? "truth_green_on_old" : "truth_read")) {
+			// read truth from when the old code could not run here, read again now that it can: record why it was read,
+			// so the next pass reuses it instead of asking the tester again
+			if (mode === "read" && envMode === "run" && !readTruthOk())
+				o.ledger.addEvidence(o.unitId, "truth_read", { cases: cases.length, file: `${truthDirRel}/${READ_CASES_FILE}`, why: "the script did not run green on the old code", ...(lastRunError ? { runError: lastRunError.slice(-800) } : {}) });
 			log(pc.dim(`  truth: the same ${cases.length} cases as recorded; kept`));
 			return;
 		}
@@ -412,8 +419,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const portedDir = join(truthDirAbs, "ported");
 	const ahead = !o.truthOnly && o.ledger.hasEvidence(o.unitId, "truth_ahead") && existsSync(portedDir);
 	// read truth from when the old code could not run here is not reused once it can: the tester runs it now
-	const readTruthOk = o.ledger.evidenceOf(o.unitId).some((e) => e.type === "truth_read" && (envMode !== "run" || JSON.parse(e.payload).why !== NOT_RUN_HERE));
-	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || readTruthOk || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
+	const readTruthOk = () => o.ledger.evidenceOf(o.unitId).some((e) => e.type === "truth_read" && (envMode !== "run" || JSON.parse(e.payload).why !== NOT_RUN_HERE));
+	const hasTruth = (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || readTruthOk() || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
 	if (!hasTruth) {
 		// Playbook: a red truth script gets one more tester pass with the exact error; then a human question (only this unit waits).
 		let truthOk = false;
@@ -594,6 +601,15 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
 			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
 		}
+		// the build/type check too, once the code the tests call is in place (a re-opened unit, a later pass): its errors
+		// are then the tests' own (before that, a missing class is the implementer's to write)
+		const iface = existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "";
+		const codeThere = iface !== "" && !interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir).length;
+		const build = codeThere ? await checkTests(targetProjectDir, adapter, "build", ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths)) : undefined;
+		if (build?.error) {
+			log(pc.dim("  ported tests fail the build check: the tester fixes them before implementing"));
+			if (await runTruth(`The ported tests fail the stack's build/type check (\`${build.command}\`, run in ${targetProjectDir}) while the code they call is in place. The implementer may not edit tests, so fix the errors in the TEST files now, behaviour unchanged. check_ported_tests runs the same check.\n${build.error}`, true)) testFiles = loadTests();
+		}
 	}
 	// kept tests and interface.md may name paths the layout does not allow (written before a layout change, the
 	// tester skipped): the implementer cannot rename them, so the tester moves them now (once)
@@ -683,6 +699,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the next one is progress, and that round gives its try back, a few times per run
 	let openBefore: number | undefined = openFindings().length || undefined;
 	let progressRounds = 0;
+	let testsOnlyRounds = 0;
 	// the reviewer found only weak tests (the code is fine): after the tester's retest the gate runs again on the same
 	// code, with no new implementer session and no new attempt
 	let reviewWeakOnly = false;
@@ -923,6 +940,27 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		reviewErrors = 0;
 
+		// build or lint errors only in the unit's own test files: the implementer may not edit them, so the tester fixes
+		// them (behaviour unchanged) and the gate runs again on the same code; the try is not counted (a few times per run).
+		// A fix that changed no test goes on to triage as usual
+		if ((gate.failedStep === "build_ok" || gate.failedStep === "lint_ok") && testsOnlyRounds < MAX_TESTS_ONLY_ROUNDS) {
+			const out = gate.steps.find((s) => !s.ok)?.output ?? "";
+			const own = ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
+			const named = filesNamed(out, targetProjectDir, adapter.layout.sourceExtensions);
+			if (named.length && named.every((f) => own.some((t) => samePath(f, t)))) {
+				testsOnlyRounds++;
+				log(pc.yellow(`  ${gate.failedStep} fails only in the unit's own test files: the tester fixes them, this round uses no try (${testsOnlyRounds}/${MAX_TESTS_ONLY_ROUNDS})`));
+				const before = JSON.stringify(loadTests());
+				if (await runTruth(`The gate's ${gate.failedStep} fails only in your test files (${named.join(", ")}); the implementer may not edit them. Fix the errors in the TEST files, behaviour unchanged; code the tests call that does not exist yet is the implementer's to write, not yours. check_ported_tests runs the same check.\n${out.slice(-4000)}`, true, { codeWritten: true })) testFiles = loadTests();
+				lastRetest = { progress: JSON.stringify(loadTests()) !== before };
+				if (lastRetest.progress) {
+					regate = true;
+					previousGate = gate;
+					continue;
+				}
+			}
+		}
+
 		if (gate.failedStep === "wired_ok" && !reviewWeakOnly) {
 			const openNow = openFindings().length;
 			if (!regateOnly && openBefore !== undefined && openNow < openBefore && progressRounds < MAX_PROGRESS_ROUNDS) {
@@ -1015,7 +1053,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				// the doctor puts the fault in the unit's own tests or code; a retest that did not help is never followed by another
 				const codeFault = dx.action === "retest" || dx.action === "reimplement";
 				const noRetest = !!afterRetest && (sameFinding(gate, previousGate) || !afterRetest.progress);
-				if (codeFault && doctorActions < 2 && !(dx.action === "retest" && noRetest)) {
+				// the same anti-gaming red twice is not the model's fault (triage says so): no doctor's retry runs the remaining tries
+				const notTheModel = triage.action === "ask_human" && gate.failedStep === "antigaming_ok";
+				if (codeFault && !notTheModel && doctorActions < 2 && !(dx.action === "retest" && noRetest)) {
 					doctorActions++;
 					if (triage.action === "escalate") forceEscalate = true;
 					if (dx.action === "retest") await retest(`The gate failed with ${gate.failedStep}: ${dx.summary}. ${dx.note ?? ""} Fix the TESTS, not production code.\n${lastGateText}`);
