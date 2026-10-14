@@ -23,7 +23,9 @@ export function startWatchdog(root: string, log: (line: string) => void, o: { ev
 		const late = now - last - every;
 		last = now;
 		if (late <= limit) return;
-		const line = `${new Date().toISOString()} Pi was blocked ${(late / 1000).toFixed(1)} s (last step: ${step})`;
+		// the run lives in its own process under Pi: its freezes do not hold Pi's screen
+		const who = process.env["BR_RUN_CHILD"] === "1" ? "the run process" : "Pi";
+		const line = `${new Date().toISOString()} ${who} was blocked ${(late / 1000).toFixed(1)} s (last step: ${step})`;
 		try {
 			mkdirSync(join(root, ".bigrefactor"), { recursive: true });
 			appendFileSync(join(root, ".bigrefactor", "blocked.log"), line + "\n");
