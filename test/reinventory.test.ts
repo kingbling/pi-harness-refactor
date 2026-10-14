@@ -1,4 +1,5 @@
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
@@ -83,6 +84,36 @@ describe("re-inventory", () => {
 		ledger.db.prepare("UPDATE units SET deps = json_insert(deps, '$[#]', ?) WHERE id = ?").run(owner!, waiter!);
 		await inventory(config, ws, ledger);
 		expect(JSON.parse(ledger.getUnit(waiter!)!.deps)).toContain(owner);
+		ledger.close();
+	}, 60_000);
+	it("flags a done unit stale only when its file really changed: on the same commit, a differing recorded hash is no change", async () => {
+		const ws = join(here, ".sim", "reinv-stale");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const src = join(ws, "legacy");
+		cpSync(join(here, "fixtures", "mini-app"), src, { recursive: true });
+		const git = (...a: string[]) => execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], { cwd: src, stdio: "pipe" }).toString().trim();
+		git("init", "-q");
+		git("add", "-A");
+		git("commit", "-qm", "legacy");
+		const head = git("rev-parse", "--short=7", "HEAD");
+		const config = ConfigSchema.parse({ source: { path: src, stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await inventory(config, ws, ledger);
+		const [a, b] = ledger.listUnits({ state: "planned" }).filter((u) => (JSON.parse(u.meta).files ?? []).length);
+		const fileOf = (u: typeof a) => (JSON.parse(u!.meta).files as string[])[0]!;
+		for (const u of [a!, b!]) ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = ?").run(u.id);
+		// an older record of the file (as a run that stopped mid-way or an older inventory leaves): same commit, file untouched
+		ledger.db.prepare("UPDATE files SET hash = 'old' WHERE path = ?").run(fileOf(a));
+		// a false flag an earlier inventory set on this same commit
+		ledger.updateUnit(b!.id, { meta: { stale: true, staleReason: `${fileOf(b)} changed upstream (${head} → ${head})` } });
+		await inventory(config, ws, ledger);
+		expect(JSON.parse(ledger.getUnit(a!.id)!.meta).stale).toBeUndefined();
+		expect(JSON.parse(ledger.getUnit(b!.id)!.meta).stale).toBeUndefined();
+		// an edit in the source's working tree on the same commit is a change
+		appendFileSync(join(src, fileOf(a)), "\n// edited\n");
+		await inventory(config, ws, ledger);
+		expect(JSON.parse(ledger.getUnit(a!.id)!.meta)).toMatchObject({ stale: true, staleReason: expect.stringContaining(fileOf(a)) });
 		ledger.close();
 	}, 60_000);
 });

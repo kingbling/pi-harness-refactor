@@ -178,9 +178,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		ledger.endAttempt(a.id, { outcome: "aborted:crash" });
 		const u = ledger.getUnit(a.unit_id);
 		if (u && ["truth", "implementing", "gating"].includes(u.state)) {
-			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now') WHERE id = ?").run(a.unit_id);
+			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = ? WHERE id = ?").run(new Date().toISOString(), a.unit_id);
 			ledger.clearStale(a.unit_id);
-			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', datetime('now'))").run(a.unit_id, u.state);
+			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', ?)").run(a.unit_id, u.state, new Date().toISOString());
 			await removeWorktree(config.target.path, worktreeDir(o.root, a.unit_id));
 		}
 	}
@@ -1354,8 +1354,8 @@ export async function resubmitParkedUnits(ledger: Ledger, config: Config, root: 
 		}
 		// what the run learned before parking (diagnosis) and the hint go to the next attempt, labelled by who gave it
 		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `${MODEL_ANSWERERS.includes(q?.answered_by ?? "") ? "A model's hint (not the owner's)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
-		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
-		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, datetime('now'))").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`);
+		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = ?, meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(new Date().toISOString(), q?.id ?? meta.applied ?? 0, lesson || null, u.id);
+		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, ?)").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`, new Date().toISOString());
 		await removeWorktree(config.target.path, worktreeDir(root, u.id));
 		parked.push(u);
 	}

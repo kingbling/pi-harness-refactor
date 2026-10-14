@@ -45,8 +45,8 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		await inventory(config, o.root, ledger);
 		const gone = new Set([...before].filter((id) => !ledger.getUnit(id)));
 		// questions about units that are gone have nothing left to decide
-		const q = ledger.db.prepare("UPDATE questions SET status = 'withdrawn', answer = COALESCE(answer || ' — ', '') || ?, answered_at = COALESCE(answered_at, datetime('now')) WHERE id = ? AND status = 'open'");
-		for (const r of open) if (gone.has(r.unit_id)) q.run("withdrawn: the unit's files are not app code", r.id);
+		const q = ledger.db.prepare("UPDATE questions SET status = 'withdrawn', answer = COALESCE(answer || ' — ', '') || ?, answered_at = COALESCE(answered_at, ?) WHERE id = ? AND status = 'open'");
+		for (const r of open) if (gone.has(r.unit_id)) q.run("withdrawn: the unit's files are not app code", new Date().toISOString(), r.id);
 		o.log(pc.cyan(`  ${gone.size} unit(s) dropped from the plan: their files are not app code`));
 		const accepted = units.filter((u) => u.state === "accepted").map((u) => u.id);
 		if (accepted.length) o.log(pc.yellow(`  ${accepted.length} accepted unit(s) hold code that is not the app's: ${accepted.slice(0, 20).join(", ")}${accepted.length > 20 ? ", …" : ""} (left as they are)`));

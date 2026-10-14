@@ -7,7 +7,8 @@ import type { FileIndex, IndexedSymbol, SourceAdapter } from "../adapters/types.
 import { getSourceAdapter } from "../adapters/registry.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { buildGraph, condense, cutLargeCycles, tarjanScc } from "./scc.ts";
-import { headOf, isRepo } from "../git.ts";
+import { git, headOf, isRepo } from "../git.ts";
+import { exec } from "../proc.ts";
 import { loadDecisions } from "./decisions.ts";
 import { answerValue } from "../jev/ask.ts";
 import { leftOut, loadNotApp } from "./not-app.ts";
@@ -411,7 +412,22 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	// a human decides whether to redo them). Removed files stay in the ledger with a note.
 	const seen = new Set(indexes.map((f) => f.path));
 	for (const p of previousHashes.keys()) if (!seen.has(p) && removedUpstream(p)) drift.removed.push(p);
+	// the source stands on the same commit as last time: only a file git shows changed in its working tree is drift
+	// (a differing hash alone, from an older inventory's record, is not a change of the code)
+	const sameCommit = !!sourceCommit && sourceCommit === previousCommit;
+	const edited = sameCommit ? await editedFiles(srcRoot) : undefined;
+	if (edited) {
+		drift.changed = drift.changed.filter((p) => edited.has(p));
+		drift.removed = drift.removed.filter((p) => edited.has(p));
+		// stale flags an earlier inventory set on that same commit were false: those units run again
+		for (const u of ledger.listUnits()) {
+			const reason = (JSON.parse(u.meta) as { stale?: boolean; staleReason?: string }).staleReason ?? "";
+			const m = /^(.+) changed upstream \((\w+) → (\w+)\)$/.exec(reason);
+			if (m && m[2] === m[3] && sourceCommit!.startsWith(m[2]!) && !edited.has(m[1]!)) ledger.clearStale(u.id);
+		}
+	}
 	for (const p of new Set([...pendingDrift, ...drift.changed, ...drift.removed])) {
+		if (edited && !edited.has(p)) continue;
 		const sym = ledger.db.prepare("SELECT DISTINCT unit_id FROM symbols WHERE path = ? AND unit_id IS NOT NULL").all(p) as Array<{ unit_id: string }>;
 		for (const { unit_id } of sym) {
 			const u = ledger.getUnit(unit_id);
@@ -514,4 +530,15 @@ function countBy(xs: string[]): Record<string, number> {
 	const r: Record<string, number> = {};
 	for (const x of xs) r[x] = (r[x] ?? 0) + 1;
 	return r;
+}
+
+/** Files changed, added or removed in the source's working tree against its commit (relative to the source); undefined when git cannot say. */
+async function editedFiles(srcRoot: string): Promise<Set<string> | undefined> {
+	try {
+		const out = await exec("git", ["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all", "--", "."], { cwd: srcRoot });
+		const top = await git(srcRoot, ["rev-parse", "--show-toplevel"]);
+		return new Set(out.split("\0").filter(Boolean).map((l) => relative(realpathSync(srcRoot), join(top, l.slice(3)))));
+	} catch {
+		return undefined;
+	}
 }
