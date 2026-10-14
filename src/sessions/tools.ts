@@ -131,6 +131,32 @@ export function unitState(ledger: Ledger, unit: string | null): string {
 	return `, unit ${unit} ${u?.state ?? "unknown"}${stack ? ` on ${stack}` : ""}`;
 }
 
+/**
+ * The legacy callers of a unit's code, one line each with the caller's unit, its state and stack: code calls and
+ * symbol-level deps, plus the files that name the unit's code in a string (a controller rendering a template by its
+ * view name). The implementer's card and the reviewer get the same lines, so both judge the wiring from the same facts.
+ */
+export function legacyCallerLines(ledger: Ledger, config: Config, unitId: string, legacyFiles: string[]): string[] {
+	const db = ledger.db;
+	const own = new Set(legacyFiles);
+	const outside = (id: string) => !own.has(id.split("::")[0]!);
+	const callers = (
+		db
+			.prepare(`SELECT DISTINCT e.from_id, e.how, f.unit_id FROM (
+				SELECT c.from_id, c.kind || ' call' AS how FROM code_calls c JOIN symbols s ON s.id = c.to_id WHERE s.unit_id = ? AND c.resolution = 'code'
+				UNION SELECT d.from_id, d.kind AS how FROM index_deps d JOIN symbols s ON s.id = d.to_id WHERE s.unit_id = ?
+			) e LEFT JOIN symbols f ON f.id = e.from_id ORDER BY e.from_id`)
+			.all(unitId, unitId) as Array<{ from_id: string; how: string; unit_id: string | null }>
+	).filter((c) => c.unit_id !== unitId && outside(c.from_id));
+	// names the code is reached by: its classes/functions, plus the names the framework knows a file by (a template's view name)
+	const names = [...new Set([...(db.prepare("SELECT DISTINCT name FROM symbols WHERE unit_id = ? AND kind IN ('class','function')").all(unitId) as Array<{ name: string }>).map((r) => r.name), ...legacyFiles.flatMap((f) => fileAliases(config, f))])];
+	const literal = names.length ? (db.prepare(`SELECT DISTINCT name, path FROM index_literal_refs WHERE name IN (${names.map(() => "?").join(",")}) ORDER BY path`).all(...names) as Array<{ name: string; path: string }>).filter((l) => !own.has(l.path)) : [];
+	return [
+		...callers.map((c) => `- ${c.from_id} (${c.how}${unitState(ledger, c.unit_id ?? unitOfLegacy(ledger, c.from_id))})`),
+		...literal.map((l) => `- ${l.path} names "${l.name}" in a string (maybe a factory, dynamic call or rendered view${unitState(ledger, unitOfLegacy(ledger, l.path))})`),
+	];
+}
+
 export function whoCalls(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "who_calls",

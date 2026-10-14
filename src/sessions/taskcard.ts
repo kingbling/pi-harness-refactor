@@ -12,6 +12,7 @@ import { noBehaviour } from "../run/gate.ts";
 import { callTree } from "../inventory/codemap.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { exec } from "../proc.ts";
+import { legacyCallerLines } from "./tools.ts";
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -31,8 +32,10 @@ export interface TaskCard {
 	depOwners: Record<string, string>;
 	/** Target files with a stub earlier units left for this unit's code (TODO(br:<this unit>)): it replaces them. */
 	waitingStubs: string[];
-	/** Who calls this unit (so interfaces stay compatible). */
-	callers: Array<{ from: string; kind: string }>;
+	/** Who calls this unit, one line each with the caller's unit, state and stack (the reviewer's lines: see legacyCallerLines). */
+	callers: string[];
+	/** The stack's wiring files (none when generated or not named), with the stack: the card says who registers this unit's code. */
+	wiring?: { stack: string; files: string[] };
 	/** Normalized-AST duplicates within the unit or against accepted target code. */
 	dupCandidates: Array<{ a: string; b: string; reason: string }>;
 	routes: Array<{ method: string | null; path: string; handler: string | null }>;
@@ -127,10 +130,9 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 		else if (!isFile) unresolvedDeps.push(to_id);
 	}
 
-	const inIds = [...ids].map(() => "?").join(",") || "''";
-	// calls inside functions come from the code map; file-scope calls (templates, scripts) only exist as symbol-level deps
-	const callers = (db.prepare(`SELECT DISTINCT d.from_id AS "from", d.kind FROM index_deps d WHERE d.to_id IN (${inIds}) AND d.from_id NOT IN (${inIds}) AND (d.kind NOT IN ('call','static_call') OR d.from_id NOT IN (SELECT id FROM code_functions))
-		UNION SELECT DISTINCT c.from_id AS "from", 'call' AS kind FROM code_calls c WHERE c.to_id IN (${inIds}) AND c.from_id NOT IN (${inIds}) AND c.resolution = 'code'`).all(...ids, ...ids, ...ids, ...ids) as Array<{ from: string; kind: string }>) ?? [];
+	// code calls, symbol-level deps and files that name the unit's code in a string (a controller rendering a template),
+	// with each caller's unit, state and stack: the same lines the reviewer judges the wiring from
+	const callers = legacyCallerLines(ledger, config, unitId, files);
 
 	// dup candidates: same ast_hash inside the unit, or against anything already accepted (source side; target dedupe comes from target_lookup)
 	const dupCandidates: TaskCard["dupCandidates"] = [];
@@ -173,13 +175,14 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 		}
 	}
 	const stackId = opts.place?.stackId ?? opts.adapter.id;
+	const wiringFiles = opts.adapter.generateRegistration ? undefined : opts.adapter.layout.wiringFiles;
 	const sharedHelpers = sharedSymbols(ledger, opts.adapter.layout.sharedDirs, undefined, 30, stackId);
 	const reuseHints = similarTargetSymbols(ledger, symbols.map((s) => s.name), 15, stackId);
 	const candidates = reuseCandidates(ledger, unitId, { stack: stackId, limit: 8 });
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -308,7 +311,12 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		for (const [owner, deps] of byOwner) L.push(`- TODO(br:${owner}): ${deps.join(", ")}`);
 	}
 	if (card.waitingStubs.length) L.push("", `## Stubs waiting for you: earlier units stubbed this unit's code, marked TODO(br:${card.unit.id}) (grep for it). Replace each stub that stands in for this unit's code with the real code, or point its callers at the real code, and remove the stub; you may edit these files for that: ${card.waitingStubs.join(", ")}`);
-	if (card.callers.length) L.push("", `## Called from: ${card.callers.map((c) => `${c.from} (${c.kind})`).join(", ")} — keep behaviour compatible`);
+	L.push("", "## Legacy callers (caller, unit, state, stack; who_calls for more) — keep behaviour compatible");
+	L.push(...(card.callers.length > 20 ? [...card.callers.slice(0, 20), `- (${card.callers.length - 20} more; who_calls)`] : card.callers.length ? card.callers : ["- none in the index (an entry point is reached by the framework)"]));
+	// the wiring rule next to the facts it applies to: who registers this unit's code follows from the callers' stack and state.
+	// Only on a card whose session may write the wiring files (the implementer's, not the tester's)
+	if (card.wiring && card.callers.length && card.wiring.files.every((f) => card.writeGlobs.includes(f)))
+		L.push(`Wiring: a caller whose unit is on another stack than ${card.wiring.stack} can never register this unit's code, so register it yourself in ${card.wiring.files.join(", ")}. A caller whose unit is on ${card.wiring.stack} and not accepted yet registers it itself later: leave that to it.`);
 	if (card.dupCandidates.length) {
 		L.push("", "## Duplicate candidates (dedupe: keep one target symbol, prove the other as merged_into)");
 		for (const d of card.dupCandidates) L.push(`- ${d.a} ≡ ${d.b}: ${d.reason}`);
