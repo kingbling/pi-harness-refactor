@@ -555,129 +555,61 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 	const n = runLanesArg(flags);
 	const cp = findConfigPath(ctx.cwd);
 	if (n !== undefined && cp) pi.appendEntry<BrEntry>("br", { title: "lanes", text: lanes(cp, { lanes: n }).split("\n")[0] ?? "" });
-	startJob(pi, ctx, limit ? `pilot run (${limit} units)` : "migration run", async () => {
-		const cp = findConfigPath(ctx.cwd);
-		if (!cp) return { error: "no bigrefactor.config.json here: run /br onboard first" };
-		const { config, root } = loadConfig(cp);
-		const { openDecisions } = await import("../inventory/decisions.ts");
-		const { getSourceAdapter, getTargetAdapter } = await import("../adapters/registry.ts");
-		const { runScheduler } = await import("../run/run.ts");
-		const { OpenRouterClient } = await import("../models/openrouter.ts");
-		// one run per workspace (a br run in a terminal counts too)
-		const { acquireRunLock } = await import("../run/run-lock.ts");
-		const release = flags.includes("--dry") ? () => {} : acquireRunLock(root);
-		const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+	const job = limit ? `pilot run (${limit} units)` : "migration run";
+	startJob(pi, ctx, job, async () => {
+		// The run lives in its own process (src/run/run-child.ts): its ledger work and model tool calls never hold
+		// Pi's thread. This side shows its progress, its decision dialogs and the question cards.
+		const { runInChild } = await import("./run-process.ts");
 		let runDone = false;
+		// Questions the resolver model could not settle (context.forOwner) come up as cards while the run goes on;
+		// "Stop answering" ends the cards for this run (/br answer still works). Reading them is light (one indexed
+		// query every 5 s, ~25 ms with 4000 open on a 450 MB ledger), so it stays here next to the dialogs.
+		const answerOnTheSide = async () => {
+			const l = locateLedger(ctx.cwd);
+			if (!ctx.hasUI || !("path" in l)) return;
+			const shown = new Set<number>();
+			const done: string[] = [];
+			// its own handle: a card still open when the run ends must still be able to save its answer
+			const ledger = new Ledger(l.path);
+			try {
+				while (!runDone && !progress.stopping) {
+					const mine = ledger.openQuestions().filter((q) => !shown.has(q.id) && q.context && JSON.parse(q.context).forOwner !== undefined);
+					const qs = groupQuestions(mine)[0];
+					if (!qs) {
+						await new Promise((r) => setTimeout(r, 5000));
+						continue;
+					}
+					for (const q of qs) shown.add(q.id);
+					const why = JSON.parse(qs[0]!.context!).forOwner as string;
+					// one group failing must not end the cards for the rest of the run
+					const r = await answerGroup(ctx, ledger, qs, `question while the run continues (${why})`, "human (pi, during run)", done).catch((e) => {
+						progress.log(`question #${qs.map((x) => x.id).join(", #")} not saved: ${e?.message ?? e}`);
+						return "skipped" as const;
+					});
+					if (r === "quit") {
+						progress.log("question cards off for this run: /br answer answers the rest");
+						return;
+					}
+					for (const d of done.splice(0)) progress.log(`answered ${d}`);
+				}
+			} finally {
+				ledger.close();
+			}
+		};
 		runActive = true;
 		try {
-			// Whole-target decisions refuse; every other open decision only blocks the units it affects and is
-			// asked on the side (dialogs) while the run goes on. Answers release their units at the next loop.
-			const { decisionGate, renderGate, liveBlocks } = await import("../run/decisions-gate.ts");
-			const { applyDecision, decisionPrompt } = await import("../inventory/decisions.ts");
-			const source = getSourceAdapter(config.source.stack);
-			const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
-			const g = await decisionGate(ledger, config, source, targets, root);
-			if (g.global.length && !flags.includes("--dry")) return { error: `${g.global.length} decision(s) change the whole target: answer them with /br decide first`, lines: g.global.map((d) => `· ${d.id}: ${d.question}`) };
-			for (const l of renderGate(g)) progress.log(l);
-			const blocked = liveBlocks(ledger, config, source, targets, root);
-			const askOnTheSide = async () => {
-				if (!ctx.hasUI) return;
-				const asked = new Set<string>();
-				// its own handle: a dialog still open when the run ends (and closes the run's ledger) must still be able to save
-				const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
-				try {
-					for (;;) {
-						const now = await decisionGate(ledger, loadConfig(cp).config, source, targets, root);
-						// blocking decisions first, biggest block first
-						const next = [...now.scoped.sort((a, b) => b.units.length - a.units.length).map((x) => x.decision), ...now.free].find((d) => !asked.has(d.id));
-						if (!next || runDone || progress.stopping) return;
-						asked.add(next.id);
-						const ui = piPrompter(ctx, []);
-						const v = await ui.select(`decision while the run continues — ${decisionPrompt(next)}`, next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint })), next.recommended);
-						if (v === undefined) {
-							progress.log(`decision ${next.id} skipped: its units stay blocked (/br decide later)`);
-							continue;
-						}
-						progress.log(`decided ${next.id} = ${v}  ${applyDecision(ledger, loadConfig(cp).config, root, next.id, v, "human (pi, during run)")}`);
-					}
-				} finally {
-					ledger.close();
-				}
-			};
-			// Questions the resolver model could not settle (context.forOwner) come up as cards while the run goes on;
-			// "Stop answering" ends the cards for this run (/br answer still works).
-			const answerOnTheSide = async () => {
-				if (!ctx.hasUI) return;
-				const shown = new Set<number>();
-				const done: string[] = [];
-				// its own handle: a card still open when the run ends must still be able to save its answer
-				const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
-				try {
-					while (!runDone && !progress.stopping) {
-						const mine = ledger.openQuestions().filter((q) => !shown.has(q.id) && q.context && JSON.parse(q.context).forOwner !== undefined);
-						const qs = groupQuestions(mine)[0];
-						if (!qs) {
-							await new Promise((r) => setTimeout(r, 5000));
-							continue;
-						}
-						for (const q of qs) shown.add(q.id);
-						const why = JSON.parse(qs[0]!.context!).forOwner as string;
-						// one group failing must not end the cards for the rest of the run
-						const r = await answerGroup(ctx, ledger, qs, `question while the run continues (${why})`, "human (pi, during run)", done).catch((e) => {
-							progress.log(`question #${qs.map((x) => x.id).join(", #")} not saved: ${e?.message ?? e}`);
-							return "skipped" as const;
-						});
-						if (r === "quit") {
-							progress.log("question cards off for this run: /br answer answers the rest");
-							return;
-						}
-						for (const d of done.splice(0)) progress.log(`answered ${d}`);
-					}
-				} finally {
-					ledger.close();
-				}
-			};
-			if (!flags.includes("--dry"))
-				void (async () => {
-					await askOnTheSide().catch((e) => progress.log(`decision dialog failed: ${e?.message ?? e}`));
-					await answerOnTheSide().catch((e) => progress.log(`question dialog failed: ${e?.message ?? e}`));
-				})();
-			// Scheduler lines → panel steps: "▶ <unit>" starts one, "✓ <unit> accepted" / "■ <unit>: …" / "✗ <unit>: …" end it.
-			const log = (l: string) => {
-				progress.log(l);
-				const t = plain(l).trim();
-				let m: RegExpExecArray | null;
-				if ((m = /^▶ (\S+)/.exec(t))) progress.stepStart(m[1]!);
-				else if ((m = /^✓ (\S+) accepted(.*)$/.exec(t))) progress.stepEnd(m[1]!, "done", m[2]!.trim());
-				else if ((m = /^⏸ ([^:\s]+): (.*)$/.exec(t))) progress.stepEnd(m[1]!, "skipped", m[2]!);
-				else if ((m = /^[■✗] ([^:\s]+): (.*)$/.exec(t))) progress.stepEnd(m[1]!, "failed", m[2]!);
-			};
-			const since = new Date().toISOString();
-			// a run never dies on an error: it starts again after a pause (longer each time), until /br stop
-			// (errors in a pass are caught inside the scheduler; what reaches here happened while no unit ran)
-			let r: Awaited<ReturnType<typeof runScheduler>>;
-			for (let crashes = 0; ; ) {
-				try {
-					r = await runScheduler({ ledger, config: crashes ? loadConfig(cp).config : config, root, client: new OpenRouterClient(), limit, slice: flag("--slice"), units: flag("--units")?.split(","), dry: flags.includes("--dry"), force: flags.includes("--force"), log, onLanes: (l) => progress.setLanes(l), onWait: (w) => progress.wait(w), shouldStop: () => progress.stopping, handleSigint: false, blocked, waitForDecisions: ctx.hasUI });
-					break;
-				} catch (e: any) {
-					if (progress.stopping || flags.includes("--dry")) throw e;
-					const pause = Math.min(600, 15 * 2 ** crashes++);
-					progress.log(pc.red(`run error: ${String(e?.message ?? e).slice(0, 600)}\n  the run starts again in ${pause}s (/br stop ends it)`));
-					progress.wait("starting again after an error");
-					for (let t = 0; t < pause && !progress.stopping; t++) await new Promise((res) => setTimeout(res, 1000));
-					progress.wait(undefined);
-					if (progress.stopping) throw e;
-				}
-			}
-			const questions = ledger.openQuestions().length;
-			const own = ledger.ownDecisions(since).length;
-			return { lines: [`${r.accepted} accepted · ${r.quarantined} quarantined · ${r.waiting} still planned · $${r.costUsd.toFixed(3)}`, ...(own ? [`${own} routine question(s) decided from your goals (br questions lists them; /br answer <id> <text> changes one)`] : []), ...(questions ? [`${questions} question(s) for you: /br answer`] : []), "continue with /br run (accepted units are never redone)"] };
+			// the child works out the next decision; the dialog is shown here and the answer goes back to it.
+			// Question cards start once the decisions are through (one dialog at a time).
+			return await runInChild(
+				{ cwd: ctx.cwd, flags, hasUI: ctx.hasUI, job },
+				{
+					ask: (q) => piPrompter(ctx, []).select(q.prompt, q.options, q.recommended),
+					decisionsDone: () => void answerOnTheSide().catch((e) => progress.log(`question dialog failed: ${e?.message ?? e}`)),
+				},
+			);
 		} finally {
 			runDone = true;
 			runActive = false;
-			release();
-			ledger.close();
 		}
 	});
 }

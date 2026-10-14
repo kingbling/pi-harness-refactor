@@ -66,6 +66,11 @@ export interface AgentState {
 }
 
 type Abortable = { abort(): Promise<void> | void };
+/** A job that runs in another process (Pi's migration run): where stops and this side's log lines go. */
+export interface RemoteJob {
+	stop(mode: "drain" | "abort"): void;
+	log(line: string): void;
+}
 const MAX_ACTIVITY = 200;
 
 class ProgressTracker {
@@ -73,6 +78,7 @@ class ProgressTracker {
 	private listeners = new Set<(s: ProgressSnapshot) => void>();
 	private sessions = new Map<number, Abortable>();
 	private nextId = 1;
+	private remote: RemoteJob | undefined;
 
 	snapshot(): ProgressSnapshot {
 		return structuredClone(this.s);
@@ -93,6 +99,7 @@ class ProgressTracker {
 
 	begin(job: string) {
 		this.abortingNow = false;
+		this.remote = undefined;
 		this.s = { job, plan: [], about: {}, running: true, stopping: false, startedAt: Date.now(), steps: [], activity: [], agents: [], costByLabel: {}, costUsd: 0, tokensIn: 0, tokensOut: 0 };
 		this.emit();
 	}
@@ -123,6 +130,7 @@ class ProgressTracker {
 	}
 	end(error?: string) {
 		this.abortingNow = false;
+		this.remote = undefined;
 		this.s.running = false;
 		this.s.stopping = false;
 		this.s.session = undefined;
@@ -149,9 +157,24 @@ class ProgressTracker {
 		this.emit();
 	}
 
+	/**
+	 * The running job lives in another process from now on (undefined: no longer): the shown state is what it sends
+	 * (mirror), a stop goes to it, and lines logged here go to it too so its feed keeps them in order.
+	 */
+	follow(remote: RemoteJob | undefined) {
+		this.remote = remote;
+	}
+	/** The other process's latest state replaces the shown one (it stays running until this side ends the job). */
+	mirror(snap: ProgressSnapshot) {
+		if (!this.s.running) return; // a late message after the end
+		this.s = { ...snap, running: true, stopping: snap.stopping || this.s.stopping };
+		this.emit();
+	}
+
 	log(line: string) {
 		const clean = line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
 		if (!clean.trim()) return;
+		this.remote?.log(clean);
 		for (const l of clean.split("\n")) this.s.activity.push(l);
 		if (this.s.activity.length > MAX_ACTIVITY) this.s.activity.splice(0, this.s.activity.length - MAX_ACTIVITY);
 		this.emit();
@@ -222,6 +245,15 @@ class ProgressTracker {
 	 */
 	async stop(mode: "abort" | "drain" = "abort"): Promise<void> {
 		if (!this.s.running) return;
+		if (this.remote) {
+			// the other process drains or aborts and says so in its feed; shown here at once
+			const drain = mode === "drain" && !this.s.stopping;
+			this.s.stopping = true;
+			if (!drain) this.abortingNow = true;
+			this.remote.stop(drain ? "drain" : "abort");
+			this.emit();
+			return;
+		}
 		if (mode === "drain" && !this.s.stopping) {
 			this.s.stopping = true;
 			this.log("■ stop requested: running units finish, no new ones start (stop again to abort them)");
