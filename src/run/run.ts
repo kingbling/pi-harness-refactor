@@ -13,7 +13,8 @@ import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
 import { progress } from "../progress.ts";
-import { paidSince } from "../spend.ts";
+import { loadSpend, paidSince } from "../spend.ts";
+import { setStep, startWatchdog } from "./watchdog.ts";
 import { gateSlots, loadConfig, type Config } from "../config.ts";
 import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
@@ -108,11 +109,24 @@ export interface SchedulerResult {
 }
 
 export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult> {
+	// the run lives in Pi's process: a step that holds the event loop over a second is written to .bigrefactor/blocked.log
+	const stopWatchdog = startWatchdog(o.root, (l) => (o.log ?? console.log)(pc.yellow(l)));
+	try {
+		return await schedule(o);
+	} finally {
+		stopWatchdog();
+	}
+}
+
+async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	process.env["BR_WORKSPACE"] = o.root; // the stacks' layout.json lives in this workspace
 	const log = o.log ?? ((l: string) => console.log(l));
 	const { ledger, config } = o;
+	// the spend log (many MB) is read in slices up front: the budget check below then reads only new lines
+	await loadSpend(o.root).catch(() => undefined);
 	// a long step with no unit running: the host shows it with a timer, so the run never looks frozen
 	const waitOn = async <T>(what: string, step: () => Promise<T>): Promise<T> => {
+		setStep(what);
 		o.onWait?.(what);
 		try {
 			return await step();
@@ -152,6 +166,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	}
 
 	// ---- crash recovery
+	setStep("crash recovery");
 	const open = ledger.db.prepare("SELECT id, unit_id FROM attempts WHERE ended_at IS NULL").all() as Array<{ id: number; unit_id: string }>;
 	for (const a of open) {
 		ledger.endAttempt(a.id, { outcome: "aborted:crash" });
@@ -361,7 +376,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let parityRunning: Promise<void> | undefined;
 	let parityStopped = false;
 	let parityLast: string | undefined;
-	const showParity = (what?: string) => progress.setParity({ now: what ? { what, since: Date.now() } : undefined, queued: parityQueue.length, last: parityLast });
+	const showParity = (what?: string) => (what && setStep(`parity: ${what}`), progress.setParity({ now: what ? { what, since: Date.now() } : undefined, queued: parityQueue.length, last: parityLast }));
 	const sliceOf = (unitId: string) => (JSON.parse(ledger.getUnit(unitId)?.meta ?? "{}") as { slice?: string }).slice;
 	// a slice can be compared once the units that answer its routes are accepted: its pages and helpers may still be open
 	const sliceDone = (slice: string) => {
@@ -448,6 +463,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const startedAt = new Date().toISOString();
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
+	setStep("removing leftover worktrees");
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
 	if (!o.dry) for (const n of sweepWorktrees(config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
 	const branchNow = mainBranch(config.target.path, config.target.git.branch);
@@ -539,9 +555,22 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const aheadRunning = new Set<string>();
 	/** Truth-ahead attempts that ended without truth in this run: never retried in a tight loop. */
 	const aheadDone = new Set<string>();
+	// lanes started in one scheduling pass make their worktrees side by side (at the start: all of them); each says
+	// where the batch is, and each starts its unit as soon as its own worktree is ready
+	let passNo = 0;
+	let wave = { pass: -1, total: 0 };
+	const joinWave = () => {
+		if (wave.pass !== passNo) wave = { pass: passNo, total: 0 };
+		return { nth: ++wave.total, of: wave };
+	};
+	const preparingNote = (unitId: string, w: ReturnType<typeof joinWave>) => {
+		setStep(`preparing worktree ${unitId}`);
+		if (w.of.total > 1) log(pc.dim(`preparing worktree ${unitId} (${w.nth}/${w.of.total})`));
+	};
 	/** Tester-only lane for a unit whose deps are not accepted yet (see UnitRunOptions.truthOnly). */
 	const startAhead = (unitId: string) => {
 		aheadRunning.add(unitId);
+		const w = joinWave();
 		const p = agents.run(async () => {
 			const wt = worktreeDir(o.root, unitId) + "-ahead";
 			const branch = `ahead/${unitId}`;
@@ -553,6 +582,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					/* no branch */
 				}
 			};
+			preparingNote(unitId, w);
 			try {
 				// inside the try: a worktree that cannot be made skips this lane like any other failure
 				drop();
@@ -593,6 +623,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 
 	const startUnit = (unitId: string) => {
+		const w = joinWave();
 		const p = agents.run(async () => {
 			const wt = worktreeDir(o.root, unitId);
 			const branch = `unit/${unitId}`;
@@ -622,6 +653,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			try {
 				// inside the try: a worktree that cannot be made (disk full, git lock) counts as a crash, so the unit is
 				// quarantined after the second one instead of being picked first again on every restart
+				preparingNote(unitId, w);
 				await fresh();
 				const restored = restoreKeptWork(ledger, wt, unitId);
 				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]${restored ? ` (earlier code kept${restored.length ? `, ${restored.length} file(s) clash with main` : ""})` : ""}`));
@@ -657,6 +689,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					if (res!.state !== "review") break;
 					try {
 						await merge.run(async () => {
+							setStep(`merging ${unitId}`);
 							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);
 							const adapter = adapters.get(stackId)!;
 							const mainProject = projectDir(config, stackId);
@@ -961,6 +994,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 	for (;;) {
 		try {
+			setStep("scheduling pass");
+			passNo++;
 			reloadLanes();
 			saveSlotTotals();
 			if (Date.now() - lastResubmitCheck > 5000) {
@@ -1082,6 +1117,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		await new Promise((r) => setImmediate(r));
 	}
 	process.off("SIGINT", onSigint);
+	setStep("finishing the run");
 	if (parityProbe) await waitOn("checking whether the old and the new app start", () => parityProbe);
 	// a stop finishes the running parity check only; otherwise the queued slices are compared before the run ends
 	if (stopRecord) parityStopped = true;

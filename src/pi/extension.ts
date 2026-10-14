@@ -1,6 +1,6 @@
 import { forecast, renderForecast, type Forecast } from "../run/forecast.ts";
 import { PLUGIN_VERSION } from "../version.ts";
-import { totalSpend } from "../spend.ts";
+import { loadSpend, totalSpend } from "../spend.ts";
 import { lanes, parseLanesArgs, runLanesArg } from "../run/lanes.ts";
 /**
  * Thin Pi shell for bigrefactor. The heavy lifting (sessions, gates, scheduler) runs in the `br`
@@ -221,9 +221,9 @@ export function durable(ledger: Ledger, root: string): Durable {
 	return { accepted: f.units.accepted, quarantined: f.units.quarantined, waiting: f.units.waiting, questions: forOwnerCount(ledger, runLive(root)), spentUsd: totalSpend(root).usd, forecast: f };
 }
 let durableCache: { at: number; cwd: string; d: Durable } | undefined;
-/** Cached for the panel, which repaints often: at most one ledger read per 5 s. */
-function durableFor(cwd: string): Durable | undefined {
-	if (durableCache && durableCache.cwd === cwd && Date.now() - durableCache.at < 5000) return durableCache.d;
+/** Cached for the panel and the footer, which repaint often: at most one ledger read per 5 s (the forecast alone takes ~0.1 s on a big ledger). */
+function durableFor(cwd: string, maxAgeMs = 5000): Durable | undefined {
+	if (durableCache && durableCache.cwd === cwd && Date.now() - durableCache.at < maxAgeMs) return durableCache.d;
 	const l = locateLedger(cwd);
 	if (!("path" in l)) return undefined;
 	const ledger = new Ledger(l.path);
@@ -239,7 +239,9 @@ function durableFor(cwd: string): Durable | undefined {
 
 const money = (x: number) => (x < 100 ? `$${x.toFixed(2)}` : `$${Math.round(x).toLocaleString("en-US")}`);
 export function statusLine(ledger: Ledger, root: string): string {
-	const d = durable(ledger, root);
+	return statusText(durable(ledger, root));
+}
+function statusText(d: Durable): string {
 	const f = d.forecast;
 	const open = d.questions;
 	const left = f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}), ${f.remaining.hours[1] < 48 ? `${f.remaining.hours[1].toFixed(1)} h` : `${(f.remaining.hours[1] / 24).toFixed(1)} days`} [${f.confidence}]` : "";
@@ -390,7 +392,7 @@ function startJob(pi: ExtensionAPI, ctx: ExtensionContext, job: string, work: ()
 		if (Date.now() - footerAt > 10_000) {
 			footerAt = Date.now();
 			try {
-				refreshStatus(ctx);
+				refreshStatus(ctx, 5000);
 			} catch {
 				/* ledger busy: next tick */
 			}
@@ -646,17 +648,12 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 	});
 }
 
-/** Footer status: refreshed on session start and after every /br command, cleared when there is no ledger. */
-function refreshStatus(ctx: ExtensionContext): void {
+/** Footer status: refreshed on session start and after every /br command, cleared when there is no ledger. A run's repaints pass `maxAgeMs` to share the panel's cached totals. */
+function refreshStatus(ctx: ExtensionContext, maxAgeMs = 0): void {
 	if (!ctx.hasUI) return;
-	const ledger = openLedger(ctx.cwd);
-	if (!ledger) return ctx.ui.setStatus("bigrefactor", undefined);
-	try {
-		const l = locateLedger(ctx.cwd);
-		ctx.ui.setStatus("bigrefactor", statusLine(ledger, "path" in l ? dirname(dirname(l.path)) : ctx.cwd));
-	} finally {
-		ledger.close();
-	}
+	if (!("path" in locateLedger(ctx.cwd))) return ctx.ui.setStatus("bigrefactor", undefined);
+	const d = durableFor(ctx.cwd, maxAgeMs);
+	if (d) ctx.ui.setStatus("bigrefactor", statusText(d));
 }
 
 function truncate(text: string, more: string): string {
@@ -1105,7 +1102,9 @@ export default function (pi: ExtensionAPI) {
 
 	// Keep the ledger in view: a one-line footer status, refreshed when a session starts.
 	pi.on("session_start", async (_e, ctx) => {
-		refreshStatus(ctx);
+		// the spend log can be many MB: read in slices first, so the footer reads only what is new
+		const l = locateLedger(ctx.cwd);
+		void ("path" in l ? loadSpend(dirname(dirname(l.path))) : Promise.resolve()).catch(() => undefined).then(() => refreshStatus(ctx)).catch(() => undefined);
 		// what this plugin needs (other Pi packages, logins, the stacks' tools): say at startup what is missing
 		void import("../requirements.ts")
 			.then(async ({ checkRequirements, requirementsNotice }) => {

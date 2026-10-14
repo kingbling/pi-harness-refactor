@@ -1,4 +1,5 @@
 import { appendFileSync, closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import { open, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -54,25 +55,55 @@ function tally(root: string): SpendTally | undefined {
 		} finally {
 			closeSync(fd);
 		}
-		const lines = (t.tail + buf.toString("utf8")).split("\n");
-		t.tail = lines.pop() ?? ""; // a line still being written
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			try {
-				const e = JSON.parse(line) as SpendEntry;
-				t.usd += e.usd;
-				t.since ??= e.at;
-				const k = e.source.split(":")[0]!;
-				t.bySource[k] = (t.bySource[k] ?? 0) + e.usd;
-				if (!e.subscription) t.paid.push([e.at, e.usd]);
-			} catch {
-				/* torn line */
-			}
-		}
-		t.size = size;
+		absorb(t, buf);
 	}
 	tallies.set(f, t);
 	return t;
+}
+
+function absorb(t: SpendTally, buf: Buffer): void {
+	const lines = (t.tail + buf.toString("utf8")).split("\n");
+	t.tail = lines.pop() ?? ""; // a line still being written
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		try {
+			const e = JSON.parse(line) as SpendEntry;
+			t.usd += e.usd;
+			t.since ??= e.at;
+			const k = e.source.split(":")[0]!;
+			t.bySource[k] = (t.bySource[k] ?? 0) + e.usd;
+			if (!e.subscription) t.paid.push([e.at, e.usd]);
+		} catch {
+			/* torn line */
+		}
+	}
+	t.size += buf.length;
+}
+
+/**
+ * Read the spend log up to now in slices, giving the event loop back between them: the first read of a log of
+ * many MB took a third of a second in one piece, and Pi runs it on its UI thread. Later reads (tally) add only new lines.
+ */
+export async function loadSpend(root: string): Promise<void> {
+	const f = file(root);
+	const size = await stat(f).then((s) => s.size, () => 0);
+	let t = tallies.get(f);
+	if (!size || (t && size >= t.size && size - t.size < 1 << 20)) return;
+	if (!t || size < t.size) tallies.set(f, (t = { size: 0, tail: "", usd: 0, bySource: {}, paid: [] }));
+	const fh = await open(f, "r");
+	try {
+		while (t.size < size && tallies.get(f) === t) {
+			const at = t.size;
+			const buf = Buffer.alloc(Math.min(4 << 20, size - at));
+			const { bytesRead } = await fh.read(buf, 0, buf.length, at);
+			// a sync read (tally) took over meanwhile: it has these bytes already
+			if (!bytesRead || t.size !== at) break;
+			// up to the last whole line: a slice cut inside a multi-byte character would spoil that line
+			absorb(t, buf.subarray(0, buf.subarray(0, bytesRead).lastIndexOf(10) + 1 || bytesRead));
+		}
+	} finally {
+		await fh.close();
+	}
 }
 
 /** Total spend of the workspace (all-time), split by source family. */

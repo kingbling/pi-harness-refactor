@@ -12,6 +12,7 @@ import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { legacyCopyTool, loadLegacyEnv, ownerPreference, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
+import { setStep } from "./watchdog.ts";
 
 /**
  * Differential parity, step one: can the OLD app and the NEW app each be started here as a local server that
@@ -159,6 +160,7 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 	if (!isLocal(recipe.ready)) return { ok: false, error: `the ready URL must be on this machine (http://localhost:<port>/…), got ${recipe.ready}` };
 	if (await answers(recipe.ready)) return { ok: false, error: `something already answers on ${recipe.ready} before the app was started: pick a free port (or stop what runs there)` };
 	const cwd = resolve(appDir, recipe.dir);
+	setStep(`parity: data reset and start of the app in ${cwd}`);
 	if (!existsSync(cwd)) return { ok: false, error: `folder ${cwd} does not exist` };
 	if (recipe.reset)
 		try {
@@ -235,6 +237,7 @@ export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeou
 /** The app's data as {table: rows}, from the recipe's dump command. Throws when it prints anything else. */
 export function dumpData(recipe: AppRecipe, appDir: string): Record<string, unknown[]> {
 	if (!recipe.dump) return {};
+	setStep(`parity: data dump of the app in ${appDir}`);
 	// stdout goes to a file, not a buffer: a real database dump is easily bigger than any buffer
 	const tmp = mkdtempSync(join(tmpdir(), "br-dump-"));
 	let outText: string;
