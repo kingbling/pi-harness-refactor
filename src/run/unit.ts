@@ -1244,14 +1244,15 @@ function transcriptPath(root: string, unitId: string, role: string, attemptId: n
 /**
  * Paths drafted in interface.md that are neither inside the allowed dirs nor existing files (an existing file is
  * something to import or a legacy/workspace reference, not something to create). Paths may carry any prefix
- * before the project-relative part (workspace, worktree).
+ * before the project-relative part (workspace, worktree), or be relative to an allowed dir.
  */
 export function draftedOutside(md: string, allowedDirs: string[], targetRel: string, existingRoots: string[]): string[] {
 	const out = new Set<string>();
 	for (const m of md.matchAll(/(?:^|[\s`'"(\[])((?:\.\/)?(?:[\w@.-]+\/)+[\w.-]+\.[A-Za-z]{1,5})(?=$|[\s`'"),:\]#])/gm)) {
 		let p = m[1]!.replace(/^\.\//, "");
 		if (targetRel && p.startsWith(`${targetRel}/`)) p = p.slice(targetRel.length + 1);
-		if (p.startsWith("..") || allowedDirs.some((d) => p.startsWith(d) || p.includes(`/${d}`)) || existingRoots.some((r) => existsSync(join(r, p)) || existsSync(join(r, m[1]!)))) continue;
+		// an existing file named relative to the unit's own folder ("components/List.tsx" in src/features/x/) is inside it
+		if (p.startsWith("..") || allowedDirs.some((d) => p.startsWith(d) || p.includes(`/${d}`)) || existingRoots.some((r) => existsSync(join(r, p)) || existsSync(join(r, m[1]!)) || allowedDirs.some((d) => existsSync(join(r, d, p))))) continue;
 		out.add(p);
 	}
 	return [...out];

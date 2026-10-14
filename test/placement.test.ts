@@ -249,6 +249,14 @@ describe("placement", () => {
 		const md = "- `api/src/features/agency/agency.service.ts` exports AgencyService\n- src/features/list.tpl/list.ts\n- ported from app/model/classes/agency.model.php";
 		expect(draftedOutside(md, ["src/features/agency/"], "api", [join(ws, "migrated"), config.source.path])).toEqual(["src/features/list.tpl/list.ts"]);
 	});
+
+	it("an existing file named relative to the unit's own folder is inside it; a new one there is not", () => {
+		const proj = join(ws, "relative-names");
+		mkdirSync(join(proj, "src/features/creatives/components"), { recursive: true });
+		writeFileSync(join(proj, "src/features/creatives/components/MediaFileList.tsx"), "export {}\n");
+		const md = "Use the contracts from this component and `components/MediaFileList.tsx`; add `components/New.tsx`.";
+		expect(draftedOutside(md, ["src/features/creatives/"], "", [proj])).toEqual(["components/New.tsx"]);
+	});
 });
 
 describe("placement + taxonomy", () => {

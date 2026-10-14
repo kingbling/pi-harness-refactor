@@ -279,7 +279,8 @@ function statusText(d: Durable): string {
 	const f = d.forecast;
 	const open = d.questions;
 	const left = f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}), ${f.remaining.hours[1] < 48 ? `${f.remaining.hours[1].toFixed(1)} h` : `${(f.remaining.hours[1] / 24).toFixed(1)} days`} [${f.confidence}]` : "";
-	return `br ${pluginVersion()} · ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
+	// the % is legacy lines weighted by difficulty, not units: small units land first, so it trails the unit count
+	return `br ${pluginVersion()} · ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% of the code · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
 }
 
 /** Warnings: a toast with a UI, the console without one (print mode swallows notify). */

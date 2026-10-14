@@ -139,9 +139,19 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 		const green = new Map(others.filter((t) => tree && greenOnMain.has(key(t))).map((t) => [t, greenOnMain.get(key(t))!] as const));
 		for (const t of others) if (!green.has(t) && !existsSync(join(main, t))) green.set(t, false);
 		const present = others.filter((t) => !green.has(t));
-		// all of them at once first; only when main is red too, file by file to find the ones it passes
-		if (present.length && (await test(main, present)).ok) for (const t of present) green.set(t, true);
-		else for (const t of present) green.set(t, (await test(main, [t])).ok);
+		// all of them at once first. Red on main too: the files the runner names failing are red, the rest run once
+		// more together; only when the runner names none (or that run is red too) file by file, which is slow with
+		// many files and one main run at a time across lanes
+		const all = present.length ? await test(main, present) : { ok: true, output: "" };
+		if (all.ok) for (const t of present) green.set(t, true);
+		else {
+			const fails = all.output.endsWith("[timed out]") ? [] : failureLines(all.output);
+			const red = present.filter((t) => fails.some((l) => l.includes(t)));
+			for (const t of red) green.set(t, false);
+			const rest = present.filter((t) => !red.includes(t));
+			if (red.length && rest.length && (await test(main, rest)).ok) for (const t of rest) green.set(t, true);
+			else for (const t of rest) green.set(t, (await test(main, [t])).ok);
+		}
 		if (tree && (await treeOf()) === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
 		return green;
 	});

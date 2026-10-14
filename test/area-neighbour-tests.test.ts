@@ -133,4 +133,19 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect(r.ok).toBe(false);
 		expect(r.output).toContain("FAIL tests/n2.spec");
 	});
+	it("main red too: the files its runner names failing are red, the rest run together once, not file by file", async () => {
+		const many = Array.from({ length: 8 }, (_, i) => `tests/m${i}.spec`);
+		for (const f of many) write(join(main, f), "pass\n");
+		git(main, "add", "-A");
+		git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "many");
+		git(wt, "pull", "-q");
+		write(join(wt, "broken.txt"), "tests/m3.spec\n");
+		// a runner that runs every file and names each failing one (vitest, jest)
+		const all = { ...adapter, test: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", `echo "$PWD $*" >> ${log}; rc=0; for f; do if ! grep -q pass "$f" || grep -qx "$f" broken.txt 2>/dev/null; then echo "FAIL $f"; rc=1; fi; done; exit $rc`, "sh", ...files] }) } as unknown as TargetAdapter;
+		const r = await runPortedTests({ ledger, unitId: "u1", adapter: all, dir: wt, tests: [...TESTS, ...many], mainDir: main, timeoutMs: 30_000 });
+		expect(r.ok).toBe(false);
+		expect(r.output).toMatch(/pass on main and fail with your code \(tests\/m3\.spec\)/);
+		expect(r.output).toMatch(/fail on main too.*tests\/n2\.spec/);
+		expect(runsIn(main)).toBe(2); // all at once (n2 named red), then the other 9 together
+	});
 });
