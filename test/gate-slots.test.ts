@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ConfigSchema } from "../src/config.ts";
+import { ConfigSchema, gateSlots, loadConfig } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { lanes } from "../src/run/lanes.ts";
 import { Semaphore } from "../src/run/pool.ts";
@@ -41,6 +41,27 @@ describe("gate slots", () => {
 			old.setMeta("gate_slots", JSON.stringify({ grants: 100, waitedMs: 100 * 40_000, heldMs: 3_600_000, since: since - 600_000, at: since + 3_000_000, limit: 2 }));
 			old.close();
 			expect(lanes(f, {})).toMatch(/gate slots last run \(10 min ago\): 50% busy/);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("gate slots follow the lanes unless the owner picks a number; new lanes alone hand them back to the lanes", () => {
+		const run = (lanes: number, gates?: number) => ConfigSchema.parse({ source: { path: "/x", stack: "php" }, target: { path: "/x", stacks: ["nestjs"] }, models: {}, run: { agentConcurrency: lanes, gateConcurrency: gates } }).run;
+		expect(gateSlots(run(20), 12)).toBe(4);
+		expect(gateSlots(run(8), 12)).toBe(2);
+		expect(gateSlots(run(40), 12)).toBe(4);
+		expect(gateSlots(run(20, 3), 12)).toBe(3);
+		const dir = mkdtempSync(join(tmpdir(), "br-follow-"));
+		try {
+			const f = join(dir, "bigrefactor.config.json");
+			// a config saved before: every default written out, gate slots stuck at 2
+			writeFileSync(f, JSON.stringify(ConfigSchema.parse({ source: { path: dir, stack: "php" }, target: { path: dir, stacks: ["nestjs"] }, models: {}, run: { agentConcurrency: 20, gateConcurrency: 2 } })));
+			lanes(f, { lanes: 20 });
+			expect(JSON.parse(readFileSync(f, "utf8")).run.gateConcurrency).toBeUndefined();
+			expect(gateSlots(loadConfig(f).config.run, 12)).toBe(4);
+			lanes(f, { gates: 3 });
+			expect(loadConfig(f).config.run.gateConcurrency).toBe(3);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

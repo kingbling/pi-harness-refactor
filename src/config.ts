@@ -103,8 +103,8 @@ export const ConfigSchema = z.object({
 	run: z
 		.object({
 			agentConcurrency: z.number().int().min(1).default(8),
-			/** Gate slots from the machine: a third of the cores (a test run starts worker threads of its own), at least 2. */
-			gateConcurrency: z.number().int().min(1).default(Math.max(2, Math.floor(cpus().length / 3))),
+			/** Gate slots; unset = follow the lanes (see gateSlots). Set only when the owner picks a number with `br lanes --gates`. */
+			gateConcurrency: z.number().int().min(1).optional(),
 			maxImplementAttempts: z.number().int().min(1).default(3),
 			maxEscalateAttempts: z.number().int().min(0).default(2),
 			budgetUsdPerDay: z.number().positive().default(200),
@@ -159,6 +159,11 @@ export function loadConfig(path = findConfigPath()): { config: Config; path: str
 	// the workspace's own files (generated stack adapters, layout rules) are found from here, on every path that loads a config
 	process.env["BR_WORKSPACE"] = root;
 	return { config, path, root };
+}
+
+/** Gate slots: the owner's number, else one per 5 lanes, at least 2 and at most a third of the cores (a test run starts worker threads of its own). */
+export function gateSlots(run: Config["run"], cores = cpus().length): number {
+	return run.gateConcurrency ?? Math.max(2, Math.min(Math.ceil(run.agentConcurrency / 5), Math.floor(cores / 3)));
 }
 
 export function saveConfig(root: string, config: Config): string {

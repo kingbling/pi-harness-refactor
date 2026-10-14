@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
-import type { Config } from "../config.ts";
+import { gateSlots, type Config } from "../config.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { describeTruthRun, loadLegacyEnv, notFromOldCode, probeRunsNow, verifyTruthOnOld, type TruthCase } from "./legacy-env.ts";
@@ -74,7 +74,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 	const source = getSourceAdapter(o.config.source.stack);
 	const lanes = new Semaphore(o.config.run.agentConcurrency);
 	// test runs are CPU-bound: few at once, like the gate
-	const gates = new Semaphore(o.config.run.gateConcurrency);
+	const gates = new Semaphore(gateSlots(o.config.run));
 	const runTests = o.runTests ?? ((cmd: string, args: string[], cwd: string) => run(cmd, args, cwd, 240_000));
 	const main = o.config.target.path;
 	const reopened: string[] = [];

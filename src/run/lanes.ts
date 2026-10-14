@@ -2,7 +2,7 @@ import { cpus, totalmem } from "node:os";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { loadConfig, saveConfig } from "../config.ts";
+import { gateSlots, loadConfig, saveConfig } from "../config.ts";
 
 /**
  * `br lanes [n] [--gates m]`: show or change how many units run at once (agent lanes) and how many gates
@@ -13,17 +13,19 @@ export function lanes(configPath: string, set: { lanes?: number; gates?: number 
 	const { config, root } = loadConfig(configPath);
 	const L: string[] = [];
 	if (set.lanes !== undefined || set.gates !== undefined) {
-		const before = { lanes: config.run.agentConcurrency, gates: config.run.gateConcurrency };
+		const before = { lanes: config.run.agentConcurrency, gates: gateSlots(config.run) };
 		if (set.lanes !== undefined) config.run.agentConcurrency = Math.max(1, Math.floor(set.lanes));
+		// new lanes without a gate number: the gate slots follow the lanes again
 		if (set.gates !== undefined) config.run.gateConcurrency = Math.max(1, Math.floor(set.gates));
+		else delete config.run.gateConcurrency;
 		saveConfig(root, config);
-		L.push(`lanes ${before.lanes} → ${config.run.agentConcurrency}, gate slots ${before.gates} → ${config.run.gateConcurrency} (a running run applies it within seconds; running units always finish)`);
-	} else L.push(`lanes ${config.run.agentConcurrency} · gate slots ${config.run.gateConcurrency} · machine ${cpus().length} cores, ${Math.round(totalmem() / 2 ** 30)} GB`);
+		L.push(`lanes ${before.lanes} → ${config.run.agentConcurrency}, gate slots ${before.gates} → ${gateSlots(config.run)}${config.run.gateConcurrency === undefined ? " (follow the lanes)" : ""} (a running run applies it within seconds; running units always finish)`);
+	} else L.push(`lanes ${config.run.agentConcurrency} · gate slots ${gateSlots(config.run)}${config.run.gateConcurrency === undefined ? " (follow the lanes)" : ""} · machine ${cpus().length} cores, ${Math.round(totalmem() / 2 ** 30)} GB`);
 	const m = measure(join(root, ".bigrefactor", "ledger.sqlite"));
 	if (m) {
 		// one unit holds a lane for ~session seconds and a gate slot for ~gate seconds
-		const gateLoad = (config.run.agentConcurrency * m.gateS) / (m.unitS * config.run.gateConcurrency);
-		const maxByGates = Math.floor((m.unitS * config.run.gateConcurrency * 0.7) / Math.max(0.1, m.gateS));
+		const gateLoad = (config.run.agentConcurrency * m.gateS) / (m.unitS * gateSlots(config.run));
+		const maxByGates = Math.floor((m.unitS * gateSlots(config.run) * 0.7) / Math.max(0.1, m.gateS));
 		L.push(`measured: a unit holds a lane ~${Math.round(m.unitS)} s (tester + implementer), a gate ~${m.gateS.toFixed(1)} s · gate slots ${Math.round(gateLoad * 100)}% busy at this lane count · rate-limited calls so far: ${m.rateLimited}`);
 		L.push(`gates would saturate around ${maxByGates} lanes; past that, raise --gates (each gate is a build + test process: ~1 core, more memory as the project grows)`);
 	}

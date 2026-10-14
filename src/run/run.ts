@@ -14,7 +14,7 @@ import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
 import { progress } from "../progress.ts";
 import { paidSince } from "../spend.ts";
-import { loadConfig, type Config } from "../config.ts";
+import { gateSlots, loadConfig, type Config } from "../config.ts";
 import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
@@ -280,8 +280,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
 	excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
 	const agents = new Semaphore(config.run.agentConcurrency);
-	const gates = new Semaphore(config.run.gateConcurrency);
-	// Lanes are live: `br lanes <n>` / `/br lanes <n>` edits run.agentConcurrency (and gateConcurrency) in the
+	const gates = new Semaphore(gateSlots(config.run));
+	// Lanes are live: `br lanes <n>` / `/br lanes <n>` edits run.agentConcurrency (and gateConcurrency; unset, the gates follow the lanes) in the
 	// config; the loop picks it up within seconds. Shrinking never kills a lane — running units finish first.
 	let laneLimit = config.run.agentConcurrency;
 	let configMtime = 0;
@@ -294,11 +294,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			configMtime = m;
 			if (first) return;
 			const run = loadConfig(f).config.run;
-			if (run.agentConcurrency !== laneLimit || run.gateConcurrency !== gates.limit) {
-				log(pc.cyan(`lanes ${laneLimit} → ${run.agentConcurrency}, gate slots ${gates.limit} → ${run.gateConcurrency}${run.agentConcurrency < running.size ? ` (${running.size} running finish first)` : ""}`));
+			if (run.agentConcurrency !== laneLimit || gateSlots(run) !== gates.limit) {
+				log(pc.cyan(`lanes ${laneLimit} → ${run.agentConcurrency}, gate slots ${gates.limit} → ${gateSlots(run)}${run.agentConcurrency < running.size ? ` (${running.size} running finish first)` : ""}`));
 				laneLimit = run.agentConcurrency;
 				agents.setLimit(laneLimit);
-				gates.setLimit(run.gateConcurrency);
+				gates.setLimit(gateSlots(run));
 			}
 		} catch {
 			/* unreadable mid-write: next tick */
