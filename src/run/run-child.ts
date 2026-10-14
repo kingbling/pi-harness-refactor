@@ -27,24 +27,8 @@ const flush = () => {
 };
 
 const answers = new Map<string, (v: string | undefined) => void>();
-process.on("message", (m: ToChild) => {
-	if (m.type === "stop") void progress.stop("drain");
-	else if (m.type === "abort") void progress.stop("abort");
-	else if (m.type === "log") progress.log(m.line);
-	else if (m.type === "answer") {
-		answers.get(m.id)?.(m.value);
-		answers.delete(m.id);
-	}
-});
-// Pi is gone: same as /br stop (running units finish), then the process ends; open questions get no answer
-process.on("disconnect", () => {
-	for (const done of answers.values()) done(undefined);
-	answers.clear();
-	if (progress.running && !progress.stopping) void progress.stop("drain");
-});
-// a stray error in a lane must not end the whole run (inside Pi the host caught these)
-process.on("uncaughtException", (e) => progress.log(pc.red(`run error: ${String(e?.stack ?? e).slice(0, 600)}`)));
-process.on("unhandledRejection", (e: any) => progress.log(pc.red(`run error: ${String(e?.stack ?? e).slice(0, 600)}`)));
+/** The decision dialogs on the side: the process stays until the one open in Pi is answered (or Pi goes away). */
+let asking: Promise<void> = Promise.resolve();
 
 async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }> {
 	const flags = a.flags;
@@ -80,26 +64,32 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 		// the next open decision is worked out here; Pi shows the dialog and sends the answer back
 		const askOnTheSide = async () => {
 			const asked = new Set<string>();
-			for (;;) {
-				const now = await decisionGate(ledger, loadConfig(cp).config, source, targets, root);
-				// blocking decisions first, biggest block first
-				const next = [...now.scoped.sort((x, y) => y.units.length - x.units.length).map((x) => x.decision), ...now.free].find((d) => !asked.has(d.id));
-				if (!next || runDone || progress.stopping || !process.connected) return;
-				asked.add(next.id);
-				const options = next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint }));
-				const v = await new Promise<string | undefined>((resolve) => {
-					answers.set(next.id, resolve);
-					send({ type: "ask", id: next.id, prompt: `decision while the run continues — ${decisionPrompt(next)}`, options, recommended: next.recommended });
-				});
-				if (v === undefined) {
-					progress.log(`decision ${next.id} skipped: its units stay blocked (/br decide later)`);
-					continue;
+			// its own handle: a dialog still open when the run ends (and closes the run's ledger) must still be able to save
+			const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+			try {
+				for (;;) {
+					const now = await decisionGate(ledger, loadConfig(cp).config, source, targets, root);
+					// blocking decisions first, biggest block first
+					const next = [...now.scoped.sort((x, y) => y.units.length - x.units.length).map((x) => x.decision), ...now.free].find((d) => !asked.has(d.id));
+					if (!next || runDone || progress.stopping || !process.connected) return;
+					asked.add(next.id);
+					const options = next.options.map((o) => ({ value: o.value, label: o.value === next.recommended ? `${o.label} (recommended)` : o.label, hint: o.hint }));
+					const v = await new Promise<string | undefined>((resolve) => {
+						answers.set(next.id, resolve);
+						send({ type: "ask", id: next.id, prompt: `decision while the run continues — ${decisionPrompt(next)}`, options, recommended: next.recommended });
+					});
+					if (v === undefined) {
+						progress.log(`decision ${next.id} skipped: its units stay blocked (/br decide later)`);
+						continue;
+					}
+					progress.log(`decided ${next.id} = ${v}  ${applyDecision(ledger, loadConfig(cp).config, root, next.id, v, "human (pi, during run)")}`);
 				}
-				progress.log(`decided ${next.id} = ${v}  ${applyDecision(ledger, loadConfig(cp).config, root, next.id, v, "human (pi, during run)")}`);
+			} finally {
+				ledger.close();
 			}
 		};
 		if (!dry && a.hasUI)
-			void askOnTheSide()
+			asking = askOnTheSide()
 				.catch((e) => progress.log(`decision dialog failed: ${e?.message ?? e}`))
 				.finally(() => send({ type: "decisions-done" }));
 		// Scheduler lines → panel steps: "▶ <unit>" starts one, "✓ <unit> accepted" / "■ <unit>: …" / "✗ <unit>: …" end it.
@@ -141,6 +131,24 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 }
 
 async function main(a: ChildArgs) {
+	process.on("message", (m: ToChild) => {
+		if (m.type === "stop") void progress.stop("drain");
+		else if (m.type === "abort") void progress.stop("abort");
+		else if (m.type === "log") progress.log(m.line);
+		else if (m.type === "answer") {
+			answers.get(m.id)?.(m.value);
+			answers.delete(m.id);
+		}
+	});
+	// Pi is gone: same as /br stop (running units finish), then the process ends; open dialogs get no answer
+	process.on("disconnect", () => {
+		for (const done of answers.values()) done(undefined);
+		answers.clear();
+		if (progress.running && !progress.stopping) void progress.stop("drain");
+	});
+	// a stray error in a lane must not end the whole run (inside Pi the host caught these)
+	process.on("uncaughtException", (e) => progress.log(pc.red(`run error: ${String(e?.stack ?? e).slice(0, 600)}`)));
+	process.on("unhandledRejection", (e: any) => progress.log(pc.red(`run error: ${String(e?.stack ?? e).slice(0, 600)}`)));
 	// no terminal here: every command's output is captured, console lines go into the feed Pi shows
 	setOutputHost("ui");
 	const capture = (...x: unknown[]) => progress.log(x.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(" "));
@@ -158,8 +166,10 @@ async function main(a: ChildArgs) {
 		out = { error: e instanceof StoppedError ? "stopped by the user" : String(e?.message ?? e) };
 	}
 	flush();
-	if (!process.connected) process.exit(0);
-	process.send!({ type: "done", ok: !out.error, ...out } satisfies FromChild, () => process.exit(0));
+	if (process.connected) await new Promise((r) => process.send!({ type: "done", ok: !out.error, ...out } satisfies FromChild, r));
+	// Pi's job ends now; a decision dialog still open there is saved here when answered, then the process ends
+	await asking.catch(() => undefined);
+	process.exit(0);
 }
 
 if (process.env["BR_RUN_CHILD"] === "1" && process.send) void main(JSON.parse(process.argv[2] ?? "{}") as ChildArgs);

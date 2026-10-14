@@ -1,5 +1,5 @@
 import { fork } from "node:child_process";
-import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
@@ -29,27 +29,29 @@ const until = async (what: string, ok: () => boolean, ms = 20_000) => {
 	}
 };
 
+/** The decisions-during-run workspace: framework decisions left open for the run to ask. */
+async function makeWorkspace(ws: string) {
+	rmSync(ws, { recursive: true, force: true });
+	mkdirSync(join(ws, "legacy", "myfw"), { recursive: true });
+	cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
+	writeFileSync(join(ws, "legacy", "myfw", "registry.php"), "<?php\nclass Registry { public static function get($k) { return null; } }\n");
+	writeFileSync(join(ws, "legacy", "src", "uses_registry.php"), `<?php\nfunction uses_registry() {\nRegistry::get('k');\n}\n`);
+	writeFileSync(join(ws, "legacy", "index.php"), `<?php\nrequire 'src/uses_registry.php';\nuses_registry();\n`);
+	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+	writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify({ id: "myfw", frameworkDirs: ["myfw/"], loaders: [], concerns: [] }));
+	const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+	writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
+	process.env["BR_WORKSPACE"] = ws;
+	const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+	await inventory(config, ws, ledger);
+	const source = getSourceAdapter("php");
+	const targets = [await getTargetAdapter("nestjs")];
+	for (const d of (await decisionGate(ledger, config, source, targets, ws)).global) applyDecision(ledger, config, ws, d.id, d.recommended!, "test");
+	ledger.close();
+}
+
 describe("migration run in its own process", () => {
-	beforeAll(async () => {
-		// the decisions-during-run workspace: framework decisions left open for the run to ask
-		rmSync(ws, { recursive: true, force: true });
-		mkdirSync(join(ws, "legacy", "myfw"), { recursive: true });
-		cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
-		writeFileSync(join(ws, "legacy", "myfw", "registry.php"), "<?php\nclass Registry { public static function get($k) { return null; } }\n");
-		writeFileSync(join(ws, "legacy", "src", "uses_registry.php"), `<?php\nfunction uses_registry() {\nRegistry::get('k');\n}\n`);
-		writeFileSync(join(ws, "legacy", "index.php"), `<?php\nrequire 'src/uses_registry.php';\nuses_registry();\n`);
-		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
-		writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify({ id: "myfw", frameworkDirs: ["myfw/"], loaders: [], concerns: [] }));
-		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
-		writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
-		process.env["BR_WORKSPACE"] = ws;
-		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
-		await inventory(config, ws, ledger);
-		const source = getSourceAdapter("php");
-		const targets = [await getTargetAdapter("nestjs")];
-		for (const d of (await decisionGate(ledger, config, source, targets, ws)).global) applyDecision(ledger, config, ws, d.id, d.recommended!, "test");
-		ledger.close();
-	}, 60_000);
+	beforeAll(() => makeWorkspace(ws), 60_000);
 	afterEach(() => {
 		delete process.env["BR_RUN_CHILD_SCHEDULER"];
 		delete process.env["BR_FAKE_CRASH"];
@@ -89,6 +91,50 @@ describe("migration run in its own process", () => {
 		expect(last.activity.some((l) => l.includes("stop requested"))).toBe(true);
 		expect(last.steps.find((s) => s.name === "U1_fake")?.status).toBe("done");
 		expect(snaps.length).toBeGreaterThan(2);
+		progress.end();
+	}, 60_000);
+
+	it("a decision dialog still open when the run ends is saved by the child after the job ended", async () => {
+		const ws2 = join(here, ".sim", "run-process-late");
+		await makeWorkspace(ws2);
+		process.env["BR_WORKSPACE"] = ws;
+		process.env["BR_RUN_CHILD_SCHEDULER"] = fake;
+		progress.begin("migration run");
+		let answer!: (v: string | undefined) => void;
+		let asked: Ask | undefined;
+		const run = runInChild({ cwd: ws2, flags: [], hasUI: true, job: "migration run" }, { ask: (q) => ((asked = q), new Promise((r) => (answer = r))) });
+		await until("the decision", () => asked !== undefined);
+		await progress.stop("drain");
+		// the job ends while the dialog is still open
+		const out = await run;
+		expect(out.error).toBeUndefined();
+		progress.end();
+		answer(asked!.recommended ?? asked!.options[0]!.value);
+		const config = ConfigSchema.parse(JSON.parse(readFileSync(join(ws2, "bigrefactor.config.json"), "utf8")));
+		const open = async () => {
+			const ledger = new Ledger(join(ws2, ".bigrefactor", "ledger.sqlite"));
+			try {
+				const g = await decisionGate(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws2);
+				return [...g.scoped.map((x) => x.decision.id), ...g.free.map((d) => d.id)];
+			} finally {
+				ledger.close();
+			}
+		};
+		const t = Date.now();
+		while ((await open()).includes(asked!.id)) {
+			if (Date.now() - t > 20_000) throw new Error("the late answer was not saved");
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}, 60_000);
+
+	it("a stop (and abort) that came before the child started reaches it", async () => {
+		process.env["BR_RUN_CHILD_SCHEDULER"] = fake;
+		progress.begin("migration run");
+		await progress.stop("drain");
+		await progress.stop("abort");
+		const out = await runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		expect(out.lines?.[0]).toMatch(/^1 accepted/);
+		expect(progress.snapshot().activity.some((l) => l.includes("aborting the running model session"))).toBe(true);
 		progress.end();
 	}, 60_000);
 

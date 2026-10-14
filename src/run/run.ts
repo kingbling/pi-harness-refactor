@@ -111,7 +111,7 @@ export interface SchedulerResult {
 }
 
 export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult> {
-	// the run lives in Pi's process: a step that holds the event loop over a second is written to .bigrefactor/blocked.log
+	// a step that holds the run's event loop over a second is written to .bigrefactor/blocked.log (slow stops and IPC to Pi)
 	const stopWatchdog = startWatchdog(o.root, (l) => (o.log ?? console.log)(pc.yellow(l)));
 	try {
 		return await schedule(o);

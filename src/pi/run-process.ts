@@ -31,7 +31,7 @@ export type ToChild = { type: "stop" } | { type: "abort" } | { type: "log"; line
 /**
  * Run the migration in its own process, so none of its work holds Pi's thread. The child's progress is mirrored into
  * this process's `progress` (the panel and footer read it unchanged), /br stop reaches the child, its decisions come
- * here as dialogs (`ask`). Resolves when the child is gone; an unexpected exit is an error. `progress.begin` comes first.
+ * here as dialogs (`ask`). Resolves at the child's `done` (or its exit: an exit without `done` is an error). `progress.begin` comes first.
  */
 export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<string | undefined>; decisionsDone?: () => void } = {}): Promise<{ error?: string; lines?: string[] }> {
 	const entry = fileURLToPath(new URL("../run/run-child.ts", import.meta.url));
@@ -42,13 +42,26 @@ export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<strin
 		if (child.connected) child.send(m);
 	};
 	// whatever the child prints lands in the feed, never on Pi's screen
-	for (const s of [child.stdout, child.stderr]) if (s) createInterface({ input: s }).on("line", (l) => progress.log(l));
-	progress.follow({ stop: (mode) => send({ type: mode === "drain" ? "stop" : "abort" }), log: (line) => send({ type: "log", line }) });
+	let over = false;
+	for (const s of [child.stdout, child.stderr]) if (s) createInterface({ input: s }).on("line", (l) => !over && progress.log(l));
 	let done: { error?: string; lines?: string[] } | undefined;
+	let resolveRun!: (o: { error?: string; lines?: string[] }) => void;
+	const ended = new Promise<{ error?: string; lines?: string[] }>((r) => (resolveRun = r));
+	// the job here ends at the child's `done` (it may stay a moment to save a decision dialog still open here) or exit
+	const end = (out: { error?: string; lines?: string[] }) => {
+		if (over) return;
+		over = true;
+		progress.follow(undefined);
+		resolveRun(out);
+	};
+	progress.follow({ stop: (mode) => send({ type: mode === "drain" ? "stop" : "abort" }), log: (line) => send({ type: "log", line }) });
+	// a /br stop that came while the child was being started
+	if (progress.stopping) send({ type: progress.aborting ? "abort" : "stop" });
 	child.on("message", (m: FromChild) => {
-		if (m.type === "progress") progress.mirror(m.snap);
-		else if (m.type === "decisions-done") o.decisionsDone?.();
-		else if (m.type === "done") done = { error: m.error, lines: m.lines };
+		if (m.type === "progress") {
+			if (!over) progress.mirror(m.snap);
+		} else if (m.type === "decisions-done") o.decisionsDone?.();
+		else if (m.type === "done") end((done = { error: m.error, lines: m.lines }));
 		else if (m.type === "ask") {
 			const ask = o.ask ?? (async () => undefined);
 			void ask(m)
@@ -56,16 +69,14 @@ export function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise<strin
 				.then((value) => send({ type: "answer", id: m.id, value }));
 		}
 	});
-	return new Promise((resolve) => {
-		const end = (why: string) => {
-			progress.follow(undefined);
-			if (done) return resolve(done);
-			const error = `the run process ended unexpectedly (${why})`;
-			progress.log(error);
-			resolve({ error });
-		};
-		// a child that could not start has no exit to wait for
-		child.on("error", (e) => child.pid === undefined && end(e.message));
-		child.on("exit", (code, signal) => end(signal ? `signal ${signal}` : `exit code ${code}`));
-	});
+	const gone = (why: string) => {
+		if (done || over) return end(done ?? {});
+		const error = `the run process ended unexpectedly (${why})`;
+		progress.log(error);
+		end({ error });
+	};
+	// a child that could not start has no exit to wait for
+	child.on("error", (e) => child.pid === undefined && gone(e.message));
+	child.on("exit", (code, signal) => gone(signal ? `signal ${signal}` : `exit code ${code}`));
+	return ended;
 }
