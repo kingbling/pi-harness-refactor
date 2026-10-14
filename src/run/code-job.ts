@@ -199,12 +199,15 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
 	if (code.length && !tests.length && !whole) return `code changed without a test: ${code.slice(0, 5).join(", ")}`;
-	const wholeSteps = whole ? wholeProjectSteps(adapter, dir).map((w) => w.step) : [];
+	// a source file added or moved may keep the app from loading (a folder its config scans), which no changed test
+	// shows: the app's boot check runs too (the builder's job runs it with the other whole-project checks)
+	const addedOrMoved = changed.some((f) => adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && (!tracked.has(f) || !existsSync(join(dir, f))));
+	const wholeSteps: string[] = whole ? wholeProjectSteps(adapter, dir).map((w) => w.step) : addedOrMoved && adapter.boot?.(dir)?.cmd ? ["boot"] : [];
 	// the builder's job: also the tests of accepted units that import the changed code
 	const related = whole && code.length ? [...tracked].filter((t) => adapter.layout.isTestFile(t) && adapter.layout.sourceExtensions.some((e) => t.endsWith(e)) && !tests.includes(t) && importedByTests(dir, [t], code.map((f) => `${f}: changed`)).length) : [];
 	// each step with the files it checks (none: the whole project), so the same step can run on main
 	const steps: Array<{ step: string; files?: string[] }> = [...wholeSteps.map((step) => ({ step })), ...(code.length && !wholeSteps.includes("build") ? [{ step: "build", files: code }] : []), ...(tests.length + related.length ? [{ step: "test", files: [...tests, ...related] }] : [])];
-	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === s.step)!);
+	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.step === "boot" ? adapter.boot!(d)! : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === s.step)!);
 	const out: string[] = [];
 	const failing = new Map<string, string>();
 	for (const s of steps) {
