@@ -267,11 +267,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	 * re-numbering): the tester only adds or fixes tests (and interface.md); a changed truth file is put back.
 	 * `codeWritten`: a retest from the implement loop (check_ported_tests runs the tests against the code).
 	 * `disputeText`: the implementer's dispute; an earlier unit's test file it names may be fixed by the tester.
+	 * `stronger`: the tester runs on the escalate model (the cheap one changed nothing in the last weak-tests round).
 	 */
-	const runTruth = async (extra?: string, testsOnly = false, more: { codeWritten?: boolean; disputeText?: string } = {}): Promise<boolean> => {
+	const runTruth = async (extra?: string, testsOnly = false, more: { codeWritten?: boolean; disputeText?: string; stronger?: boolean } = {}): Promise<boolean> => {
 		if (!o.truthOnly && o.ledger.getUnit(o.unitId)!.state === "planned") o.ledger.transitionUnit(o.unitId, "truth", "tester session started");
 		setStep(`tester ${o.unitId}`);
-		const attempt = o.ledger.startAttempt(o.unitId, "test", o.config.models.test.id);
+		const testModel = more.stronger ? o.config.models.escalate : o.config.models.test;
+		const attempt = o.ledger.startAttempt(o.unitId, "test", testModel.id);
 		const t0 = Date.now();
 		const before = testsOnly ? readTruthFiles() : undefined;
 		// its test paths and the approved tidy paths; the plugin's own folder (ledger, truth) when it sits in the project is not the tester's write
@@ -289,6 +291,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		let testerCheck: { c: CheckResult; key: string } | undefined;
 		const tester = await spawn({
 			role: "test",
+			...(more.stronger ? { modelOverride: testModel } : {}),
 			// the shell and relative paths start in the project (reviewer findings and test paths are project paths);
 			// the write globs stay relative to the workspace, where the truth folder lives
 			cwd: targetProjectDir,
@@ -755,9 +758,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// dispute about a test the weak-tests rewrite just broke still reaches the tester
 	let testRounds = 0;
 	let disputeRounds = 0;
-	// tester rounds the reviewer's weak-tests verdict drove (disputes do not count): the waiver below needs 2 of them.
-	// Kept in unit meta with the tester's "kept" answers, so a later run of the unit goes on counting
-	const unitMeta = () => JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { weakRounds?: number; testerKept?: string; truthChangeSeen?: number };
+	// tester rounds the reviewer's weak-tests verdict drove (disputes do not count) in which the tester changed a test:
+	// the waiver below needs 2 of them. Kept in unit meta with the tester's "kept" and "could not" answers, so a later
+	// run of the unit goes on counting
+	const unitMeta = () => JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { weakRounds?: number; testerKept?: string; testerCouldNot?: string; truthChangeSeen?: number };
 	// read truth a retest changed after the code existed, not yet shown to a review that judged (a finding then keeps it open)
 	const truthChangedAfterCode = (): { lines: string[]; last: number } => {
 		const rows = o.ledger.db.prepare("SELECT id, payload FROM evidence WHERE unit_id = ? AND type = 'truth_changed_after_code' AND id > ? ORDER BY id").all(o.unitId, unitMeta().truthChangeSeen ?? 0) as Array<{ id: number; payload: string }>;
@@ -768,6 +772,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return { lines, last: rows.at(-1)?.id ?? 0 };
 	};
 	let weakRounds = unitMeta().weakRounds ?? 0;
+	// the last weak-tests round changed no test: the next one runs on the escalate model
+	let weakStuck = false;
 	// open findings at the last judged review (a later run of the unit starts from those it carries): fewer open after
 	// the next one is progress, and that round gives its try back, a few times per run
 	let openBefore: number | undefined = openFindings().length || undefined;
@@ -782,7 +788,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the tester re-ported: triage never sends a retest that did not help to the tester again
 	let lastRetest: LastRetest | undefined;
 	// every retest runs from the implement loop: the code is in place, so check_ported_tests runs the tests against it
-	const retest = async (extra: string, more?: { codeWritten?: boolean; disputeText?: string }) => {
+	const retest = async (extra: string, more?: { codeWritten?: boolean; disputeText?: string; stronger?: boolean }) => {
 		// the run is stopping: no tester round, the loop hands the lane back
 		if (o.stopped?.()) return;
 		const files = () => JSON.stringify([loadTests(), readTruthFiles(), loadIface()]);
@@ -1010,9 +1016,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					if (!reuse && r.judged && changedTruth.last) o.ledger.updateUnit(o.unitId, { meta: { truthChangeSeen: changedTruth.last } });
 					cost += r.costUsd ?? 0;
 					reviewWeakOnly = r.judged && !r.ok && !!r.weakTests && !r.findings?.length && !r.outOfScope;
-					// the tester had 2 weak-tests rounds and only the tests are still called weak: the code passes, the doubt is noted
-					// on the unit. Never for a unit without ported tests: there "weak" means behaviour nobody pinned
-					if (reviewWeakOnly && weakRounds >= 2 && testFiles.length && !noBehaviour(o.ledger, o.unitId)) {
+					// the tester changed the tests in 2 weak-tests rounds and only the tests are still called weak: the code passes,
+					// the doubt is noted on the unit. Never for a unit without ported tests (there "weak" means behaviour nobody
+					// pinned), nor while the tester's last answer says it could not rewrite a test (it agrees they are weak)
+					if (reviewWeakOnly && weakRounds >= 2 && testFiles.length && !noBehaviour(o.ledger, o.unitId) && !unitMeta().testerCouldNot) {
 						o.ledger.updateUnit(o.unitId, { meta: { weakTestsNote: `accepted with tests the reviewer still finds weak after ${weakRounds} tester rounds:\n${r.weakTests}` } });
 						log(pc.yellow(`  only the tests are still called weak after ${weakRounds} tester rounds: the code passes the review, the doubt is noted on the unit`));
 						r = { ...r, ok: true, weakTests: undefined, output: `reviewer: the code is fine; tests still called weak after ${weakRounds} tester rounds (noted on the unit):\n${r.weakTests}` };
@@ -1124,18 +1131,32 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (weakDrove && gate.failedStep === "wired_ok" && reviewWeakOnly) regate = true;
 		if (testsNote) {
 			if (disputeNote) disputeRounds++;
-			if (weakDrove) {
-				testRounds++;
-				o.ledger.updateUnit(o.unitId, { meta: { weakRounds: ++weakRounds } });
-			}
+			if (weakDrove) testRounds++;
+			const stronger = weakDrove && weakStuck;
+			if (stronger) log(pc.dim(`  the last weak-tests round changed no test: this one runs on ${o.config.models.escalate.id}`));
 			// a dispute and a weak-tests round are counted apart: the weak-tests rounds are most of them
 			if (disputeNote) o.ledger.addEvidence(o.unitId, "test_disputed", { note: disputeNote.slice(0, 2000) });
 			if (weakDrove) o.ledger.addEvidence(o.unitId, "tests_weak", { note: testsNote.slice(0, 2000) });
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
-			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …" or "<test>: kept — <why>". The implementer reads your answer.`, { disputeText: disputeNote || undefined });
+			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …", "<test>: kept — <why>" (the other model is wrong), or "<test>: could not — <why>" (it is right, but you could not rewrite the test). The implementer reads your answer.`, { disputeText: disputeNote || undefined, stronger });
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
-			// the tests it kept, with its reasons, go to the next review: a kept test is called weak again only with a reason
-			if (weakDrove) o.ledger.updateUnit(o.unitId, { meta: { testerKept: lastTesterText.split("\n").filter((l) => /\bkept\b/i.test(l)).join("\n").slice(-2000) || undefined } });
+			if (weakDrove) {
+				const answer = lastTesterText.split("\n");
+				const couldNot = (l: string) => /\bcould not\b/i.test(l);
+				// only a round that changed a test counts toward the waiver; one that changed nothing goes the normal red
+				// path, and the next weak-tests round runs on the escalate model
+				const progress = !!lastRetest?.progress;
+				weakStuck = !progress;
+				// the tests it kept, with its reasons, go to the next review: a kept test is called weak again only with a reason.
+				// A test it could not rewrite is no reasoned "kept": it never reaches the reviewer as one and blocks the waiver
+				o.ledger.updateUnit(o.unitId, {
+					meta: {
+						...(progress ? { weakRounds: ++weakRounds } : {}),
+						testerKept: answer.filter((l) => /\bkept\b/i.test(l) && !couldNot(l)).join("\n").slice(-2000) || undefined,
+						testerCouldNot: answer.filter(couldNot).join("\n").slice(-2000) || undefined,
+					},
+				});
+			}
 			previousGate = gate;
 			continue;
 		}
@@ -1258,7 +1279,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 	if (gate?.ok) {
 		// the weak-tests count is for this round of the unit: a re-opened unit's new tests get their tester rounds again
-		if (weakRounds) o.ledger.updateUnit(o.unitId, { meta: { weakRounds: 0, testerKept: undefined } });
+		if (weakRounds || unitMeta().testerKept || unitMeta().testerCouldNot) o.ledger.updateUnit(o.unitId, { meta: { weakRounds: 0, testerKept: undefined, testerCouldNot: undefined } });
 		// The new code is now part of what later units can reuse: index it (exports, helpers, docs).
 		const indexed = await indexTarget(o.ledger, adapter, targetProjectDir, gate.changedFiles).catch((e) => (log(pc.yellow(`  target index failed: ${e?.message ?? e}`)), 0));
 		log(pc.dim(`  indexed ${indexed} target symbols`));

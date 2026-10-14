@@ -254,6 +254,47 @@ describe("weak-tests-only reviews", () => {
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toBeUndefined();
 	});
 
+	it("a tester that agrees but changes no test never earns the waiver: its round does not count, the next runs on the escalate model", async () => {
+		const models: Array<string | undefined> = [];
+		const calls: Array<{ role: string; task: string }> = [];
+		const inner = sessions(
+			calls,
+			async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"),
+			// it says "fixed" and "kept" but writes nothing (the cheap model admits it could not do the rewrite)
+			async (_o, _t, n) => (n === 1 ? "agency.service.spec.ts: fixed — the literal assertions still do not run the service\nTESTER DONE 0 cases" : "agency.service.spec.ts: kept — I could not safely replace them\nTESTER DONE 0 cases"),
+		);
+		const spawn = (async (opts: SpawnOptions) => (opts.role === "test" && models.push(opts.modelOverride?.id), inner(opts))) as never;
+		const inputs: ReviewInput[] = [];
+		const reviewer = async (i: ReviewInput) => (inputs.push(i), { ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
+		const meta = JSON.parse(ledger.getUnit("u1")!.meta);
+		expect(meta.weakTestsNote).toBeUndefined();
+		expect(meta.weakRounds ?? 0).toBe(0);
+		expect(r.state).not.toBe("review");
+		// the first weak-tests round on the test model changed nothing: the second runs on the escalate model
+		expect(models.slice(0, 2)).toEqual([undefined, config.models.escalate.id]);
+		expect(ledger.db.prepare("SELECT model FROM attempts WHERE unit_id = 'u1' AND role = 'test' ORDER BY id").all().map((x) => (x as { model: string }).model).slice(0, 2)).toEqual([config.models.test.id, config.models.escalate.id]);
+		// "could not" is no reasoned kept answer: it never reaches the reviewer as one
+		expect(inputs.every((i) => !i.testerKept)).toBe(true);
+	});
+
+	it("a tester that changed the tests but says it could not rewrite one gets no waiver", async () => {
+		ledger.updateUnit("u1", { meta: { weakRounds: 1 } });
+		const calls: Array<{ role: string; task: string }> = [];
+		const spawn = sessions(
+			calls,
+			async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"),
+			async (_o, _t, n) => (write(join(ws, "migrated", SPEC), `it('u1#1 creates ${n}', () => {});\n`), "agency.service.spec.ts: could not — the service needs a database I cannot fake here\nTESTER DONE 1 cases"),
+		);
+		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
+		const meta = JSON.parse(ledger.getUnit("u1")!.meta);
+		expect(meta.weakRounds).toBeGreaterThanOrEqual(2);
+		expect(meta.testerCouldNot).toMatch(/could not — the service needs a database/);
+		expect(meta.weakTestsNote).toBeUndefined();
+		expect(r.state).not.toBe("review");
+	});
+
 	it("count across runs of the unit: tester rounds of an earlier run count toward the waiver", async () => {
 		ledger.updateUnit("u1", { meta: { weakRounds: 2 } });
 		const calls: Array<{ role: string; task: string }> = [];

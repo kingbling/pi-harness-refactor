@@ -46,7 +46,8 @@ const sessions = (calls: Call[], implementerTool?: { name: string; args: object 
 		({
 			run: async (task: string) => {
 				calls.push({ role: opts.role, task });
-				if (opts.role === "test") write(join(ws, "migrated", SPEC), "it('u1#1 creates an agency with its id', () => {});\n");
+				// each tester round changes its test (a round that changes nothing never counts toward the weak-tests waiver)
+				if (opts.role === "test") write(join(ws, "migrated", SPEC), `it('u1#1 creates an agency with its id (round ${calls.filter((c) => c.role === "test").length})', () => {});\n`);
 				const tool = implementerTool && opts.role !== "test" && calls.filter((c) => c.role !== "test").length === 1 ? opts.customTools!.find((t) => t.name === implementerTool.name) : undefined;
 				if (tool) await (tool as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", implementerTool!.args);
 				return { text: opts.role === "test" ? "u1#1: fixed — the legacy code returns the new id, not true\nTESTER DONE 1 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
@@ -170,6 +171,7 @@ describe("models fix each other's work", () => {
 			({
 				run: async (task: string) => {
 					calls.push({ role: opts.role, task });
+					if (opts.role === "test") write(join(ws, "migrated", SPEC), `it('u1#1 creates (round ${calls.length})', () => {});\n`);
 					if (opts.role !== "test") await (opts.customTools!.find((t) => t.name === "dispute_test") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { test: "u1#1", why: "expects true", evidence: "returns the id" });
 					return { text: opts.role === "test" ? "u1#1: kept — the legacy code returns true\nTESTER DONE 1 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
 				},
