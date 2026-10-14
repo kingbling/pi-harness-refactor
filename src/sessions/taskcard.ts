@@ -94,6 +94,9 @@ const MAX_ACCEPTED = 15;
 const MAX_OTHER_SIBLINGS = 40;
 const MAX_SIBLING_FILES = 6;
 
+/** Gives the event loop back for a moment (between the task card's parts). */
+const breathe = () => new Promise<void>((r) => setImmediate(r));
+
 export async function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): Promise<TaskCard> {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
@@ -130,9 +133,12 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 		else if (!isFile) unresolvedDeps.push(to_id);
 	}
 
+	// the card reads many ledger tables: the run's other lanes and its scheduling get the thread between the parts
+	await breathe();
 	// code calls, symbol-level deps and files that name the unit's code in a string (a controller rendering a template),
 	// with each caller's unit, state and stack: the same lines the reviewer judges the wiring from
 	const callers = legacyCallerLines(ledger, config, unitId, files);
+	await breathe();
 
 	// dup candidates: same ast_hash inside the unit, or against anything already accepted (source side; target dedupe comes from target_lookup)
 	const dupCandidates: TaskCard["dupCandidates"] = [];
@@ -174,6 +180,7 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 			fwRefs.push({ cls, refs: n, verdict: decided[cls] ?? (!c && decided["rest"] === "port" ? "port" : undefined) ?? c?.verdict ?? "review", platform: c?.platform ?? "see RULES.md → Legacy framework mapping" });
 		}
 	}
+	await breathe();
 	const stackId = opts.place?.stackId ?? opts.adapter.id;
 	const wiringFiles = opts.adapter.generateRegistration ? undefined : opts.adapter.layout.wiringFiles;
 	const sharedHelpers = sharedSymbols(ledger, opts.adapter.layout.sharedDirs, undefined, 30, stackId);
@@ -182,7 +189,9 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	await breathe();
+	const area = opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined;
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */

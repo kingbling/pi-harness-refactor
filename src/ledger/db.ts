@@ -383,9 +383,22 @@ export class Ledger {
 	blockedUnits(): Map<string, number[]> {
 		const blocked = new Map<string, number[]>();
 		const add = (unitId: string, qid: number) => blocked.set(unitId, [...(blocked.get(unitId) ?? []), qid]);
-		const units = this.listUnits();
-		const dependents = new Map<string, string[]>();
-		for (const u of units) for (const d of JSON.parse(u.deps) as string[]) dependents.set(d, [...(dependents.get(d) ?? []), u.id]);
+		// every unit's deps and first file are read only when a question blocks dependents or a module: the scheduler
+		// asks this every pass and at every unit start, and reading all units' meta each time held the run
+		let all: { dependents: Map<string, string[]>; firstFile: Array<[id: string, file: string | undefined]> } | undefined;
+		const units = () => {
+			if (all) return all;
+			all = { dependents: new Map(), firstFile: [] };
+			for (const u of this.db.prepare("SELECT id, deps, json_extract(meta, '$.files[0]') AS file FROM units ORDER BY tier, id").all() as Array<{ id: string; deps: string; file: string | null }>) {
+				for (const d of JSON.parse(u.deps) as string[]) {
+					const list = all.dependents.get(d);
+					if (list) list.push(u.id);
+					else all.dependents.set(d, [u.id]);
+				}
+				all.firstFile.push([u.id, u.file ?? undefined]);
+			}
+			return all;
+		};
 		for (const q of this.openQuestions()) {
 			if (q.blocks !== "none") for (const w of this.db.prepare("SELECT unit_id FROM question_waiters WHERE question_id = ?").all(q.id) as Array<{ unit_id: string }>) add(w.unit_id, q.id);
 			if (q.blocks === "none" || !q.unit_id) continue;
@@ -395,12 +408,12 @@ export class Ledger {
 				const seen = new Set<string>();
 				while (stack.length) {
 					const cur = stack.pop()!;
-					for (const d of dependents.get(cur) ?? []) if (!seen.has(d)) { seen.add(d); add(d, q.id); stack.push(d); }
+					for (const d of units().dependents.get(cur) ?? []) if (!seen.has(d)) { seen.add(d); add(d, q.id); stack.push(d); }
 				}
 			} else if (q.blocks === "module") {
 				const u = this.getUnit(q.unit_id);
 				const dir = u ? (JSON.parse(u.meta).files?.[0] as string | undefined)?.split("/").slice(0, -1).join("/") : undefined;
-				if (dir !== undefined) for (const o of units) if ((JSON.parse(o.meta).files?.[0] as string | undefined)?.startsWith(dir + "/") || dir === "") add(o.id, q.id);
+				if (dir !== undefined) for (const [id, file] of units().firstFile) if (file?.startsWith(dir + "/") || dir === "") add(id, q.id);
 			}
 		}
 		return blocked;
