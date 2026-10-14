@@ -263,7 +263,7 @@ describe("weak-tests-only reviews", () => {
 			// it says "fixed" and "kept" but writes nothing (the cheap model admits it could not do the rewrite)
 			async (_o, _t, n) => (n === 1 ? "agency.service.spec.ts: fixed — the literal assertions still do not run the service\nTESTER DONE 0 cases" : "agency.service.spec.ts: kept — I could not safely replace them\nTESTER DONE 0 cases"),
 		);
-		const spawn = (async (opts: SpawnOptions) => (opts.role === "test" && models.push(opts.modelOverride?.id), inner(opts))) as never;
+		const spawn = (async (opts: SpawnOptions) => (opts.role === "test" && models.push(opts.modelOverride?.id), (inner as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts))) as never;
 		const inputs: ReviewInput[] = [];
 		const reviewer = async (i: ReviewInput) => (inputs.push(i), { ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
