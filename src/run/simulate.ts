@@ -114,6 +114,12 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 		const unfinished = rec.stop.lanes.filter((l) => ["truth", "implementing", "gating"].includes(l.state) && !ledger.openQuestions().some((q) => q.unit_id === l.unit));
 		if (unfinished.length) problems.push(`stop: lanes left mid-flight: ${unfinished.map((l) => `${l.unit}=${l.state}`).join(", ")}`);
 		if (!rec.stop.finishing.length) problems.push("stop: no lanes were running when the stop came");
+		// the stop reaches the running units: they go back to planned at their next step instead of using all their
+		// tries, and keep what they wrote for their next run
+		const sentBack = rec.stop.finishing.filter((u) => /^run stopped/.test(ledger.transitionsOf("unit", u).at(-1)?.reason ?? ""));
+		if (!sentBack.length) problems.push("stop: no running unit was sent back to planned by the stop");
+		const notKept = sentBack.filter((u) => ledger.getUnit(u)!.state !== "planned" || !(JSON.parse(ledger.getUnit(u)!.meta) as { keptWork?: string }).keptWork);
+		if (notKept.length) problems.push(`stop: units sent back without their code kept: ${notKept.join(", ")}`);
 		if (!existsSync(join(ws, ".bigrefactor", "runs.jsonl"))) problems.push("stop: runs.jsonl not written");
 		if (ledger.listUnits({ state: "planned" }).length === 0) problems.push("stop: everything ran despite the stop");
 	}

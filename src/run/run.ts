@@ -479,7 +479,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const caught = decideOpenFromGoals(ledger, config);
 		if (caught) log(pc.cyan(`decided ${caught} open routine question(s) from your goals (br questions lists them; br answer <id> changes one)`));
 	}
-	// A stop drains: running lanes finish their unit, nothing new starts. It is written down (run log + ledger)
+	// A stop drains: running lanes stop their unit at its next step (its code kept, back to planned), nothing new starts. It is written down (run log + ledger)
 	// so the next run and `br status` can say what happened.
 	let stopRecord: { at: string; reason: string; finishing: string[] } | undefined;
 	const requestStop = (reason: string) => {
@@ -490,7 +490,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// the builder starts nothing new from now on (no check, repair or code job while the lanes finish); its running
 		// check is killed, a running repair or code job finishes; the run's end waits for it
 		void builder.stop().catch(() => undefined);
-		log(pc.yellow(`■ stop requested (${reason}): ${stopRecord.finishing.length} running lane(s) finish${stopRecord.finishing.length ? ` (${stopRecord.finishing.join(", ")})` : ""}; no new units start`));
+		log(pc.yellow(`■ stop requested (${reason}): ${stopRecord.finishing.length} running lane(s) stop at their next step, code kept${stopRecord.finishing.length ? ` (${stopRecord.finishing.join(", ")})` : ""}; no new units start`));
 	};
 	const onSigint = () => {
 		requestStop("ctrl-c");
@@ -693,6 +693,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 						spawn: o.spawn,
 						gate: o.gate,
 						approved,
+						// a stop reaches the running unit: it hands its lane back at the next safe point, its code kept
+						stopped: () => stop,
+						runStartedAt: startedAt,
 					});
 					if (!mergeOnly) cost += res!.costUsd;
 					mergeOnly = false;
@@ -824,7 +827,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				if (res && res.state !== "review" && ledger.getUnit(unitId)!.state !== "accepted") {
 					const st = ledger.getUnit(unitId)!.state;
 					const q = ledger.openQuestions().find((x) => x.unit_id === unitId);
-					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined${blocksNote(unitId)}`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
+					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined${blocksNote(unitId)}`) : res.stopped ? pc.yellow(`⏸ ${unitId}: back to planned for the stop, its code kept`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
 				}
 			} catch (e: any) {
 				// a crash is not a gate failure: end the open attempts, count it, and stop after the second one so a
@@ -845,7 +848,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				// the worktree goes whatever the state: the next run of this unit starts from a fresh one anyway (fresh()),
 				// so a planned unit's would only hold disk space. A quarantined unit's code stays on its branch: a self-heal
 				// requeue starts from it (an owner's requeue drops it)
-				const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? await keepUnitWork(wt, unitId) : undefined;
+				// a unit the stop sent back to planned keeps its code the same way: its next run goes on from it
+				const kept = (st === "quarantined" && mayKeepCode(ledger, unitId)) || (st === "planned" && res?.stopped) ? await keepUnitWork(wt, unitId) : undefined;
 				if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
 				await removeWorktree(config.target.path, wt);
 				if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
@@ -895,6 +899,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		} else log(pc.yellow(`⚕ could not heal it here; those units stay quarantined (br requeue after a fix), the run goes on`));
 	};
 	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined, crash?: string) => {
+		// a unit the stop sent back failed nothing: many of them at once are no shared failure to heal
+		if (res?.stopped) return;
 		recent.push(breakerEntry(ledger, unitId, st, res, crash));
 		if (recent.length > 6) recent.shift();
 		if (healing) return;
@@ -1049,7 +1055,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			{
 				const max = laneLimit;
 				const reason = stop
-					? "stopping: running lanes finish, nothing new starts"
+					? "stopping: running lanes stop at their next step, nothing new starts"
 					: dayCapHit
 						? "daily budget cap reached"
 						: sampleReason

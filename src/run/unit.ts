@@ -98,6 +98,13 @@ export interface UnitRunOptions {
 	 * main since (repo-relative). A later round reuses that approval when only those files and wiring files changed.
 	 */
 	approved?: { review?: ApprovedReview; clash: string[] };
+	/**
+	 * The run is stopping: the unit gives its lane back at the next safe point (before an implement try, a review or a
+	 * tester round) instead of using all its tries. It goes back to planned; the scheduler keeps its code (keepUnitWork).
+	 */
+	stopped?: () => boolean;
+	/** When this run of the orchestrator started (ISO): report_migrated_bug counts this unit's reports since then. */
+	runStartedAt?: string;
 }
 
 /** What an approved review saw: each changed file's hash, and the tests with the tester's answers as one hash. */
@@ -120,6 +127,8 @@ export interface UnitRunResult {
 	gate?: GateReport;
 	triage?: Triage;
 	costUsd: number;
+	/** It went back to planned because the run is stopping: its code is to be kept for its next run. */
+	stopped?: boolean;
 }
 
 /**
@@ -670,7 +679,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let gate: GateReport | undefined;
 	let previousGate: GateReport | undefined;
 	let triage: Triage | undefined;
-	let attemptNo = 0;
+	// a unit that gave its lane back (a stop, or it waited for a unit it reported) goes on counting its tries: the wait
+	// is no fresh set of tries. One try is always left
+	const triesUsed = (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { triesUsed?: number }).triesUsed ?? 0;
+	let attemptNo = Math.max(0, Math.min(triesUsed, maxTotal - 1));
+	if (triesUsed) {
+		o.ledger.updateUnit(o.unitId, { meta: { triesUsed: undefined } });
+		log(pc.dim(`  goes on from try ${attemptNo} of ${maxTotal} (tries used before it gave its lane back)`));
+	}
 	// Jev routing (br label): a unit rated hard with confidence starts on the escalate model
 	const route = (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { route?: { difficulty?: string; difficultyConfidence?: number } }).route;
 	let doctorActions = 0;
@@ -736,6 +752,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let lastRetest: LastRetest | undefined;
 	// every retest runs from the implement loop: the code is in place, so check_ported_tests runs the tests against it
 	const retest = async (extra: string, more?: { codeWritten?: boolean; disputeText?: string }) => {
+		// the run is stopping: no tester round, the loop hands the lane back
+		if (o.stopped?.()) return;
 		const files = () => JSON.stringify([loadTests(), readTruthFiles(), loadIface()]);
 		const before = files();
 		if (await runTruth(extra, false, { codeWritten: true, ...more })) testFiles = loadTests();
@@ -787,7 +805,24 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		log(pc.yellow(`  waiting for human question #${qid} — other units keep running`));
 		return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: attemptNo, gate, costUsd: cost };
 	};
+	// the run is stopping: the unit goes back to planned with its tries counted and its ported tests saved; the
+	// scheduler keeps its code like a quarantine's, so its next run goes on from there
+	const stopNow = (attempt?: number, report?: GateReport): UnitRunResult | undefined => {
+		if (!o.stopped?.()) return undefined;
+		if (attempt !== undefined) o.ledger.endAttempt(attempt, { outcome: "stopped", gateReport: report });
+		savePorted();
+		o.ledger.updateUnit(o.unitId, { meta: { triesUsed: attemptNo, retryNote: `The run was stopped while this unit was being worked on (after ${attemptNo} of ${maxTotal} tries). Check what is done, then finish it.` } });
+		o.ledger.transitionUnit(o.unitId, "planned", `run stopped after ${attemptNo} try(s); its code is kept for the next run`);
+		log(pc.yellow(`  the run is stopping: ${o.unitId} goes back to planned, its code is kept`));
+		return { unitId: o.unitId, state: "planned", attempts: attemptNo, gate, costUsd: cost, stopped: true };
+	};
+	{
+		const s = stopNow();
+		if (s) return s;
+	}
 	while (attemptNo < maxTotal || regate) {
+		const s = stopNow();
+		if (s) return s;
 		regateOnly = regate;
 		regate = false;
 		if (!regateOnly) attemptNo++;
@@ -846,7 +881,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				res = await impl.run(prompt);
 				// DONE while its own last check_my_code was red: the gate would fail the same way, so one more turn
 				const red = lastCheck as CheckResult | undefined; // set by the tool during run()
-				if (red && !red.ok && !red.timedOut && !res.error && !reports.length) {
+				if (red && !red.ok && !red.timedOut && !res.error && !reports.length && !o.stopped?.()) {
 					log(pc.dim(`  ${role} said DONE after a red check_my_code (${red.failed}): one more turn`));
 					const more = await impl.run(`Your last check_my_code was red (${red.failed}), so the gate fails the same way. Fix it and call check_my_code again until it is clean.${red.failed === "tests" ? " A red test you are sure is wrong (it expects what the legacy code does not do): call dispute_test for it by name, with evidence from the legacy code. Every red test must be fixed or disputed." : ""} Then end with your final line as before.\n\nThe red check:\n${red.text.slice(0, 5000)}`);
 					res = { ...more, toolCalls: res.toolCalls + more.toolCalls, blocked: res.blocked + more.blocked, usage: { input: res.usage.input + more.usage.input, output: res.usage.output + more.usage.output, cost: res.usage.cost + more.usage.cost } };
@@ -913,6 +948,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					if (approvedBefore) lastReview = { key, r: o.approved!.review!.r };
 					const reuse = !disputed.length && !truthChanged.length && lastReview?.key === key;
 					if (reuse) log(pc.dim(approvedBefore ? "  only clashing or wiring files changed since the approved review: its verdict stands (no new review)" : "  code and tests unchanged since the last review: its verdict stands (no new review)"));
+					// the run is stopping: no review session; the red gate hands the lane back below
+					if (!reuse && o.stopped?.()) return { ok: false, judged: false, output: "not judged: the run is stopping" };
 					setStep(`review ${o.unitId}`);
 					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
 					let r = reuse
@@ -954,6 +991,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		gate = straight
 			? { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 0, output: check!.text }], changedFiles: check!.files, failedStep: "ported_tests_green", testFiles: testFiles.map((t) => t.path) }
 			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot, cleanCheck });
+		// the run is stopping: a red gate goes to no triage, tester or next try
+		if (!gate.ok) {
+			const s = stopNow(attempt, gate);
+			if (s) return s;
+		}
 		// only the tests were called weak: the code was fine, so this is not an implementer failure
 		const weakOnly = !gate.ok && gate.failedStep === "wired_ok" && reviewWeakOnly;
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : weakOnly ? "gate_tests_weak" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
@@ -979,7 +1021,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// build or lint errors only in the unit's own test files: the implementer may not edit them, so the tester fixes
 		// them (behaviour unchanged) and the gate runs again on the same code; the try is not counted (a few times per run).
 		// A fix that changed no test goes on to triage as usual
-		if ((gate.failedStep === "build_ok" || gate.failedStep === "lint_ok") && testsOnlyRounds < MAX_TESTS_ONLY_ROUNDS) {
+		if ((gate.failedStep === "build_ok" || gate.failedStep === "lint_ok") && testsOnlyRounds < MAX_TESTS_ONLY_ROUNDS && !o.stopped?.()) {
 			const out = gate.steps.find((s) => !s.ok)?.output ?? "";
 			const own = await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
 			const named = filesNamed(out, targetProjectDir, adapter.layout.sourceExtensions);
