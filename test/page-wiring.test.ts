@@ -69,6 +69,13 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 		expect(card).toContain('- app/controller/sales.controller.php names "offers/list" in a string (maybe a factory, dynamic call or rendered view, unit U2210 planned on symfony)');
 	});
 
+	it("the tester's card has no wiring line: it may not write the wiring files", async () => {
+		const { dir, ledger, config } = setup("planned", "symfony");
+		const card = renderTaskCard(await buildTaskCard(ledger, config, "U1482", { targetProjectDir: dir, writeGlobs: [join(dir, "src/features/offers/**/*.test.tsx")], adapter: react }), config);
+		expect(card).toMatch(/## Legacy callers[^\n]*\n- app\/controller\/sales\.controller\.php/);
+		expect(card).not.toMatch(/^Wiring:/m);
+	});
+
 	it("a unit nobody calls: the card says so, with no wiring line", async () => {
 		const { dir, ledger, config } = setup("planned");
 		const card = renderTaskCard(await buildTaskCard(ledger, config, "U2210", { targetProjectDir: dir, writeGlobs: ["src/features/offers/**"], adapter: react }), config);

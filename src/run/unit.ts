@@ -790,6 +790,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// every retest runs from the implement loop: the code is in place, so check_ported_tests runs the tests against it
 	const retest = async (extra: string, more?: { codeWritten?: boolean; disputeText?: string; stronger?: boolean }) => {
 		// the run is stopping: no tester round, the loop hands the lane back
+		// no tester round, no progress: a stale answer from an earlier retest never counts toward the waiver
+		lastRetest = undefined;
 		if (o.stopped?.()) return;
 		const files = () => JSON.stringify([loadTests(), readTruthFiles(), loadIface()]);
 		const before = files();
@@ -1140,9 +1142,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
 			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …", "<test>: kept — <why>" (the other model is wrong), or "<test>: could not — <why>" (it is right, but you could not rewrite the test). The implementer reads your answer.`, { disputeText: disputeNote || undefined, stronger });
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
-			if (weakDrove) {
+			// a stopping run had no tester round: its answer and its rounds stay as they were
+			if (weakDrove && !o.stopped?.()) {
 				const answer = lastTesterText.split("\n");
-				const couldNot = (l: string) => /\bcould not\b/i.test(l);
+				// the answer label right after the test name ("<test>: kept — <why>"), so the wording of a reason never changes how a line is classed
+				const label = (l: string, word: string) => l.match(/:\s*(fixed|kept|could not)\b/i)?.[1]?.toLowerCase() === word;
+				const couldNot = (l: string) => label(l, "could not");
 				// only a round that changed a test counts toward the waiver; one that changed nothing goes the normal red
 				// path, and the next weak-tests round runs on the escalate model
 				const progress = !!lastRetest?.progress;
@@ -1152,7 +1157,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				o.ledger.updateUnit(o.unitId, {
 					meta: {
 						...(progress ? { weakRounds: ++weakRounds } : {}),
-						testerKept: answer.filter((l) => /\bkept\b/i.test(l) && !couldNot(l)).join("\n").slice(-2000) || undefined,
+						testerKept: answer.filter((l) => label(l, "kept")).join("\n").slice(-2000) || undefined,
 						testerCouldNot: answer.filter(couldNot).join("\n").slice(-2000) || undefined,
 					},
 				});

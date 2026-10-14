@@ -313,8 +313,9 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	if (card.waitingStubs.length) L.push("", `## Stubs waiting for you: earlier units stubbed this unit's code, marked TODO(br:${card.unit.id}) (grep for it). Replace each stub that stands in for this unit's code with the real code, or point its callers at the real code, and remove the stub; you may edit these files for that: ${card.waitingStubs.join(", ")}`);
 	L.push("", "## Legacy callers (caller, unit, state, stack; who_calls for more) — keep behaviour compatible");
 	L.push(...(card.callers.length > 20 ? [...card.callers.slice(0, 20), `- (${card.callers.length - 20} more; who_calls)`] : card.callers.length ? card.callers : ["- none in the index (an entry point is reached by the framework)"]));
-	// the wiring rule next to the facts it applies to: who registers this unit's code follows from the callers' stack and state
-	if (card.wiring && card.callers.length)
+	// the wiring rule next to the facts it applies to: who registers this unit's code follows from the callers' stack and state.
+	// Only on a card whose session may write the wiring files (the implementer's, not the tester's)
+	if (card.wiring && card.callers.length && card.wiring.files.every((f) => card.writeGlobs.includes(f)))
 		L.push(`Wiring: a caller whose unit is on another stack than ${card.wiring.stack} can never register this unit's code, so register it yourself in ${card.wiring.files.join(", ")}. A caller whose unit is on ${card.wiring.stack} and not accepted yet registers it itself later: leave that to it.`);
 	if (card.dupCandidates.length) {
 		L.push("", "## Duplicate candidates (dedupe: keep one target symbol, prove the other as merged_into)");

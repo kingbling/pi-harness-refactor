@@ -261,7 +261,7 @@ describe("weak-tests-only reviews", () => {
 			calls,
 			async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"),
 			// it says "fixed" and "kept" but writes nothing (the cheap model admits it could not do the rewrite)
-			async (_o, _t, n) => (n === 1 ? "agency.service.spec.ts: fixed — the literal assertions still do not run the service\nTESTER DONE 0 cases" : "agency.service.spec.ts: kept — I could not safely replace them\nTESTER DONE 0 cases"),
+			async (_o, _t, n) => (n === 1 ? "agency.service.spec.ts: fixed — the literal assertions still do not run the service\nTESTER DONE 0 cases" : "agency.service.spec.ts: could not — I could not safely replace them\nTESTER DONE 0 cases"),
 		);
 		const spawn = (async (opts: SpawnOptions) => (opts.role === "test" && models.push(opts.modelOverride?.id), (inner as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts))) as never;
 		const inputs: ReviewInput[] = [];
@@ -293,6 +293,39 @@ describe("weak-tests-only reviews", () => {
 		expect(meta.testerCouldNot).toMatch(/could not — the service needs a database/);
 		expect(meta.weakTestsNote).toBeUndefined();
 		expect(r.state).not.toBe("review");
+	});
+
+	it("the answer label decides: a kept test whose reason says 'could not' is a reasoned kept, never a could-not", async () => {
+		const calls: Array<{ role: string; task: string }> = [];
+		const kept = "agency.service.spec.ts: kept — the legacy function could not return null, so the test is right";
+		const spawn = sessions(
+			calls,
+			async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"),
+			async (_o, _t, n) => (write(join(ws, "migrated", SPEC), `it('u1#1 creates ${n}', () => {});\n`), `${kept}\nTESTER DONE 1 cases`),
+		);
+		const inputs: ReviewInput[] = [];
+		const reviewer = async (i: ReviewInput) => (inputs.push(i), inputs.length === 1 ? { ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] } : { ok: true, judged: true, output: "fine", findings: [] });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
+		expect(inputs[1]!.testerKept).toBe(kept);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).testerCouldNot).toBeUndefined();
+	});
+
+	it("a stopping run's skipped tester round never counts toward the waiver", async () => {
+		const calls: Array<{ role: string; task: string }> = [];
+		let stop = false;
+		const spawn = sessions(
+			calls,
+			async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"),
+			async (_o, _t, n) => (write(join(ws, "migrated", SPEC), `it('u1#1 creates ${n}', () => {});\n`), "agency.service.spec.ts: fixed — it now runs the service\nTESTER DONE 1 cases"),
+		);
+		let reviews = 0;
+		const reviewer = async () => (reviews++, { ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
+		// the run is asked to stop after the second weak review, just before the tester's second round
+		const log = (m: string) => void (reviews === 2 && /tests are questioned/.test(m) && (stop = true));
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, stopped: () => stop, log });
+		expect(reviews).toBe(2);
+		expect(calls.filter((c) => c.role === "test" && !c.task.startsWith("You did not run check_ported_tests")).length).toBe(1);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakRounds).toBe(1);
 	});
 
 	it("count across runs of the unit: tester rounds of an earlier run count toward the waiver", async () => {
