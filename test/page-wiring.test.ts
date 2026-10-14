@@ -87,7 +87,7 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 
 	it("template data seam: the implementer finds the project's one shared data seam with its tools and never designs its own; stack choices only where the legacy code has that concern", () => {
 		const { config } = setup("planned");
-		const p = implementerSystemPrompt(config, { area: "offers", stackId: "react", moduleDir: "src/features/offers", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, writeGlobs: ["src/features/offers/**", ...reactAdapter.layout.wiringFiles!], source: { id: "php" } as never, target: reactAdapter });
+		const p = implementerSystemPrompt(config, { area: "offers", stackId: "react", moduleDir: "src/features/offers", structureDoc: "-", sharedDirs: [], rules: "", attempt: 1, writeGlobs: ["src/features/offers/**", ...react.layout.wiringFiles!], source: { id: "php" } as never, target: react });
 		expect(p).toMatch(/project's one shared data seam: find it with target_lookup \/ find_capability[^\n]*?use it as it is; never design a new one per page/);
 		expect(p).toMatch(/has none yet[^.]*say in your final line that the project has no shared data seam/);
 		expect(p).toMatch(/A choice applies only when the legacy code has that concern/);
