@@ -591,13 +591,16 @@ function normalizeErrorLine(line: string): string {
 		.trim();
 }
 
-/** The stack's build/lint commands that ignore the files they are given: they check the whole project. */
-export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ step: "build" | "lint"; cmd: string; args: string[] }> {
+/** The stack's build/lint commands that ignore the files they are given: they check the whole project. And its boot check, which always does. */
+export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ step: "build" | "lint" | "boot"; cmd: string; args: string[] }> {
 	const MARK = "\u0000unit-file";
 	const takesFiles = (c: { cmd: string; args: string[] }) => c.cmd === MARK || c.args.includes(MARK);
-	const out: Array<{ step: "build" | "lint"; cmd: string; args: string[] }> = [];
+	const out: Array<{ step: "build" | "lint" | "boot"; cmd: string; args: string[] }> = [];
 	if (!takesFiles(adapter.build(dir, [MARK]))) out.push({ step: "build", ...adapter.build(dir, []) });
 	if (!takesFiles(adapter.lint(dir, [MARK]))) out.push({ step: "lint", ...adapter.lint(dir, []) });
+	// the app's own start check: units that each pass can together leave an app that does not start
+	const boot = adapter.boot?.(dir);
+	if (boot?.cmd) out.push({ step: "boot", ...boot });
 	return out;
 }
 

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { saveCommandOverride, withCommandOverrides } from "../src/adapters/command-overrides.ts";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo } from "../src/git.ts";
@@ -199,5 +200,42 @@ describe("the builder", () => {
 		// after the cap: no question; with no code job to hand it to, main is parked red (br status)
 		expect(ledger.openQuestions()).toEqual([]);
 		expect(ledger.getMeta(buildParkedKey("fake"))).toMatch(/no code job/);
+	});
+
+	it("the stack's boot check (set per workspace like the other commands) is a whole-project step: an app that does not start is a red main", async () => {
+		const { root, config, adapter, ledger, mergeFix } = setup();
+		// build and lint take the unit's files: only the boot check runs on the whole project
+		const perUnit = { ...adapter, build: (_r: string, files: string[] = []) => ({ cmd: "true", args: files }), test: () => ({ cmd: "true", args: [] }) } as TargetAdapter;
+		expect(wholeProjectSteps(perUnit, root).map((s) => s.step)).toEqual([]);
+		saveCommandOverride(root, "fake", "boot", { cmd: "grep", args: ["-q", "ok", "src/a.txt"] }, "the app's own container check");
+		const booting = withCommandOverrides(perUnit, root);
+		expect(wholeProjectSteps(booting, root)).toEqual([{ step: "boot", cmd: "grep", args: ["-q", "ok", "src/a.txt"] }]);
+		const jobs: string[] = [];
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", booting]]), log: () => {}, linkAll: () => {}, mergeFix, codeJob: async (_s, what) => (jobs.push(what), undefined), every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await b.finish();
+		expect(jobs).toHaveLength(1);
+		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt\s+\(boot\)/);
+	});
+
+	it("a new app that did not start in the parity check goes to a code job as a main problem, once per main tree", async () => {
+		const { root, target, config, adapter, ledger, mergeFix } = setup();
+		const green = { ...adapter, build: () => ({ cmd: "true", args: [] }), test: () => ({ cmd: "true", args: [] }) } as TargetAdapter;
+		const jobs: string[] = [];
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", green]]), log: () => {}, linkAll: () => {}, mergeFix, codeJob: async (_s, what) => (jobs.push(what), undefined), every: { units: 5, minutes: 60 } });
+		b.appDown("fake", 'Specified non-existing directory "src/Players/Entity" as Doctrine mapping source');
+		await b.finish();
+		expect(jobs).toHaveLength(1);
+		expect(jobs[0]).toMatch(/the new fake app, started for the parity check[\s\S]*non-existing directory/);
+		// the same main again: not handed over twice
+		b.appDown("fake", "still down");
+		await b.finish();
+		expect(jobs).toHaveLength(1);
+		writeFileSync(join(target, "src", "b.txt"), "later\n");
+		commitAll(target, "a later merge");
+		b.appDown("fake", "down on the new main");
+		await b.finish();
+		expect(jobs).toHaveLength(2);
+		expect(jobs[1]).toMatch(/down on the new main/);
 	});
 });

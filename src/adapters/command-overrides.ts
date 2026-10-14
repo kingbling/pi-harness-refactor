@@ -7,8 +7,8 @@ export interface Cmd {
 	cmd: string;
 	args: string[];
 }
-/** testLenient: the test command with the runner's own flags so deprecations and notices alone do not fail a run. */
-export type CommandStep = "build" | "lint" | "test" | "testLenient";
+/** testLenient: the test command with the runner's own flags so deprecations and notices alone do not fail a run. boot: the app's own start check (whole project). */
+export type CommandStep = "build" | "lint" | "test" | "testLenient" | "boot";
 /** Per-workspace replacements of a stack's gate commands; `{files}` in an arg expands to the files (may be none). */
 export type CommandOverrides = Partial<Record<CommandStep, Cmd>> & {
 	why?: string;
@@ -89,6 +89,7 @@ export function withCommandOverrides(adapter: TargetAdapter, root: string | unde
 		lint: (r, files) => (o().lint ? expand(o().lint!, files) : adapter.lint(r, files)),
 		test: (r, files) => (o().test ? expand(o().test!, files) : adapter.test(r, files)),
 		testLenient: (r, files) => (o().testLenient ? expand(o().testLenient!, files) : adapter.testLenient?.(r, files)),
+		boot: (r) => (o().boot ? expand(o().boot!, []) : adapter.boot?.(r)),
 	};
 }
 

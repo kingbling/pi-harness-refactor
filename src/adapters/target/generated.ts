@@ -35,6 +35,8 @@ export interface AdapterManifest {
 	test: Cmd;
 	/** Applies every migration, in order, to a new empty throwaway database (a DB lane gate step). Older manifests and stacks without migrations have none. */
 	migrateFresh?: Cmd;
+	/** Loads the whole app the way it starts and exits, failing when it cannot start (a whole-project step). Older manifests have none. */
+	boot?: Cmd;
 	toolchain: {
 		ecosystem: string;
 		packageName: string;
@@ -174,6 +176,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 		lint: (root, files) => expand(m.lint, { dir: root, files }),
 		test: (root, related) => expand(m.test, { dir: root, files: related }),
 		...(m.migrateFresh?.cmd ? { migrateFresh: (root: string) => expand(m.migrateFresh!, { dir: root }) } : {}),
+		...(m.boot?.cmd ? { boot: (root: string) => expand(m.boot!, { dir: root }) } : {}),
 		protectedGlobs: m.protectedGlobs,
 		generatedFiles: [],
 		patternKinds: m.patternKinds,
@@ -209,12 +212,12 @@ function installedPackages(m: AdapterManifest, dir: string): string[] {
 const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "cmd", "cmd.exe", "powershell", "pwsh", "eval", "exec", "env", "xargs", "sudo", "su", "doas"]);
 /** Every command a manifest would run, for the owner to see before anything runs. */
 export function manifestCommands(m: AdapterManifest): string[] {
-	return [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`after scaffold ${i + 1}`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ...(m.migrateFresh?.cmd ? [["migrate fresh", m.migrateFresh] as const] : []), ["add packages", m.toolchain.add], ...(m.toolchain.installed?.list?.cmd ? [["list packages", m.toolchain.installed.list] as const] : [])].map(([k, c]) => `${k}: ${(c as Cmd).cmd} ${(c as Cmd).args.join(" ")}`);
+	return [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`after scaffold ${i + 1}`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ...(m.migrateFresh?.cmd ? [["migrate fresh", m.migrateFresh] as const] : []), ...(m.boot?.cmd ? [["boot", m.boot] as const] : []), ["add packages", m.toolchain.add], ...(m.toolchain.installed?.list?.cmd ? [["list packages", m.toolchain.installed.list] as const] : [])].map(([k, c]) => `${k}: ${(c as Cmd).cmd} ${(c as Cmd).args.join(" ")}`);
 }
 /** Problems that make a manifest unusable; empty = structurally sound (it still has to pass verification). */
 export function validateManifest(m: AdapterManifest): string[] {
 	const out: string[] = [];
-	for (const [k, c] of [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`postScaffold[${i}]`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ...(m.migrateFresh?.cmd ? [["migrateFresh", m.migrateFresh] as const] : []), ["toolchain.add", m.toolchain?.add], ...(m.toolchain?.installed?.list?.cmd ? [["toolchain.installed.list", m.toolchain.installed.list] as const] : [])] as const) {
+	for (const [k, c] of [["scaffold", m.scaffold], ...(m.postScaffold ?? []).map((c, i) => [`postScaffold[${i}]`, c] as const), ["build", m.build], ["lint", m.lint], ["test", m.test], ...(m.migrateFresh?.cmd ? [["migrateFresh", m.migrateFresh] as const] : []), ...(m.boot?.cmd ? [["boot", m.boot] as const] : []), ["toolchain.add", m.toolchain?.add], ...(m.toolchain?.installed?.list?.cmd ? [["toolchain.installed.list", m.toolchain.installed.list] as const] : [])] as const) {
 		if (!c || typeof c.cmd !== "string" || !Array.isArray(c.args)) {
 			out.push(`${k}: needs cmd + args`);
 			continue;
@@ -337,6 +340,7 @@ export const MANIFEST_SCHEMA = obj({
 	lint: CMD,
 	test: CMD,
 	migrateFresh: CMD,
+	boot: CMD,
 	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA, list: CMD, listPattern: S }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
 	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, suppressMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
 	platform: MAP,
@@ -362,6 +366,7 @@ const SYSTEM = [
 	"- layout.skipMarker: a regex matching a test that is skipped, focused or left incomplete in this stack: every skip, only and incomplete call or annotation its test runner has (from its docs), so a placeholder test is caught.",
 	"- layout.suppressMarker: a regex matching a comment or annotation that silences this stack's type checker, compiler warnings or linter for a line or a file (every such form the tools have, from their docs), so code that hides an error instead of fixing it is caught.",
 	"- migrateFresh: one command that applies every migration of the project, in order, to a NEW EMPTY throwaway database (in-memory, or a temporary one the command itself points at; never the dev, legacy or production database), and fails when a migration cannot be applied. {cmd: \"\", args: []} when the stack has no migrations.",
+	"- boot: one command that loads the whole app the way it starts and then exits (the framework's own start, config or container check from its docs), and fails when the app cannot start (a missing folder in config, a service or route that cannot be built). Never a server, watch mode or database. {cmd: \"\", args: []} when the stack has no such check.",
 	"- platform: concern → what the target stack uses for it (http, routing, orm, rendering, auth, cache, mail, jobs, events, i18n, logging, tests, …).",
 	"- stackChoices: the real decisions within this stack (2–4 options each, packages to install per option, default = the idiomatic one).",
 	"- probeTest: the smallest passing test file for a FRESH generated project, at a path the test command picks up. failing: the same file with only the expected value made wrong (e.g. 1 + 1 expected to equal 3), so the test runs and FAILS; the tool checks that the test command fails on it.",
@@ -566,7 +571,7 @@ export async function verifyPendingAdapters(
 /** Executables a manifest runs that are not on PATH (project-relative ones appear after scaffolding). */
 export function missingTools(m: AdapterManifest): string[] {
 	const dirs = (process.env["PATH"] ?? "").split(delimiter).filter(Boolean);
-	const cmds = [m.scaffold, ...(m.postScaffold ?? []), m.build, m.lint, m.test, ...(m.migrateFresh?.cmd ? [m.migrateFresh] : []), m.toolchain.add, ...(m.toolchain.installed?.list?.cmd ? [m.toolchain.installed.list] : [])].map((c) => c.cmd).filter((c) => !c.includes("/"));
+	const cmds = [m.scaffold, ...(m.postScaffold ?? []), m.build, m.lint, m.test, ...(m.migrateFresh?.cmd ? [m.migrateFresh] : []), ...(m.boot?.cmd ? [m.boot] : []), m.toolchain.add, ...(m.toolchain.installed?.list?.cmd ? [m.toolchain.installed.list] : [])].map((c) => c.cmd).filter((c) => !c.includes("/"));
 	return [...new Set(cmds)].filter((c) => !dirs.some((d) => existsSync(join(d, c))));
 }
 
@@ -583,6 +588,7 @@ function fromModel(json: unknown, id: string, role: "server" | "ui"): AdapterMan
 		platform: asMap(j.platform),
 		layout: { ...j.layout, langByExtension: asMap(j.layout?.langByExtension) },
 		migrateFresh: j.migrateFresh?.cmd ? j.migrateFresh : undefined,
+		boot: j.boot?.cmd ? j.boot : undefined,
 		stackChoices: (j.stackChoices ?? []).map((c) => ({ ...c, options: c.options.map((o) => ({ ...o, platform: asMap(o.platform) })) })),
 	};
 }
@@ -610,7 +616,7 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 		mkdirSync(dirname(join(dir, probe.path)), { recursive: true });
 		writeFileSync(join(dir, probe.path), probe.content);
 		if (!a.layout.isTestFile(probe.path)) return `probeTest.path ${probe.path} does not match layout.testFileRegex ${m.layout.testFileRegex}`;
-		for (const [step, c] of [["build", a.build(dir)], ["test", a.test(dir, [probe.path])], ...(a.migrateFresh ? [["migrateFresh", a.migrateFresh(dir)] as const] : [])] as const) {
+		for (const [step, c] of [["build", a.build(dir)], ["test", a.test(dir, [probe.path])], ...(a.migrateFresh ? [["migrateFresh", a.migrateFresh(dir)] as const] : []), ...(a.boot ? [["boot", a.boot(dir)!] as const] : [])] as const) {
 			try {
 				await runCommand(c.cmd, c.args, { cwd: dir });
 			} catch (e: any) {

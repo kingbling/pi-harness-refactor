@@ -270,4 +270,12 @@ describe("stack knowledge is checked when the adapter is written", () => {
 		expect(fromManifest(manifest()).migrateFresh).toBeUndefined();
 		expect(validateManifest(manifest({ migrateFresh: { cmd: "sh", args: ["-c", "x"] } })).join("\n")).toMatch(/migrateFresh.*shell/);
 	});
+
+	it("the model's boot check is checked like the others and passed on; an empty one is none", () => {
+		const m = manifest({ boot: { cmd: "bin/app", args: ["check"] } });
+		expect(validateManifest(m)).toEqual([]);
+		expect(fromManifest(m).boot!("/p")).toEqual({ cmd: "bin/app", args: ["check"] });
+		expect(fromManifest(manifest({ boot: { cmd: "", args: [] } })).boot).toBeUndefined();
+		expect(validateManifest(manifest({ boot: { cmd: "sh", args: ["-c", "x"] } })).join("\n")).toMatch(/boot.*shell/);
+	});
 });
