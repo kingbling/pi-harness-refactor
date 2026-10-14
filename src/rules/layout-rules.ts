@@ -139,8 +139,12 @@ const banned = (r: LayoutRules, d: string) => r.forbidDirs.some((b) => b.toLower
 const KEBAB_RE = new RegExp(`^${KEBAB}$`);
 
 /** First folders other patterns name literally (dto, entities …) plus the banned names: never a {sub} (lower case). */
+const reservedCache = new WeakMap<LayoutRules, Set<string>>();
 function reservedSubs(r: LayoutRules): Set<string> {
+	const hit = reservedCache.get(r);
+	if (hit) return hit;
 	const out = new Set(r.forbidDirs.map((d) => d.toLowerCase()));
+	reservedCache.set(r, out);
 	for (const f of r.files) {
 		const first = f.path.split("/")[0]!;
 		if (f.path.includes("/") && /^[A-Za-z0-9_.-]+$/.test(first)) out.add(first.toLowerCase());
@@ -365,6 +369,8 @@ export async function checkLayoutTree(projectDir: string, r: LayoutRules, o: Lay
 	const out: string[] = [];
 	const dirs = listDirs(join(projectDir, root), o.ignoreDirs).filter((d) => !skip.has(d));
 	for (const d of dirs) {
+		// a big tree: Pi draws between the area folders
+		await new Promise((res) => setImmediate(res));
 		const area = placeholder === "{area}" ? d : d.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/_/g, "-").toLowerCase();
 		const mod = expandModuleDir(r, area);
 		if (mod.split("/").at(-1) !== d || !KEBAB_RE.test(area) || banned(r, d)) {

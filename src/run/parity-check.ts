@@ -68,7 +68,7 @@ const stepsPath = (root: string, slice: string) => join(sliceDir(root, slice), "
 
 /** The slice's routes on the old side ("GET /invoices") and its units' legacy files. */
 export function sliceFacts(ledger: Ledger, slice: string): { routes: string[]; files: string[]; units: Array<{ id: string; state: string }> } {
-	const units = ledger.listUnits().filter((u) => (JSON.parse(u.meta) as { slice?: string }).slice === slice);
+	const units = ledger.db.prepare("SELECT id, state, meta FROM units WHERE json_extract(meta, '$.slice') = ?").all(slice) as Array<{ id: string; state: string; meta: string }>;
 	const files = units.flatMap((u) => (JSON.parse(u.meta) as { files?: string[] }).files ?? []);
 	const own = new Set(files);
 	const rows = ledger.db.prepare("SELECT method, path, handler_symbol FROM index_routes WHERE side = 'source'").all() as Array<{ method: string | null; path: string; handler_symbol: string | null }>;

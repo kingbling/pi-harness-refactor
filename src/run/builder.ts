@@ -54,7 +54,7 @@ export const buildParkedKey = (stackId: string) => `build_parked:${stackId}`;
 export function reopenBroken(ledger: Ledger, problem: string): string[] {
 	const cases = ledger.db.prepare("SELECT tc.id, tc.unit_id, u.meta FROM truth_cases tc JOIN units u ON u.id = tc.unit_id WHERE u.state = 'accepted'").all() as Array<{ id: string; unit_id: string; meta: string }>;
 	const failing = new Map<string, string[]>();
-	for (const c of cases) if (mentionsCase(problem, c.id)) failing.set(c.unit_id, [...(failing.get(c.unit_id) ?? []), c.id]);
+	for (const c of cases) if (problem.includes(c.id) && mentionsCase(problem, c.id)) failing.set(c.unit_id, [...(failing.get(c.unit_id) ?? []), c.id]);
 	const out: string[] = [];
 	for (const [unitId, ids] of failing) {
 		const n = (JSON.parse(ledger.getUnit(unitId)!.meta) as { buildReopens?: number }).buildReopens ?? 0;
@@ -180,7 +180,8 @@ export function createBuilder(o: {
 	const down = new Map<string, string>();
 	const downTrees = new Set<string>();
 	const ignored = (sig: string) =>
-		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND json_extract(context, '$.sameAs') = ? AND status IN ('answered', 'auto') ORDER BY id DESC LIMIT 1").get(sig) as { answer: string } | undefined)?.answer === "ignore";
+		// instr() first: json_extract on every build question's context held Pi's thread for ~0.2 s
+		(o.ledger.db.prepare("SELECT answer FROM questions WHERE point = 'build' AND status IN ('answered', 'auto') AND instr(context, ?) > 0 AND json_extract(context, '$.sameAs') = ? ORDER BY id DESC LIMIT 1").get(JSON.stringify(sig).slice(1, -1), sig) as { answer: string } | undefined)?.answer === "ignore";
 	let last = Date.now();
 	let running: Promise<void> | undefined;
 	let stopped = false;

@@ -1502,7 +1502,9 @@ const OPEN_DEP = "du.state != 'accepted' AND json_extract(du.meta, '$.exclude') 
  */
 export function applyParityAnswers(ledger: Ledger): string[] {
 	const slices: string[] = [];
-	for (const q of ledger.db.prepare("SELECT unit_id, MAX(id) AS id FROM questions WHERE point = 'parity' AND answer IS NOT NULL AND unit_id IS NOT NULL GROUP BY unit_id").all() as Array<{ unit_id: string; id: number }>) {
+	// answers already applied are skipped in SQL: reading every unit's meta in JS held Pi's thread for ~0.2 s
+	const answered = `SELECT unit_id, MAX(id) AS id FROM questions WHERE point = 'parity' AND answer IS NOT NULL AND unit_id IS NOT NULL GROUP BY unit_id`;
+	for (const q of ledger.db.prepare(`SELECT a.unit_id, a.id FROM (${answered}) a JOIN units u ON u.id = a.unit_id WHERE COALESCE(json_extract(u.meta, '$.parityRetried'), -1) != a.id`).all() as Array<{ unit_id: string; id: number }>) {
 		const meta = JSON.parse(ledger.getUnit(q.unit_id)?.meta ?? "{}") as { parityRetried?: number; slice?: string };
 		if (meta.parityRetried === q.id) continue;
 		const question = ledger.getQuestion(q.id);

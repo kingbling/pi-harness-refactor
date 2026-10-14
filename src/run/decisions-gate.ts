@@ -25,11 +25,23 @@ export interface DecisionGate {
 	blocked: Map<string, string[]>;
 }
 
+/**
+ * The framework plan reads the whole inventory (~0.4 s on a big ledger, on Pi's thread): it only changes when the
+ * inventory does, so it is kept until the inventory tables grow or shrink.
+ */
+let planCache: { key: string; plan: ReturnType<typeof planFrameworks> } | undefined;
+function cachedPlan(ledger: Ledger, source: SourceAdapter, targets: TargetAdapter[], sourceRoot: string): ReturnType<typeof planFrameworks> {
+	const row = ledger.db.prepare("SELECT (SELECT COUNT(*) FROM files) || ':' || (SELECT MAX(rowid) FROM index_deps) || ':' || (SELECT MAX(rowid) FROM code_calls) || ':' || (SELECT MAX(rowid) FROM index_symbols) AS k").get() as { k: string };
+	const key = `${ledger.db.location() ?? ""}|${sourceRoot}|${targets.map((t) => t.id).join(",")}|${row.k}`;
+	if (planCache?.key !== key) planCache = { key, plan: planFrameworks(ledger, source, targets, sourceRoot) };
+	return planCache.plan;
+}
+
 export async function decisionGate(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string): Promise<DecisionGate> {
 	const open = await openDecisions(ledger, config, source, targets, root);
 	const gate: DecisionGate = { global: [], scoped: [], free: [], blocked: new Map() };
 	if (!open.length) return gate;
-	const plan = open.some((d) => d.id.startsWith("fw:")) ? planFrameworks(ledger, source, targets, config.source.path) : undefined;
+	const plan = open.some((d) => d.id.startsWith("fw:")) ? cachedPlan(ledger, source, targets, config.source.path) : undefined;
 	const unitsCalling = (path: string, cls: string): string[] =>
 		(
 			ledger.db

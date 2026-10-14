@@ -213,7 +213,9 @@ export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root
 	const redone: string[] = [];
 	let red = 0;
 	let noScript = 0;
-	for (const id of ids) {
+	for (const [i, id] of ids.entries()) {
+		// thousands of units: Pi draws in between
+		if (i % 50 === 49) await new Promise((r) => setImmediate(r));
 		const u = o.ledger.getUnit(id);
 		if (!u || !["accepted", "planned", "quarantined"].includes(u.state)) continue;
 		const meta = JSON.parse(u.meta) as { files?: string[]; truthUpgradeEnv?: string };
