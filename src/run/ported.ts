@@ -289,6 +289,13 @@ export async function holds(dir: string, sha: string): Promise<boolean> {
 	}
 }
 
+/** `file` (relative to `dir`) is the same in the worktree as at `sha`, or missing in both. */
+export async function sameAsAt(dir: string, sha: string, file: string): Promise<boolean> {
+	const here = existsSync(join(dir, file)) ? readFileSync(join(dir, file), "utf8") : undefined;
+	const there = await exec("git", ["-C", dir, "show", `${sha}:./${file}`]).catch(() => undefined);
+	return here === there;
+}
+
 /**
  * Brings main's commits since the worktree was made into it, the work in it kept uncommitted on top as before: it is
  * committed, the branch rebased onto main (`to`, else the commit main's checkout `mainDir` is on), and the commit

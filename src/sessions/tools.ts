@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
-import { catchUpWithMain, caseCoverage, checkTests, holds, ownTests, runPortedTests } from "../run/ported.ts";
+import { catchUpWithMain, caseCoverage, checkTests, holds, ownTests, runPortedTests, sameAsAt } from "../run/ported.ts";
 import { buildFiles, changedFiles, clipOutput, othersTestsChanged } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
@@ -498,7 +498,9 @@ export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 				const caught = d.mainDir ? await catchUpWithMain(d.targetProjectDir, d.mainDir) : undefined;
 				if (await holds(d.targetProjectDir, commit)) return text(`${owner}'s accepted code was merged into main after your worktree was made, so you did not see it. Main's new commits are now in your worktree: read ${file} again and report only a bug that is still there. Nothing was reported.`, { error: true });
 				const clash = caught && "clash" in caught ? ` because main's new commits clash with your changes in ${caught.clash.join(", ") || "some files"}` : "";
-				return text(`${owner}'s accepted code is on main but not in your worktree${clash}, so ${file} here is older than ${owner}'s. Read it as merged (git show ${commit.slice(0, 12)}:${file}), keep your change compatible with it, and report only a bug that is in that code. Nothing was reported; the merge of this unit brings ${owner}'s code in.`, { error: true });
+				// the file is here as the owner left it (or missing in both): the bug is in the owner's code, report it
+				if (!(await sameAsAt(d.targetProjectDir, commit, file)))
+					return text(`${owner}'s accepted code is on main but not in your worktree${clash}, so ${file} here is older than ${owner}'s. Read it as merged (git show ${commit.slice(0, 12)}:${file}), keep your change compatible with it, and report only a bug that is in that code. Nothing was reported; the merge of this unit brings ${owner}'s code in. A report about ${file} goes through only once it is here as ${owner} left it, so for a bug in that code describe the gap in your final message instead of reporting it again.`, { error: true });
 			}
 			// this unit changed the file itself: what looks wrong may be its own change, not the owner's code
 			const mine = await changedFiles(d.targetProjectDir, d.adapter.toolchain.ignoredPaths).catch(() => [] as string[]);

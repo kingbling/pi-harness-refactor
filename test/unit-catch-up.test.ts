@@ -76,6 +76,7 @@ describe("a worktree that could not take main's new commits", () => {
 		const repo = join(ws, "migrated");
 		write(join(repo, "package.json"), "{}");
 		write(join(repo, "src/shared/port.ts"), "export interface Port {}\n");
+		write(join(repo, "src/shared/format.ts"), "export function format() {}\n");
 		write(join(repo, "src/features/agency/agency.service.spec.ts"), "it('u1#1 creates an agency', () => {});\n");
 		git(repo, "init", "-q");
 		git(repo, "add", "-A");
@@ -98,6 +99,7 @@ describe("a worktree that could not take main's new commits", () => {
 		ledger.createUnit({ id: "d1", tier: "T0", deps: [], meta: { commit }, symbolIds: ["app/list.php::list"] });
 		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'd1'").run();
 		ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES ('d1', 'app/list.php::list', 'moved', '[\"src/shared/list.ts::ListCommand\"]', 'x', 't')").run();
+		ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES ('d1', 'app/list.php::list', 'moved', '[\"src/shared/format.ts::format\"]', 'x', 't')").run();
 		write(join(ws, ".bigrefactor", "truth", "u1", "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
 		ledger.addEvidence("u1", "truth_green_on_old", {});
 		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
@@ -141,6 +143,21 @@ describe("a worktree that could not take main's new commits", () => {
 		expect(existsSync(join(wt, "src/shared/list.ts"))).toBe(true);
 		expect(reports).toEqual([]);
 		expect((await tool.execute("x", { ...report, problem: "list() skips archived assets" })).content[0]!.text).toMatch(/^reported to d1/);
+		expect(reports).toEqual(["d1"]);
+		ledger.close();
+	});
+
+	it("a clash: a report about a file that is here as the owner left it still goes through", async () => {
+		const { repo, wt, config, ledger } = setup("unit-catch-up-clash-same");
+		write(join(wt, "src/shared/port.ts"), "export interface Port { create(): void }\n");
+		const reports: string[] = [];
+		const tool = reportMigratedBugTool({ ledger, config, unitId: "u1", root: wt, targetProjectDir: wt, mainDir: repo, adapter: nestjsAdapter, onReport: (r) => reports.push(r.owner) } as ToolDeps) as unknown as Tool;
+		// the clash keeps the worktree behind main, but format.ts is the same here as in d1's commit
+		expect((await tool.execute("x", { target: "src/shared/format.ts::format", problem: "format() drops the currency", evidence: "legacy list.php adds it" })).content[0]!.text).toMatch(/^reported to d1/);
+		expect(reports).toEqual(["d1"]);
+		expect(git(wt, "rev-parse", "HEAD")).not.toBe(git(repo, "rev-parse", "HEAD"));
+		// list.ts is not here yet: still refused, and told not to report it again
+		expect((await tool.execute("x", report)).content[0]!.text).toMatch(/Nothing was reported[\s\S]*describe the gap in your final message/);
 		expect(reports).toEqual(["d1"]);
 		ledger.close();
 	});
