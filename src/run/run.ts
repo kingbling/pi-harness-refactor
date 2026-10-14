@@ -1060,8 +1060,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
 				const candidates = await ready();
 				readyNow = candidates.length;
+				// one unit per target module also within this pass: ready() only knows the modules busy before it
+				const startedModules = new Set<string>();
 				for (const id of candidates) {
 					if (running.size >= laneLimit || !underLimit()) break;
+					const moduleKey = placementOf(ledger.getUnit(id)!.meta).moduleKey;
+					if (startedModules.has(moduleKey)) continue;
+					startedModules.add(moduleKey);
 					startUnit(id);
 					readyNow--;
 				}
