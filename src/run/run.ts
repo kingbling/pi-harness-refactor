@@ -40,6 +40,7 @@ import { findTests, warmMainCache } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
+import { createStubSweep } from "./stub-sweep.ts";
 import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
@@ -382,6 +383,19 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				return sha;
 			}),
 	});
+	// stubs on main no unit will replace (owner accepted or no unit): after merges a code job gets them, each once
+	const stubSweep = o.setupFixer === false || (!o.setupFixer && o.spawn) || o.dry
+		? undefined
+		: createStubSweep({
+				ledger,
+				log,
+				dirOf: (stackId) => projectDir(config, stackId),
+				codeJob: async (stackId, what) => {
+					let merged: string | undefined;
+					const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `stubs-${stackId}-${Date.now()}`, linkAll, log, what, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+					if (said) noteFix(o.root, stackId, merged, `stub sweep code job: ${said}`);
+				},
+			});
 	// parity: can the old app and the new app each start here as a local server? decided once per workspace, on the
 	// side (lanes never wait); a side that does not start asks the owner once, blocking nothing
 	const probeAsk: { ask: ProbeAsker; answer: ProbeAnswer } = {
@@ -775,6 +789,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 						if (!o.dry) {
 							builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							pusher.afterMerge();
+							void stubSweep?.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							// only a route owner's accept changes what is compared; a slice never compared is queued once
 							const sl = sliceOf(unitId);
 							if (sl && (routeOwners(ledger, sl).some((u) => u.id === unitId) || !parityAgain(ledger).checked.has(sl))) queueParity(sl);
@@ -1168,6 +1183,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
 	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
+	// a stub sweep's code job finishes (it merges on main) before the run ends
+	if (stubSweep) await waitOn("a code job is replacing stubs no unit will replace", () => stubSweep.idle());
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)
 	if (!o.dry && !stopRecord) await waitOn("whole-project check of what was merged", () => builder.finish()).catch((e) => log(pc.yellow(`builder: ${e?.message ?? e}`)));
 	// a stop kills the builder's running check and waits for a running repair or code job: nothing of it outlives the run
