@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -13,7 +13,7 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { legacyCopyTool, loadLegacyEnv, ownerPreference, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
 import { exec } from "../proc.ts";
-import { rm } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { setStep } from "./watchdog.ts";
 
 /**
@@ -279,6 +279,12 @@ export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeou
 	return { ok: true };
 }
 
+/**
+ * The biggest data dump that is read. Reading and parsing a dump holds the run's thread: a dump of a whole production
+ * database (over 512 MB) held it 10 s on every try and then failed anyway ("Cannot create a string longer than …").
+ */
+export const MAX_DUMP_MB = 100;
+
 /** The app's data as {table: rows}, from the recipe's dump command. Throws when it prints anything else. */
 export async function dumpData(recipe: AppRecipe, appDir: string): Promise<Record<string, unknown[]>> {
 	if (!recipe.dump) return {};
@@ -294,7 +300,10 @@ export async function dumpData(recipe: AppRecipe, appDir: string): Promise<Recor
 		} finally {
 			closeSync(fd);
 		}
-		outText = readFileSync(join(tmp, "dump.json"), "utf8");
+		// too big: not read at all (the size alone says so), and the setup model learns what to change
+		const mb = statSync(join(tmp, "dump.json")).size / (1024 * 1024);
+		if (mb > MAX_DUMP_MB) throw new Error(`the dump printed ${Math.round(mb)} MB, more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables the app's routes write, not the whole database`);
+		outText = await readFile(join(tmp, "dump.json"), "utf8");
 	} finally {
 		await rm(tmp, { recursive: true, force: true });
 	}
@@ -323,7 +332,7 @@ const RecipeParams = Type.Object({
 	stopArgs: Type.Optional(Type.Array(Type.String())),
 	resetCmd: Type.Optional(Type.String({ description: "puts the app's data back to its starting state (e.g. reloads the database from the schema/snapshot); runs before every start" })),
 	resetArgs: Type.Optional(Type.Array(Type.String())),
-	dumpCmd: Type.Optional(Type.String({ description: 'prints the app\'s data as JSON {"table": [rows ordered by primary key]}, nothing else on stdout' })),
+	dumpCmd: Type.Optional(Type.String({ description: `prints the app's data as JSON {"table": [rows ordered by primary key]}, nothing else on stdout; at most ${MAX_DUMP_MB} MB (a small test data set or the tables the app writes, not a whole production database)` })),
 	dumpArgs: Type.Optional(Type.Array(Type.String())),
 	env: Type.Optional(Type.Record(Type.String(), Type.String())),
 	why: Type.Optional(Type.String()),
