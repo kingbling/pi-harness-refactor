@@ -337,7 +337,7 @@ export function clipOutput(out: string, max = 6000, saveTo?: string): string {
 	// each distinct message with its count, most frequent first: one shared cause behind 80 failed tests shows at once
 	const counts = new Map<string, number>();
 	for (const i of messages) {
-		const m = listed.kept[i]!.trim().slice(0, 240);
+		const m = listed.kept[i]!.trim().slice(0, 400);
 		counts.set(m, (counts.get(m) ?? 0) + 1);
 	}
 	const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 8);
