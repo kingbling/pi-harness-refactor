@@ -9,7 +9,7 @@ import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { loadSteps, sliceFacts } from "./parity-check.ts";
-import { loadApps, saveApp } from "./parity.ts";
+import { fixUpLeft, loadApps, saveApp } from "./parity.ts";
 import { askPendingQuirks, recordQuirk } from "./quirks.ts";
 import { reopenUnit } from "./recheck.ts";
 
@@ -141,7 +141,7 @@ export async function judgeRun(o: { ledger: Ledger; config: Config; root: string
 			if (g.verdict === "setup") {
 				// no unit is re-opened for how an app runs here: that app's parity setup is asked (once) to fix it
 				for (const d of these) set.run("setup", null, null, `${g.app}: ${g.problem}`, d.id);
-				if (!apps[g.app!]!.setupProbed) saveApp(o.root, g.app!, { setupProblem: `${these.map(describe).join("; ").slice(0, 1000)} — ${g.problem}` });
+				if (fixUpLeft(apps[g.app!], "setup")) saveApp(o.root, g.app!, { setupProblem: `${these.map(describe).join("; ").slice(0, 1000)} — ${g.problem}` });
 				setup += these.length;
 			} else if (g.verdict === "bug") {
 				for (const d of these) set.run("bug", g.unit, null, `${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`, d.id);

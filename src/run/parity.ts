@@ -52,20 +52,59 @@ export interface AppState {
 	/** The new app only: the main commit the last probe ran at, and how many probes in a row were red. */
 	commit?: string;
 	redProbes?: number;
-	/** Set once an app that was up was probed again to add a data reset and dump (asked once, whatever came of it). */
+	/** Set once an app that was up was probed again to add a data reset and dump (older workspaces; now dataProbes). */
 	dataProbed?: boolean;
+	/** How often an app that was up was probed again to add a data reset and dump (at most MAX_FIXUPS). */
+	dataProbes?: number;
 	/** The old app only: a slice check saw it answer with a redirect to itself on another scheme (http → https), so no handler was reached. */
 	selfRedirect?: string;
-	/** Set once the old app was probed again over that redirect (asked once, whatever came of it). */
+	/** Set once the old app was probed again over that redirect (older workspaces; now redirectProbes). */
 	redirectProbed?: boolean;
-	/** The parity judge found a difference that only this app's setup here causes (what and why). */
+	/** How often the old app was probed again over that redirect (at most MAX_FIXUPS). */
+	redirectProbes?: number;
+	/** A slice check found a problem that only this app's setup here causes (what and why): a difference the parity
+	 * judge blamed on the setup, or the old app not starting (its data reset failing). */
 	setupProblem?: string;
-	/** Set once the app was probed again over such a problem (asked once, whatever came of it). */
+	/** Set once the app was probed again over such a problem (older workspaces; now setupProbes). */
 	setupProbed?: boolean;
+	/** How often the app was probed again over such a problem (at most MAX_FIXUPS). */
+	setupProbes?: number;
 	at?: string;
 }
 
 export const LEGACY = "legacy";
+
+/** An app that is up is probed again over the same kind of problem at most this often (a model that gave up once may not twice). */
+export const MAX_FIXUPS = 3;
+const fixUps = (a: AppState, kind: "data" | "redirect" | "setup") =>
+	kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
+/** Whether the app may still be probed again over this kind of problem. */
+export const fixUpLeft = (a: AppState | undefined, kind: "data" | "redirect" | "setup") => !!a && fixUps(a, kind) < MAX_FIXUPS;
+
+/** A command's error for a person or a model: no colour codes, the start (the tool's own message) and the end (a traceback's last line). */
+export function clipError(e: any, n = 1_200): string {
+	const t = ([e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n") || String(e?.message ?? e)).replace(/\x1b\[[0-9;]*m/g, "");
+	return t.length <= n ? t : `${t.slice(0, Math.floor(n * 0.4))}\n…\n${t.slice(-Math.ceil(n * 0.6))}`;
+}
+
+/**
+ * The request a slice check saw redirected to the app itself on another scheme ("POST /x → 301 https://(this app)/x"),
+ * sent again over plain http: what it answers when it still redirects that way, else undefined.
+ */
+export async function stillRedirects(ready: string, selfRedirect: string): Promise<string | undefined> {
+	const m = /^(\S+) (\S+) →/.exec(selfRedirect);
+	if (!m) return undefined;
+	const url = new URL(m[2]!, ready);
+	try {
+		const r = await fetch(url, { method: m[1], redirect: "manual", signal: AbortSignal.timeout(10_000) });
+		const to = r.headers.get("location");
+		if (r.status < 300 || r.status >= 400 || !to) return undefined;
+		const loc = new URL(to, url);
+		return loc.hostname === url.hostname && loc.protocol !== url.protocol ? `${m[1]} ${m[2]} → ${r.status} ${to}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
 const parityDir = (root: string) => join(root, ".bigrefactor", "parity");
 const appsPath = (root: string) => join(parityDir(root), "apps.json");
 
@@ -168,7 +207,7 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 		try {
 			await exec(recipe.reset.cmd, recipe.reset.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: 300_000 });
 		} catch (e: any) {
-			return { ok: false, error: `the data reset failed: ${[e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || e?.message}` };
+			return { ok: false, error: `the data reset failed: ${clipError(e)}` };
 		}
 	const tail: string[] = [];
 	const child = spawn(recipe.start.cmd, recipe.start.args, { cwd, detached: true, env: { ...process.env, ...recipe.env, CI: "1" }, stdio: ["ignore", "pipe", "pipe"] });
@@ -222,17 +261,21 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 }
 
 /** Start, check, stop: what code (and the model's check_app_boot) runs to decide a recipe works. */
-export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number } = {}): Promise<{ ok: boolean; error?: string; dumpFailed?: boolean }> {
+export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number; selfRedirect?: string } = {}): Promise<{ ok: boolean; error?: string; dumpFailed?: boolean; redirectFailed?: boolean }> {
 	const b = await bootApp(recipe, appDir, o);
 	if (!b.ok) return b;
+	let still: string | undefined;
 	try {
+		// the request a slice check saw redirected to the app itself: plain http must reach its handler now
+		still = o.selfRedirect ? await stillRedirects(recipe.ready, o.selfRedirect) : undefined;
 		if (recipe.dump) await dumpData(recipe, appDir);
 	} catch (e: any) {
 		// the app came up after the reset ran, so the reset works: say so, it can be kept without the dump
-		return { ok: false, dumpFailed: true, error: `the app starts${recipe.reset ? " and the data reset works" : ""}, but the data dump fails: ${String(e?.message ?? e).slice(-800)}` };
+		return { ok: false, dumpFailed: true, redirectFailed: !!still, error: `the app starts${recipe.reset ? " and the data reset works" : ""}, but the data dump fails: ${clipError(e, 800)}${still ? `; and plain http still only redirects to the app itself: ${still}` : ""}` };
 	} finally {
 		await b.stop();
 	}
+	if (still) return { ok: false, redirectFailed: true, error: `the app starts${recipe.dump ? " and dumps its data" : ""}, but plain http still only redirects to the app itself: ${still}. No request reaches a handler, so nothing can be compared.` };
 	return { ok: true };
 }
 
@@ -246,7 +289,8 @@ export async function dumpData(recipe: AppRecipe, appDir: string): Promise<Recor
 	try {
 		const fd = openSync(join(tmp, "dump.json"), "w");
 		try {
-			await exec(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdout: fd });
+			// a real database dump takes minutes (all tables as JSON)
+			await exec(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, timeout: 600_000, maxBuffer: 64 * 1024 * 1024, stdout: fd });
 		} finally {
 			closeSync(fd);
 		}
@@ -309,15 +353,15 @@ export function appBootTools(config: Config, root: string, side: string): ToolDe
 	const check = {
 		name: "check_app_boot",
 		label: "Try starting the app",
-		description: "Start the app with this recipe, wait until the ready URL answers (up to 3 minutes), then stop it. Says whether it came up, with the start command's output when it did not. Use it to try a recipe before saving it.",
+		description: "Start the app with this recipe, wait until the ready URL answers (up to 3 minutes), run its data dump, then stop it. When a slice check saw the app redirect plain http to itself on https, it also sends that request again and says whether it still does. Says whether it came up, with the start command's output when it did not. Use it to try a recipe before saving it.",
 		promptSnippet: "check_app_boot: start the app with a recipe, check the ready URL answers, stop it",
 		parameters: RecipeParams,
 		execute: async (_id: string, p: RecipeInput) => {
 			const r = toRecipe(p);
 			const bad = recipeProblem(config, root, side, r);
 			if (bad) return out(`refused: ${bad}`);
-			const res = await checkRecipe(r, appRoot(config, root, side));
-			return out(res.ok ? `up: ${r.ready} answered; the app was stopped again` : `not up: ${res.error}`);
+			const res = await checkRecipe(r, appRoot(config, root, side), { selfRedirect: loadApps(root)[side]?.selfRedirect });
+			return out(res.ok ? `up: ${r.ready} answered${r.dump ? ", the data dump works" : ""}; the app was stopped again` : `not up: ${res.error}`);
 		},
 	};
 	const set = {
@@ -396,30 +440,34 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const moved = cur.up === false && commit !== undefined && commit !== cur.commit && (cur.redProbes ?? 0) < MAX_RED_PROBES;
 	// an app that starts but cannot reset or dump its data: written data is never compared, so it is asked once to add them
 	const lacksData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump);
-	// an app that only redirects to itself on https: no request reaches a handler, so it is asked once to fix that (and the data, if missing)
-	const redirect = cur.up === true && !!cur.recipe && !!cur.selfRedirect && !cur.redirectProbed;
-	// the judge blamed a difference on how this app runs here: it is asked once to fix that
-	const setup = cur.up === true && !!cur.recipe && !!cur.setupProblem && !cur.setupProbed;
-	const fixUp = (lacksData && !cur.dataProbed) || redirect || setup;
+	// an app that only redirects to itself on https: no request reaches a handler, so it is asked to fix that (and the data, if missing)
+	const redirect = cur.up === true && !!cur.recipe && !!cur.selfRedirect && fixUpLeft(cur, "redirect");
+	// a slice check blamed how this app runs here (a difference, or it did not start): it is asked to fix that
+	const setup = cur.up === true && !!cur.recipe && !!cur.setupProblem && fixUpLeft(cur, "setup");
+	// each kind at most MAX_FIXUPS times, whatever came of it
+	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup;
 	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
 	const missing = [
 		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
-		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy (the app's or its web server's own setting that forces https)`] : []),
-		...(setup ? [`comparing it with the other app showed a difference that only its setup here causes (${cur.setupProblem}): fix that in its setup, not in the app's code`] : []),
+		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy. Switch off the app's or its web server's setting that forces https, in the copy's local config only (never the app's code): the comparison sends the same plain-http requests to both apps and compares what the handlers answer, it does not check the https rule, so keeping that rule on here only hides every handler. check_app_boot sends that request again and says whether it still redirects`] : []),
+		...(setup ? [`a slice check found a problem that only its setup here causes (${cur.setupProblem}): fix that in its setup (start, data reset, data dump, local config), not in the app's code`] : []),
 	];
 	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
 	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem }).catch((e) => `setup model failed: ${e?.message ?? e}`);
 	const recipe = loadApps(o.root)[o.side]?.recipe;
 	// the copy may have been made during the session: the root is read again
 	const bad = recipe ? recipeProblem(o.config, o.root, o.side, recipe) : "no recipe saved";
-	const res = bad || !recipe ? { ok: false, error: bad } : await checkRecipe(recipe, appRoot(o.config, o.root, o.side));
+	const res: { ok: boolean; error?: string; dumpFailed?: boolean; redirectFailed?: boolean } = bad || !recipe ? { ok: false, error: bad } : await checkRecipe(recipe, appRoot(o.config, o.root, o.side), { selfRedirect: redirect ? cur.selfRedirect : undefined });
 	if (fixUp) {
 		// the app started before: a new recipe that does not work is dropped, the old one stays; one that only fails
 		// on its dump keeps the rest (the reset ran before the app came up, so it works)
-		const kept = res.ok ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
-		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: true } : {}), ...(redirect ? { redirectProbed: true, ...(res.ok ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: true, ...(res.ok ? { setupProblem: undefined } : {}) } : {}) });
-		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+		// one that starts and dumps but still redirects is kept too: it is no worse than the old one
+		const kept = res.ok || (res.redirectFailed && !res.dumpFailed) ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
+		// the redirect is gone when the check sent the request again and it was not redirected (also when only the dump failed)
+		const redirectGone = redirect && !!recipe && !bad && !res.redirectFailed && (res.ok || !!res.dumpFailed);
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}) });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
 	}

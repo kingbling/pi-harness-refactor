@@ -9,7 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
-import { appRoot, bootApp, dumpData, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe } from "./parity.ts";
+import { appRoot, bootApp, dumpData, fixUpLeft, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe } from "./parity.ts";
 
 /**
  * Differential parity for one slice: the same requests go to the old app (twice) and to the new app, code compares
@@ -267,7 +267,11 @@ async function runOnOld(config: Config, root: string, steps: Step[]): Promise<St
 	if (!recipe) return "the old app has no start recipe (br parity --probe)";
 	const dir = appRoot(config, root, LEGACY);
 	const b = await bootApp(recipe, dir);
-	if (!b.ok) return `the old app did not start: ${b.error}`;
+	if (!b.ok) {
+		// it started when it was set up: its setup here (data reset, start) is asked to fix that
+		if (fixUpLeft(loadApps(root)[LEGACY], "setup") && !loadApps(root)[LEGACY]?.setupProblem) saveApp(root, LEGACY, { setupProblem: `the old app did not start for a slice check: ${String(b.error).slice(0, 1000)}` });
+		return `the old app did not start: ${b.error}`;
+	}
 	try {
 		return await runSteps(steps, { side: "legacy", base: () => recipe.ready, dump: recipe.dump ? () => dumpData(recipe, dir) : undefined });
 	} finally {

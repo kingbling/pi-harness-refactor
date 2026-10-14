@@ -414,7 +414,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		parityRunning = (async () => {
 			showParity("checking whether the old and the new app start");
 			await parityProbe;
-			const { loadApps } = await import("./parity.ts");
+			const { fixUpLeft, loadApps } = await import("./parity.ts");
 			const apps = loadApps(o.root);
 			if (!apps["legacy"]?.up || !apps[serverStack]?.up) return void (parityLast = `off: ${!apps["legacy"]?.up ? "the old app" : "the new app"} does not start here (br parity --probe)`);
 			if (!sliceDone(slice)) return;
@@ -431,9 +431,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				}
 				await builder.appDown(r.down.stack, r.down.error);
 			}
-			// the old app only redirected to itself on https: its setup is asked once to fix that, then the slice runs again
+			// the old app only redirected to itself on https: its setup is asked to fix that (a few times at most), then the slice runs again
 			const old = loadApps(o.root)["legacy"];
-			if (old?.selfRedirect && !old.redirectProbed) {
+			if (old?.selfRedirect && fixUpLeft(old, "redirect")) {
 				showParity("setting up the old app again: it only redirects to itself on https");
 				const { probeApp } = await import("./parity.ts");
 				await probeApp({ config, root: o.root, side: "legacy", log, ...probeAsk });
@@ -445,14 +445,15 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				const { judgeRun } = await import("./parity-judge.ts");
 				const j = await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log });
 				parityLast = `${slice}: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you${j.allowed ? `, ${j.allowed} allowed` : ""}${j.setup ? `, ${j.setup} from the test setup` : ""}`;
-				// differences only an app's setup here causes: that setup is asked once to fix it, then the slice runs again
-				const blamed = Object.entries(loadApps(o.root)).filter(([, a]) => a.setupProblem && !a.setupProbed).map(([side]) => side);
-				if (blamed.length) {
-					showParity(`setting up ${blamed.join(", ")} again: a difference comes from how it runs here`);
-					const { probeApps } = await import("./parity.ts");
-					await probeApps({ config, root: o.root, linkAll, log, ...probeAsk });
-					if (blamed.some((side) => !loadApps(o.root)[side]?.setupProblem)) parityQueue.push(slice);
-				}
+			}
+			// a problem only an app's setup here causes (a difference the judge blamed on it, or the old app not starting):
+			// that setup is asked to fix it (a few times at most), then the slice runs again
+			const blamed = Object.entries(loadApps(o.root)).filter(([, a]) => a.setupProblem && fixUpLeft(a, "setup")).map(([side]) => side);
+			if (blamed.length) {
+				showParity(`setting up ${blamed.join(", ")} again: a problem comes from how it runs here`);
+				const { probeApps } = await import("./parity.ts");
+				await probeApps({ config, root: o.root, linkAll, log, ...probeAsk });
+				if (blamed.some((side) => !loadApps(o.root)[side]?.setupProblem)) parityQueue.push(slice);
 			}
 		})()
 			.catch((e) => log(pc.yellow(`parity ${slice}: ${e?.message ?? e}`)))
