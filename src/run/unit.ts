@@ -21,8 +21,8 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
-import { implementerTools, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
-import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
+import { implementerTools, missingTestImports, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
+import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
@@ -262,6 +262,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		(await adapter.layout.checkStructure?.(files, moduleDir, area, targetProjectDir, { isNew: (f) => !existsSync(join(targetProjectDir, f)), sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) })) ?? [];
 	const truthFiles = [sourceAdapter.truth.scriptName, READ_CASES_FILE, NO_BEHAVIOUR_FILE];
 	const readTruthFiles = () => truthFiles.map((f) => (existsSync(join(truthDirAbs, f)) ? readFileSync(join(truthDirAbs, f), "utf8") : undefined));
+	// the truth files as they were before a tester session, written back: the names of those that had changed
+	const putBackTruth = (before: Array<string | undefined>) => {
+		const changed = readTruthFiles().flatMap((now, i) => (now === before[i] ? [] : [truthFiles[i]!]));
+		for (const f of changed) {
+			const i = truthFiles.indexOf(f);
+			if (before[i] === undefined) rmSync(join(truthDirAbs, f), { force: true });
+			else writeFileSync(join(truthDirAbs, f), before[i]!);
+		}
+		return changed;
+	};
 	/**
 	 * `testsOnly`: a retest for coverage, lint or placement. The truth cases stay as they are (no re-run, no
 	 * re-numbering): the tester only adds or fixes tests (and interface.md); a changed truth file is put back.
@@ -274,6 +284,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const attempt = o.ledger.startAttempt(o.unitId, "test", o.config.models.test.id);
 		const t0 = Date.now();
 		const before = testsOnly ? readTruthFiles() : undefined;
+		// a later retest of a unit whose truth is recorded may change it, but a change that does not load is put back
+		const recorded = !testsOnly && truthReady ? readTruthFiles() : undefined;
 		// its test paths and the approved tidy paths; the plugin's own folder (ledger, truth) when it sits in the project is not the tester's write
 		const ownDir = relative(targetProjectDir, join(o.root, ".bigrefactor"));
 		const putBack = await scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
@@ -377,12 +389,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (noneNow) log(pc.yellow(`  tester declared no runtime behaviour in a tests-only retest; the truth is checked again`));
 		if (before && !noneNow) {
 			// tests only: the recorded truth stands; a truth file the tester changed anyway is put back
-			const changed = readTruthFiles().flatMap((now, i) => (now === before[i] ? [] : [truthFiles[i]!]));
-			for (const f of changed) {
-				const i = truthFiles.indexOf(f);
-				if (before[i] === undefined) rmSync(join(truthDirAbs, f), { force: true });
-				else writeFileSync(join(truthDirAbs, f), before[i]!);
-			}
+			const changed = putBackTruth(before);
 			if (changed.length) log(pc.yellow(`  tester changed ${changed.join(", ")} in a tests-only retest; put back (the recorded truth cases stand)`));
 			o.ledger.endAttempt(attempt, { outcome: "tests_only", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: truthMode, testsOnly: true, restored: changed } });
 			return true;
@@ -403,6 +410,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				return false;
 			}
 		}
+		// the truth was recorded before this retest and does not load now: the recorded cases stand, the truth files go
+		// back to how they were (a red truth here would only mislead heal and diagnosis)
+		if (!verified.ok && recorded) {
+			const restored = putBackTruth(recorded);
+			log(pc.yellow(`  truth (${truthMode}) does not load after the retest (${verified.error}); ${restored.length ? `put back ${restored.join(", ")}` : "the truth files are unchanged"}: the recorded cases stand`));
+			res = { ...res, text: `${res.text}\n(The truth did not load after your session: ${verified.error}. ${restored.length ? `Your change to ${restored.join(", ")} was undone` : "The truth files are as before"}; the truth cases recorded earlier stand.)` };
+			lastTesterText = res.text;
+			o.ledger.endAttempt(attempt, { outcome: "tests_only", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, truthKept: true, restored, error: verified.error } });
+			return false;
+		}
 		const runError = "runError" in verified ? verified.runError : undefined;
 		if (runError) lastRunError = runError;
 		o.ledger.endAttempt(attempt, { outcome: verified.ok ? "truth_green" : "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, cases: verified.cases.length, error: verified.error, ...(runError ? { runError } : {}) } });
@@ -416,6 +433,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		return true;
 	};
 	let linkedOnce = false;
+	// the unit's truth is recorded (captured now or reused): set once the capture below is done
+	let truthReady = false;
 	// the last truth run found the old code's runtime down (legacyEnvOutage)
 	let legacyDown = false;
 	// in read mode: why the tester's script did not run green on the old code (the last time it was tried)
@@ -475,6 +494,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const brokenBySetup = o.ledger.getMeta(truthBrokenKey(o.unitId)) || undefined;
 	if (brokenBySetup) log(pc.yellow(`  a setup fix for the old code broke this unit's truth script; the tester fixes it`));
 	const hasTruth = !brokenBySetup && (o.reuseTruth || ahead) && (o.ledger.hasEvidence(o.unitId, "truth_green_on_old") || readTruthOk() || o.ledger.hasEvidence(o.unitId, "truth_none")) && existsSync(join(truthDirAbs, "interface.md"));
+	// reused read truth (its script never ran green on the old code) stays read: retests load cases.json, and a script
+	// that still does not run is not taken for a broken truth
+	if (hasTruth && truthMode === "run" && !o.ledger.hasEvidence(o.unitId, "truth_green_on_old") && readTruthOk()) truthMode = "read";
 	if (!hasTruth) {
 		// Playbook: a red truth script gets one more tester pass with the exact error; then a human question (only this unit waits).
 		let truthOk = false;
@@ -545,6 +567,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			return { unitId: o.unitId, state: o.ledger.getUnit(o.unitId)!.state, attempts: 2, costUsd: cost };
 		}
 	}
+
+	truthReady = true;
 
 	// The drafted interface must stay inside the unit's placement (code checks, the tester fixes): never a
 	// folder per legacy file, never another area's module.
@@ -679,7 +703,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// tester skipped): the implementer cannot rename them, so the tester moves them now (once)
 	if (testFiles.length && !o.gate) {
 		const iface = existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "";
-		const bad = await portedLayout(checkLayout, await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths), interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir));
+		const own = await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
+		// the paths interface.md names and those the tests really import (a kept test may import a name the layout forbids)
+		const bad = await portedLayout(checkLayout, own, [...interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir), ...missingTestImports(targetProjectDir, own, adapter.layout.sourceExtensions).keys()]);
 		if (bad.length) {
 			log(pc.dim("  ported tests or interface.md name paths the layout does not allow: the tester moves them before implementing"));
 			if (await runTruth(`The ported tests or interface.md name files the stack's layout does not allow (the gate's structure_ok). The implementer cannot change a test's file name or imports, so it could never pass: rename or move the test files, change their imports and interface.md to paths the layout below allows, behaviour unchanged. check_ported_tests with code_files checks the new paths.\n${bad.join("\n")}\n\n${adapter.layout.structureDoc}`, true)) testFiles = loadTests();
@@ -795,6 +821,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// reviewer judged the code wrong: the same code would only be rejected again
 		if (attemptNo >= maxTotal && !regateOnly && lastRetest.progress && !(gate?.failedStep === "wired_ok" && !reviewWeakOnly)) regate = true;
 	};
+	// what the gate is given (check_my_code runs its code-only steps on the same input before the session ends)
+	const gateInput = (): GateInput => ({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) });
 	const reports: Array<{ owner: string; target: string; problem: string; evidence: string }> = [];
 	let reviewJudged = true;
 	const providerDown = async (facts: string) => {
@@ -883,7 +911,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				appendOnlyGlobs,
 				protectedGlobs: adapter.protectedGlobs,
 				systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs, source: sourceAdapter, target: adapter }),
-				customTools: implementerTools({ ...deps, attemptId: attempt, testFiles: () => testFiles.map((t) => t.path), slot: gateSlot, disputeRecheck: disputeRounds < 2, onDispute: (d) => disputes.push(d), onDisputeFinding: (d) => findingDisputes.push(d), onCheck: async (c) => {
+				customTools: implementerTools({ ...deps, attemptId: attempt, testFiles: () => testFiles.map((t) => t.path), gateInput, slot: gateSlot, disputeRecheck: disputeRounds < 2, onDispute: (d) => disputes.push(d), onDisputeFinding: (d) => findingDisputes.push(d), onCheck: async (c) => {
 					lastCheck = c;
 					checkedTree = await treeKey();
 				}, onReport: (r) => reports.push(r) }),
@@ -1041,7 +1069,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const cleanCheck = reusableCheck(check, sameTree);
 		gate = straight
 			? { ok: false, steps: [{ name: "ported_tests_green", ok: false, ms: 0, output: check!.text }], changedFiles: check!.files, failedStep: "ported_tests_green", testFiles: testFiles.map((t) => t.path) }
-			: await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter), review, slot: gateSlot, cleanCheck });
+			: await gateFn({ ...gateInput(), review, slot: gateSlot, cleanCheck });
 		// the run is stopping: a red gate goes to no triage, tester or next try
 		if (!gate.ok) {
 			const s = stopNow(attempt, gate);

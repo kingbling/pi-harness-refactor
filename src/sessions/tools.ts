@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
 import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
 import { caseCoverage, checkTests, ownTests, runPortedTests } from "../run/ported.ts";
-import { buildFiles, changedFiles, clipOutput, othersTestsChanged } from "../run/gate.ts";
+import { antigamingCheck, buildFiles, changedFiles, clipOutput, gateFiles, othersTestsChanged, structureCheck, type GateInput } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import type { Config } from "../config.ts";
@@ -69,6 +69,8 @@ export interface ToolDeps {
 	sanctioned?: string[];
 	/** Tester: the implementer's code is in place (a retest from the implement loop), so check_ported_tests runs the tests. */
 	codeWritten?: boolean;
+	/** Implementer: what the gate will be given now, so check_my_code runs the gate's cheap code-only steps (scope, stub marks, layout) first. */
+	gateInput?: () => GateInput;
 }
 
 const text = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details });
@@ -531,8 +533,14 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			const cov = caseCoverage(d.targetProjectDir, moduleDir, d.adapter.layout, ids);
 			out.push(`Searched for test files matching ${cov.globs.join(", ")} in ${d.targetProjectDir}: ${cov.files.length ? cov.files.join(", ") : "none found"}.`);
 			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
-			const layout = d.checkLayout ? await portedLayout(d.checkLayout, cov.files, (p.code_files ?? []).filter((f) => !existsSync(join(d.targetProjectDir, f)))) : [];
-			if (d.checkLayout) out.push(layout.length ? `LAYOUT FAILED (the gate's structure_ok; the implementer cannot change a test's file name or imports, so fix them now: rename or move the test, change its imports and interface.md to paths the layout allows):\n${layout.join("\n")}` : `LAYOUT clean for ${cov.files.length} test file(s) and ${p.code_files?.length ?? 0} imported code file(s).${p.code_files?.length ? "" : " Pass code_files (the production files your tests import) to check those paths too."}`);
+			// what the test files really import counts too: a leftover or renamed test can import a path code_files does not name
+			const imported = missingTestImports(d.targetProjectDir, cov.files, d.adapter.layout.sourceExtensions);
+			const codeFiles = [...new Set([...(p.code_files ?? []).map((f) => f.replace(/^\.\//, "")).filter((f) => !existsSync(join(d.targetProjectDir, f))), ...imported.keys()])];
+			const layout = d.checkLayout ? (await portedLayout(d.checkLayout, cov.files, codeFiles)).map((l) => {
+				const by = [...imported].find(([f]) => l.startsWith(`${f}:`))?.[1];
+				return by ? `${l} (imported by ${by})` : l;
+			}) : [];
+			if (d.checkLayout) out.push(layout.length ? `LAYOUT FAILED (the gate's structure_ok; the implementer cannot change a test's file name or imports, so fix them now: rename or move the test, change its imports and interface.md to paths the layout allows; a test file left over from an earlier name is removed or fixed too):\n${layout.join("\n")}` : `LAYOUT clean for ${cov.files.length} test file(s) and ${codeFiles.length} imported code file(s).${p.code_files?.length ? "" : " Pass code_files (the production files your tests import) to check those paths too."}`);
 			// earlier units' test files are put back when the session ends: the tester hears it now, not after
 			let others: string[] = [];
 			try {
@@ -573,6 +581,30 @@ export async function portedLayout(check: (files: string[]) => string[] | Promis
 	return (await check(files)).filter((l) => !l.startsWith("warning:") && files.some((f) => l.startsWith(`${f}:`)));
 }
 
+/**
+ * The production files the test files import that do not exist yet, as the implementer would have to create them: each
+ * relative path in quotes ("./SupplierViewPage", '../api/client') resolved against its test's folder, with the test's
+ * own source extension when it names none. The layout check then judges what the tests really import, not only the
+ * code_files the tester lists. Maps each path to the test that imports it.
+ */
+export function missingTestImports(projectDir: string, tests: string[], sourceExtensions: string[]): Map<string, string> {
+	const out = new Map<string, string>();
+	for (const t of tests) {
+		const abs = join(projectDir, t);
+		if (!existsSync(abs)) continue;
+		const ext = sourceExtensions.find((e) => t.endsWith(e)) ?? sourceExtensions[0] ?? "";
+		for (const m of readFileSync(abs, "utf8").matchAll(/["'](\.\.?\/[^"'\s]+)["']/g)) {
+			const rel = join(dirname(t), m[1]!);
+			if (rel.startsWith("..")) continue; // outside the project
+			// an existing file or folder (an index file) is no new path; nor is one with an extension already there
+			if (existsSync(join(projectDir, rel)) || sourceExtensions.some((e) => existsSync(join(projectDir, rel + e)))) continue;
+			const path = sourceExtensions.some((e) => rel.endsWith(e)) ? rel : rel + ext;
+			if (!out.has(path)) out.set(path, t);
+		}
+	}
+	return out;
+}
+
 /** Each command check_my_code runs gets this long: the gate runs it anyway, so a slow one is not waited for. */
 export const CHECK_MY_CODE_TIMEOUT_MS = 120_000;
 
@@ -585,8 +617,8 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "check_my_code",
 		label: "Check my code",
-		description: "Run the gate's own checks on the code you changed: the target stack's build and lint on your changed files (after a refused merge also the whole-project check the merge runs), then the unit's ported tests (run in the target project dir, the same commands the gate runs). It stops at the first failure. Call it before you finish and fix what it reports.",
-		promptSnippet: "check_my_code: the gate's build, lint and ported tests on your changed files — call before IMPLEMENTER DONE",
+		description: "Run the gate's own checks on the code you changed: write scope, silenced checks, stub marks (TODO(br:)) and the stack layout, then the target stack's build and lint on your changed files (after a refused merge also the whole-project check the merge runs), then the unit's ported tests (run in the target project dir, the same commands the gate runs). It stops at the first failure. Call it before you finish and fix what it reports.",
+		promptSnippet: "check_my_code: the gate's scope, layout, build, lint and ported tests on your changed files — call before IMPLEMENTER DONE",
 		parameters: Type.Object({}),
 		execute: async () => {
 			const dir = d.targetProjectDir;
@@ -601,6 +633,23 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 				await d.onCheck?.({ ...r, ran, text: out.join("\n"), timedOut });
 				return text(out.join("\n"), r);
 			};
+			// the gate's code-only steps first (no command, no slot): scope, silenced checks, stub marks, layout, copies
+			if (d.gateInput) {
+				const g = d.gateInput();
+				const gf = await gateFiles(g);
+				const ag = await antigamingCheck(g, gf, true);
+				if (!ag.ok) {
+					out.push(`SCOPE FAILED (the gate's antigaming_ok); fix it and call check_my_code again:\n${ag.output}`);
+					return done({ ok: false, failed: "antigaming", files });
+				}
+				const st = await structureCheck(g, gf);
+				if (!st.ok) {
+					const fromTests = st.testImported.length ? `\nYour ported tests import ${st.testImported.join(", ")}. You cannot change tests: call dispute_test for the test that imports it (the tester moves it to a path the layout allows).` : "";
+					out.push(`STRUCTURE FAILED (the gate's structure_ok); fix it and call check_my_code again:\n${st.output}${fromTests}`);
+					return done({ ok: false, failed: "structure", files });
+				}
+				out.push("SCOPE and STRUCTURE clean.");
+			}
 			// build, lint and the whole-project check in one slot: one wait in the queue, not one per command
 			const failed = await slot(async () => {
 				for (const name of ["build", "lint"] as const) {

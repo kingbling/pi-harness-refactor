@@ -6,6 +6,8 @@ import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { implementerSystemPrompt } from "../src/run/prompts.ts";
 import { checkMyCodeTool, implementerTools } from "../src/sessions/tools.ts";
+import { Ledger } from "../src/ledger/db.ts";
+import { sha1, type GateInput } from "../src/run/gate.ts";
 
 /**
  * The implementer runs the gate's build, lint and ported tests on its changed files before it says DONE, instead of
@@ -83,5 +85,38 @@ describe("check_my_code", () => {
 		expect(p).not.toMatch(/do not run builds/);
 		// a missing class the interface or the tests use is the implementer's to write (a TODO(br:) stub when another unit owns it)
 		expect(p).toMatch(/does not exist yet is yours to write[^\n]*TODO\(br:<owning unit>\)[^\n]*Only a change outside your write paths is not yours/);
+	});
+});
+
+describe("check_my_code runs the gate's code-only steps first", () => {
+	const gateTool = (layout: object = {}) => {
+		const ledgerPath = join(here, ".sim", "check-my-code-ledger.sqlite");
+		rmSync(ledgerPath, { force: true });
+		const ledger = new Ledger(ledgerPath);
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const adapter = { ...nestjsAdapter, layout: { ...nestjsAdapter.layout, ...layout }, build: sh("echo BUILT"), lint: sh("true"), test: sh("true") } as never;
+		const g = (): GateInput => ({ ledger, unitId: "u1", adapter, targetProjectDir: dir, writeGlobs: ["src/a/**"], testFiles: [{ path: SPEC, sha1: sha1(readFileSync(join(dir, SPEC))) }], moduleDir: "src/a", area: "a" });
+		return checkMyCodeTool({ ledger, config: undefined as never, unitId: "u1", root: dir, targetProjectDir: dir, adapter, testFiles: () => [SPEC], gateInput: g });
+	};
+
+	it("a stub mark naming no unit fails as the gate's antigaming_ok would, before build and lint", async () => {
+		write(join(dir, "src/a/a.service.ts"), "export class A {}\n// TODO(br:ghost) later\n");
+		const r = await exec(gateTool());
+		expect(r.details).toMatchObject({ ok: false, failed: "antigaming" });
+		expect(r.content[0]!.text).toMatch(/SCOPE FAILED[\s\S]*TODO\(br:ghost\) names no unit/);
+		expect(r.content[0]!.text).not.toMatch(/BUILD/);
+	});
+
+	it("a path the layout does not allow fails as the gate's structure_ok would", async () => {
+		write(join(dir, "src/a/AgencyEditPage.ts"), "export const p = 1;\n");
+		const r = await exec(gateTool({ checkStructure: (files: string[]) => files.filter((f) => f.endsWith("EditPage.ts")).map((f) => `${f}: not an allowed file in the feature folder`) }));
+		expect(r.details).toMatchObject({ ok: false, failed: "structure" });
+		expect(r.content[0]!.text).toMatch(/STRUCTURE FAILED[\s\S]*AgencyEditPage\.ts: not an allowed file/);
+	});
+
+	it("clean code goes on to build, lint and tests", async () => {
+		const r = await exec(gateTool());
+		expect(r.details).toMatchObject({ ok: true });
+		expect(r.content[0]!.text).toMatch(/SCOPE and STRUCTURE clean\.[\s\S]*BUILD clean/);
 	});
 });
