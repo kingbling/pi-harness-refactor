@@ -39,7 +39,7 @@ type Script = Record<string, { implement?: "ok" | "unproven_once" | "build_fail_
 const SCRIPT: Script = {
 	U001_src_Config: { implement: "ok", truth: "typed_once" }, // tester types the expected values in first → rejected → rerun
 	U002_src_Money: { implement: "build_fail_once" }, // → triage impl_bug → retry → green
-	U003_src_InvoiceRepo: { implement: "unproven_once" }, // → symbolproof fails deterministically → retry → green
+	U003_src_InvoiceRepo: { implement: "unproven_once" }, // → DONE with a symbol unproven → one more turn proves it → green on the first attempt
 	U004_src_Pricing: { implement: "outside_scope_once" }, // → write gate blocks, anti-gaming clean, green
 	U006_controllers_InvoiceController: { implement: "always_fail" }, // → escalate → quarantine at the cap
 	U005_templates_invoice: { implement: "ok", truth: "broken_once" }, // tester's cases.php broken first → truth_red → rerun
@@ -251,6 +251,8 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 		const gate = makeWriteGate({ cwd: o.cwd, globRoot: o.globRoot, sourceRoot: o.config.source.path, writeGlobs: o.writeGlobs, protectedGlobs: o.protectedGlobs ?? [] });
 		let blocked = 0;
 		let toolCalls = 0;
+		// the implementer's target file, for a follow-up turn's proofs
+		let proveAs: string | undefined;
 		const write = (rel: string, content: string) => {
 			toolCalls++;
 			const abs = resolve(base, rel);
@@ -265,6 +267,16 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 		};
 		return {
 			async run(prompt) {
+				// a follow-up turn in the same session (no task card): the implementer proves the symbols it is told are unproven
+				if (!/^# Unit /m.test(prompt)) {
+					const prove = o.customTools?.find((t) => t.name === "ledger_prove");
+					const ids = [...prompt.matchAll(/^- (\S+::\S+)$/gm)].map((m) => m[1]!);
+					if (prove && ids.length && proveAs) {
+						toolCalls++;
+						await prove.execute("sim-prove-more", { proofs: ids.map((s) => ({ srcSymbol: s, op: "moved", targetSymbols: [`${proveAs}::${s.split("::").pop()}`], why: "simulated 1:1 port (one more turn)" })) }, undefined, undefined, {} as any);
+					}
+					return { text: o.role === "test" ? "TESTER DONE" : "IMPLEMENTER DONE", toolCalls, blocked, usage: { input: 100, output: 30, cost: 0 } };
+				}
 				const unitId = /^# Unit (\S+)/m.exec(prompt)![1]!;
 				const symbols = [...prompt.matchAll(/^- (\S+)  \[/gm)].map((m) => m[1]!);
 				// every unit of an area extends the area's one service file (`<area>.service.ts`), as structure_ok demands
@@ -324,10 +336,11 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 				write("package.json", "{}"); // protected → blocked
 				const prove = o.customTools?.find((t) => t.name === "ledger_prove")!;
 				const skipOne = plan.implement === "unproven_once" && n === 1;
-				for (const [i, s] of symbols.entries()) {
-					if (skipOne && i === 0) continue;
+				proveAs = `${moduleDir}/${file}.ts`;
+				const proofs = symbols.filter((_, i) => !(skipOne && i === 0)).map((s) => ({ srcSymbol: s, op: "moved", targetSymbols: [`${moduleDir}/${file}.ts::${s.split("::").pop()}`], why: `simulated 1:1 port (attempt ${n})` }));
+				if (proofs.length) {
 					toolCalls++;
-					await prove.execute(`sim-${i}`, { srcSymbol: s, op: "moved", targetSymbols: [`${moduleDir}/${file}.ts::${s.split("::").pop()}`], why: `simulated 1:1 port (attempt ${n})` }, undefined, undefined, {} as any);
+					await prove.execute("sim-prove", { proofs }, undefined, undefined, {} as any);
 				}
 				return { text: "IMPLEMENTER DONE", toolCalls, blocked, usage };
 			},

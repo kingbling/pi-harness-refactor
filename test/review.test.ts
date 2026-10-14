@@ -172,6 +172,8 @@ describe("wired_ok: the reviewer model", () => {
 		expect(prompts[0]).toContain(earlier);
 		expect(r.findings).toEqual(["- src/features/campaign/campaign.service.ts:1: no route → register it"]);
 		expect(r.output).toMatch(/fixed since the earlier review:\n- changes\(\) returns \[\]/);
+		// the fixed list goes back to the unit (the implementer keeps those fixes working)
+		expect(r.fixed).toEqual(["changes() returns []"]);
 	});
 
 	it("judges the unit's own tests; other units' tests are listed by path only, and calling only those weak is no weak verdict", async () => {

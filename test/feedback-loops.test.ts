@@ -10,7 +10,7 @@ import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { runUnit } from "../src/run/unit.ts";
 import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
 import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
-import { disputeTestTool, MAX_REPORTS_PER_RUN, reportMigratedBugTool, type ToolDeps } from "../src/sessions/tools.ts";
+import { disputeTestTool, ledgerProve, MAX_REPORTS_PER_RUN, reportMigratedBugTool, type ToolDeps } from "../src/sessions/tools.ts";
 
 /**
  * One model tells another to fix things after it handed its work in: the implementer disputes a test (the tester
@@ -197,24 +197,24 @@ describe("models fix each other's work", () => {
 			({
 				run: async (task: string) => {
 					calls.push({ role: opts.role, task });
-					if (opts.role !== "test" && ++impls === 3) await (opts.customTools!.find((t) => t.name === "dispute_test") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { test: "u1#1", why: "pins the invented label", evidence: "the legacy label is 'Location ID'" });
+					if (opts.role !== "test" && ++impls === 2) await (opts.customTools!.find((t) => t.name === "dispute_test") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { test: "u1#1", why: "pins the invented label", evidence: "the legacy label is 'Location ID'" });
 					return { text: opts.role === "test" ? "u1#1: fixed — the legacy label\nTESTER DONE 1 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
 				},
 				dispose() {},
 			}) as unknown as LeafSession) as never;
-		// two reviews with a code finding and weak tests (an attempt each), then red tests the implementer disputes
+		// two reviews with only weak tests (a tester round each, on the same code), then red tests the implementer disputes
 		let gates = 0;
-		const reviewer = async () => ({ ok: false, judged: true, output: "findings and weak tests", findings: ["- a.ts:1: stub → port it"], weakTests: "- spec: weak" });
+		const reviewer = async () => ({ ok: false, judged: true, output: "weak tests", weakTests: "- spec: weak" });
 		const gate = async (g: GateInput): Promise<GateReport> => {
 			const n = ++gates;
 			if (n <= 2) return red(g, "wired_ok", (await g.review!([])).output);
-			return n === 3 ? red(g, "ported_tests_green") : green(g);
+			return n <= 4 ? red(g, "ported_tests_green") : green(g);
 		};
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, log: () => {} });
 		const testerTasks = asked(calls).filter((c) => c.role === "test").map((c) => c.task);
-		expect(testerTasks).toHaveLength(3);
-		expect(testerTasks[2]).toMatch(/The implementer disputes these tests:[\s\S]*pins the invented label/);
-		expect(r).toMatchObject({ state: "review", attempts: 4 });
+		expect(testerTasks.filter((t) => /The reviewer finds these tests too weak/.test(t))).toHaveLength(2);
+		expect(testerTasks.at(-1)).toMatch(/The implementer disputes these tests:[\s\S]*pins the invented label/);
+		expect(r.state).toBe("review");
 	});
 
 	it("on the last attempt a tester fix of a disputed test gets one more gate run on the same code, not a quarantine", async () => {
@@ -393,22 +393,33 @@ describe("models fix each other's work", () => {
 		expect(r).toMatchObject({ state: "review", attempts: 1 });
 	});
 
-	it("weak tests next to a code finding still cost the implementer an attempt", async () => {
+	it("weak tests next to a code finding wait: the implementer fixes the code first, the tester gets the note once only weak tests are left", async () => {
 		const calls: Call[] = [];
+		const CODE = "src/features/agency/agency.service.ts";
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => {
+			const inner = await (sessions(calls) as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts);
+			// the implementer changes the code each time (a new review judges it)
+			return { ...inner, run: async (task: string) => (opts.role !== "test" && write(join(ws, "migrated", CODE), `export const v = ${calls.length};\n`), inner.run(task)) } as LeafSession;
+		}) as never;
 		let reviews = 0;
-		const reviewer = async () => (++reviews === 1 ? { ok: false, judged: true, output: "findings and weak tests", findings: ["- a.ts:1: stub → port it"], weakTests: "- spec: weak" } : { ok: true, judged: true, output: "fine" });
+		const reviewer = async () => {
+			const n = ++reviews;
+			if (n === 1) return { ok: false, judged: true, output: "findings and weak tests", findings: ["- a.ts:1: stub → port it"], weakTests: "- spec: weak" };
+			if (n === 2) return { ok: false, judged: true, output: "weak tests", findings: [], weakTests: "- spec: weak" };
+			return { ok: true, judged: true, output: "fine" };
+		};
 		const gate = async (g: GateInput): Promise<GateReport> => {
-			const r = await g.review!([]);
+			const r = await g.review!([CODE]);
 			return r.ok ? green(g) : red(g, "wired_ok", r.output);
 		};
-		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
-		expect(asked(calls).map((c) => c.role)).toEqual(["implement", "test", "implement"]);
-		expect(r.attempts).toBe(2);
-		// the tester sees what the review told the implementer, so it does not pin the opposite
-		expect(asked(calls).find((c) => c.role === "test")!.task).toMatch(/too weak[\s\S]*do not pin the opposite in a test:\n- a\.ts:1: stub → port it/);
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, log: () => {} });
+		// no tester round next to the code finding: the implementer goes first, then the tester on the weak tests alone
+		expect(asked(calls).map((c) => c.role)).toEqual(["implement", "implement", "test"]);
+		expect(asked(calls)[2]!.task).toMatch(/The reviewer finds these tests too weak[\s\S]*spec: weak/);
+		expect(r).toMatchObject({ state: "review", attempts: 2 });
 	});
 
-	it("on the last attempt weak tests next to a code finding get the tester round, but no extra gate run on the rejected code", async () => {
+	it("on the last attempt weak tests next to a code finding wait too: no tester round, no extra gate run on the rejected code", async () => {
 		config.run.maxImplementAttempts = 1;
 		config.run.maxEscalateAttempts = 0;
 		const calls: Call[] = [];
@@ -418,7 +429,7 @@ describe("models fix each other's work", () => {
 			return r.ok ? green(g) : red(g, "wired_ok", r.output);
 		};
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
-		expect(asked(calls).map((c) => c.role)).toEqual(["implement", "test"]);
+		expect(asked(calls).map((c) => c.role)).toEqual(["implement"]);
 		expect(r.attempts).toBe(1);
 		expect(r.state).not.toBe("review");
 		expect(ledger.db.prepare("SELECT count(*) AS n FROM attempts WHERE unit_id = 'u1' AND role = 'gate'").get()).toEqual({ n: 0 });
@@ -433,7 +444,8 @@ describe("models fix each other's work", () => {
 		expect(gates).toBe(0);
 		expect(ledger.getUnit("d1")!.state).toBe("planned");
 		expect(JSON.parse(ledger.getUnit("d1")!.meta).retryNote).toMatch(/u1 uses your accepted code[\s\S]*ignores the agency discount/);
-		expect(ledger.getSymbol("app/money.php::net")!.state).toBe("clustered");
+		// its move is still in the ledger: the symbol stays proven, only what changes is proven again
+		expect(ledger.getSymbol("app/money.php::net")!.state).toBe("mapped");
 		expect(JSON.parse(ledger.getUnit("u1")!.deps)).toContain("d1");
 		expect(ledger.hasEvidence("d1", "bug_reported")).toBe(true);
 		// the wait is no fresh set of tries: the reporter's next run goes on counting
@@ -463,6 +475,76 @@ describe("models fix each other's work", () => {
 		wait(new Date().toISOString());
 		expect(await report()).toMatch(/already waited 2 times this run/);
 		expect(reports).toEqual(["d1"]);
+	});
+	it("ledger_prove takes a list: each entry is recorded on its own, a refused one is named, the reply lists what is still unproven", async () => {
+		ledger.upsertFile({ path: "app/agency/create.cmd.php", hash: "h", lang: "php", loc: 1 });
+		for (const n of ["create", "update", "remove"]) {
+			ledger.upsertSymbol({ id: `app/agency/create.cmd.php::${n}`, path: "app/agency/create.cmd.php", kind: "function", name: n });
+			ledger.db.prepare("UPDATE symbols SET unit_id = 'u1', state = 'clustered' WHERE id = ?").run(`app/agency/create.cmd.php::${n}`);
+		}
+		const tool = ledgerProve({ ledger, unitId: "u1" } as ToolDeps) as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }>; details: { left: number } }> };
+		const r = await tool.execute("x", {
+			proofs: [
+				{ srcSymbol: "app/agency/create.cmd.php::create", op: "moved", targetSymbols: ["src/features/agency/agency.service.ts::create"], why: "1:1" },
+				{ srcSymbol: "app/agency/create.cmd.php::update", op: "dropped", why: "the form does it now" },
+				{ srcSymbol: "app/agency/nope.php::x", op: "dropped", why: "x" },
+			],
+		});
+		expect(ledger.getSymbol("app/agency/create.cmd.php::create")!.state).toBe("mapped");
+		expect(ledger.getSymbol("app/agency/create.cmd.php::update")!.state).toBe("dropped");
+		expect(r.content[0]!.text).toMatch(/app\/agency\/nope\.php::x: unknown symbol/);
+		expect(r.content[0]!.text).toMatch(/1 symbol\(s\) of this unit still unproven: app\/agency\/create\.cmd\.php::remove/);
+		expect(r.details.left).toBe(1);
+	});
+
+	it("an implementer that says DONE with symbols still unproven gets one more turn naming them, not a red gate", async () => {
+		ledger.upsertFile({ path: "app/agency/create.cmd.php", hash: "h", lang: "php", loc: 1 });
+		ledger.upsertSymbol({ id: "app/agency/create.cmd.php::create", path: "app/agency/create.cmd.php", kind: "function", name: "create" });
+		ledger.db.prepare("UPDATE symbols SET unit_id = 'u1', state = 'clustered' WHERE id = 'app/agency/create.cmd.php::create'").run();
+		const calls: Call[] = [];
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (task: string) => {
+					calls.push({ role: opts.role, task });
+					// it proves nothing in its first turn; asked again, it proves the symbols the task names
+					if (opts.role !== "test" && /still unproven/.test(task)) await (opts.customTools!.find((t) => t.name === "ledger_prove") as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", { proofs: [{ srcSymbol: "app/agency/create.cmd.php::create", op: "moved", targetSymbols: ["src/features/agency/agency.service.ts::create"], why: "1:1" }] });
+					return { text: opts.role === "test" ? "TESTER DONE 1 cases" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		const gate = async (g: GateInput): Promise<GateReport> => (ledger.symbolsOfUnit("u1").some((x) => x.state === "clustered") ? red(g, "symbolproof_ok", "unproven symbols") : green(g));
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, log: () => {} });
+		const impl = calls.filter((c) => c.role === "implement");
+		expect(impl).toHaveLength(2);
+		expect(impl[1]!.task).toMatch(/1 legacy symbol\(s\) of this unit are still unproven[\s\S]*ledger_prove once with all of them as a list[\s\S]*- app\/agency\/create\.cmd\.php::create/);
+		expect(r).toMatchObject({ state: "review", attempts: 1 });
+	});
+
+	it("what the reviewer called fixed is kept on the unit and shown to the implementer as fixes to keep working", async () => {
+		const calls: Call[] = [];
+		const CODE = "src/features/agency/agency.service.ts";
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => {
+			const inner = await (sessions(calls) as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts);
+			return { ...inner, run: async (task: string) => (opts.role !== "test" && write(join(ws, "migrated", CODE), `export const v = ${calls.length};\n`), inner.run(task)) } as LeafSession;
+		}) as never;
+		let reviews = 0;
+		const reviewer = async () => {
+			const n = ++reviews;
+			if (n === 1) return { ok: false, judged: true, output: "findings", findings: ["- a.ts:1: no breadcrumb → add it", "- a.ts:2: labels differ → use the legacy labels"] };
+			if (n === 2) return { ok: false, judged: true, output: "findings", findings: ["- a.ts:2: labels differ → use the legacy labels"], fixed: ["a.ts:1: the breadcrumb is there now"] };
+			return { ok: true, judged: true, output: "fine" };
+		};
+		const gate = async (g: GateInput): Promise<GateReport> => {
+			const r = await g.review!([CODE]);
+			return r.ok ? green(g) : red(g, "wired_ok", r.output);
+		};
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate, reviewer, log: () => {} });
+		const impl = asked(calls).filter((c) => c.role === "implement");
+		expect(impl).toHaveLength(3);
+		expect(impl[1]!.task).not.toMatch(/Fixed before/);
+		expect(impl[2]!.task).toMatch(/## Fixed before: keep these working[^\n]*\n- a\.ts:1: the breadcrumb is there now/);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).reviewFixed).toEqual(["a.ts:1: the breadcrumb is there now"]);
+		expect(r.state).toBe("review");
 	});
 });
 

@@ -104,7 +104,8 @@ export const SYMBOL_TRANSITIONS: Record<SymbolState, readonly SymbolState[]> = {
 	mapped: ["tested", "in_progress", "quarantined"],
 	dropped: ["in_progress"], // a human can re-open
 	tested: ["accepted", "in_progress", "quarantined"],
-	accepted: ["clustered"], // br recheck re-opens a unit whose accepted code fails the newer checks
+	// a re-opened unit (recheck, bug report …): back to clustered, or to mapped when its move is still in the ledger
+	accepted: ["clustered", "mapped"],
 	quarantined: ["clustered", "dropped"],
 };
 
