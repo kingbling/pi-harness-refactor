@@ -279,31 +279,77 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 const FAILURE = /\b(?:fail(?:ed|ures?|s)?|errors?|exception|assert\w*|expect(?:ed)?|not ok)\b|[✗×✕]|\w+Error\b/i;
 /** A deprecation or notice: noise next to a failure, never its cause. */
 const NOTICE = /\b(?:deprecat\w*|notices?)\b/i;
+/** The heading of a runner's numbered list ("12 tests triggered 24 PHPUnit notices:", "There were 2 errors:"). */
+const LIST_HEADING = /^(?:\d+ tests? triggered|There (?:was|were)) .*:$/i;
+/** A line that may follow a blank line inside such a list: blank, indented, a numbered entry, a "* " detail or a file:line. */
+const LIST_BODY = /^(?:\s|$|\d+\) |\* |\S*\/\S+:\d+$)/;
+/** A line that starts one failed test: "1) Class::test", "FAIL file > test", "✗ test". */
+const FAILURE_HEAD = /^\s*(?:\d+\)|FAIL(?:ED)?|[✗×✕])\s+\S/i;
+
+/**
+ * The output without the runner's notice and deprecation lists (a heading that says notices or deprecations and
+ * its numbered entries): they never hold the failure, and their numbered entries look like failed tests. An entry's
+ * message lines follow it directly; after a blank line only list lines go on, anything else ends the list.
+ */
+export function dropNoticeLists(lines: string[]): { kept: string[]; dropped: number } {
+	const kept: string[] = [];
+	let dropped = 0;
+	let inList = false;
+	let afterBlank = false;
+	for (const l of lines) {
+		if (LIST_HEADING.test(l.trim())) inList = NOTICE.test(l);
+		else if (inList && afterBlank && !LIST_BODY.test(l)) inList = false;
+		afterBlank = !l.trim();
+		if (inList) dropped++;
+		else kept.push(l);
+	}
+	return { kept, dropped };
+}
+
+/** The line that says why each failed test failed: the first one after its head that is not a bare file:line or the next head. */
+function messageLines(lines: string[]): Set<number> {
+	const out = new Set<number>();
+	lines.forEach((l, i) => {
+		if (!FAILURE_HEAD.test(l)) return;
+		const j = lines.findIndex((m, k) => k > i && m.trim() !== "");
+		if (j > i && j <= i + 3 && !FAILURE_HEAD.test(lines[j]!) && !/^\S*\/\S+:\d+$/.test(lines[j]!.trim())) out.add(j);
+	});
+	return out;
+}
 
 /**
  * A step's output for the report and the next prompt, at most `max` chars. Long output (phpstan, phpunit, vitest)
- * shows the failure blocks first (the lines around what says FAIL, Error, assert, expected, ✗), then the rest with
- * its start (the command, the first errors) and its end (the summary): colour codes, deprecation and notice lines
- * and padding go, a line already shown twice is left out, and what still does not fit is cut from the middle.
+ * starts with each distinct error message and how many tests failed with it, then the failure blocks (the lines
+ * around what says FAIL, Error, assert, expected, ✗), then the rest with its start (the command, the first errors)
+ * and its end (the summary). Colour codes, the runner's notice and deprecation lists, other deprecation and notice
+ * lines and padding go; a line already shown twice is left out, except the message right after each failed test;
+ * what still does not fit is cut from the middle.
  * `saveTo`: when anything was cut, the full output is written there and the clip names the file.
  */
 export function clipOutput(out: string, max = 6000, saveTo?: string): string {
 	const plain = out.replace(ANSI, "");
 	if (plain.length <= max) return plain;
+	const listed = dropNoticeLists(plain.split("\n").map((l) => l.trimEnd()));
+	const messages = messageLines(listed.kept);
+	// each distinct message with its count, most frequent first: one shared cause behind 80 failed tests shows at once
+	const counts = new Map<string, number>();
+	for (const i of messages) {
+		const m = listed.kept[i]!.trim().slice(0, 240);
+		counts.set(m, (counts.get(m) ?? 0) + 1);
+	}
+	const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 8);
+	const summary = top.length ? `error messages (each distinct one, × the failed tests with it):\n${top.map(([m, n]) => `${n} × ${m}`).join("\n").slice(0, Math.floor(max / 4))}${counts.size > top.length ? `\n… ${counts.size - top.length} more` : ""}\n` : "";
 	const seen = new Map<string, number>();
 	let dropped = 0;
-	let notices = 0;
-	const all = plain
-		.split("\n")
-		.map((l) => l.trimEnd())
-		.filter((l) => {
-			if (!l.trim()) return true;
-			const n = (seen.get(l.trim()) ?? 0) + 1;
-			seen.set(l.trim(), n);
-			if (n <= 2) return true;
-			dropped++;
-			return false;
-		});
+	let notices = listed.dropped;
+	const all = listed.kept.filter((l, i) => {
+		if (!l.trim() || messages.has(i)) return true;
+		const n = (seen.get(l.trim()) ?? 0) + 1;
+		seen.set(l.trim(), n);
+		if (n <= 2) return true;
+		dropped++;
+		return false;
+	});
 	// the failure blocks: each failure line with one line before and eight after (the message, the code frame).
 	// Deprecation and notice lines go, but never from a failure line or the eight after it (a code line with the word)
 	const frame = new Set<number>();
@@ -314,9 +360,10 @@ export function clipOutput(out: string, max = 6000, saveTo?: string): string {
 		for (let j = i; j <= Math.min(all.length - 1, i + 8); j++) frame.add(j);
 	});
 	const inBlock = new Set<number>();
+	let gone = 0;
 	const lines = all.filter((l, i) => {
-		if (!frame.has(i) && NOTICE.test(l)) return (notices++, false);
-		if (frame.has(i) || before.has(i)) inBlock.add(i - notices);
+		if (!frame.has(i) && NOTICE.test(l)) return (notices++, gone++, false);
+		if (frame.has(i) || before.has(i)) inBlock.add(i - gone);
 		return true;
 	});
 	let saved = "";
@@ -328,7 +375,7 @@ export function clipOutput(out: string, max = 6000, saveTo?: string): string {
 		} catch {
 			/* no file: the clip alone */
 		}
-	const note = `${saved}${dropped ? `(${dropped} repeated line(s) left out)\n` : ""}${notices ? `(${notices} deprecation or notice line(s) left out)\n` : ""}`;
+	const note = `${saved}${dropped ? `(${dropped} repeated line(s) left out)\n` : ""}${notices ? `(${notices} deprecation or notice line(s) left out)\n` : ""}${summary}`;
 	const cut = (text: string, room: number) => {
 		if (text.length <= room) return text;
 		const head = Math.floor(room / 3);
