@@ -90,7 +90,7 @@ describe("br advise: models make the judgment calls", () => {
 		expect(client.calls.some((c) => c.kind === "chat")).toBe(true);
 		expect(client.calls.some((c) => c.kind === "decide")).toBe(true);
 		expect(r.libraries).toBeGreaterThan(0);
-		const ds = openDecisions(ledger, config, source, targets, ws);
+		const ds = await openDecisions(ledger, config, source, targets, ws);
 		const lib = ds.find((d) => d.id === "lib:acme/obscure-lib");
 		expect(lib?.recommended).toBe("replace:obscure-ts");
 		expect(lib?.reason).toMatch(/maintained/);
@@ -148,9 +148,9 @@ describe("advice hygiene", () => {
 		});
 		const source = getSourceAdapter("php");
 		const targets = [await getTargetAdapter("nestjs")];
-		const staticRec = openDecisions(ledger, config, source, targets, ws).find((d) => d.id === "store:arangodb")?.recommended;
+		const staticRec = (await openDecisions(ledger, config, source, targets, ws)).find((d) => d.id === "store:arangodb")?.recommended;
 		await advise(config, ws, ledger, client, source, targets, () => {});
-		const ds = openDecisions(ledger, config, source, targets, ws);
+		const ds = await openDecisions(ledger, config, source, targets, ws);
 		const lib = ds.find((d) => d.id === "lib:acme/obscure-lib")!;
 		expect(lib.recommended).toBe("replace:ssh2");
 		expect(lib.reason).toMatch(/only if SFTP is used/);
@@ -194,7 +194,7 @@ describe("where each part goes: rated from the analyzed repo, not from the adapt
 		const source = getSourceAdapter("php");
 		const targets = await Promise.all(["nestjs", "react"].map((t) => getTargetAdapter(t)));
 		await advise(config, ws, ledger, client, source, targets, () => {});
-		const all = openDecisions(ledger, config, source, targets, ws);
+		const all = await openDecisions(ledger, config, source, targets, ws);
 		const ui = all.find((d) => d.id === "target:ui")!;
 		expect(ui.recommended).toBe("vue");
 		expect(ui.options.map((o) => o.value)).toEqual(expect.arrayContaining(["vue", "react", "none"]));

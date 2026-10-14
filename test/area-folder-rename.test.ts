@@ -30,28 +30,28 @@ function workspace(files: string[]) {
 	// only what placement reads: the stack's area folder ({Area} → PascalCase) and its shared dir
 	const pascal = (a: string) => a.split("-").map((w) => w[0]!.toUpperCase() + w.slice(1)).join("");
 	const layout = { moduleDir: (a: string) => `src/${pascal(a)}`, sharedDirs: ["src/Shared/"] } as unknown as TargetLayout;
-	const rename = () => renameMisspelledAreaDirs(config, ledger, new Map([["symfony", layout]]), () => repo);
+	const rename = async () => await renameMisspelledAreaDirs(config, ledger, new Map([["symfony", layout]]), () => repo);
 	return { repo, unit, rename };
 }
 
 describe("area folders follow the plugin's spelling", () => {
-	it("renames a case-only and a kebab spelling in git, commits it, and leaves the right ones alone", () => {
+	it("renames a case-only and a kebab spelling in git, commits it, and leaves the right ones alone", async () => {
 		const { repo, unit, rename } = workspace(["src/Shared/persistence/DynamicData.php", "src/Shared/persistence/tests/DynamicDataTest.php", "src/Shared/file-storage/DocumentOwner.php", "src/Campaigns/Campaign.php"]);
 		unit("U1", "persistence", true);
 		unit("U2", "file-storage", true);
 		unit("U3", "campaigns", false);
-		expect(rename().sort()).toEqual(["src/Shared/file-storage → src/Shared/FileStorage", "src/Shared/persistence → src/Shared/Persistence"]);
+		expect((await rename()).sort()).toEqual(["src/Shared/file-storage → src/Shared/FileStorage", "src/Shared/persistence → src/Shared/Persistence"]);
 		expect(git(repo, "ls-files").split("\n").sort()).toEqual(["src/Campaigns/Campaign.php", "src/Shared/FileStorage/DocumentOwner.php", "src/Shared/Persistence/DynamicData.php", "src/Shared/Persistence/tests/DynamicDataTest.php"]);
 		expect(git(repo, "status", "--porcelain")).toBe("");
-		expect(rename()).toEqual([]); // nothing left to do
+		expect(await rename()).toEqual([]); // nothing left to do
 	});
 
-	it("leaves the folders alone while something is staged", () => {
+	it("leaves the folders alone while something is staged", async () => {
 		const { repo, unit, rename } = workspace(["src/Shared/persistence/DynamicData.php"]);
 		unit("U1", "persistence", true);
 		writeFileSync(join(repo, "README.md"), "x\n");
 		git(repo, "add", "README.md");
-		expect(rename()).toEqual([]);
+		expect(await rename()).toEqual([]);
 		expect(git(repo, "ls-files")).toContain("src/Shared/persistence/DynamicData.php");
 	});
 });

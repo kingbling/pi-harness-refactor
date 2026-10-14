@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -12,6 +12,7 @@ import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 import { FAIL_ON_MAIN_TOO, runPortedTests } from "./ported.ts";
+import { exec } from "../proc.ts";
 
 /**
  * The gate: deterministic, cheapest-first, stops at the first failure. Runs AFTER the implementer
@@ -83,8 +84,8 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const steps: GateStep[] = [];
 	// structure_ok: its failing paths a protected test imports (set by that step)
 	let testImported: string[] | undefined;
-	const changed = changedFiles(g.targetProjectDir, g.adapter.toolchain.ignoredPaths);
-	const tracked = new Set(trackedFiles(g.targetProjectDir));
+	const changed = await changedFiles(g.targetProjectDir, g.adapter.toolchain.ignoredPaths);
+	const tracked = new Set(await trackedFiles(g.targetProjectDir));
 	const prodFiles = changed.filter((f) => !g.adapter.layout.isTestFile(f));
 	const timeout = g.timeoutMs ?? 240_000;
 	const slot = g.slot ?? (<T>(fn: () => Promise<T>) => fn());
@@ -140,14 +141,14 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 			else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
 			else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
 		}
-		for (const f of othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
+		for (const f of await othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
 		// a comment that silences the type check or the linter hides an error instead of fixing it (only lines this unit added)
 		const silence = g.adapter.layout.suppressMarker;
-		if (silence) for (const f of prodFiles) for (const l of addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
+		if (silence) for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);
 		// a merge conflict restored into the worktree: no marker line may reach main (build and tests do not read every file)
 		for (const f of conflictMarkers(g.targetProjectDir, changed)) problems.push(`unresolved merge conflict in ${f}: keep the changes of both sides and remove the <<<<<<< ======= >>>>>>> lines`);
 		// a stub mark names the unit that replaces it when it runs: a name that is no unit still to come is a stub nobody replaces
-		for (const f of prodFiles) for (const l of addedLines(g.targetProjectDir, f, tracked.has(f))) for (const m of l.text.matchAll(/TODO\(br:([^)]*)\)/g)) {
+		for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) for (const m of l.text.matchAll(/TODO\(br:([^)]*)\)/g)) {
 			const why = stubOwnerProblem(g.ledger, g.unitId, m[1]!.trim());
 			if (why) problems.push(`${f}:${l.line}: TODO(br:${m[1]}) ${why}`);
 		}
@@ -165,10 +166,10 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const structureOk = await step("structure_ok", async () => {
 		const present = changed.filter((f) => existsSync(join(g.targetProjectDir, f)));
 		const ctx = { isNew: (f: string) => !tracked.has(f), sanctioned: g.sanctioned ?? [], legacyWords: g.legacyWords };
-		const lines = g.moduleDir && g.adapter.layout.checkStructure ? g.adapter.layout.checkStructure(present, g.moduleDir, g.area ?? "", g.targetProjectDir, ctx) : [];
+		const lines = g.moduleDir && g.adapter.layout.checkStructure ? await g.adapter.layout.checkStructure(present, g.moduleDir, g.area ?? "", g.targetProjectDir, ctx) : [];
 		const warnings = lines.filter((l) => l.startsWith("warning:"));
 		// drift checks (size cap, one class per responsibility …) on the touched files; drift elsewhere is reported, not failed
-		const tree = checkTree(g.targetProjectDir, g.adapter, present);
+		const tree = await checkTree(g.targetProjectDir, g.adapter, present);
 		const reuse = await reuseProblems(g, prodFiles.filter((f) => present.includes(f)), changed);
 		nearDuplicates = reuse.near;
 		const problems = [...new Set([...lines.filter((l) => !l.startsWith("warning:")), ...tree, ...sharedTopicProblems(g, present, tracked)])].concat(reuse.problems);
@@ -505,13 +506,13 @@ export async function runTests(adapter: TargetAdapter, dir: string, files: strin
 /** Files changed in the working tree under `dir` (git status), relative to `dir`. */
 /** Files changed in the project, without generated paths (`ignored`: dependencies, build output; symlinked in worktrees). */
 /** Lines of `f` (project-relative) not in HEAD, with their line numbers: a new file's every line. */
-export function addedLines(dir: string, f: string, isTracked: boolean): Array<{ line: number; text: string }> {
+export async function addedLines(dir: string, f: string, isTracked: boolean): Promise<Array<{ line: number; text: string }>> {
 	const abs = join(dir, f);
 	if (!existsSync(abs)) return [];
 	if (!isTracked) return readFileSync(abs, "utf8").split("\n").map((text, i) => ({ line: i + 1, text }));
 	const out: Array<{ line: number; text: string }> = [];
 	let at = 0;
-	for (const l of execFileSync("git", ["diff", "-U0", "HEAD", "--", f], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n")) {
+	for (const l of (await exec("git", ["diff", "-U0", "HEAD", "--", f], { cwd: dir })).split("\n")) {
 		const hunk = /^@@ -\S+ \+(\d+)/.exec(l);
 		if (hunk) at = Number(hunk[1]);
 		else if (l.startsWith("+") && !l.startsWith("+++")) out.push({ line: at++, text: l.slice(1) });
@@ -524,10 +525,10 @@ export function buildFiles(dir: string, adapter: TargetAdapter, changed: string[
 	return changed.filter((f) => adapter.layout.lang(f) && existsSync(join(dir, f)));
 }
 
-export function changedFiles(dir: string, ignored: string[] = []): string[] {
+export async function changedFiles(dir: string, ignored: string[] = []): Promise<string[]> {
 	// a git failure throws: read as "nothing written" it would be blamed on the implementer, not the environment
-	const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-	const out = execFileSync("git", ["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const top = (await exec("git", ["rev-parse", "--show-toplevel"], { cwd: dir })).trim();
+	const out = await exec("git", ["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all", "--", "."], { cwd: dir });
 	return out
 		.split("\0")
 		.filter(Boolean)
@@ -541,23 +542,25 @@ export function changedFiles(dir: string, ignored: string[] = []): string[] {
  * not name one of this unit's truth cases (`<unit>#N`). Only their own unit's tester may change them (a reopen);
  * a test that looks wrong is reported (dispute_test, report_migrated_bug), not rewritten. Tidy-sanctioned paths pass.
  */
-export function othersTestsChanged(dir: string, unitId: string, isTestFile: (f: string) => boolean, sanctioned: string[] = []): string[] {
-	const tracked = new Set(trackedFiles(dir));
+export async function othersTestsChanged(dir: string, unitId: string, isTestFile: (f: string) => boolean, sanctioned: string[] = []): Promise<string[]> {
+	const tracked = new Set(await trackedFiles(dir));
 	const own = new RegExp(`(?<![\\w-])${unitId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}#\\d`);
-	return changedFiles(dir).filter((f) => {
-		if (!isTestFile(f) || !tracked.has(f) || sanctioned.includes(f)) return false;
+	const out: string[] = [];
+	for (const f of await changedFiles(dir)) {
+		if (!isTestFile(f) || !tracked.has(f) || sanctioned.includes(f)) continue;
 		try {
-			return !own.test(execFileSync("git", ["show", `HEAD:./${f}`], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 }));
+			if (!own.test(await exec("git", ["show", `HEAD:./${f}`], { cwd: dir, maxBuffer: 32 * 1024 * 1024 }))) out.push(f);
 		} catch {
-			return false; // not in HEAD: new in this worktree
+			/* not in HEAD: new in this worktree */
 		}
-	});
+	}
+	return out;
 }
 
 /** Files git already tracks under `dir` (relative to `dir`). */
-export function trackedFiles(dir: string): string[] {
+export async function trackedFiles(dir: string): Promise<string[]> {
 	try {
-		return execFileSync("git", ["ls-files", "--", "."], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean);
+		return (await exec("git", ["ls-files", "--", "."], { cwd: dir })).split("\n").filter(Boolean);
 	} catch {
 		return [];
 	}

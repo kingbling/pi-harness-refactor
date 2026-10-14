@@ -38,7 +38,7 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		};
 		const units = ledger.listUnits().filter((u) => u.state !== "planned" && !isDbUnitKind(u.kind) && outside(u));
 		const started = units.filter((u) => u.state !== "accepted").map((u) => u.id);
-		if (started.length) requeueUnits(ledger, config, o.root, started, "run start: their files are not app code");
+		if (started.length) await requeueUnits(ledger, config, o.root, started, "run start: their files are not app code");
 		// open questions per unit, read now: a unit the inventory deletes loses the link (unit_id is set to null)
 		const open = ledger.db.prepare("SELECT id, unit_id FROM questions WHERE unit_id IS NOT NULL AND status = 'open'").all() as Array<{ id: number; unit_id: string }>;
 		const before = new Set(ledger.listUnits().map((u) => u.id));

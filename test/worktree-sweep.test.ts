@@ -26,10 +26,10 @@ afterEach(() => {
 });
 
 describe("leftover worktrees", () => {
-	it("removes every leftover worktree: nothing resumes in one, a unit's next run starts from a fresh one", () => {
-		for (const [n, b] of [["u1", "unit/u1"], ["u1-ahead", "ahead/u1"], ["u2", "unit/u2"], ["__code__build-react-1", "code/x"], ["__builder__react", "builder/react"]]) addWorktree(repo, join(dir, n!), b!);
+	it("removes every leftover worktree: nothing resumes in one, a unit's next run starts from a fresh one", async () => {
+		for (const [n, b] of [["u1", "unit/u1"], ["u1-ahead", "ahead/u1"], ["u2", "unit/u2"], ["__code__build-react-1", "code/x"], ["__builder__react", "builder/react"]]) await addWorktree(repo, join(dir, n!), b!);
 		mkdirSync(join(dir, ".trash"), { recursive: true });
-		expect(sweepWorktrees(repo, dir).sort()).toEqual(["__builder__react", "__code__build-react-1", "u1", "u1-ahead", "u2"]);
+		expect((await sweepWorktrees(repo, dir)).sort()).toEqual(["__builder__react", "__code__build-react-1", "u1", "u1-ahead", "u2"]);
 		expect(existsSync(join(dir, "u2"))).toBe(false);
 		expect(existsSync(join(dir, ".trash"))).toBe(true);
 	});

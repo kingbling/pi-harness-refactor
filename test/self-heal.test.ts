@@ -63,7 +63,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("quarantined units go back after a fix or, an hour later, with a new failure, 5 times; then one question per kind of failure, and the answer is applied", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		for (const id of ["U1", "U2"]) {
 			mk(id, "billing", "implementing");
@@ -94,7 +94,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("the resolver model's retry counts against the automatic tries: past them the unit stays parked and nobody is asked", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		const { RESOLVER } = await import("../src/jev/resolve.ts");
 		mk("U1", "billing", "implementing");
@@ -125,7 +125,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("a job's retry counts against the automatic tries too: past them the unit parks, and only a change since its failure brings it back", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { healQuarantined } = await import("../src/run/run.ts");
 		const { FIX_JOB } = await import("../src/jev/resolve.ts");
 		mk("U1", "billing", "implementing");
@@ -141,7 +141,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("the same error in new words is the same failure: stuck, and a plain retry is no answer; a new error at the same step is not", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		const hour = 60 * 60_000;
 		const heal = () => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() - hour, now: Date.now() + hour + 1000 });
@@ -166,7 +166,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("a job's retry past the cap parks the unit; its change on main brings it back, and what it changed goes to the next attempt", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		const { resolveOpenQuestions, CODE_JOB } = await import("../src/jev/resolve.ts");
 		mk("U1", "billing", "implementing");
@@ -186,7 +186,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("a unit a model parked comes back when main changes after the park; the owner's leave stands", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { healQuarantined } = await import("../src/run/run.ts");
 		const { RESOLVER } = await import("../src/jev/resolve.ts");
 		for (const id of ["U1", "U2"]) {
@@ -208,7 +208,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("a unit a model parked gets one more try when the plugin changed after the park", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { healQuarantined } = await import("../src/run/run.ts");
 		mk("U1", "billing", "implementing");
 		ledger.transitionUnit("U1", "quarantined", "a code job wrote it but was not merged: protected config was changed");
@@ -226,20 +226,20 @@ describe("answers are applied per option", () => {
 	});
 
 	it("a model's leave on a waiting unit's question parks it with the model's reason; the owner's leave does not", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { RESOLVER } = await import("../src/jev/resolve.ts");
 		for (const id of ["U1", "U2"]) mk(id, "billing", "implementing");
 		const ask = (unitId: string) => ledger.askQuestion({ unitId, point: "gate_env", question: "lint fails", options: ["retry — run it again", "leave — leave it parked"], askedBy: "orchestrator" });
 		ledger.answerQuestion(ask("U1"), "leave — leave it parked\nhint: a fix job was tried and changed nothing: add the lint config", RESOLVER);
 		ledger.answerQuestion(ask("U2"), "leave — leave it parked");
-		resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
+		await resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
 		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
 		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ healQuestion: 0, parkedWhy: "a fix job was tried and changed nothing: add the lint config" });
 		expect(JSON.parse(ledger.getUnit("U2")!.meta).parkedWhy).toBeUndefined();
 	});
 
 	it("the same failure again with nothing changed is not retried: the unit is asked about, and a later fix still brings it back", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		mk("U1", "billing", "implementing");
 		ledger.transitionUnit("U1", "quarantined", "truth cases without a ported test after 2 retests: U1#1");
@@ -258,7 +258,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("a fix job that lands (the resolver's code job, a widened layout, a builder repair) re-checks quarantined units at once", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { healQuarantined } = await import("../src/run/run.ts");
 		const { noteFix } = await import("../src/adapters/command-overrides.ts");
 		mk("U1", "billing", "implementing");
@@ -270,7 +270,7 @@ describe("answers are applied per option", () => {
 	});
 
 	it("units hitting the same problem share one question: no new question, all wait, one answer releases them all", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		for (const id of ["U1", "U2", "U3"]) mk(id, "billing", "implementing");
 		const { askViaModel } = await import("../src/jev/ask.ts");
 		const req = (unitId: string, sameAs: string) => askViaModel({ ledger, config, root }, { unitId, point: "gate_env", facts: "phpstan: Allowed memory size exhausted", options: [{ value: "fixed" }, { value: "quarantine" }], sameAs, askedBy: "test" });
@@ -281,15 +281,15 @@ describe("answers are applied per option", () => {
 		expect(other.id).not.toBe(first.id);
 		expect(ledger.openQuestions()).toHaveLength(2);
 		expect([...ledger.blockedUnits().entries()].filter(([, q]) => q.includes(first.id)).map(([u]) => u).sort()).toEqual(["U1", "U2"]);
-		const go = () => resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
-		expect(go()).toEqual([]);
+		const go = async () => await resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
+		expect(await go()).toEqual([]);
 		ledger.answerQuestion(first.id, "fixed");
-		expect(go().sort()).toEqual(["U1", "U2"]);
+		expect((await go()).sort()).toEqual(["U1", "U2"]);
 		expect(ledger.getUnit("U3")!.state).toBe("implementing");
 	});
 
 	it("a different key with the same cause joins the open question only when the decision model is sure; the join is remembered", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		for (const id of ["U1", "U2", "U3", "U4"]) mk(id, "billing", "implementing");
 		const { askViaModel } = await import("../src/jev/ask.ts");
 		let pick: { choice: string; confidence: number } = { choice: "none", confidence: 0.9 };
@@ -316,8 +316,8 @@ describe("answers are applied per option", () => {
 		expect([...ledger.blockedUnits().entries()].filter(([, q]) => q.includes(first.id)).map(([u]) => u).sort()).toEqual(["U1", "U3", "U4"]);
 	});
 
-	it("quarantine quarantines, free text becomes the next attempt's note, wait holds, a non-blocking question never strands", () => {
-		const { root, config, ledger, mk } = workspace();
+	it("quarantine quarantines, free text becomes the next attempt's note, wait holds, a non-blocking question never strands", async () => {
+		const { root, config, ledger, mk } = await workspace();
 		for (const id of ["U1", "U2", "U3", "U4"]) mk(id, "billing", "implementing");
 		const ask = (unitId: string, blocks: "unit" | "none" = "unit") => ledger.askQuestion({ unitId, point: "triage_gate", question: "?", options: ["fixed", "retry", "quarantine"], blocks, askedBy: "test" });
 		const q1 = ask("U1");
@@ -326,21 +326,21 @@ describe("answers are applied per option", () => {
 		const q3 = ask("U3");
 		ask("U4", "none"); // an old calibration-style question: must not keep U4 waiting forever
 		const logs: string[] = [];
-		const go = () => resubmitParkedUnits(ledger, config, root, new Set(), (l) => logs.push(l), noManifests);
+		const go = async () => await resubmitParkedUnits(ledger, config, root, new Set(), (l) => logs.push(l), noManifests);
 
-		expect(go().sort()).toEqual(["U4"]);
+		expect((await go()).sort()).toEqual(["U4"]);
 		ledger.answerQuestion(q1, "quarantine");
 		ledger.answerQuestion(q2, "start the db with docker compose up db first");
 		ledger.answerQuestion(q3, "wait");
-		expect(go().sort()).toEqual(["U2"]);
+		expect((await go()).sort()).toEqual(["U2"]);
 		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
 		const meta2 = JSON.parse(ledger.getUnit("U2")!.meta);
 		expect(meta2.retryNote).toMatch(/DB container is down.*docker compose up db/);
 		expect(meta2.parked).toBeUndefined();
 		// wait: stays put on every later pass, until a requeue
-		expect(go()).toEqual([]);
+		expect(await go()).toEqual([]);
 		expect(ledger.getUnit("U3")!.state).toBe("implementing");
-		expect(requeueUnits(ledger, config, root, ["U3"], "test")).toEqual(["U3: requeued"]);
+		expect(await requeueUnits(ledger, config, root, ["U3"], "test")).toEqual(["U3: requeued"]);
 		expect(ledger.getUnit("U3")!.state).toBe("planned");
 		expect(JSON.parse(ledger.getUnit("U3")!.meta).hold).toBeUndefined();
 		ledger.close();
@@ -350,7 +350,7 @@ describe("answers are applied per option", () => {
 describe("triage", () => {
 	const gate = (output: string) => ({ ok: false, failedStep: "ported_tests_green", steps: [{ name: "ported_tests_green", ok: false, output, exitCode: 1 }], changedFiles: ["src/a.ts"], testFiles: ["test/a.spec.ts"] }) as never;
 	it("asks only for the cause and whether the failure repeats; escalation comes from code", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug", same_as_previous: true }) });
 		const t1 = await triageGate({ ledger, config, client }, "U1", gate("FAIL test/a.spec.ts\nexpected 2, got 3"), undefined, 1);
@@ -370,7 +370,7 @@ describe("triage", () => {
 	});
 
 	it("an unsure test-or-code cause acts on the best guess; nobody is asked", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const unsure = { cause: { type: "choice", choice: "test_bug", probabilities: { test_bug: 0.52, impl_bug: 0.32, env: 0, other: 0.16 }, confidence: 0.44 } };
 		// no second opinion comes back, so the answer stays unsure (a disagreeing one would decide the cause instead)
@@ -383,7 +383,7 @@ describe("triage", () => {
 	});
 
 	it("the same finding after a retest, or a retest that changed nothing, never goes to the tester again: escalate", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({ decide: () => ({ cause: "interface_mismatch" }) });
 		const wired = (output: string) => ({ ok: false, failedStep: "wired_ok", steps: [{ name: "wired_ok", ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php"], testFiles: [] }) as never;
@@ -404,7 +404,7 @@ describe("triage", () => {
 	});
 
 	it("errors only in the ported tests are a fact Jev reads, whichever side of the path is longer; the command line is not an error", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({ decide: (req) => ({ cause: (req.state as { errors_in_protected_tests_only: boolean }).errors_in_protected_tests_only ? "test_bug" : "impl_bug" }) });
 		const step = (name: string, output: string, testFiles: string[]) => ({ ok: false, failedStep: name, steps: [{ name, ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php", "tests/Billing/InvoiceTest.php"], testFiles }) as never;
@@ -423,7 +423,7 @@ describe("triage", () => {
 	});
 
 	it("lint errors only in the ported tests go to the tester by code; build errors there are still the decision model's", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug" }) });
 		const step = (name: string, output: string) => ({ ok: false, failedStep: name, steps: [{ name, ok: false, output, exitCode: 1 }], changedFiles: ["src/Billing/Invoice.php", "tests/Billing/InvoiceTest.php"], testFiles: ["tests/Billing/InvoiceTest.php"] }) as never;
@@ -444,7 +444,7 @@ describe("triage", () => {
 	});
 
 	it("an attempt that wrote nothing is retried with that message, twice or not; other identical anti-gaming failures are an environment cause, asked later", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({});
 		const ag = (output: string) => ({ ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output, exitCode: 1 }], changedFiles: [] }) as never;
@@ -458,7 +458,7 @@ describe("triage", () => {
 	});
 
 	it("an environment cause returns ask_human without asking anyone: the doctor looks first", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({ decide: () => ({ cause: "env" }) });
 		const t = await triageGate({ ledger, config, client }, "U1", gate("connect ECONNREFUSED 127.0.0.1:5432"), undefined, 1);
@@ -470,7 +470,7 @@ describe("triage", () => {
 
 describe("triage without a decision model", () => {
 	it("falls back to the playbook by attempt count instead of throwing", async () => {
-		const { config, ledger, mk } = workspace();
+		const { config, ledger, mk } = await workspace();
 		mk("U1", "billing", "implementing");
 		const client = new FakeModelClient({ decide: () => { throw new Error("model gone"); } });
 		const gate = { ok: false, failedStep: "ported_tests_green", steps: [{ name: "ported_tests_green", ok: false, output: "1 failed", exitCode: 1 }], changedFiles: ["src/a.ts"] } as never;
@@ -487,7 +487,7 @@ describe("triage without a decision model", () => {
 
 describe("quirks stay few", () => {
 	it("drops of artifacts and edge cases are the tester's call; the owner's earlier answers go to the phrasing model", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		mk("U1");
 		mk("U2");
 		mk("U3");
@@ -519,7 +519,7 @@ describe("quirks stay few", () => {
 
 describe("phrasing a question", () => {
 	it("mentions another pick only when one was passed", async () => {
-		const { config, ledger } = workspace();
+		const { config, ledger } = await workspace();
 		const systems: string[] = [];
 		const client = new FakeModelClient({ chat: (req) => (systems.push(req.messages[0]!.content as string), undefined) });
 		const { askViaModel } = await import("../src/jev/ask.ts");
@@ -538,7 +538,7 @@ describe("phrasing a question", () => {
 
 describe("area curation never touches migrated code", () => {
 	it("areas with started units are fixed, only planned units move, keep is remembered", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		mk("A1", "metadataids", "implementing");
 		mk("A2", "metadataids");
 		mk("B1", "clock");
@@ -579,24 +579,24 @@ describe("area curation never touches migrated code", () => {
 
 describe("an owner's quarantine answer stands", () => {
 	it("leave on a waiting unit quarantines it; the auto-heal neither puts it back nor asks again", async () => {
-		const { root, config, ledger, mk } = workspace();
+		const { root, config, ledger, mk } = await workspace();
 		const { askStuckUnits, healQuarantined } = await import("../src/run/run.ts");
 		mk("U1", "billing", "implementing");
 		const q = ledger.askQuestion({ unitId: "U1", point: "gate_env", question: "the gate needs redis", options: ["retry", "leave"], askedBy: "orchestrator" });
 		ledger.answerQuestion(q, "leave");
-		resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
+		await resubmitParkedUnits(ledger, config, root, new Set(), () => {}, noManifests);
 		expect(ledger.getUnit("U1")!.state).toBe("quarantined");
 		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() + 1000, now: Date.now() + 9 * 60 * 60_000 })).toEqual([]);
 		expect(await askStuckUnits({ ledger, config, root })).toBe(0);
 		// a person's requeue still brings it back
-		expect(requeueUnits(ledger, config, root, ["U1"], "owner", { human: true })).toEqual(["U1: requeued"]);
+		expect(await requeueUnits(ledger, config, root, ["U1"], "owner", { human: true })).toEqual(["U1: requeued"]);
 		ledger.close();
 	});
 });
 
 describe("circuit breaker", () => {
 	it("every failure kind brings its text and a key; the same merge error in 3 units heals by code", async () => {
-		const { ledger, mk } = workspace();
+		const { ledger, mk } = await workspace();
 		const { breakerEntry, breakerPick } = await import("../src/run/run.ts");
 		const recent = ["U2415_a_cmd", "U0007_b", "U0100_c"].map((id) => {
 			mk(id, "billing", "implementing");
@@ -639,7 +639,7 @@ describe("circuit breaker", () => {
 		expect(breakerPick([...mixed, ...["A", "B", "C", "D"].map((unit) => ({ unit, ok: true }))], new Set())).toBeUndefined();
 	});
 	it("a unit waiting only on quirk questions is no failure; one waiting on an environment question still is", async () => {
-		const { ledger, mk } = workspace();
+		const { ledger, mk } = await workspace();
 		const { breakerEntry } = await import("../src/run/run.ts");
 		const res = (id: string) => ({ unitId: id, state: "truth", attempts: 0, costUsd: 0 });
 		for (const id of ["U1", "U2"]) mk(id, "billing", "implementing");

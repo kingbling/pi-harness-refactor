@@ -81,7 +81,7 @@ describe("gate structure_ok", () => {
 	it("retains obsolete file deletion in the patch and checks only remaining files", async () => {
 		const path = "src/features/agency/agency.service.ts";
 		rmSync(join(project, path));
-		expect(changedFiles(project)).toContain(path);
+		expect(await changedFiles(project)).toContain(path);
 		const patch = execFileSync("git", ["diff", "HEAD", "--", path], { cwd: project, encoding: "utf8" });
 		expect(patch).toContain("deleted file mode");
 		const report = await gate("agency");
@@ -328,8 +328,8 @@ describe("silenced checks in production code", () => {
 		write(j(dir, "a.ts"), "// eslint-disable-next-line\nconst a = 1;\n// @ts-ignore\nconst b: number = 'x';\n");
 		write(j(dir, "b.ts"), "/* eslint-disable */\nexport {};\n");
 		const silence = (await getTargetAdapter("nestjs")).layout.suppressMarker!;
-		expect(addedLines(dir, "a.ts", true).filter((l) => silence.test(l.text))).toEqual([{ line: 3, text: "// @ts-ignore" }]); // the old disable is not this unit's
-		expect(addedLines(dir, "b.ts", false).filter((l) => silence.test(l.text)).map((l) => l.line)).toEqual([1]);
+		expect((await addedLines(dir, "a.ts", true)).filter((l) => silence.test(l.text))).toEqual([{ line: 3, text: "// @ts-ignore" }]); // the old disable is not this unit's
+		expect((await addedLines(dir, "b.ts", false)).filter((l) => silence.test(l.text)).map((l) => l.line)).toEqual([1]);
 		for (const ok of ["// a note on eslint rules", "const ignore = true;"]) expect(silence.test(ok)).toBe(false);
 		for (const bad of ["// @ts-nocheck", "// @ts-expect-error", "// oxlint-disable-next-line no-unused-vars"]) expect(silence.test(bad)).toBe(true);
 	});

@@ -42,7 +42,7 @@ export interface ToolDeps {
 	/** Implementer: a reviewer finding it believes is wrong goes back to the reviewer, who keeps it with a reason or drops it (see dispute_finding). */
 	onDisputeFinding?: (d: { finding: string; why: string; evidence: string }) => void;
 	/** Implementer: every check_my_code result, so the orchestrator knows when DONE comes after a red check. Tester (codeWritten): every check_ported_tests result (`failed: "tests"` when its test run was red). */
-	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[]; ran?: Array<"build" | "lint" | "tests">; tests?: string[] }) => void;
+	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[]; ran?: Array<"build" | "lint" | "tests">; tests?: string[] }) => void | Promise<void>;
 	/** Implementer: false when the unit's tester has no dispute re-check left (dispute_test then says so). */
 	disputeRecheck?: boolean;
 	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
@@ -52,9 +52,9 @@ export interface ToolDeps {
 	/** Tester: the unit's truth dir (absolute), where no_behaviour_to_pin writes its declaration. */
 	truthDir?: string;
 	/** Tester: the truth cases as code would load them now (runs the truth script / reads cases.json), for check_ported_tests. */
-	currentTruth?: () => TruthResult;
+	currentTruth?: () => TruthResult | Promise<TruthResult>;
 	/** Tester: the gate's structure_ok layout check on these project-relative paths (one `<path>: <problem>` per line), for check_ported_tests. */
-	checkLayout?: (files: string[]) => string[];
+	checkLayout?: (files: string[]) => string[] | Promise<string[]>;
 	/** The unit's last pass was not merged for whole-project errors: that check on the worktree, only errors main does not have (undefined = none). */
 	wholeCheck?: () => Promise<string | undefined>;
 	/** Implementer: the unit's ported test files (project-relative) as they are now, for check_my_code. */
@@ -474,7 +474,7 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 		execute: async (_id, p) => {
 			const moduleDir = d.moduleDir ?? "";
 			const out: string[] = [];
-			const truth = d.currentTruth?.();
+			const truth = await d.currentTruth?.();
 			let ids: string[];
 			if (truth?.ok) {
 				ids = caseIds(d.unitId, d.ledger.db.prepare("SELECT id, symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(d.unitId) as Array<{ id: string; symbol_id: string; inputs: string }>, truth.cases);
@@ -486,12 +486,12 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			const cov = caseCoverage(d.targetProjectDir, moduleDir, d.adapter.layout, ids);
 			out.push(`Searched for test files matching ${cov.globs.join(", ")} in ${d.targetProjectDir}: ${cov.files.length ? cov.files.join(", ") : "none found"}.`);
 			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
-			const layout = d.checkLayout ? portedLayout(d.checkLayout, cov.files, (p.code_files ?? []).filter((f) => !existsSync(join(d.targetProjectDir, f)))) : [];
+			const layout = d.checkLayout ? await portedLayout(d.checkLayout, cov.files, (p.code_files ?? []).filter((f) => !existsSync(join(d.targetProjectDir, f)))) : [];
 			if (d.checkLayout) out.push(layout.length ? `LAYOUT FAILED (the gate's structure_ok; the implementer cannot change a test's file name or imports, so fix them now: rename or move the test, change its imports and interface.md to paths the layout allows):\n${layout.join("\n")}` : `LAYOUT clean for ${cov.files.length} test file(s) and ${p.code_files?.length ?? 0} imported code file(s).${p.code_files?.length ? "" : " Pass code_files (the production files your tests import) to check those paths too."}`);
 			// earlier units' test files are put back when the session ends: the tester hears it now, not after
 			let others: string[] = [];
 			try {
-				others = othersTestsChanged(d.targetProjectDir, d.unitId, (f) => d.adapter.layout.isTestFile(f), d.sanctioned ?? []);
+				others = await othersTestsChanged(d.targetProjectDir, d.unitId, (f) => d.adapter.layout.isTestFile(f), d.sanctioned ?? []);
 			} catch {
 				/* not a git checkout: nothing to compare */
 			}
@@ -499,7 +499,7 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			if (cov.files.length) {
 				// the same build and lint the gate runs, on this unit's own test files (other units' are not the tester's to fix);
 				// a whole-project one is not the tester's to fix either
-				const own = ownTests(d.ledger, d.unitId, d.targetProjectDir, cov.files, d.adapter.toolchain.ignoredPaths);
+				const own = await ownTests(d.ledger, d.unitId, d.targetProjectDir, cov.files, d.adapter.toolchain.ignoredPaths);
 				for (const name of ["build", "lint"] as const) {
 					const r = await checkTests(d.targetProjectDir, d.adapter, name, own);
 					const NAME = name.toUpperCase();
@@ -514,18 +514,18 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 				const full = join(d.root, ".bigrefactor", "sessions", `${d.unitId}.check_ported_tests.log`);
 				out.push(r.ok ? `TESTS green against the implementer's code (${cov.files.join(", ")}).` : `TESTS FAILED: the implementer's code is in place: a test that fails here is either wrong (check it against the legacy code and fix it) or catches a real bug in the code (keep it and say why in your final line):\n${clipOutput(r.output, 4000, full)}`);
 				// the orchestrator knows when TESTER DONE comes after a red run (or tests changed after it)
-				d.onCheck?.({ ok: r.ok, failed: r.ok ? undefined : "tests", text: out.join("\n"), timedOut: r.output.endsWith("[timed out]"), files: cov.files });
-			} else if (d.codeWritten) d.onCheck?.({ ok: true, text: out.join("\n"), files: cov.files });
+				await d.onCheck?.({ ok: r.ok, failed: r.ok ? undefined : "tests", text: out.join("\n"), timedOut: r.output.endsWith("[timed out]"), files: cov.files });
+			} else if (d.codeWritten) await d.onCheck?.({ ok: true, text: out.join("\n"), files: cov.files });
 			return text(out.join("\n"), { missing: cov.missing, files: cov.files, layout });
 		},
 	});
 }
 
 /** The layout findings on the tester's test files and the production paths they import; findings about other files (a required file missing) are the implementer's. */
-export function portedLayout(check: (files: string[]) => string[], tests: string[], codeFiles: string[]): string[] {
+export async function portedLayout(check: (files: string[]) => string[] | Promise<string[]>, tests: string[], codeFiles: string[]): Promise<string[]> {
 	const files = [...new Set([...tests, ...codeFiles.map((f) => f.replace(/^\.\//, ""))])];
 	if (!files.length) return [];
-	return check(files).filter((l) => !l.startsWith("warning:") && files.some((f) => l.startsWith(`${f}:`)));
+	return (await check(files)).filter((l) => !l.startsWith("warning:") && files.some((f) => l.startsWith(`${f}:`)));
 }
 
 /** Each command check_my_code runs gets this long: the gate runs it anyway, so a slow one is not waited for. */
@@ -547,13 +547,13 @@ export function checkMyCodeTool(d: ToolDeps): ToolDefinition {
 			const dir = d.targetProjectDir;
 			const slot = d.slot ?? (<T>(fn: () => Promise<T>) => fn());
 			const secs = CHECK_MY_CODE_TIMEOUT_MS / 1000;
-			const files = buildFiles(dir, d.adapter, changedFiles(dir, d.adapter.toolchain.ignoredPaths));
+			const files = buildFiles(dir, d.adapter, await changedFiles(dir, d.adapter.toolchain.ignoredPaths));
 			const out = [`Changed files checked: ${files.length ? files.join(", ") : "none"}.`];
 			// what really ran (not skipped): a green check on the gate's tree spares the gate the runs it holds
 			const ran: Array<"build" | "lint" | "tests"> = [];
 			// every result reaches the orchestrator: DONE after a red check gets one more turn
-			const done = (r: { ok: boolean; failed?: string; files: string[]; tests?: string[] }, timedOut?: boolean) => {
-				d.onCheck?.({ ...r, ran, text: out.join("\n"), timedOut });
+			const done = async (r: { ok: boolean; failed?: string; files: string[]; tests?: string[] }, timedOut?: boolean) => {
+				await d.onCheck?.({ ...r, ran, text: out.join("\n"), timedOut });
 				return text(out.join("\n"), r);
 			};
 			// build, lint and the whole-project check in one slot: one wait in the queue, not one per command

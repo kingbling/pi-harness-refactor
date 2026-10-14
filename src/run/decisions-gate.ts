@@ -25,8 +25,8 @@ export interface DecisionGate {
 	blocked: Map<string, string[]>;
 }
 
-export function decisionGate(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string): DecisionGate {
-	const open = openDecisions(ledger, config, source, targets, root);
+export async function decisionGate(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string): Promise<DecisionGate> {
+	const open = await openDecisions(ledger, config, source, targets, root);
 	const gate: DecisionGate = { global: [], scoped: [], free: [], blocked: new Map() };
 	if (!open.length) return gate;
 	const plan = open.some((d) => d.id.startsWith("fw:")) ? planFrameworks(ledger, source, targets, config.source.path) : undefined;
@@ -79,12 +79,12 @@ export function renderGate(g: DecisionGate): string[] {
  * Live blocks for the scheduler: recomputed only when decisions.json changes (an answer landed), so the
  * per-loop cost is one stat call. Returns the hook `runScheduler({ blocked })` expects.
  */
-export function liveBlocks(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string, onChange?: (g: DecisionGate) => void): () => Map<string, string[]> {
+export function liveBlocks(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string, onChange?: (g: DecisionGate) => void): () => Promise<Map<string, string[]>> {
 
 	const file = `${root}/.bigrefactor/decisions.json`;
 	let seen = -1;
 	let current = new Map<string, string[]>();
-	return () => {
+	return async () => {
 		let m = 0;
 		try {
 			m = statSync(file).mtimeMs;
@@ -95,7 +95,7 @@ export function liveBlocks(ledger: Ledger, config: Config, source: SourceAdapter
 			// the file counts as read only once the blocks are recomputed: a slip (the ledger busy while `br decide`
 			// writes) keeps the last blocks and tries again on the next loop
 			try {
-				const g = decisionGate(ledger, config, source, targets, root);
+				const g = await decisionGate(ledger, config, source, targets, root);
 				current = g.blocked;
 				seen = m;
 				onChange?.(g);

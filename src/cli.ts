@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import pc from "picocolors";
@@ -76,7 +75,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { findConfigPath } = await import("./config.ts");
 		const p = findConfigPath();
 		if (!p) throw new Error("no bigrefactor.config.json here");
-		console.log(pushSetting(p, args));
+		console.log(await pushSetting(p, args));
 	},
 	forecast: async () => {
 		const { forecast, renderForecast } = await import("./run/forecast.ts");
@@ -205,8 +204,8 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!u) throw new Error(`unknown unit ${id}`);
 		if (u.state !== "review") throw new Error(`unit ${id} is ${u.state}, not in review`);
 		const { stackId, area } = placeUnit(config, u.meta, root);
-		const sha = acceptUnit({ ledger, config, unitId: id }, projectDir(config, stackId), area);
-		afterAccept(ledger, await getTargetAdapter(stackId), projectDir(config, stackId), stackId, area, (l) => console.log(l));
+		const sha = await acceptUnit({ ledger, config, unitId: id }, projectDir(config, stackId), area);
+		await afterAccept(ledger, await getTargetAdapter(stackId), projectDir(config, stackId), stackId, area, (l) => console.log(l));
 		console.log(pc.green(`accepted ${id}${sha ? ` @ ${sha.slice(0, 7)}` : ""}`));
 	},
 	simulate: async (args) => {
@@ -242,7 +241,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { config, root, ledger } = open();
 		const scope = requeueScope(ledger, root, args.includes("--all") ? "all" : args.filter((a) => !a.startsWith("--")));
 		for (const l of scope.refused) console.log(pc.yellow(l));
-		for (const l of requeueUnits(ledger, config, root, scope.ids, process.env["USER"] ?? "human", { fresh: args.includes("--fresh"), human: true })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
+		for (const l of await requeueUnits(ledger, config, root, scope.ids, process.env["USER"] ?? "human", { fresh: args.includes("--fresh"), human: true })) console.log(/requeued$/.test(l) ? pc.green(l) : pc.yellow(l));
 	},
 	reopen: async (args) => {
 		const { reopenUnit } = await import("./run/recheck.ts");
@@ -384,7 +383,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		}
 		const { config: cfg2 } = open(); // answers may have changed the config
 		const targets2 = await Promise.all(cfg2.target.stacks.map((s) => getTargetAdapter(s)));
-		const ds = openDecisions(ledger, cfg2, source, targets2, root);
+		const ds = await openDecisions(ledger, cfg2, source, targets2, root);
 		if (args.includes("--json")) return console.log(JSON.stringify(ds, null, 2));
 		if (!answers.length && !args.includes("--list") && ds.length && process.stdout.isTTY) {
 			const { terminalPrompter } = await import("./init/init.ts");
@@ -393,7 +392,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 				if (v === undefined) break;
 				console.log(pc.dim(applyDecision(ledger, cfg2, root, d.id, v, process.env["USER"] ?? "human")));
 			}
-			return console.log(renderDecisions(openDecisions(ledger, open().config, source, targets2, root)));
+			return console.log(renderDecisions(await openDecisions(ledger, open().config, source, targets2, root)));
 		}
 		console.log(renderDecisions(ds));
 	},
@@ -423,7 +422,7 @@ async function assertNoGlobalDecisions(): Promise<void> {
 	const { decisionGate, renderGate } = await import("./run/decisions-gate.ts");
 	const { getSourceAdapter, getTargetAdapter } = await import("./adapters/registry.ts");
 	const { config, ledger, root } = open();
-	const g = decisionGate(ledger, config, getSourceAdapter(config.source.stack), await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s))), root);
+	const g = await decisionGate(ledger, config, getSourceAdapter(config.source.stack), await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s))), root);
 	if (g.global.length) throw new Error(`${renderGate(g)[0]} — run \`br decide\` first`);
 	for (const l of renderGate(g)) console.log(pc.yellow(l));
 	if (g.scoped.length || g.free.length) console.log(pc.dim("the run continues with everything else; answer with `br decide` (another terminal works) and blocked units start"));
@@ -436,7 +435,7 @@ async function assertNoOpenDecisions(): Promise<void> {
 	const source = getSourceAdapter(config.source.stack);
 	source.frameworkDirs?.(config.source.path);
 	const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
-	const ds = openDecisions(ledger, config, source, targets, root);
+	const ds = await openDecisions(ledger, config, source, targets, root);
 	if (ds.length) throw new Error(`${ds.length} open decision(s): ${ds.map((d) => d.id).join(", ")} — run \`br decide\` first (nothing is defaulted silently)`);
 }
 

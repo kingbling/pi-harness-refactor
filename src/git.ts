@@ -1,42 +1,63 @@
-import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { exec } from "./proc.ts";
 
 /**
  * Minimal git helpers. Two repos with opposite rules:
  *  - source: read-only. We only ever record its HEAD (pinned commit) and read files. Never write, never commit.
  *  - target: ours. Initialized at `init`, committed by the orchestrator on accepted units/modules.
  */
-function git(cwd: string, args: string[], opts: ExecFileSyncOptions = {}): string {
-	return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }).toString().trim();
+export function git(cwd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}): Promise<string> {
+	return exec("git", args, { cwd, ...opts }).then((o) => o.trim());
 }
 
-export function isRepo(path: string): boolean {
+/**
+ * Git writes that touch a repo's shared parts (worktree list, branch refs, packed-refs) from parallel lanes take
+ * turns: now that launches are awaited, two lanes can be inside git at once and collide on its lock files.
+ */
+const repoQueues = new Map<string, Promise<unknown>>();
+export function withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+	const key = resolve(repo);
+	const next = (repoQueues.get(key) ?? Promise.resolve()).then(fn, fn);
+	const tail = next.catch(() => {});
+	repoQueues.set(key, tail);
+	void tail.then(() => {
+		if (repoQueues.get(key) === tail) repoQueues.delete(key);
+	});
+	return next;
+}
+
+/** Delete a local branch (a leftover unit branch); the repo's ref writes take turns. */
+export function deleteBranch(repo: string, branch: string): Promise<string> {
+	return withRepoLock(repo, () => git(repo, ["branch", "-q", "-D", branch]));
+}
+
+export async function isRepo(path: string): Promise<boolean> {
 	if (!existsSync(path)) return false;
 	try {
-		return git(path, ["rev-parse", "--is-inside-work-tree"]) === "true";
+		return await git(path, ["rev-parse", "--is-inside-work-tree"]) === "true";
 	} catch {
 		return false;
 	}
 }
 
-export function headOf(path: string): string | undefined {
-	if (!isRepo(path)) return undefined;
+export async function headOf(path: string): Promise<string | undefined> {
+	if (!await isRepo(path)) return undefined;
 	try {
-		return git(path, ["rev-parse", "HEAD"]);
+		return await git(path, ["rev-parse", "HEAD"]);
 	} catch {
 		return undefined; // empty repo
 	}
 }
 
-export function isDirty(path: string): boolean {
-	return git(path, ["status", "--porcelain"]).length > 0;
+export async function isDirty(path: string): Promise<boolean> {
+	return (await git(path, ["status", "--porcelain"])).length > 0;
 }
 
 /** Files changed between two commits (paths relative to repo root). */
-export function changedFiles(path: string, fromCommit: string, toCommit = "HEAD"): { added: string[]; modified: string[]; deleted: string[] } {
-	const out = git(path, ["diff", "--name-status", fromCommit, toCommit]);
+export async function changedFiles(path: string, fromCommit: string, toCommit = "HEAD"): Promise<{ added: string[]; modified: string[]; deleted: string[] }> {
+	const out = await git(path, ["diff", "--name-status", fromCommit, toCommit]);
 	const r = { added: [] as string[], modified: [] as string[], deleted: [] as string[] };
 	for (const line of out.split("\n").filter(Boolean)) {
 		const [status, ...rest] = line.split("\t");
@@ -49,10 +70,10 @@ export function changedFiles(path: string, fromCommit: string, toCommit = "HEAD"
 }
 
 /** `ignored`: generated paths of the stacks living here (TargetToolchain.ignoredPaths), written to a new .gitignore. */
-export function ensureRepo(path: string, defaultBranch = "main", ignored: string[] = []): void {
+export async function ensureRepo(path: string, defaultBranch = "main", ignored: string[] = []): Promise<void> {
 	// a target nested inside another checkout (a workspace under a repo) gets its own repo: commits must never land in the parent
-	if (isRepo(path) && realpathSync(git(path, ["rev-parse", "--show-toplevel"])) === realpathSync(path)) return;
-	git(path, ["init", "-b", defaultBranch]);
+	if (await isRepo(path) && realpathSync(await git(path, ["rev-parse", "--show-toplevel"])) === realpathSync(path)) return;
+	await git(path, ["init", "-b", defaultBranch]);
 	// only a .env at the repo root is kept out: a stack's own .env (Symfony commits its defaults there) is the stack's
 	// business, and its own .gitignore says what stays local
 	if (!existsSync(join(path, ".gitignore"))) writeFileSync(join(path, ".gitignore"), [...ignored.map((i) => `${i}/`), "/.env"].join("\n") + "\n");
@@ -62,10 +83,10 @@ export function ensureRepo(path: string, defaultBranch = "main", ignored: string
  * True when a tracked file's change is only whitespace and blank lines (a formatter's fix): it cannot change what
  * a test checks, so the "tests stay untouched" rules let it through.
  */
-export function whitespaceOnly(repo: string, path: string): boolean {
+export async function whitespaceOnly(repo: string, path: string): Promise<boolean> {
 	try {
-		execFileSync("git", ["-C", repo, "ls-files", "--error-unmatch", "--", path], { stdio: "pipe" });
-		execFileSync("git", ["-C", repo, "diff", "--quiet", "-w", "--ignore-blank-lines", "HEAD", "--", path], { stdio: "pipe" });
+		await git(repo, ["ls-files", "--error-unmatch", "--", path]);
+		await git(repo, ["diff", "--quiet", "-w", "--ignore-blank-lines", "HEAD", "--", path]);
 		return true;
 	} catch {
 		return false;
@@ -73,28 +94,28 @@ export function whitespaceOnly(repo: string, path: string): boolean {
 }
 
 /** True when `path` is the top of its own git repo (not a folder inside some other repo, where git would act on the parent). */
-export function isRepoRoot(path: string): boolean {
+export async function isRepoRoot(path: string): Promise<boolean> {
 	try {
-		return realpathSync(git(path, ["rev-parse", "--show-toplevel"]).trim()) === realpathSync(path);
+		return realpathSync((await git(path, ["rev-parse", "--show-toplevel"])).trim()) === realpathSync(path);
 	} catch {
 		return false;
 	}
 }
 
 /** `exclude`: repo-relative folders left out of the commit (another stack's project). */
-export function commitAll(path: string, message: string, opts: { allowEmpty?: boolean; exclude?: string[] } = {}): string | undefined {
+export async function commitAll(path: string, message: string, opts: { allowEmpty?: boolean; exclude?: string[] } = {}): Promise<string | undefined> {
 	// never commit a parent repo's files: a target folder inside another checkout is not ours to commit
-	if (!isRepoRoot(path)) throw new Error(`${path} is not the top of its own git repo; refusing to commit there`);
-	git(path, ["add", "-A", ...(opts.exclude?.length ? ["--", ".", ...opts.exclude.map((d) => `:(exclude)${d}`)] : [])]);
-	if (!opts.allowEmpty && (opts.exclude?.length || !isDirty(path)) && git(path, ["diff", "--cached", "--name-only"]).length === 0) return undefined;
-	git(path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message, ...(opts.allowEmpty ? ["--allow-empty"] : [])]);
-	return headOf(path);
+	if (!await isRepoRoot(path)) throw new Error(`${path} is not the top of its own git repo; refusing to commit there`);
+	await git(path, ["add", "-A", ...(opts.exclude?.length ? ["--", ".", ...opts.exclude.map((d) => `:(exclude)${d}`)] : [])]);
+	if (!opts.allowEmpty && (opts.exclude?.length || !await isDirty(path)) && (await git(path, ["diff", "--cached", "--name-only"])).length === 0) return undefined;
+	await git(path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message, ...(opts.allowEmpty ? ["--allow-empty"] : [])]);
+	return await headOf(path);
 }
 
 /** Folders git tracks directly under `parent` (relative to the repo). */
-export function trackedChildDirs(repo: string, parent: string): string[] {
+export async function trackedChildDirs(repo: string, parent: string): Promise<string[]> {
 	const pre = parent.replace(/\/?$/, "/");
-	const files = git(repo, ["ls-files", "--", pre]).split("\n").filter(Boolean);
+	const files = (await git(repo, ["ls-files", "--", pre])).split("\n").filter(Boolean);
 	return [...new Set(files.map((f) => f.slice(pre.length)).filter((f) => f.includes("/")).map((f) => f.split("/")[0]!))];
 }
 
@@ -102,30 +123,33 @@ export function trackedChildDirs(repo: string, parent: string): string[] {
  * Rename a tracked folder and commit just that. Two steps through a temporary name, so a rename that only changes
  * upper/lower case also lands where the disk and git ignore case (macOS). Nothing happens while changes are staged.
  */
-export function renameDir(repo: string, from: string, to: string, message: string): string | undefined {
-	if (git(repo, ["diff", "--cached", "--name-only"]).length) return undefined;
+export async function renameDir(repo: string, from: string, to: string, message: string): Promise<string | undefined> {
+	if ((await git(repo, ["diff", "--cached", "--name-only"])).length) return undefined;
 	const tmp = `${from}.rename-${Date.now()}`;
-	git(repo, ["mv", from, tmp]);
+	await git(repo, ["mv", from, tmp]);
 	mkdirSync(dirname(join(repo, to)), { recursive: true });
-	git(repo, ["mv", tmp, to]);
-	git(repo, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message]);
-	return headOf(repo);
+	await git(repo, ["mv", tmp, to]);
+	await git(repo, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message]);
+	return await headOf(repo);
 }
 
 /** Worktree per unit so parallel implementers never share a working copy. */
-export function addWorktree(repo: string, worktreePath: string, branch: string): void {
+export async function addWorktree(repo: string, worktreePath: string, branch: string): Promise<void> {
 	if (existsSync(worktreePath)) return; // same unit resuming in place: keep its work
 	// A new worktree always starts from the current main: -B resets a leftover unit branch (from a parked or
 	// crashed attempt) instead of reviving it on an old base that lacks every unit accepted since.
-	git(repo, ["worktree", "prune"]);
-	git(repo, ["worktree", "add", "-q", "-B", branch, worktreePath]);
+	// the worktree list and branch refs are shared by every lane: adds, prunes and removes take turns
+	await withRepoLock(repo, async () => {
+		await git(repo, ["worktree", "prune"]);
+		await git(repo, ["worktree", "add", "-q", "-B", branch, worktreePath]);
+	});
 }
 
 /**
  * A worktree can hold thousands of files (a copied dependency dir): deleting it inline froze the run for a second
  * per unit. It is moved aside instead (instant, same disk), git forgets it, and the files go in the background.
  */
-export function removeWorktree(repo: string, worktreePath: string): void {
+export async function removeWorktree(repo: string, worktreePath: string): Promise<void> {
 	if (!existsSync(worktreePath)) return;
 	const trash = join(dirname(worktreePath), ".trash", `${basename(worktreePath)}-${process.pid}-${trashSeq++}`);
 	try {
@@ -133,14 +157,14 @@ export function removeWorktree(repo: string, worktreePath: string): void {
 		renameSync(worktreePath, trash);
 	} catch {
 		try {
-			git(repo, ["worktree", "remove", "--force", worktreePath]);
+			await withRepoLock(repo, () => git(repo, ["worktree", "remove", "--force", worktreePath]));
 		} catch {
 			/* already gone */
 		}
 		return;
 	}
 	try {
-		git(repo, ["worktree", "prune"]);
+		await withRepoLock(repo, () => git(repo, ["worktree", "prune"]));
 	} catch {
 		/* pruned on the next add */
 	}
@@ -159,13 +183,13 @@ export function emptyWorktreeTrash(worktreesDir: string): void {
  * The branch units merge into: the configured one, or, when it is gone from the repo (renamed by hand, e.g.
  * migration/main → main), the branch the target repo has checked out.
  */
-export function mainBranch(repo: string, configured: string): string {
+export async function mainBranch(repo: string, configured: string): Promise<string> {
 	try {
-		git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${configured}`]);
+		await git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${configured}`]);
 		return configured;
 	} catch {
 		try {
-			return git(repo, ["symbolic-ref", "--short", "HEAD"]) || configured;
+			return await git(repo, ["symbolic-ref", "--short", "HEAD"]) || configured;
 		} catch {
 			return configured;
 		}

@@ -102,10 +102,10 @@ describe("generated target adapters on non-TypeScript stacks", () => {
 		});
 	};
 
-	it("installed packages come from the stack's list command when it has no JSON manifest", () => {
-		expect(fromManifest(go()).toolchain.installedPackages(here)).toEqual(["github.com/go-chi/chi/v5"]);
+	it("installed packages come from the stack's list command when it has no JSON manifest", async () => {
+		expect(await fromManifest(go()).toolchain.installedPackages(here)).toEqual(["github.com/go-chi/chi/v5"]);
 		// the JSON manifest still works where it applies
-		expect(fromManifest(manifest()).toolchain.installedPackages(here)).toContain("vitest");
+		expect(await fromManifest(manifest()).toolchain.installedPackages(here)).toContain("vitest");
 		const ok = go();
 		ok.toolchain.installed.list = { cmd: "go", args: ["list", "-m", "all"] };
 		expect(validateManifest(ok)).toEqual([]);

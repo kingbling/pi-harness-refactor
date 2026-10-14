@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -10,6 +9,7 @@ import type { CodeCall, CodeComment, CodeContainer, CodeFunction, FileIndex, Ind
 import { STORE_KINDS } from "../types.ts";
 import { exampleProfileJson, phpAdapter, profileFromJson, type FrameworkProfileJson } from "./php.ts";
 import { sqlTables } from "./sql.ts";
+import { exec } from "../../proc.ts";
 
 /**
  * A source (legacy) adapter for a language bigrefactor has no hand-written adapter for. A model looks at the
@@ -559,13 +559,13 @@ export async function verifySourceManifest(m: SourceManifest, o: { root: string;
 	if (broken.length) problems.push(`indexing failed on ${broken.length} of ${sample.length} sample files:\n${broken.slice(0, 5).join("\n")}`);
 	if (empty.length * 2 > sample.length) problems.push(`queries.symbols found no declaration in ${empty.length} of ${sample.length} sample files, e.g. ${empty.slice(0, 5).join(", ")}`);
 
-	const truth = probeTruth(m, o.root, o.sourceRoot);
+	const truth = await probeTruth(m, o.root, o.sourceRoot);
 	if (truth) problems.push(truth);
 	return problems.length ? problems.join("\n") : undefined;
 }
 
 /** Runs truth.probe with truth.run from the legacy root; it must print []. */
-function probeTruth(m: SourceManifest, root: string, sourceRoot: string): string | undefined {
+async function probeTruth(m: SourceManifest, root: string, sourceRoot: string): Promise<string | undefined> {
 	const dir = join(sourceAdaptersDir(root), "probe");
 	mkdirSync(dir, { recursive: true });
 	const script = join(dir, m.truth.scriptName);
@@ -573,7 +573,7 @@ function probeTruth(m: SourceManifest, root: string, sourceRoot: string): string
 	const fill = (a: string) => a.replaceAll("{script}", script).replaceAll("{root}", sourceRoot);
 	const cmd = [fill(m.truth.run.cmd), ...m.truth.run.args.map(fill)];
 	try {
-		const out = execFileSync(cmd[0]!, cmd.slice(1), { cwd: sourceRoot, encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "pipe"] });
+		const out = await exec(cmd[0]!, cmd.slice(1), { cwd: sourceRoot, timeout: 60_000 });
 		const at = out.indexOf("[");
 		let ok = false;
 		try {

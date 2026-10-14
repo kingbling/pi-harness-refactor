@@ -82,10 +82,10 @@ export function examplesProblems(r: LayoutRules, mustPass: string[], mustFail: s
 }
 
 /** How much of the project as it is now breaks the rules: findings and feature folders affected. */
-export function layoutImpact(projectDir: string, adapter: TargetAdapter, r: LayoutRules): { findings: string[]; areas: number } {
+export async function layoutImpact(projectDir: string, adapter: TargetAdapter, r: LayoutRules): Promise<{ findings: string[]; areas: number }> {
 	if (!existsSync(projectDir)) return { findings: [], areas: 0 };
 	const l = adapter.layout;
-	const findings = checkLayoutTree(projectDir, r, { sharedDirs: l.sharedDirs, dataDirs: l.dataDirs, isTestFile: (f) => l.isTestFile(f), sourceExtensions: l.sourceExtensions, ignoreDirs: l.ignoreDirs, wiringFiles: l.wiringFiles, fileFindings: l.fileFindings });
+	const findings = await checkLayoutTree(projectDir, r, { sharedDirs: l.sharedDirs, dataDirs: l.dataDirs, isTestFile: (f) => l.isTestFile(f), sourceExtensions: l.sourceExtensions, ignoreDirs: l.ignoreDirs, wiringFiles: l.wiringFiles, fileFindings: l.fileFindings });
 	const root = r.moduleDir.split("/").slice(0, -1).join("/");
 	const areas = new Set(findings.map((f) => f.startsWith(`${root}/`) ? f.slice(root.length + 1).split("/")[0] : "").filter(Boolean));
 	return { findings, areas: areas.size };
@@ -105,7 +105,7 @@ export async function applyLayout(o: { root: string; stack: string; rules: Layou
 	if (o.ledger && o.projectDir && existsSync(o.projectDir)) {
 		const { recordDrift } = await import("../run/layout-check.ts");
 		const { getTargetAdapter } = await import("../adapters/registry.ts");
-		recordDrift(o.ledger, await getTargetAdapter(o.stack), o.projectDir);
+		await recordDrift(o.ledger, await getTargetAdapter(o.stack), o.projectDir);
 	}
 	return path;
 }
@@ -134,7 +134,7 @@ export async function askLayout(o: { root: string; stack: string; adapter: Targe
 		return `${rules.moduleDir} (${summary || "proposed"})`;
 	}
 	for (;;) {
-		const impact = o.projectDir ? layoutImpact(o.projectDir, o.adapter, rules) : { findings: [], areas: 0 };
+		const impact = o.projectDir ? await layoutImpact(o.projectDir, o.adapter, rules) : { findings: [], areas: 0 };
 		const v = await o.ui.select(
 			`How should the ${o.stack} code be organised? Proposed: ${summary || "this layout"}.\n${layoutPreview(rules).split("\n").map((l) => `   ${l}`).join("\n")}${impact.findings.length ? `\n   ${impact.findings.length} thing(s) in ${impact.areas} feature folder(s) already there break it; the cleanup step proposes moving them.` : ""}\n   Every agent's work is checked against this; breaking it fails the check with what to fix.`,
 			[
@@ -180,7 +180,7 @@ export async function ownerRule(o: { root: string; stack: string; adapter: Targe
 		if (o.ledger) proposeRule({ ledger: o.ledger }, { stack: o.stack, kind: "add", text: o.words, why: "owner (/br rule)" });
 		return `not a folder rule the checker can enforce (${d.reason}); added as a written rule for the agents instead (merged into RULES.md with the next rules update)`;
 	}
-	const impact = o.projectDir ? layoutImpact(o.projectDir, o.adapter, d.rules) : { findings: [], areas: 0 };
+	const impact = o.projectDir ? await layoutImpact(o.projectDir, o.adapter, d.rules) : { findings: [], areas: 0 };
 	const v = await o.ui.select(
 		`Change the ${o.stack} folder layout? ${d.summary}\n${layoutPreview(d.rules).split("\n").map((l) => `   ${l}`).join("\n")}\n   ${impact.findings.length ? `${impact.findings.length} thing(s) in ${impact.areas} feature folder(s) already there break it, e.g. ${impact.findings[0]}; the cleanup step proposes moving them.` : "Nothing already there breaks it."}\n   From the next unit on, every agent's work is checked against it.`,
 		[
@@ -207,8 +207,8 @@ export async function layoutJob(o: { root: string; stack: string; adapter: Targe
 	if (!d.ok) return { owner: `a layout change was tried and the checker refused it (${d.reason}): ${o.words}` };
 	// by path: a finding's text names the allowed files, which the change itself rewrites
 	const path = (f: string) => f.split(": ")[0];
-	const before = new Set(layoutImpact(o.projectDir, o.adapter, current).findings.map(path));
-	const broken = layoutImpact(o.projectDir, o.adapter, d.rules).findings.filter((f) => !before.has(path(f)));
+	const before = new Set((await layoutImpact(o.projectDir, o.adapter, current)).findings.map(path));
+	const broken = (await layoutImpact(o.projectDir, o.adapter, d.rules)).findings.filter((f) => !before.has(path(f)));
 	if (broken.length) return { owner: `the layout change "${d.summary}" would make code already on main wrong (${broken.length}, e.g. ${broken[0]}); /br rule ${o.stack}: ${o.words} applies it if you want it` };
 	await applyLayout({ root: o.root, stack: o.stack, rules: d.rules, ledger: o.ledger, projectDir: o.projectDir });
 	return { applied: d.summary };

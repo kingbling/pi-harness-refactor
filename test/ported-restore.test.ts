@@ -7,7 +7,7 @@ import { everOnMain } from "../src/run/unit.ts";
 
 /** Saved tests are not put back at a path main once had: another unit's test, or one tidy moved since. */
 describe("everOnMain", () => {
-	it("names the paths main's history held, also ones moved away since", () => {
+	it("names the paths main's history held, also ones moved away since", async () => {
 		const repo = mkdtempSync(join(tmpdir(), "br-ever-"));
 		const git = (...a: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd: repo, stdio: "pipe" });
 		git("init", "-q");
@@ -19,7 +19,7 @@ describe("everOnMain", () => {
 		git("mv", "app/tests/OldTest.php", "app/moved/OldTest.php");
 		git("commit", "-qm", "tidy");
 		const dir = join(repo, "app");
-		expect(everOnMain(dir, ["tests/OldTest.php", "tests/MineTest.php"])).toEqual(new Set(["tests/OldTest.php"]));
-		expect(everOnMain(tmpdir(), ["x.php"])).toEqual(new Set());
+		expect(await everOnMain(dir, ["tests/OldTest.php", "tests/MineTest.php"])).toEqual(new Set(["tests/OldTest.php"]));
+		expect(await everOnMain(tmpdir(), ["x.php"])).toEqual(new Set());
 	});
 });

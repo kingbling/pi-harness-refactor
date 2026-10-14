@@ -50,17 +50,17 @@ afterEach(() => {
 });
 
 describe("checkTree", () => {
-	it("a clean tree has no findings", () => {
-		expect(checkTree(project, adapter)).toEqual([]);
+	it("a clean tree has no findings", async () => {
+		expect(await checkTree(project, adapter)).toEqual([]);
 	});
 
-	it("reports dotted folders, stray folders, misnamed files, oversized files and two services in one file", () => {
+	it("reports dotted folders, stray folders, misnamed files, oversized files and two services in one file", async () => {
 		write("src/features/list.tpl/list.ts", "export {};\n");
 		write("src/players.facade/players.ts", "export {};\n");
 		write("src/features/agency/agency-list.service.ts", TWO);
 		write("src/features/agency/helpers.ts", "export {};\n");
 		write("src/features/campaign/campaign.service.ts", `export class CampaignService {\n${"\t// line\n".repeat(420)}}\n`);
-		const lines = checkTree(project, adapter);
+		const lines = await checkTree(project, adapter);
 		const has = (re: RegExp) => expect(lines.some((l) => re.test(l)), `${re} in\n${lines.join("\n")}`).toBe(true);
 		has(/^src\/features\/list\.tpl\/: folder "list\.tpl" is not kebab-case/);
 		has(/^src\/players\.facade\/: outside the feature root/);
@@ -70,19 +70,19 @@ describe("checkTree", () => {
 		expect(lines.filter((l) => l.startsWith("src/features/agency/agency.service.ts"))).toEqual([]);
 	});
 
-	it("ui stack: a component file with a legacy template name is drift; the React shapes are not", () => {
+	it("ui stack: a component file with a legacy template name is drift; the React shapes are not", async () => {
 		write("src/features/agency/pages/AgencyPage.tsx", "export default function AgencyPage() { return null; }\n");
 		write("src/features/agency/components/AgencyTable.tsx", "export function AgencyTable() { return null; }\n");
 		write("src/features/agency/list.vue.tsx", "export {};\n");
-		const lines = reactAdapter.layout.checkTree!(project).filter((l) => l.includes("/agency/") && !l.includes(".service.ts") && !l.includes(".controller.ts") && !l.includes("/dto/"));
+		const lines = (await reactAdapter.layout.checkTree!(project)).filter((l) => l.includes("/agency/") && !l.includes(".service.ts") && !l.includes(".controller.ts") && !l.includes("/dto/"));
 		expect(lines).toEqual([expect.stringMatching(/^src\/features\/agency\/list\.vue\.tsx: not a file of the area module/)]);
 	});
 
-	it("records the report line-oriented in the ledger; driftReport filters one area", () => {
+	it("records the report line-oriented in the ledger; driftReport filters one area", async () => {
 		write("src/features/agency/agency-list.service.ts", TWO);
 		write("src/features/agency-sso/sso.ts", "export {};\n");
 		write("src/shared/agency/AgencyThing.service.ts", "export class AgencyThingService {}\nexport class OtherService {}\n");
-		const all = recordDrift(ledger, adapter, project);
+		const all = await recordDrift(ledger, adapter, project);
 		expect(ledger.getMeta("drift:nestjs")!.split("\n")).toEqual(all);
 		const agency = driftReport(ledger, "nestjs", "agency");
 		// the file's two classes, the misnamed class, the area-wide parallel classes, the shared file

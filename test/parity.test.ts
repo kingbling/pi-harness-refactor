@@ -110,7 +110,7 @@ describe("starting the apps for parity", () => {
 		expect(kept.recipe!.reset).toEqual({ cmd: process.execPath, args: ["-e", "0"] });
 		expect(kept.recipe!.dump).toBeUndefined();
 		// 70 MB on stdout: more than the 64 MB a buffer would take
-		const big = dumpData({ ...asRecipe(serverRecipe(port)), dump: { cmd: process.execPath, args: ["-e", "process.stdout.write(JSON.stringify({ t: ['x'.repeat(70 * 1024 * 1024)] }))"] } }, legacy);
+		const big = await dumpData({ ...asRecipe(serverRecipe(port)), dump: { cmd: process.execPath, args: ["-e", "process.stdout.write(JSON.stringify({ t: ['x'.repeat(70 * 1024 * 1024)] }))"] } }, legacy);
 		expect((big["t"]![0] as string).length).toBe(70 * 1024 * 1024);
 	});
 
@@ -153,8 +153,8 @@ describe("starting the apps for parity", () => {
 	it("a red new app is probed again once main has moved on, a few times at most, without asking the owner again", async () => {
 		const { root, config } = workspace();
 		mkdirSync(config.target.path, { recursive: true });
-		ensureRepo(config.target.path);
-		commitAll(config.target.path, "scaffold", { allowEmpty: true });
+		await ensureRepo(config.target.path);
+		await commitAll(config.target.path, "scaffold", { allowEmpty: true });
 		let calls = 0;
 		const red: AppFixer = async () => (calls++, "nothing to start yet");
 		let asked = 0;
@@ -163,7 +163,7 @@ describe("starting the apps for parity", () => {
 		expect(await probeApp(opts)).toBe(false);
 		expect(calls).toBe(1);
 		for (let i = 0; i < 4; i++) {
-			commitAll(config.target.path, `unit ${i}`, { allowEmpty: true });
+			await commitAll(config.target.path, `unit ${i}`, { allowEmpty: true });
 			await probeApp(opts);
 		}
 		expect(calls).toBe(3);

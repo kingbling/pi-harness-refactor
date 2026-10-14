@@ -9,10 +9,10 @@ const dirs: string[] = [];
 afterAll(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
 
 describe("a new target repo's ignore file", () => {
-	it("keeps out only a .env at the root; a stack's own .env (Symfony's committed defaults) is tracked", () => {
+	it("keeps out only a .env at the root; a stack's own .env (Symfony's committed defaults) is tracked", async () => {
 		const t = mkdtempSync(join(tmpdir(), "br-env-"));
 		dirs.push(t);
-		ensureRepo(t, "main", ["vendor"]);
+		await ensureRepo(t, "main", ["vendor"]);
 		expect(readFileSync(join(t, ".gitignore"), "utf8")).toBe("vendor/\n/.env\n");
 		mkdirSync(join(t, "symfony"));
 		writeFileSync(join(t, "symfony", ".env"), "APP_ENV=dev\n");
@@ -30,17 +30,17 @@ describe("a new target repo's ignore file", () => {
 		expect(ignored("symfony/.env")).toBe(false);
 	});
 
-	it("a formatter's whitespace-only change is told apart from a real one", () => {
+	it("a formatter's whitespace-only change is told apart from a real one", async () => {
 		const t = mkdtempSync(join(tmpdir(), "br-ws-"));
 		dirs.push(t);
-		ensureRepo(t, "main", []);
+		await ensureRepo(t, "main", []);
 		writeFileSync(join(t, "a.php"), "<?php\nassert(1+1 === 2);\n");
-		commitAll(t, "init");
+		await commitAll(t, "init");
 		writeFileSync(join(t, "a.php"), "<?php\n\nassert(1 + 1 === 2);\n");
-		expect(whitespaceOnly(t, "a.php")).toBe(true);
+		expect(await whitespaceOnly(t, "a.php")).toBe(true);
 		writeFileSync(join(t, "a.php"), "<?php\nassert(1+1 === 3);\n");
-		expect(whitespaceOnly(t, "a.php")).toBe(false);
+		expect(await whitespaceOnly(t, "a.php")).toBe(false);
 		writeFileSync(join(t, "new.php"), "x");
-		expect(whitespaceOnly(t, "new.php")).toBe(false);
+		expect(await whitespaceOnly(t, "new.php")).toBe(false);
 	});
 });

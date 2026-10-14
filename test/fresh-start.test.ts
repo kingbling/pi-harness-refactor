@@ -38,14 +38,14 @@ describe("init in a workspace with earlier work", () => {
 		expect(await offerFreshStart(root, never, { yes: false, fresh: false })).toBe(false); // only kept adapters: nothing to ask
 	});
 
-	it("an adapter an earlier fresh start left behind is brought back, newest first", () => {
+	it("an adapter an earlier fresh start left behind is brought back, newest first", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-fresh-"));
 		for (const [old, body] of [[".bigrefactor.old-2026-10-07T08-00-00", "older"], [".bigrefactor.old-2026-10-08T08-11-33", "newer"]]) {
 			mkdirSync(join(root, old!, "adapters", "symfony.seed"), { recursive: true });
 			writeFileSync(join(root, old!, "adapters", "symfony.json"), body!);
 		}
-		expect(restoreManifest(root, "vue")).toBe(false);
-		expect(restoreManifest(root, "symfony")).toBe(true);
+		expect(await restoreManifest(root, "vue")).toBe(false);
+		expect(await restoreManifest(root, "symfony")).toBe(true);
 		expect(readFileSync(join(root, ".bigrefactor", "adapters", "symfony.json"), "utf8")).toBe("newer");
 		expect(existsSync(join(root, ".bigrefactor", "adapters", "symfony.seed"))).toBe(true);
 	});
@@ -73,8 +73,8 @@ describe("git: never commits a parent repo", () => {
 		const inner = join(parent, "target");
 		mkdirSync(inner);
 		writeFileSync(join(inner, "a.txt"), "x");
-		expect(isRepoRoot(parent)).toBe(true);
-		expect(isRepoRoot(inner)).toBe(false);
-		expect(() => commitAll(inner, "nope")).toThrow(/not the top of its own git repo/);
+		expect(await isRepoRoot(parent)).toBe(true);
+		expect(await isRepoRoot(inner)).toBe(false);
+		await expect(commitAll(inner, "nope")).rejects.toThrow(/not the top of its own git repo/);
 	});
 });

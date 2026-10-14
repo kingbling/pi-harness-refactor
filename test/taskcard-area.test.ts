@@ -31,7 +31,7 @@ const card = async (id: string) => {
 	const adapter = await getTargetAdapter("nestjs");
 	const place = placeUnit(config, ledger.getUnit(id)!.meta, ws);
 	const moduleDir = placementDir(adapter.layout, place);
-	return buildTaskCard(ledger, config, id, { targetProjectDir: api, writeGlobs: [`${moduleDir}/**`], adapter, place, moduleDir, root: ws });
+	return await buildTaskCard(ledger, config, id, { targetProjectDir: api, writeGlobs: [`${moduleDir}/**`], adapter, place, moduleDir, root: ws });
 };
 
 beforeEach(async () => {

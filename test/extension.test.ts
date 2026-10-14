@@ -63,8 +63,8 @@ describe("pi extension /br", () => {
 		mkdirSync(join(target, "src"), { recursive: true });
 		writeFileSync(join(target, "package.json"), JSON.stringify({ name: "sim", private: true, devDependencies: { vitest: "x" } }));
 		writeFileSync(join(target, "nest-cli.json"), "{}");
-		ensureRepo(target, "migration/main");
-		commitAll(target, "chore: bootstrap (test)");
+		await ensureRepo(target, "migration/main");
+		await commitAll(target, "chore: bootstrap (test)");
 
 		// no config yet: status warns instead of throwing
 		const { ctx: c0, notified } = stubCtx(ws, false);

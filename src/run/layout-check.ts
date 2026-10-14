@@ -125,7 +125,7 @@ export async function checkLayout(config: Config, root: string, ledger: Ledger):
 	problems.push(...(await validateRulesLayout(root, config)));
 
 	// ---- (c) the target tree as it is now
-	const trees = adapters.map((a) => scanTree(config, a));
+	const trees = await Promise.all(adapters.map((a) => scanTree(config, a)));
 	for (const [i, t] of trees.entries()) {
 		if (t.stray.length) problems.push(`${t.stackId}: ${t.stray.length} folder(s) under ${t.srcRoot}/ outside ${t.moduleRoot} and the shared dirs: ${examples(t.stray.map((d) => `${d}/`))}`);
 		const bad = t.features.filter((f) => !isAreaFolder(adapters[i]!.layout, f.area)).map((f) => f.area);
@@ -143,7 +143,7 @@ export async function checkLayout(config: Config, root: string, ledger: Ledger):
 	// ---- (e) drift: naming, size, one class per responsibility over the whole tree (stray folders are problems above)
 	const drift: Record<string, string[]> = {};
 	for (const a of adapters) {
-		const lines = (drift[a.id] = checkTree(projectDir(config, a.id), a));
+		const lines = (drift[a.id] = await checkTree(projectDir(config, a.id), a));
 		const own = lines.filter((l) => !l.endsWith(STRAY));
 		if (own.length) warnings.push(`${a.id}: ${own.length} drift finding(s) in the tree (${examples(own)})`);
 	}
@@ -171,11 +171,11 @@ export function moduleRootOf(l: { moduleDir(area: string): string }): string {
 	return at >= 0 ? probe.slice(0, at) : probe.replace(/[^/]*$/, "");
 }
 
-export function scanTree(config: Config, a: TargetAdapter): StackTree {
+export function scanTree(config: Config, a: TargetAdapter): Promise<StackTree> {
 	return scanDir(projectDir(config, a.id), a);
 }
 
-function scanDir(dir: string, a: TargetAdapter): StackTree {
+async function scanDir(dir: string, a: TargetAdapter): Promise<StackTree> {
 	const l = a.layout;
 	const ig = l.ignoreDirs;
 	const moduleRoot = moduleRootOf(l);
@@ -185,14 +185,14 @@ function scanDir(dir: string, a: TargetAdapter): StackTree {
 	const notAreas = new Set<string>();
 	if (parts.length === 1) {
 		for (const d of [...l.sharedDirs, ...(l.dataDirs ?? [])]) if (d.startsWith(moduleRoot)) notAreas.add(d.slice(moduleRoot.length).split("/")[0]!);
-		for (const d of scaffoldDirs(dir, parts[0]!)) notAreas.add(d);
+		for (const d of await scaffoldDirs(dir, parts[0]!)) notAreas.add(d);
 	}
 	const features = listDirs(join(dir, moduleRoot), ig).filter((d) => !notAreas.has(d)).map((area) => ({ area, files: walk(join(dir, moduleRoot, area), ig).length }));
 	const shared = l.sharedDirs.flatMap((s) => walk(join(dir, s), ig).map((f) => posix.join(s, f)));
 	let stray: string[] = [];
 	if (srcRoot) {
 		const top = (p: string) => (p.startsWith(`${srcRoot}/`) ? p.slice(srcRoot.length + 1).split("/") : []);
-		const allowed = new Set<string>([parts.at(-1)!, ...scaffoldDirs(dir, srcRoot)]);
+		const allowed = new Set<string>([parts.at(-1)!, ...(await scaffoldDirs(dir, srcRoot))]);
 		// shared dirs are dirs with or without a trailing slash; generated entries are files (their folder counts)
 		for (const p of l.sharedDirs) {
 			const t = top(p.replace(/\/?$/, "/"));
@@ -211,8 +211,8 @@ function scanDir(dir: string, a: TargetAdapter): StackTree {
 export const STRAY = "outside the feature root, the shared dirs and the scaffold";
 
 /** Source folders straight under the source root outside the feature root, the shared dirs and the scaffold, project-relative with a trailing slash (`src/api/`). */
-export function strayDirs(dir: string, a: TargetAdapter): string[] {
-	const t = scanDir(dir, a);
+export async function strayDirs(dir: string, a: TargetAdapter): Promise<string[]> {
+	const t = await scanDir(dir, a);
 	return t.stray.map((d) => `${t.srcRoot}/${d}/`);
 }
 
@@ -221,17 +221,17 @@ export function strayDirs(dir: string, a: TargetAdapter): string[] {
  * (naming per structureDoc, size cap, one class per responsibility) + source folders outside the feature root, the
  * shared dirs and the scaffold. `only` limits the adapter's findings to those files (the gate) and skips the folders.
  */
-export function checkTree(dir: string, a: TargetAdapter, only?: string[]): string[] {
+export async function checkTree(dir: string, a: TargetAdapter, only?: string[]): Promise<string[]> {
 	// files that came with the generated project (its first commit) are the framework's, never drift
-	const scaffold = new Set(scaffoldFiles(dir));
-	const lines = (a.layout.checkTree?.(dir, only) ?? []).filter((l) => !scaffold.has(l.slice(0, l.indexOf(": "))));
+	const scaffold = new Set(await scaffoldFiles(dir));
+	const lines = ((await a.layout.checkTree?.(dir, only)) ?? []).filter((l) => !scaffold.has(l.slice(0, l.indexOf(": "))));
 	if (only) return lines;
-	return [...lines, ...strayDirs(dir, a).map((d) => `${d}: ${STRAY}`)];
+	return [...lines, ...(await strayDirs(dir, a)).map((d) => `${d}: ${STRAY}`)];
 }
 
 /** After an accept: the stack's drift findings, stored line-oriented in ledger meta `drift:<stackId>` (tidy reads it). */
-export function recordDrift(ledger: Ledger, a: TargetAdapter, dir: string): string[] {
-	const lines = checkTree(dir, a);
+export async function recordDrift(ledger: Ledger, a: TargetAdapter, dir: string): Promise<string[]> {
+	const lines = await checkTree(dir, a);
 	ledger.setMeta(`drift:${a.id}`, lines.join("\n"));
 	ledger.setMeta(`drift_dirs:${a.id}`, JSON.stringify({ moduleRoot: moduleRootOf(a.layout), sharedDirs: a.layout.sharedDirs }));
 	return lines;
@@ -291,7 +291,7 @@ export async function sampleFacts(config: Config, ledger: Ledger, landed: Placem
 	for (const id of config.target.stacks) {
 		const a = await getTargetAdapter(id);
 		const dir = projectDir(config, id);
-		const found = checkTree(dir, a);
+		const found = await checkTree(dir, a);
 		drift += found.length;
 		const classes = ledger.db.prepare("SELECT path, kind, name FROM index_symbols WHERE side = 'target' AND tags LIKE '%\"class\"%' AND tags LIKE ?").all(stackTagLike(id)) as Array<{ path: string; kind: string; name: string }>;
 		for (const mod of [...new Set(landed.filter((p) => p.stackId === id).map((p) => placementDir(a.layout, p)))].sort()) {

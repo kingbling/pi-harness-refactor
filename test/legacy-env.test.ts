@@ -27,7 +27,7 @@ const call = (t: unknown, p: object) => (t as { execute: (id: string, p: object)
 describe("the old code's environment", () => {
 	it("is the legacy repo until the setup model makes a copy; the copy gets the dependencies, the repo stays read-only", async () => {
 		const { root, legacy, truthDir, config, source } = workspace();
-		expect(verifyTruthOnOld(truthDir, config, source, root).ok).toBe(false);
+		expect((await verifyTruthOnOld(truthDir, config, source, root)).ok).toBe(false);
 		const fixer: LegacyFixer = async (o) => {
 			await call(legacyCopyTool(o.root, o.config), { why: "packages were never installed" });
 			const copy = loadLegacyEnv(o.root, o.config).root;
@@ -37,7 +37,7 @@ describe("the old code's environment", () => {
 		};
 		const fixed = await fixLegacyEnv({ config, root, source, problem: "cat: deps/lib.json: No such file", truthDir, signature: "truth: missing deps", fixer });
 		expect(fixed).toBe("installed the dependencies in a copy");
-		expect(verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: true, cases: [{ symbol: "app.sh::run" }] });
+		expect(await verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: true, cases: [{ symbol: "app.sh::run" }] });
 		expect(existsSync(join(legacy, "deps"))).toBe(false);
 		expect(describeTruthRun(root, config, source, "/t/cases.sh")).toBe(`cd ${loadLegacyEnv(root, config).root} && sh /t/cases.sh`);
 		expect(readFileSync(join(root, ".bigrefactor", "legacy-env.log"), "utf8")).toMatch(/installed the dependencies/);
@@ -55,12 +55,12 @@ describe("the old code's environment", () => {
 		expect(calls).toBe(MAX_LEGACY_FIXES_PER_PROBLEM + 1);
 	});
 
-	it("the cases are the JSON array printed last; notices with a [ before it do not hide them", () => {
+	it("the cases are the JSON array printed last; notices with a [ before it do not hide them", async () => {
 		const { root, legacy, truthDir, config, source } = workspace();
 		writeFileSync(join(legacy, "app.sh"), `echo "Notice: [deprecated] something"\necho '[{"symbol":"a::b",'\necho ' "inputs":[],"expected":1}]'\n`);
-		expect(verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: true, cases: [{ symbol: "a::b" }] });
+		expect(await verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: true, cases: [{ symbol: "a::b" }] });
 		writeFileSync(join(legacy, "app.sh"), `echo "Warning: [x] could not connect"\n`);
-		expect(verifyTruthOnOld(truthDir, config, source, root).error).toMatch(/could not connect/);
+		expect((await verifyTruthOnOld(truthDir, config, source, root)).error).toMatch(/could not connect/);
 	});
 
 	it("the run command can change, but must run the script", async () => {
@@ -162,7 +162,7 @@ describe("the old code's environment", () => {
 	});
 
 
-	it("a truth script that loads the old code by its absolute legacy-repo path still runs where the old code really is", () => {
+	it("a truth script that loads the old code by its absolute legacy-repo path still runs where the old code really is", async () => {
 		const { root, config, source } = workspace();
 		const elsewhere = join(root, "old-copy");
 		mkdirSync(join(elsewhere, "lib"), { recursive: true });
@@ -172,7 +172,7 @@ describe("the old code's environment", () => {
 		mkdirSync(dir, { recursive: true });
 		const script = join(dir, "cases.sh");
 		writeFileSync(script, `. ${resolve(config.source.path)}/lib/value.sh\necho "[{\\"symbol\\":\\"s\\",\\"inputs\\":[],\\"expected\\":$V}]"\n`);
-		const r = verifyTruthOnOld(dir, config, source, root);
+		const r = await verifyTruthOnOld(dir, config, source, root);
 		expect(r).toMatchObject({ ok: true, cases: [{ expected: 7 }] });
 		expect(readFileSync(script, "utf8")).toContain(resolve(config.source.path)); // the tester's script is untouched
 	});
@@ -214,16 +214,16 @@ describe("the old code's environment", () => {
 });
 
 describe("truth that changes from run to run", () => {
-	it("an expected value that differs between two runs of the old code is refused, with the case and what to do", () => {
+	it("an expected value that differs between two runs of the old code is refused, with the case and what to do", async () => {
 		const { root, legacy, truthDir, config, source } = workspace();
 		// a counter file stands in for a clock: each run prints a different created_at
 		writeFileSync(join(legacy, "app.sh"), `n=$(cat n 2>/dev/null || echo 0); n=$((n+1)); echo $n > n\necho '[{"symbol":"a::b","inputs":[],"expected":{"total":5,"created_at":'$n'}}]'\n`);
-		const r = verifyTruthOnOld(truthDir, config, source, root);
+		const r = await verifyTruthOnOld(truthDir, config, source, root);
 		expect(r.ok).toBe(false);
 		expect(r.error).toMatch(/differ between two runs[\s\S]*case #1\.created_at: \d+ then \d+[\s\S]*fixed input/);
 		expect(r.error).not.toMatch(/total/);
 		writeFileSync(join(legacy, "app.sh"), `echo '[{"symbol":"a::b","inputs":[],"expected":{"total":5}}]'\n`);
-		expect(verifyTruthOnOld(truthDir, config, source, root).ok).toBe(true);
+		expect((await verifyTruthOnOld(truthDir, config, source, root)).ok).toBe(true);
 	});
 
 	it("a probe that ran green and fails now means the runtime is down: waited for, over once it runs again, down when it stays red", async () => {

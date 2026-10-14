@@ -1,17 +1,19 @@
-import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
 import type { Config } from "../config.ts";
-import { addWorktree, headOf, removeWorktree } from "../git.ts";
+import { addWorktree, headOf, removeWorktree, deleteBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { legacyCopyTool, loadLegacyEnv, ownerPreference, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
+import { exec } from "../proc.ts";
+import { rm } from "node:fs/promises";
 
 /**
  * Differential parity, step one: can the OLD app and the NEW app each be started here as a local server that
@@ -95,13 +97,13 @@ const TARGET_BRANCH = "parity/main";
 /** A fresh worktree of main for the new app (dependencies linked like a unit's). */
 export async function prepareTargetCopy(config: Config, root: string, linkAll: (wt: string) => void | Promise<void>): Promise<string> {
 	const wt = targetWorktree(root);
-	removeWorktree(config.target.path, wt);
+	await removeWorktree(config.target.path, wt);
 	try {
-		execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", TARGET_BRANCH], { stdio: "pipe" });
+		await deleteBranch(config.target.path, TARGET_BRANCH);
 	} catch {
 		/* no branch */
 	}
-	addWorktree(config.target.path, wt, TARGET_BRANCH);
+	await addWorktree(config.target.path, wt, TARGET_BRANCH);
 	await linkAll(wt);
 	return wt;
 }
@@ -162,7 +164,7 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 	if (!existsSync(cwd)) return { ok: false, error: `folder ${cwd} does not exist` };
 	if (recipe.reset)
 		try {
-			execFileSync(recipe.reset.cmd, recipe.reset.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: 300_000, stdio: "pipe" });
+			await exec(recipe.reset.cmd, recipe.reset.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: 300_000 });
 		} catch (e: any) {
 			return { ok: false, error: `the data reset failed: ${[e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || e?.message}` };
 		}
@@ -201,7 +203,7 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 		}
 		if (recipe.stop)
 			try {
-				execFileSync(recipe.stop.cmd, recipe.stop.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: 120_000, stdio: "pipe" });
+				await exec(recipe.stop.cmd, recipe.stop.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: 120_000 });
 			} catch {
 				/* best effort: the next boot's port check catches a leftover */
 			}
@@ -222,7 +224,7 @@ export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeou
 	const b = await bootApp(recipe, appDir, o);
 	if (!b.ok) return b;
 	try {
-		if (recipe.dump) dumpData(recipe, appDir);
+		if (recipe.dump) await dumpData(recipe, appDir);
 	} catch (e: any) {
 		// the app came up after the reset ran, so the reset works: say so, it can be kept without the dump
 		return { ok: false, dumpFailed: true, error: `the app starts${recipe.reset ? " and the data reset works" : ""}, but the data dump fails: ${String(e?.message ?? e).slice(-800)}` };
@@ -233,7 +235,7 @@ export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeou
 }
 
 /** The app's data as {table: rows}, from the recipe's dump command. Throws when it prints anything else. */
-export function dumpData(recipe: AppRecipe, appDir: string): Record<string, unknown[]> {
+export async function dumpData(recipe: AppRecipe, appDir: string): Promise<Record<string, unknown[]>> {
 	if (!recipe.dump) return {};
 	// stdout goes to a file, not a buffer: a real database dump is easily bigger than any buffer
 	const tmp = mkdtempSync(join(tmpdir(), "br-dump-"));
@@ -241,13 +243,13 @@ export function dumpData(recipe: AppRecipe, appDir: string): Record<string, unkn
 	try {
 		const fd = openSync(join(tmp, "dump.json"), "w");
 		try {
-			execFileSync(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", fd, "pipe"] });
+			await exec(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdout: fd });
 		} finally {
 			closeSync(fd);
 		}
 		outText = readFileSync(join(tmp, "dump.json"), "utf8");
 	} finally {
-		rmSync(tmp, { recursive: true, force: true });
+		await rm(tmp, { recursive: true, force: true });
 	}
 	const data = JSON.parse(outText.slice(outText.indexOf("{"))) as unknown;
 	if (!data || typeof data !== "object" || Array.isArray(data) || !Object.values(data).every(Array.isArray)) throw new Error('the dump must print {"table": [rows]}');
@@ -387,7 +389,7 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const log = o.log ?? ((l: string) => console.log(l));
 	const cur = loadApps(o.root)[o.side] ?? {};
 	const retry = cur.up === false && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
-	const commit = o.side === LEGACY ? undefined : headOf(o.config.target.path);
+	const commit = o.side === LEGACY ? undefined : await headOf(o.config.target.path);
 	const moved = cur.up === false && commit !== undefined && commit !== cur.commit && (cur.redProbes ?? 0) < MAX_RED_PROBES;
 	// an app that starts but cannot reset or dump its data: written data is never compared, so it is asked once to add them
 	const lacksData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump);
@@ -452,7 +454,7 @@ export async function probeApps(o: { config: Config; root: string; linkAll: (wt:
 	try {
 		for (const s of o.config.target.stacks) up[s] = await probeApp({ ...o, side: s });
 	} finally {
-		removeWorktree(o.config.target.path, wt);
+		await removeWorktree(o.config.target.path, wt);
 	}
 	return up;
 }

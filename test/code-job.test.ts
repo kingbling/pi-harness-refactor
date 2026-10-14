@@ -20,8 +20,8 @@ describe("the code job", () => {
 		writeFileSync(join(target, "src", "a.test.txt"), "expects ok\n");
 		writeFileSync(join(target, "tsconfig.json"), "{}\n");
 		for (const [f, text] of Object.entries(o.main ?? {})) writeFileSync(join(target, f), text);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
 		const adapter = {
 			id: "fake",

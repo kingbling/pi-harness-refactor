@@ -42,12 +42,12 @@ function workspace() {
 }
 
 describe("a target project created anew", () => {
-	it("puts the units worked on back to planned, drops the old project's answers, keeps the legacy-side ones", () => {
+	it("puts the units worked on back to planned, drops the old project's answers, keeps the legacy-side ones", async () => {
 		const { ws, repo, config, ledger, sample, place } = workspace();
 		rmSync(join(repo, ".git"), { recursive: true, force: true });
 		git(repo, "init", "-q", "-b", "main");
 		commit(repo, "bootstrap.txt");
-		expect(resetForNewTarget(ledger, config, ws)?.sort()).toEqual(["U1", "U2"]);
+		expect((await resetForNewTarget(ledger, config, ws))?.sort()).toEqual(["U1", "U2"]);
 		expect(ledger.getUnit("U1")!.state).toBe("planned");
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).commit).toBeUndefined();
 		expect(ledger.getUnit("U2")!.state).toBe("planned");
@@ -56,23 +56,23 @@ describe("a target project created anew", () => {
 		expect(ledger.getQuestion(place)!.status).toBe("answered");
 		expect(ledger.getMeta("layout_sample")).toBe("{}");
 		// nothing left to reset on the next start
-		expect(resetForNewTarget(ledger, config, ws)).toBeUndefined();
+		expect(await resetForNewTarget(ledger, config, ws)).toBeUndefined();
 	});
-	it("does nothing while the accepted code is still in the project", () => {
+	it("does nothing while the accepted code is still in the project", async () => {
 		const { ws, config, ledger, sample } = workspace();
-		expect(resetForNewTarget(ledger, config, ws)).toBeUndefined();
+		expect(await resetForNewTarget(ledger, config, ws)).toBeUndefined();
 		expect(ledger.getUnit("U1")!.state).toBe("accepted");
 		expect(ledger.getUnit("U2")!.state).toBe("quarantined");
 		expect(ledger.getQuestion(sample)!.status).toBe("answered");
 	});
-	it("does nothing when the owner checked out another branch or rewrote the migration branch", () => {
+	it("does nothing when the owner checked out another branch or rewrote the migration branch", async () => {
 		const { ws, repo, config, ledger } = workspace();
 		git(repo, "checkout", "-q", "--orphan", "other");
 		commit(repo, "other.txt");
-		expect(resetForNewTarget(ledger, config, ws)).toBeUndefined();
+		expect(await resetForNewTarget(ledger, config, ws)).toBeUndefined();
 		git(repo, "checkout", "-q", "main");
 		git(repo, "reset", "-q", "--hard", "HEAD~1");
-		expect(resetForNewTarget(ledger, config, ws)).toBeUndefined();
+		expect(await resetForNewTarget(ledger, config, ws)).toBeUndefined();
 		expect(ledger.getUnit("U1")!.state).toBe("accepted");
 	});
 });

@@ -19,7 +19,7 @@ export async function diagnoseFailure(o: { config: Config; adapter: TargetAdapte
 	const rule = o.adapter.diagnose?.(o.projectDir, o.failedStep, o.output, o.adapter.layout.isTestFile, expected);
 	if (rule) return rule;
 	if (!o.client) return { action: "unknown", summary: "no rule matched and no model available", by: "rule" };
-	const deps = o.adapter.toolchain.installedPackages(o.projectDir).join(", ");
+	const deps = (await o.adapter.toolchain.installedPackages(o.projectDir)).join(", ");
 	const schema = {
 		type: "object",
 		additionalProperties: false,

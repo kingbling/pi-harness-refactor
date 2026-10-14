@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -10,6 +9,8 @@ import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
+import { exec } from "../proc.ts";
+import { cp } from "node:fs/promises";
 
 /**
  * Truth runs on the OLD code. Out of the box it runs in the legacy repo with this machine's tools; when that is
@@ -136,13 +137,13 @@ const NO_CASES_HINT = "(when the unit has no runtime behaviour at all, say so wi
  * With `legacyFiles` (the unit's legacy files) the script must load one of them and must not type the expected
  * values in: truth that the old code did not produce is no truth.
  */
-export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter, root?: string, legacyFiles?: string[]): TruthResult {
+export async function verifyTruthOnOld(truthDirAbs: string, config: Config, source: SourceAdapter, root?: string, legacyFiles?: string[]): Promise<TruthResult> {
 	const script = join(truthDirAbs, source.truth.scriptName);
 	const none = noBehaviourReason(truthDirAbs);
 	if (!existsSync(script)) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `tester did not write ${source.truth.scriptName}` };
 	try {
 		const { cmd, args, cwd } = truthCommand(loadLegacyEnv(root, config), source, script, config.source.path);
-		const out = execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+		const out = await exec(cmd, args, { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024 });
 		const cases = lastJsonArray(out) as TruthCase[] | undefined;
 		if (!cases) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no JSON array of cases at its end; its output ends with:\n${out.trim().slice(-800) || "(nothing)"}` };
 		if (!Array.isArray(cases) || !cases.length) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases ${NO_CASES_HINT}` };
@@ -151,7 +152,7 @@ export function verifyTruthOnOld(truthDirAbs: string, config: Config, source: So
 		const invented = legacyFiles ? notFromOldCode(readFileSync(script, "utf8"), cases, legacyFiles) : undefined;
 		if (invented) return { ok: false, cases: [], error: invented };
 		// a value that changes from run to run (a timestamp, a random id, hash order) is no truth: no new code can match it
-		const again = lastJsonArray(execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }));
+		const again = lastJsonArray(await exec(cmd, args, { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024 }));
 		const unstable = differences(cases.map((c) => c.expected), (again as TruthCase[] | undefined)?.map((c) => c?.expected) ?? []);
 		if (unstable.length) return { ok: false, cases: [], error: `expected values differ between two runs of the old code, so no new code can match them: ${unstable.slice(0, 3).map((d) => `case ${d.path.replace(/^\[(\d+)\]/, (_, n) => `#${Number(n) + 1}`)}: ${JSON.stringify(d.a)} then ${JSON.stringify(d.b)}`).join("; ")}. Give the code a fixed input (clock, seed, sorted order), or leave that value out of expected.` };
 		return { ok: true, cases };
@@ -263,7 +264,7 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 	// a red probe nobody was asked about: the machine may have changed since (docker installed), so it is probed once more
 	const unasked = cur.mode === "read" && cur.probeQuestion === undefined && !cur.probedAgain;
 	// a saved run command that cannot reach the units' truth scripts (a container mounting only the probe's folder)
-	const unreachable = cur.run && cur.unreachableRun !== JSON.stringify(cur.run) ? reachesTruthScripts(o.root, o.config, o.source, cur.run) : undefined;
+	const unreachable = cur.run && cur.unreachableRun !== JSON.stringify(cur.run) ? await reachesTruthScripts(o.root, o.config, o.source, cur.run) : undefined;
 	if (cur.mode && !retry && !unasked && !unreachable) return cur.mode;
 	const dir = join(o.root, ".bigrefactor", "legacy-env", "probe");
 	mkdirSync(dir, { recursive: true });
@@ -278,13 +279,13 @@ export async function probeLegacyEnv(o: { config: Config; root: string; source: 
 		probe: true,
 		problem: `${unreachable ? `The saved run command (${[cur.run!.cmd, ...cur.run!.args].join(" ")}) runs the probe but no unit's truth script: ${unreachable}\nSet a run command that reaches both (set_legacy_run checks it), then confirm the probe.\n\n` : ""}Nothing has run on the old code yet. Find out whether single units of the old code can be loaded and called with what this machine has (any installed runtime or tool; check which ones and their versions). The whole app does not need to boot: loading one real file of the old code (and what it needs) and calling one of its functions is enough. Install dependencies in a copy only if that unit needs them.${db} Then write the probe ${script}: it loads that file, calls ONE real function of the old code and prints its result as ${o.source.truth.instructions} The array must have exactly this shape: [{"symbol": "probe", "inputs": <the arguments, JSON>, "expected": <what the function returned, JSON>}]. Try more than one way before giving up; if nothing works, say exactly what is missing.`,
 	}).catch((e) => `setup model failed: ${e?.message ?? e}`);
-	let probe = verifyTruthOnOld(dir, o.config, o.source, o.root);
+	let probe = await verifyTruthOnOld(dir, o.config, o.source, o.root);
 	// the probe ran but code refused what it printed (a wrong shape, a typo): one more turn with code's own error
 	if (!probe.ok && existsSync(script)) {
 		said = await fixer({ config: o.config, root: o.root, source: o.source, script, probe: true, problem: `The tool ran your probe ${script} itself and refused it:\n${String(probe.error).slice(-1500)}\nFix the probe (or the run command) so the tool's own run passes. The array must have exactly this shape: [{"symbol": "probe", "inputs": <JSON>, "expected": <JSON>}].` }).catch((e) => `setup model failed: ${e?.message ?? e}`);
-		probe = verifyTruthOnOld(dir, o.config, o.source, o.root);
+		probe = await verifyTruthOnOld(dir, o.config, o.source, o.root);
 	}
-	const blocked = probe.ok ? reachesTruthScripts(o.root, o.config, o.source) : undefined;
+	const blocked = probe.ok ? await reachesTruthScripts(o.root, o.config, o.source) : undefined;
 	const ok = probe.ok && !blocked;
 	if (blocked) said = `${said || ""} — ${blocked}`;
 	const mode: TruthMode = ok ? "run" : "read";
@@ -327,9 +328,9 @@ export function legacyCopyTool(root: string, config: Config): ToolDefinition {
 			if (!existsSync(dst)) {
 				mkdirSync(join(dst, ".."), { recursive: true });
 				try {
-					execFileSync("cp", process.platform === "darwin" ? ["-cR", config.source.path, dst] : ["-R", "--reflink=auto", config.source.path, dst], { stdio: ["ignore", "pipe", "pipe"] });
+					await exec("cp", process.platform === "darwin" ? ["-cR", config.source.path, dst] : ["-R", "--reflink=auto", config.source.path, dst]);
 				} catch {
-					cpSync(config.source.path, dst, { recursive: true, verbatimSymlinks: true });
+					await cp(config.source.path, dst, { recursive: true, verbatimSymlinks: true });
 				}
 			}
 			saveLegacyEnv(root, config, { root: dst }, p.why);
@@ -339,10 +340,10 @@ export function legacyCopyTool(root: string, config: Config): ToolDefinition {
 }
 
 /** Runs `script` with `env`'s command: undefined when it exits 0, else what it printed. */
-function runError(env: LegacyEnv, source: SourceAdapter, script: string, sourcePath: string): string | undefined {
+async function runError(env: LegacyEnv, source: SourceAdapter, script: string, sourcePath: string): Promise<string | undefined> {
 	const { cmd, args, cwd } = truthCommand(env, source, script, sourcePath);
 	try {
-		execFileSync(cmd, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+		await exec(cmd, args, { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024 });
 		return undefined;
 	} catch (e: any) {
 		return [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-600) || String(e?.message ?? e);
@@ -361,34 +362,34 @@ export const LEGACY_DOWN = { tries: 6, waitMs: 30_000 };
 export async function legacyEnvOutage(root: string, config: Config, source: SourceAdapter, wait = LEGACY_DOWN): Promise<"none" | "over" | "down"> {
 	for (let i = 0; i < wait.tries; i++) {
 		if (i) await new Promise((r) => setTimeout(r, wait.waitMs));
-		if (probeRunsNow(root, config, source) !== false) return i ? "over" : "none";
+		if ((await probeRunsNow(root, config, source)) !== false) return i ? "over" : "none";
 	}
 	return "down";
 }
 
 /** Whether the probe, green when this workspace was set up, runs now; undefined when there is none (read mode, no probe). */
-export function probeRunsNow(root: string, config: Config, source: SourceAdapter): boolean | undefined {
+export async function probeRunsNow(root: string, config: Config, source: SourceAdapter): Promise<boolean | undefined> {
 	const env = loadLegacyEnv(root, config);
 	const probe = join(root, ".bigrefactor", "legacy-env", "probe", source.truth.scriptName);
 	if (env.mode !== "run" || !existsSync(probe)) return undefined;
-	return !runError(env, source, probe, config.source.path);
+	return !(await runError(env, source, probe, config.source.path));
 }
 
 /**
  * Why a run command reaches the probe but not the units' truth scripts (a container that mounts only the probe's
  * folder), or undefined. The probe that runs green is copied into the truth folder and run from there.
  */
-function reachesTruthScripts(root: string, config: Config, source: SourceAdapter, run?: { cmd: string; args: string[] }): string | undefined {
+async function reachesTruthScripts(root: string, config: Config, source: SourceAdapter, run?: { cmd: string; args: string[] }): Promise<string | undefined> {
 	const probe = join(root, ".bigrefactor", "legacy-env", "probe", source.truth.scriptName);
 	if (!existsSync(probe)) return undefined;
 	const env = run ? { ...loadLegacyEnv(root, config), run } : loadLegacyEnv(root, config);
-	if (runError(env, source, probe, config.source.path)) return undefined; // the probe itself does not run: nothing to compare
+	if (await runError(env, source, probe, config.source.path)) return undefined; // the probe itself does not run: nothing to compare
 	const dir = join(root, ".bigrefactor", "truth", "__runcheck__");
 	mkdirSync(dir, { recursive: true });
 	const copy = join(dir, source.truth.scriptName);
 	cpSync(probe, copy);
 	try {
-		const err = runError(env, source, copy, config.source.path);
+		const err = await runError(env, source, copy, config.source.path);
 		return err ? `the probe runs from ${dirname(probe)}, but not from the units' truth folders (${join(root, ".bigrefactor", "truth")}/<unit>/), where every truth script lives:\n${err}` : undefined;
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -404,7 +405,7 @@ export function legacyRunTool(root: string, config: Config, source?: SourceAdapt
 		parameters: Type.Object({ cmd: Type.String(), args: Type.Array(Type.String()), why: Type.String() }),
 		execute: async (_id: string, p: { cmd: string; args: string[]; why: string }) => {
 			if (![p.cmd, ...p.args].some((a) => a.includes("{script}"))) return out('refused: one arg must contain "{script}"');
-			const unreachable = source ? reachesTruthScripts(root, config, source, { cmd: p.cmd, args: p.args }) : undefined;
+			const unreachable = source ? await reachesTruthScripts(root, config, source, { cmd: p.cmd, args: p.args }) : undefined;
 			if (unreachable) return out(`refused: ${unreachable}`);
 			saveLegacyEnv(root, config, { run: { cmd: p.cmd, args: p.args } }, p.why);
 			return out(`truth scripts run with: ${[p.cmd, ...p.args].join(" ")}`);
@@ -461,7 +462,7 @@ export const MAX_LEGACY_FIXES = 10;
 export async function fixLegacyEnv(o: { config: Config; root: string; source: SourceAdapter; problem: string; truthDir: string; signature: string; fixer?: LegacyFixer }): Promise<string | undefined> {
 	if (fixing) {
 		const said = await fixing;
-		return said && verifyTruthOnOld(o.truthDir, o.config, o.source, o.root).ok ? said : undefined;
+		return said && (await verifyTruthOnOld(o.truthDir, o.config, o.source, o.root)).ok ? said : undefined;
 	}
 	const tries = triesByRun.get(o.config) ?? triesByRun.set(o.config, new Map()).get(o.config)!;
 	if ((tries.get(o.signature) ?? 0) >= MAX_LEGACY_FIXES_PER_PROBLEM || (tries.get("") ?? 0) >= MAX_LEGACY_FIXES) return undefined;
@@ -469,7 +470,7 @@ export async function fixLegacyEnv(o: { config: Config; root: string; source: So
 	tries.set("", (tries.get("") ?? 0) + 1);
 	fixing = (async () => {
 		const said = await (o.fixer ?? fixLegacyEnvWithModel)({ config: o.config, root: o.root, source: o.source, problem: o.problem, script: join(o.truthDir, o.source.truth.scriptName) });
-		if (!verifyTruthOnOld(o.truthDir, o.config, o.source, o.root).ok) return undefined;
+		if (!(await verifyTruthOnOld(o.truthDir, o.config, o.source, o.root)).ok) return undefined;
 		const what = said || "the old code's environment was set up";
 		const env = loadLegacyEnv(o.root, o.config);
 		appendFileSync(join(o.root, ".bigrefactor", "legacy-env.log"), `${new Date().toISOString()} ${relative(o.root, resolve(env.root)) || env.root} ${what.replace(/\s+/g, " ")}\n`);

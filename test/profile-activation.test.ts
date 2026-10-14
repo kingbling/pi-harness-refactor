@@ -38,7 +38,7 @@ describe("framework profile is loaded wherever decisions are computed", () => {
 
 		// simulate a fresh process: profile cache dropped, nobody calls frameworkDirs() first
 		source.reloadProfile?.();
-		const ids = openDecisions(ledger, config, source, targets, ws).map((d) => d.id);
+		const ids = (await openDecisions(ledger, config, source, targets, ws)).map((d) => d.id);
 		expect(ids).not.toContain("fw:Load");
 		source.reloadProfile?.();
 		const plan = planFrameworks(ledger, source, targets, config.source.path);

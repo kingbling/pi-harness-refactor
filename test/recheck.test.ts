@@ -190,14 +190,14 @@ describe("truth read from the old code, run once it can", () => {
 			ledger.addEvidence(id, "truth_read", {});
 			writeFileSync(join(root, ".bigrefactor", "truth", id, "cases.sh"), script);
 		}
-		const r = upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		const r = await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
 		expect(r).toMatchObject({ upgraded: ["fine"], redone: ["stub"], red: 1 });
 		expect(ledger.hasEvidence("fine", "truth_green_on_old")).toBe(true);
 		expect(ledger.db.prepare("SELECT verified_on_old v FROM truth_cases WHERE unit_id = 'fine'").get()).toEqual({ v: 1 });
 		expect(ledger.getUnit("stub")!.state).toBe("planned");
 		expect(JSON.parse(ledger.getUnit("stub")!.meta).retryNote).toMatch(/the old code returns 99/);
 		// the same environment: the red one is not run again
-		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} }).red).toBe(0);
+		expect((await upgradeReadTruth({ ledger, config, root, source, log: () => {} })).red).toBe(0);
 	});
 
 	it("while the old code's runtime is down (the probe does not run either) no unit counts as tried: the next upgrade runs them", async () => {
@@ -214,10 +214,10 @@ describe("truth read from the old code, run once it can", () => {
 		ledger.addEvidence("fine", "truth_read", { runError: "failed to connect to the runtime" });
 		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"$(printf %s.%s 123 45)"'}]'\n`);
 		writeFileSync(join(config.source.path, "down"), "");
-		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} })).toMatchObject({ upgraded: [], red: 0 });
+		expect(await upgradeReadTruth({ ledger, config, root, source, log: () => {} })).toMatchObject({ upgraded: [], red: 0 });
 		expect(JSON.parse(ledger.getUnit("fine")!.meta).truthUpgradeEnv).toBeUndefined();
 		rmSync(join(config.source.path, "down"));
-		expect(upgradeReadTruth({ ledger, config, root, source, log: () => {} }).upgraded).toEqual(["fine"]);
+		expect((await upgradeReadTruth({ ledger, config, root, source, log: () => {} })).upgraded).toEqual(["fine"]);
 	});
 });
 
@@ -235,7 +235,7 @@ describe("truth read from the old code, run once it can: values compared where b
 			ledger.addEvidence(id, "truth_read", {});
 			writeFileSync(join(root, ".bigrefactor", "truth", id, "cases.sh"), print(ran));
 		}
-		const r = upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		const r = await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
 		expect(r).toMatchObject({ upgraded: [], redone: ["typed"], red: 0 });
 		for (const id of ["fine", "stub"]) {
 			expect(ledger.getUnit(id)!.state).toBe("accepted");
@@ -259,7 +259,7 @@ describe("a script for truth that was only read, already there but red here", ()
 			ledger.addEvidence(id, "truth_read", {});
 		}
 		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), "echo 'Class Money not found' >&2; exit 1\n");
-		upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
 		// a red script on a unit the upgrade has not run yet waits for it
 		writeFileSync(join(root, ".bigrefactor", "truth", "stub", "cases.sh"), "exit 1\n");
 		const told = new Map<string, string | undefined>();

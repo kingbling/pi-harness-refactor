@@ -25,10 +25,10 @@ describe("layout rules on a Python target", () => {
 		expect(check("app/billing/migrations/0001_initial.py")).toEqual([]);
 		expect(check("app/billing/invoice-service.py")).not.toEqual([]);
 	});
-	it("folders the stack's tools make (layout.ignoreDirs) are no drift", () => {
+	it("folders the stack's tools make (layout.ignoreDirs) are no drift", async () => {
 		const dir = project({ "app/billing/invoice_service.py": "x = 1\n", "app/billing/__pycache__/invoice_service.cpython-312.pyc": "", "app/__pycache__/x.pyc": "" });
-		expect(checkLayoutTree(dir, py, opts)).toEqual([]);
-		expect(checkLayoutTree(dir, py, { ...opts, ignoreDirs: [] }).length).toBeGreaterThan(0);
+		expect(await checkLayoutTree(dir, py, opts)).toEqual([]);
+		expect((await checkLayoutTree(dir, py, { ...opts, ignoreDirs: [] })).length).toBeGreaterThan(0);
 	});
 });
 

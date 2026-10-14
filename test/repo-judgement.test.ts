@@ -96,18 +96,18 @@ describe("two models disagree: the owner decides alone, with both views", () => 
 		await inventory(config, ws, ledger);
 		const source = getSourceAdapter("php");
 		const targets = [await getTargetAdapter("nestjs")];
-		const d0 = openDecisions(ledger, config, source, targets, ws, { raw: true }).find((d) => d.id === "db-strategy")!;
+		const d0 = (await openDecisions(ledger, config, source, targets, ws, { raw: true })).find((d) => d.id === "db-strategy")!;
 		const file = { answers: {}, advice: { "db-strategy": { value: "keep-schema", reason: "the schema is used everywhere" } } };
 		writeFileSync(join(ws, ".bigrefactor", "decisions.json"), JSON.stringify(file));
-		const advised = openDecisions(ledger, config, source, targets, ws, { raw: true }).find((d) => d.id === "db-strategy")!;
+		const advised = (await openDecisions(ledger, config, source, targets, ws, { raw: true })).find((d) => d.id === "db-strategy")!;
 		const phrased = { question: "Keep the database as it is?", options: d0.options.map((o) => ({ value: o.value, label: o.label })), recommended: "new-schema", opinion: "the tables are half unused", by: "m", hash: pointHash(toPoint(advised)) };
 		writeFileSync(join(ws, ".bigrefactor", "decisions.json"), JSON.stringify({ ...file, phrased: { "db-strategy": phrased } }));
-		const d = openDecisions(ledger, config, source, targets, ws).find((x) => x.id === "db-strategy")!;
+		const d = (await openDecisions(ledger, config, source, targets, ws)).find((x) => x.id === "db-strategy")!;
 		expect(d.disagree).toEqual({ advised: { value: "keep-schema", why: expect.stringMatching(/schema is used everywhere/) }, phrased: { value: "new-schema", why: "the tables are half unused" } });
 		expect(decisionPrompt(d)).toMatch(/the models disagree[\s\S]*keep-schema: the schema is used everywhere[\s\S]*new-schema: the tables are half unused/);
 		// agreeing models: no mark
 		writeFileSync(join(ws, ".bigrefactor", "decisions.json"), JSON.stringify({ ...file, phrased: { "db-strategy": { ...phrased, recommended: "keep-schema" } } }));
-		expect(openDecisions(ledger, config, source, targets, ws).find((x) => x.id === "db-strategy")!.disagree).toBeUndefined();
+		expect((await openDecisions(ledger, config, source, targets, ws)).find((x) => x.id === "db-strategy")!.disagree).toBeUndefined();
 	});
 });
 
@@ -130,7 +130,7 @@ describe("folders that are not the app: the profile model's call, not a fixed li
 		const files = (ledger.db.prepare("SELECT path FROM files").all() as Array<{ path: string }>).map((f) => f.path);
 		expect(files).toContain("docs/index.php");
 		expect(files.some((f) => f.startsWith("app/3rdparty/") || f.startsWith("phpstan-stubs/"))).toBe(false);
-		const lib = openDecisions(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws).find((d) => d.id === "lib:phpmailer/phpmailer")!;
+		const lib = (await openDecisions(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws)).find((d) => d.id === "lib:phpmailer/phpmailer")!;
 		expect(lib.evidence).toMatch(/vendored copy in app\/3rdparty\/phpmailer\/: PHPMailer 5 copied/);
 	});
 });

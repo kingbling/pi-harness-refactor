@@ -56,7 +56,7 @@ describe("model judgments", () => {
 		const source = getSourceAdapter("php");
 		const targets = [await getTargetAdapter("nestjs")];
 		await advise(config, d, ledger, client, source, targets, () => {});
-		const db = openDecisions(ledger, config, source, targets, d).find((x) => x.id === "stack:nestjs.database")!;
+		const db = (await openDecisions(ledger, config, source, targets, d)).find((x) => x.id === "stack:nestjs.database")!;
 		expect(db.recommended).toBe("mysql");
 		expect(db.reason).toMatch(/MySQL family/);
 		expect(db.options[0]!.value).toBe("mysql"); // recommendation first: Enter takes it
@@ -64,7 +64,7 @@ describe("model judgments", () => {
 		const cfg = JSON.parse(readFileSync(join(d, "bigrefactor.config.json"), "utf8"));
 		expect(cfg.target.choices.nestjs.database).toBe("mysql");
 		// every open decision has a recommendation that is one of its options
-		for (const x of openDecisions(ledger, loadConfig(join(d, "bigrefactor.config.json")).config, source, targets, d)) expect(x.options.map((o) => o.value)).toContain(x.recommended);
+		for (const x of await openDecisions(ledger, loadConfig(join(d, "bigrefactor.config.json")).config, source, targets, d)) expect(x.options.map((o) => o.value)).toContain(x.recommended);
 		ledger.close();
 	});
 

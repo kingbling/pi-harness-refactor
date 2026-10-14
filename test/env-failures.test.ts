@@ -137,11 +137,11 @@ describe("parked units resubmit themselves", () => {
 		const logs: string[] = [];
 		const adapters = new Map([["nestjs", nest]]);
 
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters)).toEqual([]); // nothing changed: stays parked
+		expect(await resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters)).toEqual([]); // nothing changed: stays parked
 		expect(ledger.getUnit(unit)!.state).toBe("implementing");
 
 		writeFileSync(join(api, "package.json"), JSON.stringify({ dependencies: { "drizzle-orm": "^1" }, devDependencies: { vitest: "^3" } })); // e.g. `pnpm add drizzle-orm`
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters).sort()).toEqual([unit, other].sort());
+		expect((await resubmitParkedUnits(ledger, config, ws, new Set(), (l) => logs.push(l), adapters)).sort()).toEqual([unit, other].sort());
 		expect(ledger.getUnit(unit)!.state).toBe("planned");
 		expect(ledger.openQuestions().some((x) => x.id === q)).toBe(false);
 		expect(JSON.parse(ledger.getUnit(unit)!.meta).parked).toBeUndefined();
@@ -262,12 +262,12 @@ describe("br lanes", () => {
 		appendFileSync(setupLogPath(ws, "nestjs"), "earlier fix\n");
 		ledger.updateUnit(unit, { meta: { parked: { question: q, env: envFingerprint(config, api, nest.toolchain.manifestFiles, setupFiles(ws, "nestjs")) } } });
 		const adapters = new Map([["nestjs", nest]]);
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
+		expect(await resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
 		appendFileSync(setupLogPath(ws, "nestjs"), "lint gets more memory\n"); // what fixRunSetup writes after a fix
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
+		expect(await resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([]);
 		expect(ledger.getQuestion(q)!.status).toBe("open");
 		writeFileSync(overridesPath(ws, "nestjs"), JSON.stringify({ lint: { cmd: "npx", args: ["eslint", "{files}"] } })); // a gate command the setup model changed
-		expect(resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([unit]);
+		expect(await resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, adapters)).toEqual([unit]);
 	});
 });
 
@@ -289,7 +289,7 @@ describe("a hint carried to the next attempt says who gave it", () => {
 			const q = ledger.askQuestion({ unitId: id, point: "gate_env", question: "q", options: ["retry — run again", "leave — leave it"], askedBy: "orchestrator" });
 			ledger.answerQuestion(q, "retry: the reviewer is wrong, X is not needed", by);
 		}
-		resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, new Map());
+		await resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, new Map());
 		expect(JSON.parse(ledger.getUnit("byModel")!.meta).retryNote).toMatch(/^A model's hint \(not the owner's\): the reviewer is wrong/);
 		expect(JSON.parse(ledger.getUnit("byOwner")!.meta).retryNote).toMatch(/^The owner's hint: the reviewer is wrong/);
 	});

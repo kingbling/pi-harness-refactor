@@ -126,13 +126,16 @@ export async function maybeTidyReview(d: Deps, o: { stackId: string; area: strin
 	const allowedFrom = (p: string) => allowed(p) || stray.some((s) => p.startsWith(s));
 	// a target file the layout check would refuse is never proposed: the tidy job would only fail its check (only the
 	// file's own findings: a folder missing a required file is not the move's fault)
-	const misfit = (to: string[]) => to.some((p) => (adapter.layout.checkStructure?.([p], areaDir, o.area, proj, { isNew: () => false }) ?? []).some((l) => l.startsWith(`${p}: `)));
+	const misfit = async (to: string[]) => {
+		for (const p of to) if (((await adapter.layout.checkStructure?.([p], areaDir, o.area, proj, { isNew: () => false })) ?? []).some((l) => l.startsWith(`${p}: `))) return true;
+		return false;
+	};
 	// only what is not code and not a test is ever deleted; whether anything uses it, the job's build and tests say
 	const deletable = (c: { op: string; from: string[]; to: string[] }) => c.op !== "delete" || (!c.to.length && c.from.every((f) => !adapter.layout.isTestFile(f) && !adapter.layout.sourceExtensions.some((e) => f.endsWith(e))));
 	const tasks = loadTasks(d.ledger);
 	let asked = 0;
 	for (const c of j.changes ?? []) {
-		if (!c.from.length || (c.op !== "delete" && !c.to.length) || !deletable(c) || !c.from.every(allowedFrom) || !c.to.every(allowed) || seen.has(sig(c.op, c.from, c.to)) || tried.has(sig(c.op, c.from, [])) || takenStray(c.from) || onlyCase(c) || misfit(c.to)) continue;
+		if (!c.from.length || (c.op !== "delete" && !c.to.length) || !deletable(c) || !c.from.every(allowedFrom) || !c.to.every(allowed) || seen.has(sig(c.op, c.from, c.to)) || tried.has(sig(c.op, c.from, [])) || takenStray(c.from) || onlyCase(c) || (await misfit(c.to))) continue;
 		const q = await askViaModel(d, {
 			point: "tidy",
 			facts: `Tidy review of area "${o.area}" (${o.stackId}) proposes: ${c.op} ${c.from.join(", ")} → ${c.to.join(", ")}. Reason: ${c.why}. If approved, a separate job does it once on the main branch and updates every file that uses the moved code; it is kept only when the build and the tests of the changed files pass. Nothing waits for this answer.`,

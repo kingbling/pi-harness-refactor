@@ -30,10 +30,10 @@ describe("setup fix during the run: renames and failed commits", () => {
 		const { undoMigratedCode } = await import("../src/init/setup-fixer.ts");
 		const { ensureRepo, commitAll } = await import("../src/git.ts");
 		const { target, adapter } = targetRepo("mv");
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		git(target, "mv", "src/a.spec.txt", "src/b.spec.txt");
-		expect(undoMigratedCode(target, target, adapter)).toEqual(["src/b.spec.txt"]);
+		expect(await undoMigratedCode(target, target, adapter)).toEqual(["src/b.spec.txt"]);
 		expect(existsSync(join(target, "src", "a.spec.txt"))).toBe(true);
 		expect(existsSync(join(target, "src", "b.spec.txt"))).toBe(false);
 		expect(git(target, "status", "--porcelain")).toBe("");
@@ -43,8 +43,8 @@ describe("setup fix during the run: renames and failed commits", () => {
 		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
 		const { ensureRepo, commitAll } = await import("../src/git.ts");
 		const { root, target, adapter, config } = targetRepo("hook");
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		const hook = join(target, ".git", "hooks", "pre-commit");
 		writeFileSync(hook, "#!/bin/sh\nexit 1\n");
 		chmodSync(hook, 0o755);
@@ -133,11 +133,11 @@ describe("onboarding steps count as done only when they finished", () => {
 		const root = tmp("br-setup-");
 		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: join(root, "new"), stacks: ["nestjs"], choices: { nestjs: { orm: "prisma" } } }, models: {} });
 		const adapters = [{ id: "nestjs", toolchain: { isProjectReady: () => true, installedPackages: () => [] } } as unknown as TargetAdapter];
-		expect(setupDone(config, root, adapters)).toBe(false); // project files but no commit: a stopped setup
+		expect(await setupDone(config, root, adapters)).toBe(false); // project files but no commit: a stopped setup
 		writeFileSync(statePath(root, "setup-done.json"), JSON.stringify({ stacks: ["nestjs"], choices: { nestjs: { orm: "prisma" } } }));
-		expect(setupDone(config, root, adapters)).toBe(true);
+		expect(await setupDone(config, root, adapters)).toBe(true);
 		config.target.choices["nestjs"] = { orm: "typeorm" };
-		expect(setupDone(config, root, adapters)).toBe(false);
+		expect(await setupDone(config, root, adapters)).toBe(false);
 	});
 });
 

@@ -80,7 +80,7 @@ export function placementDir(layout: TargetLayout, p: Placement): string {
  * now places src/Shared/Persistence, file-storage for FileStorage): renamed in git and committed, so new units
  * land next to the old code instead of in a second folder. Only spelling (case, "-", "_"); returns what moved.
  */
-export function renameMisspelledAreaDirs(config: Config, ledger: Ledger, layouts: Map<string, TargetLayout>, projectDirOf: (stackId: string) => string): string[] {
+export async function renameMisspelledAreaDirs(config: Config, ledger: Ledger, layouts: Map<string, TargetLayout>, projectDirOf: (stackId: string) => string): Promise<string[]> {
 	const same = (a: string) => a.toLowerCase().replace(/[-_]/g, "");
 	const repo = config.target.path;
 	const dirs = new Map<string, Set<string>>();
@@ -98,12 +98,12 @@ export function renameMisspelledAreaDirs(config: Config, ledger: Ledger, layouts
 		for (const dir of set) {
 			const parent = join(prefix, dirname(dir));
 			const want = basename(dir);
-			const tracked = trackedChildDirs(repo, parent);
+			const tracked = await trackedChildDirs(repo, parent);
 			if (tracked.includes(want)) continue; // both spellings exist (a disk that tells case apart): a move would nest them
 			for (const have of tracked.filter((h) => same(h) === same(want))) {
 				const from = join(parent, have);
 				const to = join(parent, want);
-				if (renameDir(repo, from, to, `bigrefactor: rename ${from} to ${to} (the area's folder as the stack spells it)`)) moved.push(`${from} → ${to}`);
+				if (await renameDir(repo, from, to, `bigrefactor: rename ${from} to ${to} (the area's folder as the stack spells it)`)) moved.push(`${from} → ${to}`);
 			}
 		}
 	}

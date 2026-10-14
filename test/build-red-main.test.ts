@@ -17,13 +17,13 @@ import { runCodeJob } from "../src/run/code-job.ts";
  */
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
-function setup(a = "ok\n") {
+async function setup(a = "ok\n") {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "br-red-main-")));
 	const target = join(root, "new");
 	mkdirSync(join(target, "src"), { recursive: true });
 	writeFileSync(join(target, "src", "a.txt"), a);
-	ensureRepo(target, "migration/main", []);
-	commitAll(target, "init");
+	await ensureRepo(target, "migration/main", []);
+	await commitAll(target, "init");
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
 	const runs = join(root, "runs");
 	writeFileSync(runs, "");
@@ -38,11 +38,11 @@ function setup(a = "ok\n") {
 		lint: (_r: string, files: string[]) => ({ cmd: "true", args: files }),
 		test: () => ({ cmd: "true", args: [] }),
 	} as unknown as TargetAdapter;
-	const unit = (name: string, content: string) => {
+	const unit = async (name: string, content: string) => {
 		const wt = join(root, "wt", name);
 		git(target, ["worktree", "add", "-q", "-b", `unit/${name}`, wt]);
 		writeFileSync(join(wt, "src", "a.txt"), content);
-		commitAll(wt, name);
+		await commitAll(wt, name);
 		return wt;
 	};
 	return { root, target, config, adapter, unit, checks: () => readFileSync(runs, "utf8").split("\n").filter(Boolean).length };
@@ -50,36 +50,36 @@ function setup(a = "ok\n") {
 
 describe("a merge that turns the whole-project check red", () => {
 	it("does not land when main was green; the errors come back", async () => {
-		const s = setup();
+		const s = await setup();
 		const check = createMergeCheck({ config: s.config, adapters: new Map([["fake", s.adapter]]) });
-		const out = await check("fake", s.unit("u1", "bad\n"));
+		const out = await check("fake", (await s.unit("u1", "bad\n")));
 		expect(out).toMatch(/whole-project build/);
 		expect(out).toMatch(/grep -q ok src\/a\.txt/);
-		expect(await check("fake", s.unit("u2", "still ok\n"))).toBeUndefined();
+		expect(await check("fake", (await s.unit("u2", "still ok\n")))).toBeUndefined();
 	});
 
 	it("lands when main was red already (the builder deals with that)", async () => {
-		const s = setup("bad\n");
+		const s = await setup("bad\n");
 		const check = createMergeCheck({ config: s.config, adapters: new Map([["fake", s.adapter]]) });
-		expect(await check("fake", s.unit("u1", "worse\n"))).toBeUndefined();
+		expect(await check("fake", (await s.unit("u1", "worse\n")))).toBeUndefined();
 	});
 
 	it("is not run when the merge changes nothing of the stack, and main is checked only when the unit fails", async () => {
-		const s = setup();
+		const s = await setup();
 		const check = createMergeCheck({ config: s.config, adapters: new Map([["fake", s.adapter]]) });
 		const wt = join(s.root, "wt", "same");
 		git(s.target, ["worktree", "add", "-q", "-b", "unit/same", wt]);
 		const before = s.checks();
 		expect(await check("fake", wt)).toBeUndefined();
 		expect(s.checks()).toBe(before); // nothing ran
-		await check("fake", s.unit("u1", "ok too\n"));
+		await check("fake", (await s.unit("u1", "ok too\n")));
 		expect(s.checks() - before).toBe(1); // the worktree only
 	});
 });
 
 describe("a red main", () => {
-	function builder(codeJob?: (stack: string, what: string) => Promise<string | undefined>) {
-		const s = setup("bad\n");
+	async function builder(codeJob?: (stack: string, what: string) => Promise<string | undefined>) {
+		const s = await setup("bad\n");
 		const ledger = new Ledger(":memory:");
 		const b = createBuilder({ config: s.config, root: s.root, ledger, adapters: new Map([["fake", s.adapter]]), log: () => {}, linkAll: () => {}, mergeFix: async () => undefined, repair: false, codeJob, every: { units: 1, minutes: 60 } });
 		return { ...s, ledger, b };
@@ -87,7 +87,7 @@ describe("a red main", () => {
 
 	it("goes to a code job with the errors, no question; after the jobs fail it is parked quietly (br status)", async () => {
 		const asked: string[] = [];
-		const { b, ledger } = builder(async (_s, what) => (asked.push(what), undefined));
+		const { b, ledger } = (await builder(async (_s, what) => (asked.push(what), undefined)));
 		for (let i = 0; i < MAX_BUILD_CODE_JOBS + 2; i++) {
 			b.afterMerge("fake");
 			await b.finish();
@@ -100,14 +100,14 @@ describe("a red main", () => {
 	});
 
 	it("green again clears the parked line", async () => {
-		const { b, ledger, target } = builder(async () => undefined);
+		const { b, ledger, target } = (await builder(async () => undefined));
 		for (let i = 0; i < MAX_BUILD_CODE_JOBS; i++) {
 			b.afterMerge("fake");
 			await b.finish();
 		}
 		expect(ledger.getMeta(buildParkedKey("fake"))).toBeTruthy();
 		writeFileSync(join(target, "src", "a.txt"), "ok\n");
-		commitAll(target, "fixed by hand");
+		await commitAll(target, "fixed by hand");
 		b.afterMerge("fake");
 		await b.finish();
 		expect(ledger.getMeta(buildParkedKey("fake"))).toBe("");
@@ -117,7 +117,7 @@ describe("a red main", () => {
 
 describe("the builder's code job", () => {
 	async function job(fix: string) {
-		const s = setup("bad\n");
+		const s = await setup("bad\n");
 		let merged = false;
 		const said = await runCodeJob({
 			config: s.config,

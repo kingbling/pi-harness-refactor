@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Config } from "../config.ts";
@@ -12,6 +11,7 @@ import { slashed } from "../rules/layout-rules.ts";
 import { noBehaviour } from "../run/gate.ts";
 import { callTree } from "../inventory/codemap.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
+import { exec } from "../proc.ts";
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -91,13 +91,13 @@ const MAX_ACCEPTED = 15;
 const MAX_OTHER_SIBLINGS = 40;
 const MAX_SIBLING_FILES = 6;
 
-export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): TaskCard {
+export async function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): Promise<TaskCard> {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
 	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]>; stubFiles?: string[] };
 	const files = meta.files ?? [];
 	// the stub files stay this unit's to edit once found: its restored work or a code job may have removed the marks since
-	const waitingStubs = [...new Set([...(meta.stubFiles ?? []), ...stubsWaitingFor(opts.targetProjectDir, unitId)])];
+	const waitingStubs = [...new Set([...(meta.stubFiles ?? []), ...(await stubsWaitingFor(opts.targetProjectDir, unitId))])];
 	if (waitingStubs.length !== (meta.stubFiles ?? []).length) ledger.updateUnit(unitId, { meta: { stubFiles: waitingStubs } });
 	const db = ledger.db;
 
@@ -369,9 +369,9 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
  * Files of the project (relative to it) that carry the mark of a stub left for `unitId`; none when it is not a git repo.
  * Searches the index, not the disk: a requeued unit's restored work has already replaced the marks on disk.
  */
-function stubsWaitingFor(projectDir: string, unitId: string): string[] {
+async function stubsWaitingFor(projectDir: string, unitId: string): Promise<string[]> {
 	try {
-		return execFileSync("git", ["grep", "--cached", "-l", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: projectDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").filter(Boolean);
+		return (await exec("git", ["grep", "--cached", "-l", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: projectDir })).split("\n").filter(Boolean);
 	} catch {
 		return []; // no match, or not a repo
 	}

@@ -3,7 +3,7 @@ import { progress } from "./progress.ts";
 
 /**
  * Run a long external command (official generators, package installs) without blocking the event loop.
- * A blocking execFileSync freezes the whole host: inside Pi that means no widget updates, no chat and no
+ * A blocking (sync) launch freezes the whole host: inside Pi that means no widget updates, no chat and no
  * stop for the minutes `nest new` takes. While a tracked job runs, output goes line by line into the
  * progress feed instead of the terminal (raw writes corrupt the TUI); otherwise it streams to stdio as before.
  * Rejects with the command's tail output on a non-zero exit.
@@ -93,6 +93,70 @@ export function runCommand(cmd: string, args: string[], opts: { cwd: string; env
 		// settle a little after the main process exits anyway.
 		child.on("exit", (code, signal) => {
 			exitGrace = setTimeout(() => done(code, signal), 2_000);
+		});
+	});
+}
+
+/** Error from `exec`: the same fields a sync launch's error had, so existing catch blocks keep working. */
+export type ExecError = Error & { stdout: string; stderr: string; status: number | null; signal: NodeJS.Signals | null; code?: string };
+
+/**
+ * The awaited stand-in for a sync launch: runs a command and resolves with its stdout (not trimmed). A sync launch
+ * freezes Pi's screen for as long as the command runs, so nothing in the plugin launches one.
+ * Rejects like the sync call threw: `status`, `signal`, `stdout`, `stderr` on the error (and `code`, e.g. ENOENT,
+ * when the command could not start). `stdout` may be a file descriptor: output then goes there, not to the result.
+ * `maxBuffer` defaults to node's 1 MiB; `timeout` kills with SIGTERM, as the sync call did.
+ */
+export function exec(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; stdout?: number } = {}): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const maxBuffer = opts.maxBuffer ?? 1024 * 1024;
+		const out: Buffer[] = [];
+		const err: Buffer[] = [];
+		let outLen = 0;
+		let errLen = 0;
+		let failure: string | undefined;
+		let settled = false;
+		const fd = opts.stdout ?? "pipe"; // stdout into a file the caller opened, else captured
+		const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", fd, "pipe"] });
+		const timer = opts.timeout
+			? setTimeout(() => {
+					failure ??= "ETIMEDOUT";
+					child.kill("SIGTERM");
+				}, opts.timeout)
+			: undefined;
+		const take = (into: Buffer[], add: (n: number) => number) => (chunk: Buffer) => {
+			if (add(chunk.length) > maxBuffer) {
+				failure ??= "ENOBUFS";
+				child.kill("SIGTERM");
+				return;
+			}
+			into.push(chunk);
+		};
+		child.stdout?.on("data", take(out, (n) => (outLen += n)));
+		child.stderr?.on("data", take(err, (n) => (errLen += n)));
+		const fail = (e: Partial<ExecError> & Error, status: number | null, signal: NodeJS.Signals | null) => {
+			const x = e as ExecError;
+			x.stdout = Buffer.concat(out).toString("utf8");
+			x.stderr = Buffer.concat(err).toString("utf8");
+			x.status = status;
+			x.signal = signal;
+			reject(x);
+		};
+		child.on("error", (e: NodeJS.ErrnoException) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			fail(e as Error, null, null);
+		});
+		child.on("close", (code, signal) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			const stderr = Buffer.concat(err).toString("utf8");
+			if (code === 0 && !failure) return resolve(Buffer.concat(out).toString("utf8"));
+			const e = new Error(`Command failed: ${[cmd, ...args].join(" ")}${stderr ? `\n${stderr}` : ""}`) as Error & { code?: string };
+			if (failure) e.code = failure;
+			fail(e, code, signal);
 		});
 	});
 }

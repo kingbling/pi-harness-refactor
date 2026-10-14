@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -15,6 +14,7 @@ import { quirksOf } from "./quirks.ts";
 import { samePath } from "./triage.ts";
 import { docsLookup, fileAliases, readFunctionTool, sourceSymbolBody, targetLookup, unitOfLegacy, unitState, whoCalls } from "../sessions/tools.ts";
 import { unitFacts } from "../sessions/taskcard.ts";
+import { exec } from "../proc.ts";
 
 /**
  * wired_ok, judged by a model with tools (no fixed pattern lists): is what the unit added real code (no stubs,
@@ -106,7 +106,7 @@ export const reviewWithModel: Reviewer = async (o) => {
 4. The tests: the ported tests (listed below) really check the legacy behaviour — they assert the expected values, not only that something renders or exists. Weak tests go in weakTests (the tester rewrites them), never in findings.
 Judge only what this unit added or changed, against the facts below: the behaviour policy and the decided quirks are settled (never ask to undo a decided quirk, never ask to widen the target's types back to the legacy inputs). Read the files and search the project with your tools before you decide; do not guess. Then call review_verdict once. Findings are concrete (file, line, problem, fix) and complete: list ALL open problems in this one verdict, not a few at a time (the implementer fixes them in one go), but only what must change for the unit to be acceptable, and only inside the files the implementer may write. A fix anywhere else (project setup, config, manifests, autoloading, folder names, a missing package, the migration tool itself) goes in outOfScope, never in findings. The implementer has no shell: it writes source files by hand and cannot run scripts or copy files. A data or asset file it cannot write by hand (binary such as a certificate, made by running a tool or converter, copied from the legacy repo, or very large) goes in outOfScope too, naming where the file comes from; check that source exists in the legacy repo first, and if it does not, it is no finding at all.${goalsText(o.config.goals) ? `\n\n${goalsText(o.config.goals)}` : ""}`,
 		});
-		const r = await session.run(facts(o));
+		const r = await session.run(await facts(o));
 		// no verdict: ask once more in the same session; still none is red, never a pass
 		if (!verdict) {
 			const again = await session.run("You ended without a verdict. Call review_verdict now, once.");
@@ -142,7 +142,7 @@ Judge only what this unit added or changed, against the facts below: the behavio
 };
 
 /** What code knows for sure, handed to the reviewer: the diff, the legacy files, the migrated deps, the stack choices. */
-function facts(o: ReviewInput): string {
+async function facts(o: ReviewInput): Promise<string> {
 	const unit = o.ledger.getUnit(o.unitId);
 	const deps = (JSON.parse(unit?.deps ?? "[]") as string[])
 		.filter((d) => o.ledger.getUnit(d)?.state === "accepted")
@@ -166,15 +166,15 @@ function facts(o: ReviewInput): string {
 		...(o.truthChanged?.length ? [`\nThe tester changed these expected values after the implementer's code existed. They were read from the old code, never run on it, so nothing but the tester checked the change. Read the legacy code for each: where the old value was right, it is a finding ("truth case <id>: the old code gives <old value>; put it back in the test and the case"):\n${o.truthChanged.map((t) => `- ${t}`).join("\n")}`] : []),
 		...(o.testerKept ? [`\nThe tester re-checked the tests you called weak against the legacy code and kept these, with its reasons. Call a kept test weak again only when its reason is wrong, and say why:\n${o.testerKept}`] : []),
 		...(o.ownerNote ? [`Note from the orchestrator for this run (only an answer by the owner, a person, counts as decided; a model's hint is context to check against the legacy code): ${o.ownerNote}`] : []),
-		...legacyFacts(o),
+		...(await legacyFacts(o)),
 		...(none ? [`The tester found no runtime behaviour to pin in this unit, so it has no truth cases and no ported tests. Its reason: ${none}. Check that against the legacy code: if the unit does compute or decide something, name it in weakTests (the tester then writes cases for it).`] : []),
 		`\nStack choices of the owner (${o.adapter.id}):\n${choices.join("\n") || "- none recorded"}`,
 		`\nAlready migrated code this unit's legacy code calls:\n${deps.join("\n") || "- none"}`,
 		...(o.nearDuplicates?.length ? [`\nLook-alike class names the reuse check found (a guess from the names, not proof). For each, read both classes: when they are the same record or class, it is a finding (reuse the existing one); when they hold different things, it is fine:\n${o.nearDuplicates.map((n) => `- ${n}`).join("\n")}`] : []),
 		o.recheck
-			? `\nThis unit was accepted earlier; later units, tidy and repairs may have changed its code since. Judge its files as they are now:\n${current(o.targetProjectDir, o.changedFiles)}${o.commit ? `\n\nIts original commit (context only, may be outdated): ${summary(o.config.target.path, o.commit)}` : ""}`
+			? `\nThis unit was accepted earlier; later units, tidy and repairs may have changed its code since. Judge its files as they are now:\n${current(o.targetProjectDir, o.changedFiles)}${o.commit ? `\n\nIts original commit (context only, may be outdated): ${await summary(o.config.target.path, o.commit)}` : ""}`
 			: o.changedFiles.length
-				? `\nWhat the unit changed:\n${diff(o.targetProjectDir, o.changedFiles)}`
+				? `\nWhat the unit changed:\n${await diff(o.targetProjectDir, o.changedFiles)}`
 				: `\nThe unit changed no file: the implementer says existing code already does this (reuse). Find that code (the ported tests' imports, the legacy symbols' names) and judge whether it really does what the legacy code does, wired where it is used; if it does not, that is a finding.`,
 	].join("\n");
 }
@@ -186,7 +186,7 @@ const capped = (rows: string[], what: string) => (rows.length > CAP ? [...rows.s
  * What the ledger knows about the unit's legacy side, for judging against it: the behaviour policy, the decided
  * quirks, the truth cases, the code owned by planned units, the legacy callers, the legacy packages. Capped.
  */
-export function legacyFacts(o: Pick<ReviewInput, "ledger" | "config" | "unitId" | "legacyFiles" | "adapter" | "targetProjectDir">): string[] {
+export async function legacyFacts(o: Pick<ReviewInput, "ledger" | "config" | "unitId" | "legacyFiles" | "adapter" | "targetProjectDir">): Promise<string[]> {
 	const db = o.ledger.db;
 	const out: string[] = [];
 	try {
@@ -231,7 +231,7 @@ export function legacyFacts(o: Pick<ReviewInput, "ledger" | "config" | "unitId" 
 	if (libs.length) {
 		let have: string[] = [];
 		try {
-			have = o.adapter.toolchain.installedPackages(o.targetProjectDir);
+			have = await o.adapter.toolchain.installedPackages(o.targetProjectDir);
 		} catch {
 			/* no manifest readable: the reviewer reads it with its tools */
 		}
@@ -253,20 +253,20 @@ function current(dir: string, files: string[]): string {
 }
 
 /** A commit's subject and the files it touched (cheap context, no diff). */
-function summary(repo: string, sha: string): string {
+async function summary(repo: string, sha: string): Promise<string> {
 	try {
-		return execFileSync("git", ["show", "--stat", "--format=%h %s", sha], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+		return (await exec("git", ["show", "--stat", "--format=%h %s", sha], { cwd: repo })).trim();
 	} catch {
 		return `${sha} (not found)`;
 	}
 }
 
 /** The unit's changes: git diff for files git knows, the whole file for new ones; capped. */
-function diff(dir: string, files: string[]): string {
+async function diff(dir: string, files: string[]): Promise<string> {
 	const out: string[] = [];
 	let tracked = "";
 	try {
-		tracked = execFileSync("git", ["diff", "HEAD", "--", ...files], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
+		tracked = await exec("git", ["diff", "HEAD", "--", ...files], { cwd: dir, maxBuffer: 32 * 1024 * 1024 });
 	} catch {
 		/* not a repo, or no HEAD yet */
 	}

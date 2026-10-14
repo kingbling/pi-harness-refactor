@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
@@ -18,6 +17,7 @@ import { mentionsCase } from "./ported.ts";
 import { differences } from "./differences.ts";
 import { Semaphore } from "./pool.ts";
 import { reviewWithModel, type Reviewer } from "./review.ts";
+import { exec } from "../proc.ts";
 
 /**
  * `br recheck`: accepted units, held to the checks they never met. Truth that names "run on the old code" must
@@ -59,11 +59,11 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 	const restored: string[] = [];
 	// every test file of a project with its text, read once per recheck (only when a recorded test path is gone)
 	const texts = new Map<string, Array<readonly [string, string]>>();
-	const testTexts = (dir: string, layout: { isTestFile: (f: string) => boolean }) => {
+	const testTexts = async (dir: string, layout: { isTestFile: (f: string) => boolean }) => {
 		if (!texts.has(dir)) {
 			let files: string[] = [];
 			try {
-				files = execFileSync("git", ["ls-files"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).split("\n").filter((f) => f && layout.isTestFile(f));
+				files = (await exec("git", ["ls-files"], { cwd: dir, maxBuffer: 64 * 1024 * 1024 })).split("\n").filter((f) => f && layout.isTestFile(f));
 			} catch {
 				/* not a git checkout: nothing to find */
 			}
@@ -106,7 +106,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 				//    found again by its case id (it is in the test's text) and the case is linked to its new file
 				const linked = o.ledger.db.prepare("SELECT id, ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(u.id) as Array<{ id: string; p: string }>;
 				for (const c of linked.filter((c) => !existsSync(join(dir, c.p)))) {
-					const now = testTexts(dir, adapter.layout).find(([, t]) => mentionsCase(t, c.id))?.[0];
+					const now = (await testTexts(dir, adapter.layout)).find(([, t]) => mentionsCase(t, c.id))?.[0];
 					if (now) (o.ledger.db.prepare("UPDATE truth_cases SET ported_test_path = ? WHERE id = ?").run(now, c.id), (c.p = now));
 				}
 				const ported = [...new Set(linked.map((c) => c.p))];
@@ -119,7 +119,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 					if (!res.ok) findings.push(`the ported tests fail on the main branch now:\n${res.output.slice(-2500)}`);
 				}
 				// 3. the reviewer on the unit's files as they are now: where its moves point, plus its commit's files still there
-				const files = currentFiles(o.ledger, u.id, main, dir, meta.commit);
+				const files = await currentFiles(o.ledger, u.id, main, dir, meta.commit);
 				// the reviewer actually looked: no files or a reviewer error is not a clean result
 				let judged = false;
 				if (files.length) {
@@ -183,15 +183,15 @@ export function reopenUnit(ledger: Ledger, unitId: string, note: string, reason:
  * The unit's files on main now, relative to its stack's project `dir`: the files its moves point to, plus the files
  * of its commit (repo-relative in git, so only those inside `dir`) that still exist.
  */
-export function currentFiles(ledger: Ledger, unitId: string, main: string, dir: string, commit?: string): string[] {
+export async function currentFiles(ledger: Ledger, unitId: string, main: string, dir: string, commit?: string): Promise<string[]> {
 	const targets = (ledger.db.prepare("SELECT target_symbols FROM moves WHERE unit_id = ? AND op != 'dropped'").all(unitId) as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!));
-	const committed = (commit ? committedFiles(main, commit) : []).map((f) => relative(dir, join(main, f))).filter((f) => !f.startsWith(".."));
+	const committed = (commit ? await committedFiles(main, commit) : []).map((f) => relative(dir, join(main, f))).filter((f) => !f.startsWith(".."));
 	return [...new Set([...targets, ...committed])].filter((f) => f && existsSync(join(dir, f)));
 }
 
-function committedFiles(repo: string, sha: string): string[] {
+async function committedFiles(repo: string, sha: string): Promise<string[]> {
 	try {
-		return execFileSync("git", ["show", "--name-only", "--format=", sha], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean);
+		return (await exec("git", ["show", "--name-only", "--format=", sha], { cwd: repo })).split("\n").filter(Boolean);
 	} catch {
 		return [];
 	}
@@ -204,7 +204,7 @@ function committedFiles(repo: string, sha: string): string[] {
  * accepted one goes back to planned with its code kept). Red → left as it is, tried again once the old code's
  * environment changes. Units with only cases.json are counted, not touched (they need a tester session each).
  */
-export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; log?: (l: string) => void }): { upgraded: string[]; redone: string[]; red: number; noScript: number } {
+export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; log?: (l: string) => void }): Promise<{ upgraded: string[]; redone: string[]; red: number; noScript: number }> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const source = o.source ?? getSourceAdapter(o.config.source.stack);
 	const env = envHash(o.root, o.config);
@@ -223,9 +223,9 @@ export function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: stri
 			continue;
 		}
 		if (meta.truthUpgradeEnv === env) continue;
-		const ran = verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		const ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
 		// red, and the probe does not run either: the old code's runtime is down, so no unit counts as tried
-		if (!ran.ok && probeRunsNow(o.root, o.config, source) === false) {
+		if (!ran.ok && (await probeRunsNow(o.root, o.config, source)) === false) {
 			log(pc.yellow(`truth upgrade: the old code's runtime is down (the probe does not run either); tried again at the next run`));
 			break;
 		}
@@ -330,13 +330,13 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 		const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(id) as Array<{ symbol_id: string; inputs: string }>).map((c) => ({ symbol: c.symbol_id, inputs: JSON.parse(c.inputs) as unknown }));
 		if (!cases.length) continue;
 		res.tried++;
-		const before = existsSync(join(truthDir, source.truth.scriptName)) ? verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []) : undefined;
+		const before = existsSync(join(truthDir, source.truth.scriptName)) ? await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []) : undefined;
 		const failed = before && (before.ok ? `it runs, but its cases do not match the recorded ones (other symbols or inputs, or other keys in expected); it printed these (expected left out): ${JSON.stringify(before.cases.map((c) => ({ symbol: c.symbol, inputs: c.inputs }))).slice(0, 1000)}` : before.error ?? "it does not run");
 		const said = await (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases, failed }).catch((e) => `failed: ${e?.message ?? e}`);
 		o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
 		// the unit may have been re-opened meanwhile (parity, a bug report): then its truth is redone anyway
 		if (o.ledger.getUnit(id)?.state !== "accepted") continue;
-		const ran = verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		const ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
 		if (!ran.ok) {
 			res.red++;
 			log(pc.dim(`  ${id}: the script does not run green on the old code (${String(ran.error ?? said).split("\n")[0]!.slice(0, 160)})`));

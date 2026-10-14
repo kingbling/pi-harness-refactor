@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
-import { outputCaptured, runCommand } from "../../proc.ts";
+import { exec, outputCaptured, runCommand } from "../../proc.ts";
 import { progress } from "../../progress.ts";
 import { MissingToolsError } from "../../init/toolchain-install.ts";
 import type { ModelClient } from "../../models/types.ts";
@@ -185,7 +185,7 @@ export function fromManifest(m: AdapterManifest): TargetAdapter {
 }
 
 /** Package names the project has: from the JSON manifest when the stack has one, else from the list command's output. */
-function installedPackages(m: AdapterManifest, dir: string): string[] {
+async function installedPackages(m: AdapterManifest, dir: string): Promise<string[]> {
 	const inst = m.toolchain.installed;
 	if (inst.file && inst.keys?.length) {
 		try {
@@ -196,11 +196,16 @@ function installedPackages(m: AdapterManifest, dir: string): string[] {
 		}
 	}
 	if (!inst.list?.cmd) return [];
-	const r = spawnSync(inst.list.cmd, inst.list.args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
-	if (r.status !== 0 || !r.stdout) return [];
+	let stdout = "";
+	try {
+		stdout = await exec(inst.list.cmd, inst.list.args, { cwd: dir, timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+	} catch {
+		return [];
+	}
+	if (!stdout) return [];
 	// the model's pattern names the package in group 1; without one, the package-name regex's match is the name
 	const re = new RegExp(inst.listPattern || m.toolchain.packageName);
-	const names = r.stdout.split("\n").map((l) => {
+	const names = stdout.split("\n").map((l) => {
 		const x = re.exec(l.trim());
 		return inst.listPattern ? x?.[1] : x?.[0];
 	});
@@ -279,13 +284,13 @@ export function generatedDir(root: string): string {
  * A stack's generated adapter that a fresh start left behind in .bigrefactor.old-<time>/adapters (before fresh
  * starts kept them): copied back, newest first. Returns whether one was found.
  */
-export function restoreManifest(root: string, id: string): boolean {
+export async function restoreManifest(root: string, id: string): Promise<boolean> {
 	const olds = existsSync(root) ? readdirSync(root).filter((n) => n.startsWith(".bigrefactor.old-")).sort().reverse() : [];
 	for (const old of olds) {
 		const from = join(root, old, "adapters");
 		if (!existsSync(join(from, `${id}.json`))) continue;
 		mkdirSync(generatedDir(root), { recursive: true });
-		for (const n of [`${id}.json`, `${id}.seed`]) if (existsSync(join(from, n))) cpSync(join(from, n), join(generatedDir(root), n), { recursive: true });
+		for (const n of [`${id}.json`, `${id}.seed`]) if (existsSync(join(from, n))) await cp(join(from, n), join(generatedDir(root), n), { recursive: true });
 		return true;
 	}
 	return false;
@@ -473,10 +478,11 @@ export async function healWiringFiles(root: string, opts: { client: ModelClient;
 		const require = (own ?? m.layout.rules)?.require ?? [];
 		const dir = opts.dirOf?.(m.id);
 		// gone only when git shows the project once had it: a file a unit creates later (or a dir without git) is not stale
-		const gone = dir && existsSync(dir) ? (m.layout.wiringFiles ?? []).filter((w) => !/[*?[{]/.test(w) && !existsSync(join(dir, w)) && wasTracked(dir, w)) : [];
+		const gone: string[] = [];
+		if (dir && existsSync(dir)) for (const w of m.layout.wiringFiles ?? []) if (!/[*?[{]/.test(w) && !existsSync(join(dir, w)) && (await wasTracked(dir, w))) gone.push(w);
 		if (m.layout.wiringFiles && (m.layout.wiringFiles.length || !require.length) && !gone.length) continue;
 		const ask = gone.length
-			? `The ${m.id} manifest names wiring files the project no longer has: ${gone.join(", ")} (layout.wiringFiles now: ${m.layout.wiringFiles!.join(", ")}). The project's files tracked near them:\n${trackedNear(dir!, gone)}\n\nName the files where the project registers features now (it may have moved them); keep the entries that still hold. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}.`
+			? `The ${m.id} manifest names wiring files the project no longer has: ${gone.join(", ")} (layout.wiringFiles now: ${m.layout.wiringFiles!.join(", ")}). The project's files tracked near them:\n${await trackedNear(dir!, gone)}\n\nName the files where the project registers features now (it may have moved them); keep the entries that still hold. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}.`
 			: `The ${m.id} manifest has no layout.wiringFiles yet. Its layout: moduleDir ${m.layout.moduleDir}; files every feature folder must hold (layout.rules.require): ${require.join(", ") || "none"}; structure doc:\n${m.layout.structureDoc}`;
 		const res = await opts.client.chat({
 			model: opts.model,
@@ -507,17 +513,22 @@ export async function healWiringFiles(root: string, opts: { client: ModelClient;
 }
 
 /** git has a commit that touched `file` in the project dir (false without git). */
-function wasTracked(dir: string, file: string): boolean {
-	const r = spawnSync("git", ["-C", dir, "log", "-1", "--format=%h", "--", file], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-	return r.status === 0 && !!r.stdout.trim();
+async function wasTracked(dir: string, file: string): Promise<boolean> {
+	try {
+		return !!(await exec("git", ["-C", dir, "log", "-1", "--format=%h", "--", file])).trim();
+	} catch {
+		return false;
+	}
 }
 
 /** The tracked files in the nearest folder that still holds each missing path (the project root at worst), capped. */
-function trackedNear(dir: string, missing: string[]): string {
+async function trackedNear(dir: string, missing: string[]): Promise<string> {
 	const near = (p: string): string => (p === "." || existsSync(join(dir, p)) ? p : near(dirname(p)));
 	const dirs = [...new Set(missing.map((p) => near(dirname(p))))];
-	const r = spawnSync("git", ["-C", dir, "ls-files", "--", ...dirs], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-	const files = r.status === 0 ? r.stdout.split("\n").filter(Boolean) : [];
+	const files = await exec("git", ["-C", dir, "ls-files", "--", ...dirs]).then(
+		(out) => out.split("\n").filter(Boolean),
+		() => [],
+	);
 	return files.length ? `${files.slice(0, 300).join("\n")}${files.length > 300 ? `\n… ${files.length - 300} more` : ""}` : "(none tracked)";
 }
 
@@ -560,7 +571,7 @@ export async function verifyPendingAdapters(
 			await generateAdapter({ id: m.id, role: m.role, why: "chosen by the owner during onboarding", client: opts.client, model: opts.model, root, previous: { manifest: prev as AdapterManifest, failure }, ensureTools: opts.ensureTools && ((t) => opts.ensureTools!(t, m.id)), log });
 		} catch (e: any) {
 			if (e instanceof MissingToolsError) throw e; // the owner installs them and resumes: the choice stands
-			for (const n of [`${m.id}.json`, `${m.id}.seed`]) rmSync(join(generatedDir(root), n), { recursive: true, force: true });
+			for (const n of [`${m.id}.json`, `${m.id}.seed`]) await rm(join(generatedDir(root), n), { recursive: true, force: true });
 			throw new AdapterGaveUpError(m.id, m.role, String(e?.message ?? e));
 		}
 		done.push(m.id);
@@ -596,7 +607,7 @@ function fromModel(json: unknown, id: string, role: "server" | "ui"): AdapterMan
 /** Scaffold → build → probe test on a scratch project; undefined when all pass, else what failed. */
 export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string } = {}): Promise<string | undefined> {
 	// keepAt: the verified project stays there (probe test removed) for setup to reuse; a failed one is removed
-	if (opts.keepAt) rmSync(opts.keepAt, { recursive: true, force: true });
+	if (opts.keepAt) await rm(opts.keepAt, { recursive: true, force: true });
 	const scratch = opts.keepAt ?? mkdtempSync(join(tmpdir(), `br-adapter-${m.id}-`));
 	mkdirSync(scratch, { recursive: true });
 	const a = fromManifest(m);
@@ -651,7 +662,7 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 		ok = true;
 		return undefined;
 	} finally {
-		if (!ok || !opts.keepAt) rmSync(scratch, { recursive: true, force: true });
+		if (!ok || !opts.keepAt) await rm(scratch, { recursive: true, force: true });
 	}
 }
 

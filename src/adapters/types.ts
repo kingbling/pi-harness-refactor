@@ -100,7 +100,7 @@ export interface TargetToolchain {
 	/** Files whose change means dependencies changed (re-submits units parked on the environment). */
 	manifestFiles: string[];
 	/** Packages the project declares. */
-	installedPackages(dir: string): string[];
+	installedPackages(dir: string): string[] | Promise<string[]>;
 	/** Command that adds packages to the project. */
 	addPackages(dir: string, packages: string[]): { cmd: string; args: string[] };
 	/** Dependency dirs shared from the main project into unit worktrees (symlinked, never copied). */
@@ -292,14 +292,14 @@ export interface TargetLayout {
 	 * Lines starting with "warning:" are shown, never failed. `ctx` (the gate) says which files are new and which a
 	 * tidy task sanctions, so shapes allowed only with a reason (a second file of a kind) can be judged.
 	 */
-	checkStructure?(files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext): string[];
+	checkStructure?(files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext): string[] | Promise<string[]>;
 	/**
 	 * Drift findings of the whole project tree against structureDoc (naming, size cap, one class per responsibility),
 	 * one `<project-relative path>: <finding>` per line; `only` limits them to those files. Without `only`, area-wide
 	 * findings are anchored at `<moduleDir>/` (several same-kind classes in one area). Folders outside the feature
 	 * root and shared dirs are the core's part (it knows the scaffold).
 	 */
-	checkTree?(projectDir: string, only?: string[]): string[];
+	checkTree?(projectDir: string, only?: string[]): string[] | Promise<string[]>;
 	/** Per-file findings that do not depend on the folder layout (size cap, one class per file); `moduleDir`/`area` when the file is in a feature folder. */
 	fileFindings?(projectDir: string, file: string, moduleDir?: string, area?: string): string[];
 	/** Add-only zones for cross-cutting helpers (reuse, never edit from a feature unit). Trailing slash. */

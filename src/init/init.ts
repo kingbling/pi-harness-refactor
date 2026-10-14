@@ -1,5 +1,5 @@
 import { runCommand } from "../proc.ts";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as p from "@clack/prompts";
@@ -13,6 +13,7 @@ import { createProjectWithModel, fixSetupWithModel, type ProjectCreator, type Se
 import { withCommandOverrides } from "../adapters/command-overrides.ts";
 import { libraryPlan, parseChoiceFlag, parseReplaceFlag, renderStackPlan, resolveChoices } from "./stack.ts";
 import { loadDecisions, recordEarlyDecision } from "../inventory/decisions.ts";
+import { cp, rm } from "node:fs/promises";
 
 export interface PromptOption {
 	value: string;
@@ -238,7 +239,7 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 		if (root === p || root.startsWith(p + "/")) throw new Error(`run br init from a workspace directory outside the ${name} repo (${p}); migration files never live inside a repo`);
 	const detected = await getSourceAdapter(stack).detect(absSource);
 	// Pin the legacy repo. It is never written to; later `br inventory` runs report drift against this commit.
-	const commit = headOf(absSource);
+	const commit = await headOf(absSource);
 	const config = ConfigSchema.parse({
 		source: { path: sourcePath, stack, framework: detected.framework, version: detected.version, commit },
 		target: { path: targetPath, stacks: to, choices },
@@ -273,7 +274,7 @@ export async function setup(config: Config, root: string, opts: { creator?: Proj
 	const target = config.target.path;
 	mkdirSync(target, { recursive: true });
 	const adapters = await Promise.all(config.target.stacks.map((id) => getTargetAdapter(id)));
-	ensureRepo(target, config.target.git.branch, [...new Set(adapters.flatMap((a) => a.toolchain.ignoredPaths))]);
+	await ensureRepo(target, config.target.git.branch, [...new Set(adapters.flatMap((a) => a.toolchain.ignoredPaths))]);
 	for (const adapter of adapters) {
 		const id = adapter.id;
 		const dir = projectDir(config, id);
@@ -281,30 +282,30 @@ export async function setup(config: Config, root: string, opts: { creator?: Proj
 		// the project the adapter check already built (generator + packages, probe test removed) is moved, not built again
 		if (adapter.seedProject && existsSync(adapter.seedProject) && !adapter.toolchain.isProjectReady(dir)) {
 			mkdirSync(dirname(dir), { recursive: true });
-			if (existsSync(dir) && !readdirSync(dir).length) rmSync(dir, { recursive: true });
+			if (existsSync(dir) && !readdirSync(dir).length) await rm(dir, { recursive: true });
 			try {
 				renameSync(adapter.seedProject, dir);
 			} catch {
-				cpSync(adapter.seedProject, dir, { recursive: true }); // another disk: copy instead
-				rmSync(adapter.seedProject, { recursive: true, force: true });
+				await cp(adapter.seedProject, dir, { recursive: true }); // another disk: copy instead
+				await rm(adapter.seedProject, { recursive: true, force: true });
 			}
 			console.log(pc.dim(`  reused the ${id} project built by the adapter check (no second download)`));
 		}
 		// the stack choices made at init (ORM, validation, router…) bring their packages; the generator alone does not know them
 		const choices = resolveChoices(adapter, config.target.choices).map((c) => ({ choice: c.choice.key, option: c.option.id, packages: c.option.packages ?? [] }));
-		const missing = () => {
+		const missing = async () => {
 			if (!adapter.toolchain.isProjectReady(dir)) return choices.flatMap((c) => c.packages);
-			const installed = new Set(adapter.toolchain.installedPackages(dir));
+			const installed = new Set(await adapter.toolchain.installedPackages(dir));
 			return choices.flatMap((c) => c.packages).filter((p) => !installed.has(p));
 		};
-		if (!adapter.toolchain.isProjectReady(dir) || missing().length) {
+		if (!adapter.toolchain.isProjectReady(dir) || (await missing()).length) {
 			// the setup model creates the project and installs the choices with the official tools; code checks below
 			try {
 				await (opts.creator ?? createProjectWithModel)({ config, root, adapter, projectDir: dir, packages: choices });
 			} catch (e: any) {
 				console.log(pc.yellow(`  ${id}: ${e?.message ?? e} — using the built-in generator instead`));
 				await adapter.scaffoldProject(dir);
-				const left = missing();
+				const left = await missing();
 				if (left.length && adapter.toolchain.isProjectReady(dir)) {
 					const add = adapter.toolchain.addPackages(dir, left);
 					await runCommand(add.cmd, add.args, { cwd: dir });
@@ -316,7 +317,7 @@ export async function setup(config: Config, root: string, opts: { creator?: Proj
 	// Guarantee, before any unit runs: the project matches every stack choice, and the gate's own build and
 	// test commands pass on a probe test written the way agents will write theirs.
 	for (const id of config.target.stacks) await checkToolchain(config, await getTargetAdapter(id), { root });
-	const sha = commitAll(target, `chore: bootstrap ${config.target.stacks.join(" + ")} with official generators\n\nsource: ${config.source.stack} @ ${config.source.commit ?? "unpinned"}`);
+	const sha = await commitAll(target, `chore: bootstrap ${config.target.stacks.join(" + ")} with official generators\n\nsource: ${config.source.stack} @ ${config.source.commit ?? "unpinned"}`);
 	console.log(sha ? pc.green(`committed ${sha.slice(0, 7)} on ${config.target.git.branch}`) : pc.dim("nothing new to commit"));
 	writeFileSync(statePath(root, "setup-done.json"), setupKey(config));
 }
@@ -330,7 +331,7 @@ function setupKey(config: Config): string {
  * without this plugin (or before the marker existed) counts when every project is there, committed, and has
  * every chosen package; a stopped setup or other choices run setup again.
  */
-export function setupDone(config: Config, root: string, adapters: TargetAdapter[]): boolean {
+export async function setupDone(config: Config, root: string, adapters: TargetAdapter[]): Promise<boolean> {
 	if (!adapters.every((a) => a.toolchain.isProjectReady(projectDir(config, a.id)))) return false;
 	let marker: string | undefined;
 	try {
@@ -339,11 +340,12 @@ export function setupDone(config: Config, root: string, adapters: TargetAdapter[
 		/* no marker */
 	}
 	if (marker !== undefined) return marker === setupKey(config);
-	if (!headOf(config.target.path)) return false;
-	return adapters.every((a) => {
-		const installed = new Set(a.toolchain.installedPackages(projectDir(config, a.id)));
-		return resolveChoices(a, config.target.choices).every((c) => (c.option.packages ?? []).every((p) => installed.has(p)));
-	});
+	if (!await headOf(config.target.path)) return false;
+	for (const a of adapters) {
+		const installed = new Set(await a.toolchain.installedPackages(projectDir(config, a.id)));
+		if (!resolveChoices(a, config.target.choices).every((c) => (c.option.packages ?? []).every((p) => installed.has(p)))) return false;
+	}
+	return true;
 }
 
 /** Where a stack's project lives inside the target repo. Single stack → the target root itself. */
@@ -386,7 +388,7 @@ export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: 
 	renameSync(dir, to);
 	// generated stack adapters are verified setup, not answers: a running session keeps them in memory, so without
 	// a copy here the next start no longer knows the stack ("unknown target adapter")
-	if (existsSync(join(to, "adapters"))) cpSync(join(to, "adapters"), join(dir, "adapters"), { recursive: true });
+	if (existsSync(join(to, "adapters"))) await cp(join(to, "adapters"), join(dir, "adapters"), { recursive: true });
 	ui.log(`earlier work moved to ${basename(to)}; starting fresh${existsSync(join(dir, "adapters")) ? " (generated stack adapters kept)" : ""}`);
 	return true;
 }

@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { join, matchesGlob, resolve } from "node:path";
 import { CONFIG_FILE } from "../config.ts";
 import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
+import { exec } from "../proc.ts";
 
 /**
  * The feature-folder layout of one stack as DATA: `.bigrefactor/rules/<stack>/layout.json`. Decided at onboarding
@@ -355,9 +355,9 @@ function missingRequired(projectDir: string, mod: string, area: string, r: Layou
  * Whole tree (drift): every feature folder under the module root against the rules, the shared topics, and the
  * stack's per-file findings. `only` limits the findings to those files (the gate). Lines `<path>: <finding>`.
  */
-export function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutCheckOptions, only?: string[], notAreas: string[] = []): string[] {
+export async function checkLayoutTree(projectDir: string, r: LayoutRules, o: LayoutCheckOptions, only?: string[], notAreas: string[] = []): Promise<string[]> {
 	// files that came with the generated project (its first commit) are the framework's, never drift
-	const scaffold = new Set(scaffoldFiles(projectDir));
+	const scaffold = new Set(await scaffoldFiles(projectDir));
 	const want = only && new Set(only);
 	const root = r.moduleDir.replace(/\/$/, "").split("/").slice(0, -1).join("/");
 	const placeholder = r.moduleDir.replace(/\/$/, "").split("/").at(-1)!;
@@ -478,18 +478,22 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 	// the layout doc, layout.sharedDirs (placement, the tidy review, units' write rules) and both checks leave it out,
 	// and its files are never layout findings. Read from the stack's project in the workspace, else the checked one.
 	let home: string | undefined;
-	const framework = (projectDir?: string) => {
+	const framework = async (projectDir?: string) => {
 		home ??= root ? workspaceProject(root, adapter) : undefined;
 		const at = home ?? projectDir;
 		return at ? generatorDirs(at, base.sharedDirs) : [];
 	};
-	const sharedOf = (projectDir?: string) => {
-		const own = framework(projectDir);
-		return base.sharedDirs.filter((d) => !own.includes(d));
+	// the doc and layout.sharedDirs are read synchronously: they take what is known of the workspace's project
+	// (getTargetAdapter asks before handing the adapter out; a project made later is asked in the background)
+	const frameworkKnown = () => {
+		home ??= root ? workspaceProject(root, adapter) : undefined;
+		return home ? generatorDirsKnown(home, base.sharedDirs) : [];
 	};
-	const optsFor = (projectDir: string): LayoutCheckOptions => {
-		const own = framework(projectDir);
-		return own.length ? { ...opts, sharedDirs: sharedOf(projectDir), dataDirs: [...(base.dataDirs ?? []), ...own] } : opts;
+	const without = (own: string[]) => base.sharedDirs.filter((d) => !own.includes(d));
+	const sharedOf = () => without(frameworkKnown());
+	const optsFor = async (projectDir: string): Promise<LayoutCheckOptions> => {
+		const own = await framework(projectDir);
+		return own.length ? { ...opts, sharedDirs: without(own), dataDirs: [...(base.dataDirs ?? []), ...own] } : opts;
 	};
 	const layout = {
 		...base,
@@ -497,15 +501,15 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 			const r = rules();
 			return r ? expandModuleDir(r, area) : base.moduleDir(area);
 		},
-		checkStructure: (files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext) => {
+		checkStructure: async (files: string[], moduleDir: string, area: string, projectDir: string, ctx?: StructureContext) => {
 			const r = rules();
-			if (r) return checkLayoutRules(files, moduleDir, area, projectDir, r, optsFor(projectDir), ctx);
+			if (r) return checkLayoutRules(files, moduleDir, area, projectDir, r, await optsFor(projectDir), ctx);
 			const own = base.checkStructure?.(files.filter((f) => !isWiringFile(f, base.wiringFiles)), moduleDir, area, projectDir, ctx) ?? [];
 			return own;
 		},
-		checkTree: (projectDir: string, only?: string[]) => {
+		checkTree: async (projectDir: string, only?: string[]) => {
 			const r = rules();
-			return r ? checkLayoutTree(projectDir, r, optsFor(projectDir), only, scaffoldDirs(projectDir, r.moduleDir.split("/").slice(0, -1).join("/"))) : (base.checkTree?.(projectDir, only) ?? []);
+			return r ? checkLayoutTree(projectDir, r, await optsFor(projectDir), only, await scaffoldDirs(projectDir, r.moduleDir.split("/").slice(0, -1).join("/"))) : ((await base.checkTree?.(projectDir, only)) ?? []);
 		},
 	};
 	// the adapter's own notes stay next to the layout written from layout.json
@@ -513,6 +517,15 @@ export function withLayoutRules(adapter: TargetAdapter, root: string | undefined
 	Object.defineProperty(layout, "structureDoc", { enumerable: true, get: () => (rules() ? doc(rules()!) : base.structureDoc) });
 	Object.defineProperty(layout, "sharedDirs", { enumerable: true, get: () => sharedOf() });
 	return { ...adapter, layout };
+}
+
+/**
+ * Asks the workspace project's first commit for the generator's folders, so the adapter's layout doc and
+ * layout.sharedDirs (read synchronously) already know them. Called with the adapter withLayoutRules wraps.
+ */
+export async function learnGeneratorDirs(adapter: TargetAdapter, root: string | undefined): Promise<void> {
+	const home = root ? workspaceProject(root, adapter) : undefined;
+	if (home) await generatorDirs(home, adapter.layout.sharedDirs.map(slashed));
 }
 
 // ---- helpers ------------------------------------------------------------------------------------------------
@@ -533,36 +546,36 @@ function workspaceProject(root: string, adapter: TargetAdapter): string | undefi
 export const slashed = (d: string) => d.replace(/\/*$/, "/");
 
 /** The project's first commit (what the official generator made), or undefined (no repo or no commit yet). */
-function firstCommit(dir: string): string | undefined {
+async function firstCommit(dir: string): Promise<string | undefined> {
 	try {
-		return execFileSync("git", ["-C", dir, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n").at(-1) || undefined;
+		return (await gitOut(dir, ["rev-list", "--max-parents=0", "HEAD"])).trim().split("\n").at(-1) || undefined;
 	} catch {
 		return undefined;
 	}
 }
-const gitOut = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+const gitOut = (dir: string, args: string[]) => exec("git", ["-C", dir, ...args]);
 
 /**
  * Files of the project's first commit (what the official generator made) still as generated, relative to `dir`:
  * never drift. A scaffold file a unit changed is checked like any other.
  */
-export function scaffoldFiles(dir: string): string[] {
-	const first = firstCommit(dir);
+export async function scaffoldFiles(dir: string): Promise<string[]> {
+	const first = await firstCommit(dir);
 	if (!first) return [];
 	try {
-		const changed = new Set(gitOut(dir, ["diff", "--name-only", "--relative", first]).split("\n").filter(Boolean));
-		return gitOut(dir, ["ls-tree", "-r", "--name-only", first]).split("\n").filter((f) => f && !changed.has(f));
+		const changed = new Set((await gitOut(dir, ["diff", "--name-only", "--relative", first])).split("\n").filter(Boolean));
+		return (await gitOut(dir, ["ls-tree", "-r", "--name-only", first])).split("\n").filter((f) => f && !changed.has(f));
 	} catch {
 		return [];
 	}
 }
 
 /** Dirs under `srcRoot` in the project's first commit (what the official generator made): never feature folders. */
-export function scaffoldDirs(dir: string, srcRoot: string): string[] {
-	const first = firstCommit(dir);
+export async function scaffoldDirs(dir: string, srcRoot: string): Promise<string[]> {
+	const first = await firstCommit(dir);
 	if (!first) return [];
 	try {
-		return gitOut(dir, ["ls-tree", "-d", "--name-only", first, `${srcRoot}/`])
+		return (await gitOut(dir, ["ls-tree", "-d", "--name-only", first, `${srcRoot}/`]))
 			.split("\n")
 			.filter(Boolean)
 			.map((p) => p.split("/").at(-1)!);
@@ -578,22 +591,40 @@ const generated = new Map<string, string[]>();
  * Those of `dirs` (project-relative, with a trailing slash) that the project's first commit (what the official
  * generator made) already has as folders, such as config/ or tests/: the framework's folders, never shared app code.
  */
-export function generatorDirs(dir: string, dirs: string[]): string[] {
+export async function generatorDirs(dir: string, dirs: string[]): Promise<string[]> {
 	if (!dirs.length) return [];
 	const key = `${dir}\0${dirs.join("\0")}`;
 	const hit = generated.get(key);
 	if (hit) return hit;
-	const first = firstCommit(dir);
+	const first = await firstCommit(dir);
 	if (!first) return []; // no project yet: asked again once there is one
 	let out: string[] = [];
 	try {
-		const have = new Set(gitOut(dir, ["ls-tree", "-d", "--name-only", first, "--", ...dirs.map((d) => d.replace(/\/+$/, ""))]).split("\n").filter(Boolean).map(slashed));
+		const have = new Set((await gitOut(dir, ["ls-tree", "-d", "--name-only", first, "--", ...dirs.map((d) => d.replace(/\/+$/, ""))])).split("\n").filter(Boolean).map(slashed));
 		out = dirs.filter((d) => have.has(slashed(d)));
 	} catch {
 		/* unreadable first commit: no generator folders known */
 	}
 	generated.set(key, out);
 	return out;
+}
+
+/**
+ * generatorDirs as far as already known, for synchronous readers. Not known yet (a project made after the adapter
+ * was handed out): none for now, and the answer is asked in the background for the next read.
+ */
+const asking = new Set<string>();
+function generatorDirsKnown(dir: string, dirs: string[]): string[] {
+	const key = `${dir}\0${dirs.join("\0")}`;
+	const hit = generated.get(key);
+	if (hit) return hit;
+	if (!asking.has(key)) {
+		asking.add(key);
+		void generatorDirs(dir, dirs)
+			.catch(() => [])
+			.finally(() => asking.delete(key));
+	}
+	return [];
 }
 
 /**

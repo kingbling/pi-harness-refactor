@@ -27,7 +27,7 @@ async function setup(name: string) {
 	await inventory(config, ws, ledger);
 	const source = getSourceAdapter("php");
 	const targets = [await getTargetAdapter("nestjs")];
-	for (const d of decisionGate(ledger, config, source, targets, ws).global) applyDecision(ledger, config, ws, d.id, d.recommended!, "test");
+	for (const d of (await decisionGate(ledger, config, source, targets, ws)).global) applyDecision(ledger, config, ws, d.id, d.recommended!, "test");
 	// every unit placed, so only deps and flags decide what is ready
 	for (const u of ledger.listUnits()) ledger.updateUnit(u.id, { meta: { place: { stack: "nestjs", area: "app", shared: false, source: "answer" } } });
 	const readyNow = async () => {
@@ -68,11 +68,11 @@ describe("planned units that could never start", () => {
 		ledger.transitionUnit(id, "quarantined", "gate red");
 		const q = ledger.askQuestion({ unitId: id, point: "quarantine", question: "stuck?", options: ["retry", "leave"], blocks: "unit", askedBy: "orchestrator" });
 		ledger.updateUnit(id, { meta: { healQuestion: 0, stuck: true, autoHeals: 2 } });
-		expect(requeueUnits(ledger, config, ws, [id], "self-heal")).toEqual([`${id}: requeued`]);
+		expect(await requeueUnits(ledger, config, ws, [id], "self-heal")).toEqual([`${id}: requeued`]);
 		expect(ledger.getQuestion(q)!.status).toBe("withdrawn");
 		expect(JSON.parse(ledger.getUnit(id)!.meta)).toMatchObject({ healQuestion: 0, stuck: true, autoHeals: 2 }); // automatic: caps kept
 		ledger.transitionUnit(id, "quarantined", "gate red again");
-		requeueUnits(ledger, config, ws, [id], "owner", { human: true });
+		await requeueUnits(ledger, config, ws, [id], "owner", { human: true });
 		const meta = JSON.parse(ledger.getUnit(id)!.meta);
 		expect([meta.healQuestion, meta.stuck, meta.autoHeals]).toEqual([undefined, undefined, undefined]);
 		ledger.close();

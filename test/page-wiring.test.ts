@@ -36,9 +36,9 @@ function setup(controllerState: "planned" | "accepted", controllerStack = "react
 }
 
 describe("page wiring: callers by view name, choices and wiring for the implementer, assets out of scope", () => {
-	it("the reviewer sees the controller that renders the page by its view name, with that unit's state", () => {
+	it("the reviewer sees the controller that renders the page by its view name, with that unit's state", async () => {
 		const { ledger, config, tpl } = setup("planned");
-		const facts = legacyFacts({ ledger, config, unitId: "U1482", legacyFiles: [tpl], adapter: reactAdapter, targetProjectDir: "/nowhere" }).join("\n");
+		const facts = (await legacyFacts({ ledger, config, unitId: "U1482", legacyFiles: [tpl], adapter: reactAdapter, targetProjectDir: "/nowhere" })).join("\n");
 		expect(facts).not.toMatch(/Legacy callers of this unit's code: none/);
 		expect(facts).toMatch(/app\/controller\/sales\.controller\.php names "offers\/list" in a string \([^)]*unit U2210 planned on react\)/);
 		expect(facts).toMatch(/A caller whose unit is not accepted yet and is on react too is not migrated[^\n]*TODO\(br:<that unit>\)/);
@@ -46,7 +46,7 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 
 	it("a caller unit on another stack never wires this stack: the page registers itself, the reviewer and who_calls show the stack", async () => {
 		const { ledger, config, tpl } = setup("planned", "symfony");
-		const facts = legacyFacts({ ledger, config, unitId: "U1482", legacyFiles: [tpl], adapter: reactAdapter, targetProjectDir: "/nowhere" }).join("\n");
+		const facts = (await legacyFacts({ ledger, config, unitId: "U1482", legacyFiles: [tpl], adapter: reactAdapter, targetProjectDir: "/nowhere" })).join("\n");
 		expect(facts).toMatch(/unit U2210 planned on symfony\)/);
 		expect(facts).toMatch(/A caller's unit on another stack can never write react's wiring files: registering the page or handler here[^\n]*is this unit's own job/);
 		const out = await whoCalls({ ledger, config } as never).execute("t", { symbolId: `${tpl}::template` }, undefined as never, undefined as never, undefined as never);

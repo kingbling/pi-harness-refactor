@@ -1,5 +1,5 @@
 import { forecast, renderForecast, type Forecast } from "../run/forecast.ts";
-import { PLUGIN_VERSION } from "../version.ts";
+import { pluginVersion } from "../version.ts";
 import { totalSpend } from "../spend.ts";
 import { lanes, parseLanesArgs, runLanesArg } from "../run/lanes.ts";
 /**
@@ -243,7 +243,7 @@ export function statusLine(ledger: Ledger, root: string): string {
 	const f = d.forecast;
 	const open = d.questions;
 	const left = f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}), ${f.remaining.hours[1] < 48 ? `${f.remaining.hours[1].toFixed(1)} h` : `${(f.remaining.hours[1] / 24).toFixed(1)} days`} [${f.confidence}]` : "";
-	return `br ${PLUGIN_VERSION} · ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
+	return `br ${pluginVersion()} · ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
 }
 
 /** Warnings: a toast with a UI, the console without one (print mode swallows notify). */
@@ -276,7 +276,7 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 	const now = Date.now();
 	const L: string[] = [];
 	const state = s.stopping ? pc.yellow(`${spinner(now)} stopping…`) : s.running ? pc.cyan(`${spinner(now)} running`) : s.error ? pc.red("stopped") : pc.green("finished");
-	L.push(`${pc.bold("bigrefactor")} ${pc.dim(PLUGIN_VERSION)} ${s.job ?? ""} · ${state} · ${ELAPSED(now - (s.startedAt ?? now))} · ${fmtUsage(s, 3)}${s.running ? pc.dim("   /br stop · /br progress · chat works meanwhile") : ""}`);
+	L.push(`${pc.bold("bigrefactor")} ${pc.dim(pluginVersion())} ${s.job ?? ""} · ${state} · ${ELAPSED(now - (s.startedAt ?? now))} · ${fmtUsage(s, 3)}${s.running ? pc.dim("   /br stop · /br progress · chat works meanwhile") : ""}`);
 	const names = [...s.plan, ...s.steps.map((x) => x.name).filter((n) => !s.plan.includes(n))];
 	const icon = (n: string) => {
 		const st = [...s.steps].reverse().find((x) => x.name === n);
@@ -540,7 +540,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 			const { applyDecision, decisionPrompt } = await import("../inventory/decisions.ts");
 			const source = getSourceAdapter(config.source.stack);
 			const targets = await Promise.all(config.target.stacks.map((s) => getTargetAdapter(s)));
-			const g = decisionGate(ledger, config, source, targets, root);
+			const g = await decisionGate(ledger, config, source, targets, root);
 			if (g.global.length && !flags.includes("--dry")) return { error: `${g.global.length} decision(s) change the whole target: answer them with /br decide first`, lines: g.global.map((d) => `· ${d.id}: ${d.question}`) };
 			for (const l of renderGate(g)) progress.log(l);
 			const blocked = liveBlocks(ledger, config, source, targets, root);
@@ -551,7 +551,7 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 				const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
 				try {
 					for (;;) {
-						const now = decisionGate(ledger, loadConfig(cp).config, source, targets, root);
+						const now = await decisionGate(ledger, loadConfig(cp).config, source, targets, root);
 						// blocking decisions first, biggest block first
 						const next = [...now.scoped.sort((a, b) => b.units.length - a.units.length).map((x) => x.decision), ...now.free].find((d) => !asked.has(d.id));
 						if (!next || runDone || progress.stopping) return;
@@ -727,7 +727,7 @@ export default function (pi: ExtensionAPI) {
 				if (!p) return warn(ctx, "no bigrefactor.config.json here");
 				try {
 					const { pushSetting } = await import("../run/push.ts");
-					show(ctx, "push", pushSetting(p, rest));
+					show(ctx, "push", await pushSetting(p, rest));
 				} catch (e: any) {
 					warn(ctx, `push: ${e?.message ?? e}`);
 				}
@@ -874,7 +874,7 @@ export default function (pi: ExtensionAPI) {
 								const eq = a.indexOf("=");
 								if (eq > 0) lines.push(`decided ${a.slice(0, eq)} = ${a.slice(eq + 1)}  ${applyDecision(ledger, config, root, a.slice(0, eq), a.slice(eq + 1), "human (pi)")}`);
 							}
-							const ds = openDecisions(ledger, loadConfig(cp).config, source, targets, root);
+							const ds = await openDecisions(ledger, loadConfig(cp).config, source, targets, root);
 							if (ctx.hasUI) {
 								const ui = piPrompter(ctx, lines);
 								for (const d of ds) {
@@ -882,7 +882,7 @@ export default function (pi: ExtensionAPI) {
 									if (v === undefined) break;
 									lines.push(`decided ${d.id} = ${v}  ${applyDecision(ledger, config, root, d.id, v, "human (pi)")}`);
 								}
-								lines.push(renderDecisions(openDecisions(ledger, loadConfig(cp).config, source, targets, root)));
+								lines.push(renderDecisions(await openDecisions(ledger, loadConfig(cp).config, source, targets, root)));
 							} else lines.push(renderDecisions(ds));
 						}
 					} finally {
@@ -965,7 +965,7 @@ export default function (pi: ExtensionAPI) {
 						const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
 						// units a live run holds are left alone; --all then means the quarantined ones
 						const scope = requeueScope(ledger, root, rest.includes("--all") ? "all" : rest.filter((a) => !a.startsWith("--")));
-						text = [...scope.refused, ...requeueUnits(ledger, config, root, scope.ids, "human (pi)", { fresh: rest.includes("--fresh"), human: true })].join("\n");
+						text = [...scope.refused, ...(await requeueUnits(ledger, config, root, scope.ids, "human (pi)", { fresh: rest.includes("--fresh"), human: true }))].join("\n");
 					}
 				} else if (sub === "unaccounted") {
 					const rows = ledger.unaccounted();

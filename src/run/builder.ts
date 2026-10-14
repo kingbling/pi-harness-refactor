@@ -1,11 +1,11 @@
-import { execFile, execFileSync } from "node:child_process";
-import { existsSync, realpathSync, rmSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, mainBranch, removeWorktree, whitespaceOnly } from "../git.ts";
+import { addWorktree, mainBranch, removeWorktree, whitespaceOnly, deleteBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
@@ -14,6 +14,8 @@ import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { mentionsCase } from "./ported.ts";
 import { reopenUnit } from "./recheck.ts";
 import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { exec } from "../proc.ts";
+import { rm } from "node:fs/promises";
 
 /**
  * The builder: whole-project checks (a type check of everything, a linter that cannot take files, all tests) do not run in
@@ -136,7 +138,7 @@ export interface Builder {
 	/** A unit of this stack was merged into main. */
 	afterMerge(stackId: string): void;
 	/** The stack's new app did not start on main (parity found it): a main problem, built once per main tree. */
-	appDown(stackId: string, error: string): void;
+	appDown(stackId: string, error: string): Promise<void>;
 	/** At the end of the run: one last build of what was merged since the last one. */
 	finish(): Promise<void>;
 }
@@ -198,16 +200,16 @@ export function createBuilder(o: {
 		if (!adapter) return false;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__builder__${stackId}`);
 		const branch = `builder/${stackId}`;
-		const reset = () => {
-			removeWorktree(o.config.target.path, wt);
+		const reset = async () => {
+			await removeWorktree(o.config.target.path, wt);
 			try {
-				execFileSync("git", ["-C", o.config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+				await deleteBranch(o.config.target.path, branch);
 			} catch {
 				/* no branch */
 			}
 		};
-		reset();
-		addWorktree(o.config.target.path, wt, branch);
+		await reset();
+		await addWorktree(o.config.target.path, wt, branch);
 		try {
 			await o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, stackId)));
@@ -215,7 +217,7 @@ export function createBuilder(o: {
 			// only runs the tests of its own area
 			// the test files found are named to the runner: a run without files may skip folders its config does not
 			// list, and "no tests ran" would pass
-			const tests = trackedFiles(dir).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
+			const tests = (await trackedFiles(dir)).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
 			if (!steps.length && !appDown) return false;
 			const check = async () => {
@@ -253,17 +255,18 @@ export function createBuilder(o: {
 				said = (await repair({ config: o.config, root: o.root, adapter, dir, problem, attempt: i }).finally(() => overrides.restore() && o.log(pc.yellow(`builder ${stackId}: the repair changed the gate commands file; put back`)))) || "";
 				// tests are the truth and protected config (tsconfig, test and lint config, manifests) holds the checks:
 				// a repair never changes them, also not through bash, which the write gate does not see
-				const status = execFileSync("git", ["-C", wt, "status", "--porcelain", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean).map((l) => ({ added: l.startsWith("??"), f: l.slice(3).trim() }));
+				const status = (await exec("git", ["-C", wt, "status", "--porcelain", "-uall"])).split("\n").filter(Boolean).map((l) => ({ added: l.startsWith("??"), f: l.slice(3).trim() }));
 				const proj = relative(o.config.target.path, projectDir(o.config, stackId));
 				const inProj = (f: string) => (proj && f.startsWith(`${proj}/`) ? f.slice(proj.length + 1) : f);
 				// a formatter's whitespace fix in a test stays (it cannot change what the test checks)
-				const tests = status.filter((t) => adapter.layout.isTestFile(inProj(t.f)) && (t.added || !whitespaceOnly(wt, t.f)));
+				const tests: typeof status = [];
+				for (const t of status) if (adapter.layout.isTestFile(inProj(t.f)) && (t.added || !(await whitespaceOnly(wt, t.f)))) tests.push(t);
 				const configFiles = status.filter(({ f }) => !tests.some((t) => t.f === f) && isProtected(inProj(f)));
 				const undo = [...tests, ...configFiles];
 				const tracked = undo.filter((u) => !u.added).map((u) => u.f);
-				if (tracked.length) execFileSync("git", ["-C", wt, "checkout", "--", ...tracked], { stdio: "pipe" });
+				if (tracked.length) await exec("git", ["-C", wt, "checkout", "--", ...tracked]);
 				// a new file is not in git, so checkout cannot undo it: it is deleted
-				for (const u of undo.filter((u) => u.added)) rmSync(join(wt, u.f), { recursive: true, force: true });
+				for (const u of undo.filter((u) => u.added)) await rm(join(wt, u.f), { recursive: true, force: true });
 				if (configFiles.length) o.log(pc.yellow(`builder ${stackId}: the repair changed protected config; undone: ${configFiles.map((u) => u.f).slice(0, 5).join(", ")}`));
 				problem = await check();
 			}
@@ -297,7 +300,7 @@ export function createBuilder(o: {
 			o.log(pc.yellow(`builder ${stackId}: whole project still fails; parked, no question (br status)`));
 			return false;
 		} finally {
-			reset();
+			await reset();
 		}
 	};
 
@@ -306,8 +309,8 @@ export function createBuilder(o: {
 			merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
 			start(false);
 		},
-		appDown(stackId, error) {
-			const tree = execFileSync("git", ["-C", o.config.target.path, "rev-parse", `${mainBranch(o.config.target.path, o.config.target.git.branch)}^{tree}`], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+		async appDown(stackId, error) {
+			const tree = (await exec("git", ["-C", o.config.target.path, "rev-parse", `${await mainBranch(o.config.target.path, o.config.target.git.branch)}^{tree}`])).trim();
 			if (downTrees.has(`${stackId} ${tree}`)) return;
 			downTrees.add(`${stackId} ${tree}`);
 			down.set(stackId, error);
@@ -336,7 +339,7 @@ export type MergeCheck = (stackId: string, wt: string, draft?: boolean) => Promi
 export function createMergeCheck(o: { config: Config; adapters: Map<string, TargetAdapter> }): MergeCheck {
 	const repo = o.config.target.path;
 	const seen = new Map<string, { tree: string; dir: string; failing: Map<string, string> }>();
-	const git = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	const git = async (cwd: string, args: string[]) => (await exec("git", ["-C", cwd, ...args])).trim();
 	const failingSteps = async (adapter: TargetAdapter, dir: string) => {
 		const failing = new Map<string, string>();
 		for (const s of wholeProjectSteps(adapter, dir)) {
@@ -349,10 +352,10 @@ export function createMergeCheck(o: { config: Config; adapters: Map<string, Targ
 		const adapter = o.adapters.get(stackId);
 		if (!adapter) return undefined;
 		const rel = relative(repo, projectDir(o.config, stackId));
-		const main = mainBranch(repo, o.config.target.git.branch);
+		const main = await mainBranch(repo, o.config.target.git.branch);
 		if (!draft) {
 			try {
-				git(wt, ["diff", "--quiet", main, "HEAD", "--", rel || "."]);
+				await git(wt, ["diff", "--quiet", main, "HEAD", "--", rel || "."]);
 				return undefined; // nothing of this stack changes
 			} catch {
 				/* it changes files of this stack */
@@ -362,7 +365,7 @@ export function createMergeCheck(o: { config: Config; adapters: Map<string, Targ
 		const steps = wholeProjectSteps(adapter, dir);
 		if (!steps.length) return undefined;
 		const failing = await failingSteps(adapter, dir);
-		const mainTree = git(repo, ["rev-parse", `${main}^{tree}`]);
+		const mainTree = await git(repo, ["rev-parse", `${main}^{tree}`]);
 		let before = seen.get(stackId);
 		if (failing.size && before?.tree !== mainTree) {
 			const mainDir = projectDir(o.config, stackId);
@@ -380,7 +383,7 @@ export function createMergeCheck(o: { config: Config; adapters: Map<string, Targ
 			return added.length ? [`${head}; main fails it too, these ${added.length} error line(s) are new:\n${added.join("\n").slice(-8000)}`] : [];
 		});
 		// kept: main as it stays (refused), or as it is once this merges
-		if (!draft) seen.set(stackId, broke.length ? before! : { tree: git(wt, ["rev-parse", "HEAD^{tree}"]), dir, failing });
+		if (!draft) seen.set(stackId, broke.length ? before! : { tree: await git(wt, ["rev-parse", "HEAD^{tree}"]), dir, failing });
 		return broke.length ? broke.join("\n\n") : undefined;
 	};
 }

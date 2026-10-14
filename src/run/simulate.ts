@@ -1,4 +1,4 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import pc from "picocolors";
 import { ConfigSchema, type Config } from "../config.ts";
@@ -14,7 +14,8 @@ import { runGate } from "./gate.ts";
 import { lastRun, runScheduler } from "./run.ts";
 import { lanes } from "./lanes.ts";
 import { reopenUnit } from "./recheck.ts";
-import { execFileSync } from "node:child_process";
+import { exec } from "../proc.ts";
+import { rm, cp } from "node:fs/promises";
 
 /**
  * Simulation levels gate `br run`:
@@ -51,9 +52,9 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 	const ws = opts.dir ?? join(here, ".sim", "l1");
 	const lines: string[] = [];
 	const print = (l: string) => (lines.push(l), opts.quiet || console.log(l));
-	rmSync(ws, { recursive: true, force: true });
+	await rm(ws, { recursive: true, force: true });
 	mkdirSync(join(ws, "legacy"), { recursive: true });
-	cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
+	await cp(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
 	const target = join(ws, "migrated");
 	mkdirSync(join(target, "src", "health"), { recursive: true });
 	writeFileSync(join(target, "package.json"), JSON.stringify({ name: "sim", private: true, scripts: {}, devDependencies: { vitest: "x" } }, null, 2));
@@ -64,8 +65,8 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 	// a generated app module with one feature module: the first accept regenerates its registration on main
 	writeFileSync(join(target, "src", "app.module.ts"), "import { Module } from '@nestjs/common';\n\n@Module({ imports: [] })\nexport class AppModule {}\n");
 	writeFileSync(join(target, "src", "health", "health.module.ts"), "import { Module } from '@nestjs/common';\n\n@Module({})\nexport class HealthModule {}\n");
-	ensureRepo(target, "migration/main");
-	commitAll(target, "chore: bootstrap (simulated)");
+	await ensureRepo(target, "migration/main");
+	await commitAll(target, "chore: bootstrap (simulated)");
 	// the registration commit after a merge fails (a hook refuses it): the merged unit must stay accepted
 	writeFileSync(join(target, ".git", "hooks", "commit-msg"), "#!/bin/sh\ngrep -q 'regenerate registration' \"$1\" && { echo 'simulated: registration commit refused' >&2; exit 1; }\nexit 0\n", { mode: 0o755 });
 
@@ -142,7 +143,7 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 	if (!postMerge) problems.push("post-merge: the refused registration commit was never reported");
 	else if (ledger.getUnit(postMerge)!.state !== "accepted") problems.push(`post-merge: ${postMerge} should stay accepted after its registration commit failed, got ${ledger.getUnit(postMerge)!.state}`);
 	// and the regenerated wiring was put back, not left changed on main (the next accept would see no change and never commit it)
-	const leftOnMain = execFileSync("git", ["-C", target, "status", "--porcelain", "--", "src/app.module.ts"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	const leftOnMain = (await exec("git", ["-C", target, "status", "--porcelain", "--", "src/app.module.ts"])).trim();
 	if (leftOnMain) problems.push(`post-merge: the refused registration was left changed on main: ${leftOnMain}`);
 
 	// Run 3: a recheck re-opens U005 (accepted count drops below the sample), it earlier crashed once, and it waits
@@ -199,8 +200,8 @@ export async function simulateL1(opts: { dir?: string; quiet?: boolean } = {}): 
 	const commits = (ledger.db.prepare("SELECT COUNT(*) n FROM units WHERE json_extract(meta,'$.commit') IS NOT NULL").get() as { n: number }).n;
 	const worktrees = existsSync(join(ws, ".bigrefactor", "worktrees")) ? readdirSync(join(ws, ".bigrefactor", "worktrees")).filter((n) => n !== ".trash").length : 0;
 	if (worktrees) problems.push(`${worktrees} worktree(s) left behind`);
-	const mainLog = execFileSync("git", ["-C", target, "log", "--oneline"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim().split("\n");
-	if (execFileSync("git", ["-C", target, "ls-files", "node_modules"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()) problems.push("node_modules got committed");
+	const mainLog = (await exec("git", ["-C", target, "log", "--oneline"])).trim().split("\n");
+	if ((await exec("git", ["-C", target, "ls-files", "node_modules"])).trim()) problems.push("node_modules got committed");
 	if (!statSync(join(target, "node_modules")).isDirectory() || lstatSync(join(target, "node_modules")).isSymbolicLink()) problems.push("node_modules in the main checkout is no longer a real directory");
 	if (mainLog.length < 6) problems.push(`expected ≥6 commits on migration/main, got ${mainLog.length}`);
 	if (commits < 5) problems.push(`expected ≥5 commits, got ${commits}`);

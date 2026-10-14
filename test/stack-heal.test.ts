@@ -71,7 +71,7 @@ describe("run start: a profile without notApp", () => {
 		expect(ledger.getQuestion(qid)!.status).toBe("withdrawn");
 		expect(ledger.getUnit(reader!)!.state).toBe("accepted");
 		expect(log.join("\n")).toMatch(/1 accepted unit\(s\) hold code that is not the app's/);
-		const lib = openDecisions(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws).find((d) => d.id === "lib:phpoffice/phpexcel");
+		const lib = (await openDecisions(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws)).find((d) => d.id === "lib:phpoffice/phpexcel");
 		expect(lib?.evidence).toMatch(/vendored copy in app\/3rdparty\/PHPExcel\//);
 
 		// written once: the next run start asks nothing

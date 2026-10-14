@@ -44,13 +44,13 @@ function prompter(answers: RegExp[]) {
 }
 
 describe("missing toolchain: offered install instead of a dead end", () => {
-	it("maps tools to the machine's package manager; sudo only shown, never run", () => {
+	it("maps tools to the machine's package manager; sudo only shown, never run", async () => {
 		const has = (set: string[]) => (t: string) => set.includes(t);
-		expect(installPlan(["php", "composer"], has(["brew"]), "darwin").display).toBe("brew install php composer");
-		const apt = installPlan(["php", "composer"], has(["apt-get"]), "linux", false);
+		expect((await installPlan(["php", "composer"], has(["brew"]), "darwin")).display).toBe("brew install php composer");
+		const apt = await installPlan(["php", "composer"], has(["apt-get"]), "linux", false);
 		expect(apt).toMatchObject({ manager: "apt-get", needsSudo: true, display: "sudo apt-get install -y php-cli composer" });
-		expect(installPlan(["frobnicate"], has(["brew"]), "darwin").unknown).toEqual(["frobnicate"]);
-		expect(installPlan(["php"], has([]), "linux")).toMatchObject({ unknown: ["php"], needsSudo: false });
+		expect((await installPlan(["frobnicate"], has(["brew"]), "darwin")).unknown).toEqual(["frobnicate"]);
+		expect(await installPlan(["php"], has([]), "linux")).toMatchObject({ unknown: ["php"], needsSudo: false });
 	});
 
 	it("generation: missing tools → install hook → tools on PATH → the same manifest goes on to verification", async () => {

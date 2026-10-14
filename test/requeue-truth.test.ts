@@ -40,7 +40,7 @@ describe("a requeue keeps the truth", () => {
 		const layout = (await getTargetAdapter("nestjs")).layout;
 		expect(keepPortedTests(config, ws, "u1", ledger.getUnit("u1")!.meta, old, layout)).toEqual([SPEC]);
 		rmSync(old, { recursive: true, force: true });
-		expect(requeueUnits(ledger, config, ws, ["u1"], "self-heal")).toEqual(["u1: requeued"]);
+		expect(await requeueUnits(ledger, config, ws, ["u1"], "self-heal")).toEqual(["u1: requeued"]);
 
 		// the next run starts from a fresh worktree without the tests
 		const fresh = join(ws, "worktrees", "u1");
@@ -60,7 +60,7 @@ describe("a requeue keeps the truth", () => {
 		ledger.close();
 	});
 
-	it("--fresh: the interface and the kept tests go, so the tester drafts them again; the truth cases stay", () => {
+	it("--fresh: the interface and the kept tests go, so the tester drafts them again; the truth cases stay", async () => {
 		const ws = join(here, ".sim", "requeue-fresh");
 		rmSync(ws, { recursive: true, force: true });
 		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
@@ -75,7 +75,7 @@ describe("a requeue keeps the truth", () => {
 		ledger.transitionUnit("u1", "truth", "t");
 		ledger.transitionUnit("u1", "quarantined", "gate still red after 5 attempts (antigaming_ok)");
 		// u1 is quarantined, u2 still waits in the queue: both lose their draft
-		expect(requeueUnits(ledger, config, ws, ["u1", "u2"], "owner", { fresh: true })).toEqual(["u1: requeued", "u2: requeued"]);
+		expect(await requeueUnits(ledger, config, ws, ["u1", "u2"], "owner", { fresh: true })).toEqual(["u1: requeued", "u2: requeued"]);
 		for (const id of ["u1", "u2"]) {
 			expect(ledger.getUnit(id)!.state).toBe("planned");
 			expect(existsSync(join(ws, ".bigrefactor", "truth", id, "interface.md"))).toBe(false);

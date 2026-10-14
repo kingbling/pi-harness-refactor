@@ -17,15 +17,15 @@ import { createTidyJobs, type TidyWorker } from "../src/run/tidy-job.ts";
  */
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
-function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
+async function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "br-tidy-job-")));
 	const target = join(root, "new");
 	mkdirSync(join(target, "src", "A"), { recursive: true });
 	writeFileSync(join(target, "src", "A", "Old.txt"), "class Old\n");
 	// an earlier unit's test imports the old path
 	writeFileSync(join(target, "src", "A", "Old.test.txt"), "import src/A/Old.txt\nexpects Old\n");
-	ensureRepo(target, "migration/main", []);
-	commitAll(target, "init");
+	await ensureRepo(target, "migration/main", []);
+	await commitAll(target, "init");
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
 	const adapter = {
 		id: "fake",
@@ -42,7 +42,7 @@ function setup(checkTree?: (dir: string, only?: string[]) => string[]) {
 	const task: TidyTask = { id: "T7", stack: "fake", area: "a", op: "move", from: ["src/A/Old.txt"], to: ["src/B/New.txt"], why: "B is where it belongs", questionId: 7, status: "approved" };
 	ledger.setMeta("tidy_tasks", JSON.stringify([task]));
 	const mergeFix = async (wt: string, branch: string, what: string) => {
-		commitAll(wt, what);
+		await commitAll(wt, what);
 		git(target, ["merge", "-q", "--ff-only", branch]);
 		return git(target, ["rev-parse", "HEAD"]);
 	};
@@ -62,7 +62,7 @@ const mover =
 
 describe("the tidy job", () => {
 	it("moves the file and updates the test that imports it; green is merged and the task is done", async () => {
-		const { target, ledger, jobs } = setup();
+		const { target, ledger, jobs } = (await setup());
 		const j = jobs(mover(true));
 		expect(j.holds("fake", "a")).toBe(true); // units of the area wait
 		j.next();
@@ -79,7 +79,7 @@ describe("the tidy job", () => {
 	});
 
 	it("a reference left behind makes the build red: the change is thrown away and the task is failed", async () => {
-		const { target, ledger, jobs } = setup();
+		const { target, ledger, jobs } = (await setup());
 		const j = jobs(mover(false));
 		j.next();
 		await j.busy;
@@ -94,10 +94,10 @@ describe("the tidy job", () => {
 	});
 
 	it("main red already: its errors are not the task's, only error lines main does not have fail it", async () => {
-		const { target, ledger, jobs } = setup();
+		const { target, ledger, jobs } = (await setup());
 		mkdirSync(join(target, "src", "Z"), { recursive: true });
 		writeFileSync(join(target, "src", "Z", "Broken.txt"), "import src/Z/Missing.txt\n");
-		commitAll(target, "main is red");
+		await commitAll(target, "main is red");
 		const j = jobs(mover(true));
 		j.next();
 		await j.busy;
@@ -115,7 +115,7 @@ describe("the tidy job", () => {
 
 	it("a move to a path the layout check refuses is failed like the gate would, before any build; files touched only for imports are not checked", async () => {
 		const seen: string[][] = [];
-		const { target, ledger, jobs } = setup((_dir, only) => (seen.push(only ?? []), (only ?? []).filter((f) => f.startsWith("src/B/")).map((f) => `${f}: not an allowed file in the feature folder`)));
+		const { target, ledger, jobs } = (await setup((_dir, only) => (seen.push(only ?? []), (only ?? []).filter((f) => f.startsWith("src/B/")).map((f) => `${f}: not an allowed file in the feature folder`))));
 		const j = jobs(mover(true));
 		j.next();
 		await j.busy;
@@ -128,10 +128,10 @@ describe("the tidy job", () => {
 	});
 
 	it("a delete of a note: done when the note is gone; deleting more than the task names fails", async () => {
-		const { target, ledger, jobs } = setup();
+		const { target, ledger, jobs } = (await setup());
 		writeFileSync(join(target, "src", "A", "README.md"), "notes for other units\n");
 		writeFileSync(join(target, "src", "A", "Old.test.txt"), "expects Old\n"); // main builds green
-		commitAll(target, "note");
+		await commitAll(target, "note");
 		const del: TidyTask = { id: "T8", stack: "fake", area: "a", op: "delete", from: ["src/A/README.md"], to: [], why: "a handoff note, not code", questionId: 8, status: "approved" };
 		ledger.setMeta("tidy_tasks", JSON.stringify([del]));
 		const greedy = jobs(async ({ dir }) => (rmSync(join(dir, "src", "A", "README.md")), rmSync(join(dir, "src", "A", "Old.test.txt")), "deleted the note"));
@@ -148,7 +148,7 @@ describe("the tidy job", () => {
 	});
 
 	it("a move the model did not finish is failed by code before any build", async () => {
-		const { ledger, jobs } = setup();
+		const { ledger, jobs } = (await setup());
 		const j = jobs(async () => "did nothing");
 		j.next();
 		await j.busy;
@@ -156,7 +156,7 @@ describe("the tidy job", () => {
 	});
 
 	it("a worktree that cannot be made fails the task instead of holding its area back", async () => {
-		const { ledger, jobs } = setup();
+		const { ledger, jobs } = (await setup());
 		const bad = { ...tidyTasks(ledger)[0]!, id: "T..7" }; // not a valid branch name: git worktree add fails
 		ledger.setMeta("tidy_tasks", JSON.stringify([bad]));
 		const j = jobs(mover(true));
@@ -167,12 +167,12 @@ describe("the tidy job", () => {
 	});
 
 	it("a unit merged into main while the job ran is checked too: its use of the old path makes the job red", async () => {
-		const { target, ledger, jobs } = setup();
+		const { target, ledger, jobs } = (await setup());
 		const j = jobs(async (o) => {
 			const said = await mover(true)(o);
 			mkdirSync(join(target, "src", "C"), { recursive: true });
 			writeFileSync(join(target, "src", "C", "Use.txt"), "uses src/A/Old.txt\n");
-			commitAll(target, "a unit merged meanwhile");
+			await commitAll(target, "a unit merged meanwhile");
 			return said;
 		});
 		j.next();
@@ -183,8 +183,8 @@ describe("the tidy job", () => {
 		expect(existsSync(join(target, "src", "A", "Old.txt"))).toBe(true);
 	});
 
-	it("a task whose question was withdrawn is dropped, not left asked forever", () => {
-		const { ledger } = setup();
+	it("a task whose question was withdrawn is dropped, not left asked forever", async () => {
+		const { ledger } = (await setup());
 		const id = ledger.askQuestion({ point: "tidy", question: "move?", askedBy: "tidy" });
 		ledger.setMeta("tidy_tasks", JSON.stringify([{ ...tidyTasks(ledger)[0]!, questionId: id, status: "asked" }]));
 		ledger.withdrawQuestion(id, "gone");
@@ -192,7 +192,7 @@ describe("the tidy job", () => {
 	});
 
 	it("waits while a unit of the area runs; without a tidy job no unit is held back", async () => {
-		const { ledger, jobs } = setup();
+		const { ledger, jobs } = (await setup());
 		let calls = 0;
 		const j = jobs(async () => (calls++, ""), () => true);
 		j.next();

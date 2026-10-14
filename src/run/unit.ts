@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { diagnoseFailure } from "./doctor.ts";
-import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import pc from "picocolors";
@@ -39,6 +38,7 @@ import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-f
 import { caseIds, describeTruthRun, fixLegacyEnv, fixLegacyEnvWithModel, legacyEnvOutage, loadLegacyEnv, loadReadTruth, NO_BEHAVIOUR_FILE, noBehaviourReason, READ_CASES_FILE, verifyTruthOnOld, type LegacyFixer, type TruthCase, type TruthMode } from "./legacy-env.ts";
 import { filesNamed } from "./builder.ts";
 import { caseCoverage, checkTests, findTests, onlyOwnTests, ownTests, scopeGuard, testsPass } from "./ported.ts";
+import { exec } from "../proc.ts";
 export { mentionsCase } from "./ported.ts";
 
 /**
@@ -126,12 +126,12 @@ export interface UnitRunResult {
  * in its name): the tester gets one go at them (`retest`). Still green, the returned note goes to the reviewer; behaviour
  * an earlier unit of the area already wrote can make them legitimately green, so it never fails the unit by itself.
  */
-export async function testsGreenBefore(o: { files: () => string[]; pass: (files: string[]) => Promise<boolean>; retest: (why: string) => Promise<void> }): Promise<string | undefined> {
-	const why = () => `These ported test files pass before any code for this unit exists, so they do not call the code in interface.md: ${o.files().join(", ")}.`;
-	if (!(await o.pass(o.files()))) return undefined;
-	await o.retest(`${why()} Make each test call the code in interface.md and assert the case's expected value, so it fails until that code exists.`);
-	if (!(await o.pass(o.files()))) return undefined;
-	return `${why()} The tester was asked once to fix them and they still pass: check in weakTests that each one really calls this unit's code.`;
+export async function testsGreenBefore(o: { files: () => string[] | Promise<string[]>; pass: (files: string[]) => Promise<boolean>; retest: (why: string) => Promise<void> }): Promise<string | undefined> {
+	const why = async () => `These ported test files pass before any code for this unit exists, so they do not call the code in interface.md: ${(await o.files()).join(", ")}.`;
+	if (!(await o.pass(await o.files()))) return undefined;
+	await o.retest(`${await why()} Make each test call the code in interface.md and assert the case's expected value, so it fails until that code exists.`);
+	if (!(await o.pass(await o.files()))) return undefined;
+	return `${await why()} The tester was asked once to fix them and they still pass: check in weakTests that each one really calls this unit's code.`;
 }
 
 /** One check_my_code result (see ToolDeps.onCheck). */
@@ -205,7 +205,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	};
 
 	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck, mainDir };
-	const card = buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
+	const card = await buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
 	for (const f of card.waitingStubs) if (!writeGlobs.includes(f)) writeGlobs.push(f);
@@ -226,16 +226,16 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const absGlob = (g: string) => join(o.root, g);
 	// the truth as code loads it now (the tester's check_ported_tests and the verification after its session)
 	// in read mode a small per-unit script the tester got running still counts as run when it is green on the old code
-	const currentTruth = () => {
-		if (truthMode === "run") return { ...verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files), madeBy: "run" as TruthMode };
-		const ran = existsSync(join(truthDirAbs, sourceAdapter.truth.scriptName)) ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
+	const currentTruth = async () => {
+		if (truthMode === "run") return { ...(await verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files)), madeBy: "run" as TruthMode };
+		const ran = existsSync(join(truthDirAbs, sourceAdapter.truth.scriptName)) ? await verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 		// why the script did not run green is kept: it is what the old code's environment needs
 		return ran?.ok ? { ...ran, madeBy: "run" as TruthMode } : { ...loadReadTruth(truthDirAbs), madeBy: "read" as TruthMode, runError: ran?.error };
 	};
 	// the gate's structure_ok on the tester's test files and the code paths they import (check_ported_tests): a test
 	// whose own path or import the layout does not allow fails every implementer attempt
-	const checkLayout = (files: string[]) =>
-		adapter.layout.checkStructure?.(files, moduleDir, area, targetProjectDir, { isNew: (f) => !existsSync(join(targetProjectDir, f)), sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) }) ?? [];
+	const checkLayout = async (files: string[]) =>
+		(await adapter.layout.checkStructure?.(files, moduleDir, area, targetProjectDir, { isNew: (f) => !existsSync(join(targetProjectDir, f)), sanctioned: [...tidyPaths, ...card.waitingStubs], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) })) ?? [];
 	const truthFiles = [sourceAdapter.truth.scriptName, READ_CASES_FILE, NO_BEHAVIOUR_FILE];
 	const readTruthFiles = () => truthFiles.map((f) => (existsSync(join(truthDirAbs, f)) ? readFileSync(join(truthDirAbs, f), "utf8") : undefined));
 	/**
@@ -251,11 +251,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const before = testsOnly ? readTruthFiles() : undefined;
 		// its test paths and the approved tidy paths; the plugin's own folder (ledger, truth) when it sits in the project is not the tester's write
 		const ownDir = relative(targetProjectDir, join(o.root, ".bigrefactor"));
-		const putBack = scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
+		const putBack = await scopeGuard(targetProjectDir, [...adapter.layout.testFileGlobs(moduleDir), ...tidyPaths], [...adapter.toolchain.ignoredPaths, ...(ownDir.startsWith("..") ? [] : [ownDir])]);
 		const overrides = keepOverrides(o.root, stackId); // the gate's commands are the setup fixer's, never the tester's
 		let overridesChanged = false;
 		const disputed = (f: string) => !!more.disputeText && (more.disputeText.includes(f) || more.disputeText.includes(basename(f)));
-		const sanctioned = [...tidyPaths, ...disputedOthers, ...(more.disputeText ? trackedFiles(targetProjectDir).filter((f) => adapter.layout.isTestFile(f) && disputed(f)) : [])];
+		const sanctioned = [...tidyPaths, ...disputedOthers, ...(more.disputeText ? (await trackedFiles(targetProjectDir)).filter((f) => adapter.layout.isTestFile(f) && disputed(f)) : [])];
 		lastTesterBlocked = [];
 		// the tester called no_behaviour_to_pin (the decision model checked it against the legacy code)
 		let declaredNone = false;
@@ -272,7 +272,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			writeGlobs: testerWriteGlobs,
 			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
-			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onCheck: more.codeWritten ? (c) => (testerCheck = { c, key: testsKey() }) : undefined }),
+			customTools: testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onCheck: more.codeWritten ? (c) => void (testerCheck = { c, key: testsKey() }) : undefined }),
 			transcriptPath: transcriptPath(o.root, o.unitId, "test", attempt),
 			onToolCall: (e) => {
 				if (e.toolName === "no_behaviour_to_pin" && !e.blocked) declaredNone = true;
@@ -310,14 +310,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		cost += res.usage.cost;
 		lastTesterText = res.text;
 		// tests of earlier units prove accepted behaviour: the tester may not rewrite them (undone, and it is told)
-		const changedOthers = othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);
+		const changedOthers = await othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);
 		// one the implementer disputed is kept: the tester re-checked it against the legacy code
 		const kept = changedOthers.filter(disputed);
 		if (kept.length) log(pc.yellow(`  tester fixed ${kept.length} disputed test(s) of earlier units; kept: ${kept.join(", ")}`));
 		disputedOthers.push(...kept.filter((f) => !disputedOthers.includes(f)));
 		const others = changedOthers.filter((f) => !kept.includes(f));
 		if (others.length) {
-			execFileSync("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir, stdio: "pipe" });
+			await exec("git", ["checkout", "HEAD", "--", ...others], { cwd: targetProjectDir });
 			log(pc.yellow(`  tester changed ${others.length} test(s) of earlier units; undone: ${others.slice(0, 5).join(", ")}`));
 			res = { ...res, text: `${res.text}\n(Your changes to tests of earlier units were undone: ${others.join(", ")}. If one is wrong, say which and why in your final answer.)` };
 			lastTesterText = res.text;
@@ -328,7 +328,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			lastTesterText = res.text;
 		}
 		// the tester writes tests only: anything else it changed (a formatter run over the project) is put back
-		const outside = putBack();
+		const outside = await putBack();
 		if (outside.length) {
 			log(pc.yellow(`  tester changed ${outside.length} file(s) outside its test paths; put back: ${outside.slice(0, 5).join(", ")}`));
 			res = { ...res, text: `${res.text}\n(Your changes outside your test paths were put back: ${outside.join(", ")}. Run fix modes on your test files only.)` };
@@ -354,13 +354,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		// Code verifies the truth: re-run the cases script ourselves (it must load the unit's legacy files and not
 		// type the results in) and load the cases; read-not-run cases are only checked for shape.
-		let verified = currentTruth();
+		let verified = await currentTruth();
 		// the script did not run: when the probe that ran green before does not run either, the old code's runtime is
 		// down, not this script. It is waited for; back up, the same script is checked again; still down, no truth is
 		// decided from it (no read truth, no question): the unit is tested again later
 		if ((!verified.ok && verified.madeBy === "run") || ("runError" in verified && verified.runError)) {
 			const outage = await legacyEnvOutage(o.root, o.config, sourceAdapter);
-			if (outage === "over") verified = currentTruth();
+			if (outage === "over") verified = await currentTruth();
 			if (outage === "down") {
 				legacyDown = true;
 				o.ledger.endAttempt(attempt, { outcome: "truth_red", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { mode: verified.madeBy, legacyDown: true, error: ("runError" in verified && verified.runError) || verified.error } });
@@ -458,7 +458,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const legacyFixer = o.legacyFixer === false ? undefined : (o.legacyFixer ?? (o.spawn ? undefined : fixLegacyEnvWithModel));
 		if (!truthOk && truthMode === "run" && legacyFixer && lastErr) {
 			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: lastErr, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(lastErr)), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
-			const verified = fixed ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
+			const verified = fixed ? await verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 			if (fixed && verified?.ok) {
 				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
 				recordTruth(verified.cases, "run", verified.none);
@@ -472,7 +472,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (truthOk && envMode === "read" && legacyFixer && lastRunError && !o.ledger.hasEvidence(o.unitId, "truth_green_on_old")) {
 			const err = lastRunError;
 			const fixed = await fixLegacyEnv({ config: o.config, root: o.root, source: sourceAdapter, problem: err, truthDir: truthDirAbs, signature: errorSignature("truth", truthError(err)), fixer: legacyFixer }).catch((e) => (log(pc.yellow(`  legacy setup failed: ${e?.message ?? e}`)), undefined));
-			const verified = fixed ? verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
+			const verified = fixed ? await verifyTruthOnOld(truthDirAbs, o.config, sourceAdapter, o.root, card.files) : undefined;
 			if (fixed && verified?.ok) {
 				log(pc.cyan(`  the old code's environment was set up: ${fixed}`));
 				recordTruth(verified.cases, "run", verified.none);
@@ -589,7 +589,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const walk = (d: string): string[] => readdirSync(d).flatMap((n) => (statSync(join(d, n)).isDirectory() ? walk(join(d, n)) : [join(d, n)]));
 		const saved = walk(portedDir).map((abs) => relative(portedDir, abs));
 		// a path main ever had is not this unit's unmerged test: another unit's, or one tidy moved or removed since
-		const onMainOnce = everOnMain(targetProjectDir, saved);
+		const onMainOnce = await everOnMain(targetProjectDir, saved);
 		for (const f of saved) {
 			const abs = join(portedDir, f);
 			const dest = join(targetProjectDir, f);
@@ -620,7 +620,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// so the tester fixes them now (once). Only with the real gate (simulations fake it).
 	if (testFiles.length && !o.gate) {
 		// the unit's own tests: other units' formatting on main is not this tester's to fix
-		const lint = await checkTests(targetProjectDir, adapter, "lint", ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths));
+		const lint = await checkTests(targetProjectDir, adapter, "lint", await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths));
 		if (lint.error) {
 			log(pc.dim("  ported tests fail the lint check: the tester fixes them before implementing"));
 			if (await runTruth(`The ported tests fail the stack's lint/format check (\`${lint.command}\`, run in ${targetProjectDir}). The implementer may not edit tests, so fix them now: formatting and lint only, in the TEST files (the linter's fix mode is fine when you give it only those files; other changes are put back), behaviour unchanged. check_ported_tests runs the same check.\n${lint.error}`, true)) testFiles = loadTests();
@@ -629,7 +629,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// are then the tests' own (before that, a missing class is the implementer's to write)
 		const iface = existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "";
 		const codeThere = iface !== "" && !interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir).length;
-		const build = codeThere ? await checkTests(targetProjectDir, adapter, "build", ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths)) : undefined;
+		const build = codeThere ? await checkTests(targetProjectDir, adapter, "build", await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths)) : undefined;
 		if (build?.error) {
 			log(pc.dim("  ported tests fail the build check: the tester fixes them before implementing"));
 			if (await runTruth(`The ported tests fail the stack's build/type check (\`${build.command}\`, run in ${targetProjectDir}) while the code they call is in place. The implementer may not edit tests, so fix the errors in the TEST files now, behaviour unchanged. check_ported_tests runs the same check.\n${build.error}`, true)) testFiles = loadTests();
@@ -639,7 +639,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// tester skipped): the implementer cannot rename them, so the tester moves them now (once)
 	if (testFiles.length && !o.gate) {
 		const iface = existsSync(join(truthDirAbs, "interface.md")) ? readFileSync(join(truthDirAbs, "interface.md"), "utf8") : "";
-		const bad = portedLayout(checkLayout, ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths), interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir));
+		const bad = await portedLayout(checkLayout, await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths), interfaceCodeFiles(iface, relative(o.config.target.path, targetProjectDir), moduleDir, targetProjectDir));
 		if (bad.length) {
 			log(pc.dim("  ported tests or interface.md name paths the layout does not allow: the tester moves them before implementing"));
 			if (await runTruth(`The ported tests or interface.md name files the stack's layout does not allow (the gate's structure_ok). The implementer cannot change a test's file name or imports, so it could never pass: rename or move the test files, change their imports and interface.md to paths the layout below allows, behaviour unchanged. check_ported_tests with code_files checks the new paths.\n${bad.join("\n")}\n\n${adapter.layout.structureDoc}`, true)) testFiles = loadTests();
@@ -686,10 +686,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let implementerNote: string | undefined;
 	let lastCheck: CheckResult | undefined;
 	// the worktree's changed files as they were at that check: code changed after it makes the check stale
-	const treeKey = () => {
+	const treeKey = async () => {
 		const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
 		try {
-			return sha1(JSON.stringify(changedFiles(targetProjectDir, adapter.toolchain.ignoredPaths).sort().map((f) => [f, read(f)])));
+			return sha1(JSON.stringify((await changedFiles(targetProjectDir, adapter.toolchain.ignoredPaths)).sort().map((f) => [f, read(f)])));
 		} catch {
 			return undefined; // no git answer: the check counts as stale
 		}
@@ -807,7 +807,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				appendOnlyGlobs,
 				protectedGlobs: adapter.protectedGlobs,
 				systemPrompt: implementerSystemPrompt(o.config, { ...placeOpts, sharedDirs: adapter.layout.sharedDirs, rules, attempt: attemptNo, quirks: quirkSummary({ ledger: o.ledger }, o.unitId) || undefined, writeGlobs, source: sourceAdapter, target: adapter }),
-				customTools: implementerTools({ ...deps, attemptId: attempt, testFiles: () => testFiles.map((t) => t.path), slot: gateSlot, disputeRecheck: disputeRounds < 2, onDispute: (d) => disputes.push(d), onDisputeFinding: (d) => findingDisputes.push(d), onCheck: (c) => ((lastCheck = c), (checkedTree = treeKey())), onReport: (r) => reports.push(r) }),
+				customTools: implementerTools({ ...deps, attemptId: attempt, testFiles: () => testFiles.map((t) => t.path), slot: gateSlot, disputeRecheck: disputeRounds < 2, onDispute: (d) => disputes.push(d), onDisputeFinding: (d) => findingDisputes.push(d), onCheck: async (c) => {
+					lastCheck = c;
+					checkedTree = await treeKey();
+				}, onReport: (r) => reports.push(r) }),
 				transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
 				validateWrite: async (path, content) => {
 					const lang = adapter.layout.lang(path);
@@ -819,7 +822,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			});
 			const open = openFindings();
 			// only the unit's own tests in full (the area's others can be many and long): the rest by path, the gate runs them all
-			const own = new Set(ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths));
+			const own = new Set(await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths));
 			const others = testFiles.filter((t) => !own.has(t.path)).map((t) => t.path);
 			const prompt = [
 				// the truth as recorded now (the card was built before the tester ran)
@@ -893,7 +896,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					// (a tester that kept every test and only answered gets a fresh review that reads them)
 					const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : "");
 					// the reviewer judges the unit's own tests; the area's others it sees by path only (not its to judge)
-					const own = onlyOwnTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
+					const own = await onlyOwnTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
 					const otherTests = testFiles.map((t) => t.path).filter((t) => !own.includes(t));
 					const key = sha1(JSON.stringify([[...changedFiles].sort().map((f) => [f, read(f)]).concat(own.map((t) => [t, read(t)])), otherTests, unitMeta().testerKept ?? ""]));
 					const seen = { files: Object.fromEntries(changedFiles.map((f) => [f, sha1(read(f))])), tests: sha1(JSON.stringify([testFiles.map((t) => [t.path, read(t.path)]), unitMeta().testerKept ?? ""])) };
@@ -940,7 +943,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// repeat that test run, so the disputes go straight to the tester (the next attempt runs the whole gate)
 		const check = lastCheck as CheckResult | undefined;
 		// only when no file changed after that check: a fix made after it (DONE without checking again) needs the real gate
-		const sameTree = !!check && checkedTree !== undefined && checkedTree === treeKey();
+		const sameTree = !!check && checkedTree !== undefined && checkedTree === (await treeKey());
 		const straight = !!check && !check.ok && check.failed === "tests" && !check.timedOut && disputes.length > 0 && disputeRounds < 2 && sameTree;
 		if (straight) log(pc.dim("  ported tests still red and disputed: straight to the tester"));
 		const cleanCheck = reusableCheck(check, sameTree);
@@ -974,7 +977,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// A fix that changed no test goes on to triage as usual
 		if ((gate.failedStep === "build_ok" || gate.failedStep === "lint_ok") && testsOnlyRounds < MAX_TESTS_ONLY_ROUNDS) {
 			const out = gate.steps.find((s) => !s.ok)?.output ?? "";
-			const own = ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
+			const own = await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
 			const named = filesNamed(out, targetProjectDir, adapter.layout.sourceExtensions);
 			if (named.length && named.every((f) => own.some((t) => samePath(f, t)))) {
 				testsOnlyRounds++;
@@ -1168,8 +1171,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (caps.cards) log(pc.dim(`  ${caps.cards} capability card(s)`));
 		o.ledger.transitionUnit(o.unitId, "review", "gate green");
 		if (o.accept) {
-			acceptUnit(o, targetProjectDir, area);
-			afterAccept(o.ledger, adapter, targetProjectDir, stackId, area, log);
+			await acceptUnit(o, targetProjectDir, area);
+			await afterAccept(o.ledger, adapter, targetProjectDir, stackId, area, log);
 		}
 	} else if (attemptNo >= maxTotal || triage?.action === "quarantine") {
 		o.ledger.transitionUnit(o.unitId, "quarantined", `gate still red after ${attemptNo} attempts (${gate?.failedStep}); ${triage?.reason ?? ""}`.trim());
@@ -1178,18 +1181,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	return { unitId: o.unitId, state: final.state, attempts: attemptNo, gate, triage, costUsd: cost };
 }
 
-export function acceptUnit(o: { ledger: Ledger; config: Config; unitId: string }, targetProjectDir: string, area: string): string | undefined {
-	const sha = commitAll(o.config.target.path, `feat(${area}): migrate ${o.unitId}\n\n${o.ledger.symbolsOfUnit(o.unitId).map((s) => `- ${s.id} → ${s.state}`).join("\n")}\n\nbigrefactor: unit ${o.unitId}, target ${relative(o.config.target.path, targetProjectDir) || "."}`);
+export async function acceptUnit(o: { ledger: Ledger; config: Config; unitId: string }, targetProjectDir: string, area: string): Promise<string | undefined> {
+	const sha = await commitAll(o.config.target.path, `feat(${area}): migrate ${o.unitId}\n\n${o.ledger.symbolsOfUnit(o.unitId).map((s) => `- ${s.id} → ${s.state}`).join("\n")}\n\nbigrefactor: unit ${o.unitId}, target ${relative(o.config.target.path, targetProjectDir) || "."}`);
 	o.ledger.transitionUnit(o.unitId, "accepted", sha ? `committed ${sha.slice(0, 7)}` : "accepted (nothing new to commit)");
-	if (sha) o.ledger.updateUnit(o.unitId, { branch: mainBranch(o.config.target.path, o.config.target.git.branch), meta: { ...JSON.parse(o.ledger.getUnit(o.unitId)!.meta), commit: sha } });
+	if (sha) o.ledger.updateUnit(o.unitId, { branch: await mainBranch(o.config.target.path, o.config.target.git.branch), meta: { ...JSON.parse(o.ledger.getUnit(o.unitId)!.meta), commit: sha } });
 	return sha;
 }
 
 /** After a unit landed in `projectDir`: close tidy tasks the tree shows done, record the stack's drift report. */
-export function afterAccept(ledger: Ledger, adapter: TargetAdapter, projectDirAbs: string, stackId: string, area: string, log: (l: string) => void): void {
+export async function afterAccept(ledger: Ledger, adapter: TargetAdapter, projectDirAbs: string, stackId: string, area: string, log: (l: string) => void): Promise<void> {
 	const done = completeTidyTasks(ledger, projectDirAbs, stackId, area);
 	if (done.length) log(pc.dim(`  tidy done: ${done.join(", ")}`));
-	const drift = recordDrift(ledger, adapter, projectDirAbs);
+	const drift = await recordDrift(ledger, adapter, projectDirAbs);
 	if (drift.length) log(pc.dim(`  drift ${stackId}: ${drift.length} finding(s) (br layout)`));
 }
 
@@ -1264,10 +1267,10 @@ export function legacyWordsFor(words: string[] | undefined, target: TargetAdapte
 }
 
 /** Which of `paths` (relative to `dir`) main's history ever held; none when `dir` is not in a git checkout. */
-export function everOnMain(dir: string, paths: string[]): Set<string> {
+export async function everOnMain(dir: string, paths: string[]): Promise<Set<string>> {
 	if (!paths.length) return new Set();
 	try {
-		const out = execFileSync("git", ["log", "--format=", "--name-only", "--no-renames", "--relative", "HEAD", "--", ...paths], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 << 20 });
+		const out = await exec("git", ["log", "--format=", "--name-only", "--no-renames", "--relative", "HEAD", "--", ...paths], { cwd: dir, maxBuffer: 64 << 20 });
 		return new Set(out.split("\n").filter(Boolean));
 	} catch {
 		return new Set();

@@ -1,9 +1,9 @@
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import pc from "picocolors";
 import { findConfigPath, loadConfig } from "./config.ts";
+import { exec } from "./proc.ts";
 
 /**
  * What bigrefactor needs on this machine, checked at Pi startup (`/br check`, `br check`):
@@ -27,8 +27,8 @@ export async function checkRequirements(o: { cwd: string; tools?: string[] }): P
 	const [maj = 0, min = 0] = process.versions.node.split(".").map(Number);
 	const nodeOk = maj > MIN_NODE[0]! || (maj === MIN_NODE[0] && min >= MIN_NODE[1]!);
 	out.push({ name: `node ${process.versions.node}`, status: nodeOk ? "ok" : "missing", why: `needs node >= ${MIN_NODE.join(".")} (built-in sqlite)`, fix: nodeOk ? undefined : "nvm install 22 && nvm use 22" });
-	out.push(command("git", "worktrees, commits per accepted unit", "install git"));
-	out.push(astGrep());
+	out.push(await command("git", "worktrees, commits per accepted unit", "install git"));
+	out.push(await astGrep());
 
 	const { resolveOpenRouterKey } = await import("./models/openrouter.ts");
 	let openrouter = true;
@@ -72,7 +72,7 @@ export async function checkRequirements(o: { cwd: string; tools?: string[] }): P
 				const dir = projectDir(config, id);
 				for (const c of [t.build(dir).cmd, t.test(dir, []).cmd, t.toolchain.addPackages(dir, []).cmd]) if (!needs.has(c)) needs.set(c, { why: `${id}: build, test and packages`, dir });
 			}
-			for (const [cmd, n] of needs) out.push(command(cmd, n.why, `install ${cmd}`, n.dir));
+			for (const [cmd, n] of needs) out.push(await command(cmd, n.why, `install ${cmd}`, n.dir));
 		} catch (e) {
 			out.push({ name: "workspace config", status: "missing", why: String((e as Error)?.message ?? e).slice(0, 200), fix: "fix bigrefactor.config.json (br init)" });
 		}
@@ -80,21 +80,21 @@ export async function checkRequirements(o: { cwd: string; tools?: string[] }): P
 	return out;
 }
 
-function command(cmd: string, why: string, fix: string, dir?: string): Requirement {
-	const ok = /^[\w.+-]+$/.test(cmd) ? onPath(cmd) : existsSync(dir && !cmd.startsWith("/") ? join(dir, cmd) : cmd);
+async function command(cmd: string, why: string, fix: string, dir?: string): Promise<Requirement> {
+	const ok = /^[\w.+-]+$/.test(cmd) ? await onPath(cmd) : existsSync(dir && !cmd.startsWith("/") ? join(dir, cmd) : cmd);
 	return { name: cmd, status: ok ? "ok" : "missing", why, fix: ok ? undefined : fix };
 }
 
-function onPath(cmd: string): boolean {
+async function onPath(cmd: string): Promise<boolean> {
 	try {
-		execFileSync("sh", ["-c", `command -v ${cmd}`], { stdio: "pipe" });
+		await exec("sh", ["-c", `command -v ${cmd}`]);
 		return true;
 	} catch {
 		return false;
 	}
 }
 
-function astGrep(): Requirement {
+async function astGrep(): Promise<Requirement> {
 	let bin: string | undefined;
 	try {
 		const dir = dirname(createRequire(import.meta.url).resolve("@ast-grep/cli/package.json"));
@@ -102,7 +102,7 @@ function astGrep(): Requirement {
 	} catch {
 		/* not installed with this package */
 	}
-	const ok = bin ? true : onPath("ast-grep");
+	const ok = bin ? true : await onPath("ast-grep");
 	return { name: "ast-grep", status: ok ? "ok" : "missing", why: "the rules gate checks written code with ast-grep", fix: ok ? undefined : "pnpm install in the bigrefactor checkout (or install ast-grep)" };
 }
 

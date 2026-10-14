@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -13,6 +12,7 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { strayDirs } from "../run/layout-check.ts";
 import { projectDir as stackDir, testCannotFail } from "./init.ts";
+import { exec } from "../proc.ts";
 
 /**
  * When a setup check fails (gate build/test on a fresh project, stack choices not installed), a model with tools
@@ -167,19 +167,19 @@ function migratedCodeDirs(adapter: TargetAdapter): string[] {
  * source folders. Without the ledger, the folders decide.
  * Returns the paths put back (relative to the repo).
  */
-export function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter, migrated?: Set<string>): string[] {
+export async function undoMigratedCode(repo: string, projectDir: string, adapter: TargetAdapter, migrated?: Set<string>): Promise<string[]> {
 	const proj = relative(repo, projectDir);
 	const dirs = migratedCodeDirs(adapter);
 	const exts = adapter.layout.sourceExtensions ?? [];
-	const stray = strayDirs(projectDir, adapter);
+	const stray = await strayDirs(projectDir, adapter);
 	// folders main already has (repo-relative): a new file outside them sits in a folder the fix made
 	let folders: Set<string> | undefined;
 	try {
-		folders = new Set(execFileSync("git", ["-C", repo, "ls-tree", "-r", "-d", "--name-only", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean));
+		folders = new Set((await exec("git", ["-C", repo, "ls-tree", "-r", "-d", "--name-only", "HEAD"])).split("\n").filter(Boolean));
 	} catch {
 		/* no commit yet: no folder is the fix's own */
 	}
-	const entries = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0");
+	const entries = (await exec("git", ["-C", repo, "status", "--porcelain", "-z", "-uall"])).split("\0");
 	const changes: Array<{ path: string; rel?: string; isNew: boolean; from?: string; undo: "always" | "newCode" | "keep" }> = [];
 	const relOf = (p: string) => (!proj ? p : p.startsWith(`${proj}/`) ? p.slice(proj.length + 1) : undefined);
 	for (let i = 0; i < entries.length; i++) {
@@ -200,7 +200,7 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		const newCode = isNew && inCodeDirs && (!exts.length || exts.some((x) => rel.endsWith(x)));
 		const guarded = (r: string) => adapter.layout.isTestFile(r) || (migrated ? migrated.has(r) : dirs.some((d) => r.startsWith(d)));
 		let undo: "always" | "newCode" | "keep" = guarded(rel) || (fromRel !== undefined && guarded(fromRel)) ? "always" : newCode ? "newCode" : "keep";
-		if (undo === "always" && !isNew && whitespaceOnly(repo, path)) undo = "keep"; // a formatter's fix changes no behaviour
+		if (undo === "always" && !isNew && await whitespaceOnly(repo, path)) undo = "keep"; // a formatter's fix changes no behaviour
 		changes.push({ path, rel, isNew, from, undo });
 	}
 	// what the fix keeps: a new code file one of them names by path belongs to the fix
@@ -216,10 +216,10 @@ export function undoMigratedCode(repo: string, projectDir: string, adapter: Targ
 		if (c.undo === "keep") continue;
 		if (c.undo === "newCode" && kept.some((t) => t.includes(c.rel!) || t.includes(c.path))) continue;
 		if (c.isNew) {
-			execFileSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", c.path], { stdio: "pipe" });
+			await exec("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", c.path]);
 			rmSync(join(repo, c.path), { force: true });
-			if (c.from) execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", c.from], { stdio: "pipe" });
-		} else execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", c.path], { stdio: "pipe" });
+			if (c.from) await exec("git", ["-C", repo, "checkout", "HEAD", "--", c.from]);
+		} else await exec("git", ["-C", repo, "checkout", "HEAD", "--", c.path]);
 		undone.push(c.path);
 	}
 	return undone;
@@ -275,7 +275,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		const repo = o.config.target.path;
 		const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
 		// the target must be its own repo: inside another checkout, undo and commit would act on the parent's files
-		if (!isRepoRoot(repo)) {
+		if (!await isRepoRoot(repo)) {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "no_change", gateReport: { said, error: `${repo} is not its own git repo: nothing undone or committed` } });
 			wasted();
 			return undefined;
@@ -283,14 +283,14 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		const { sha, undone, changed, cannotFail } = await lock(async () => {
 			try {
 				const migrated = o.ledger ? new Set((o.ledger.db.prepare("SELECT target_symbols FROM moves WHERE op != 'dropped'").all() as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!))) : undefined;
-				const undone = undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
+				const undone = await undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
 				// a fix may change the test command or its config so that nothing can fail any more: the probe test with a
 				// wrong expected value must still fail, else the whole fix is put back (it would turn every gate green)
 				const cannotFail = await testCannotFail(o.config, withCommandOverrides(o.adapter, o.root)).catch((e) => (console.log(pc.yellow(`  setup fix: could not check that the test command can still fail (${e?.message ?? e})`)), undefined));
 				if (cannotFail) {
 					overrides.restore(true);
-					execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", o.projectDir], { stdio: "pipe" });
-					execFileSync("git", ["-C", repo, "clean", "-fdq", "--", o.projectDir], { stdio: "pipe" }); // ignored dirs (installs) stay
+					await exec("git", ["-C", repo, "checkout", "HEAD", "--", o.projectDir]);
+					await exec("git", ["-C", repo, "clean", "-fdq", "--", o.projectDir]); // ignored dirs (installs) stay
 					return { sha: undefined, undone, changed: [], cannotFail };
 				}
 				removeProbe(o.adapter, o.projectDir);
@@ -298,29 +298,29 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 				// stack's own fix is running (whose edits they may be)
 				const others = o.config.target.stacks.filter((s) => s !== key).map((s) => ({ s, dir: relative(repo, stackDir(o.config, s)) })).filter((x) => x.dir && !x.dir.startsWith(".."));
 				for (const x of others.filter((x) => !fixing.has(x.s))) {
-					const there = execFileSync("git", ["-C", repo, "status", "--porcelain", "-uall", "--", x.dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean).map((l) => l.slice(3));
+					const there = (await exec("git", ["-C", repo, "status", "--porcelain", "-uall", "--", x.dir])).split("\n").filter(Boolean).map((l) => l.slice(3));
 					if (!there.length) continue;
 					try {
-						execFileSync("git", ["-C", repo, "checkout", "HEAD", "--", x.dir], { stdio: "pipe" });
+						await exec("git", ["-C", repo, "checkout", "HEAD", "--", x.dir]);
 					} catch {
 						/* nothing of that project committed yet: only new files to remove */
 					}
-					execFileSync("git", ["-C", repo, "clean", "-fdq", "--", x.dir], { stdio: "pipe" });
+					await exec("git", ["-C", repo, "clean", "-fdq", "--", x.dir]);
 					undone.push(...there);
 				}
-				const sha = commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`, { exclude: others.map((x) => x.dir) });
-				const changed = sha ? execFileSync("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\n").filter(Boolean) : [];
+				const sha = await commitAll(repo, `chore(${key}): setup fixed during the run\n\n${said || "setup model"}`, { exclude: others.map((x) => x.dir) });
+				const changed = sha ? (await exec("git", ["-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha])).split("\n").filter(Boolean) : [];
 				// a commit of notes only (.md) fixes nothing a gate runs: it is taken back, the units are not retried for it
 				if (changed.length && changed.every((f) => f.endsWith(".md"))) {
-					execFileSync("git", ["-C", repo, "reset", "-q", "--keep", "HEAD~1"], { stdio: "pipe" });
+					await exec("git", ["-C", repo, "reset", "-q", "--keep", "HEAD~1"]);
 					return { sha: undefined, undone: [...undone, ...changed], changed: [], cannotFail: undefined };
 				}
 				return { sha, undone, changed, cannotFail: undefined };
 			} catch (e: any) {
 				// a failed put-back or commit (a hook) must not leave the fixer's edits on main for the next commit to sweep up
 				try {
-					execFileSync("git", ["-C", repo, "reset", "-q", "--hard", "HEAD"], { stdio: "pipe" });
-					execFileSync("git", ["-C", repo, "clean", "-fdq"], { stdio: "pipe" });
+					await exec("git", ["-C", repo, "reset", "-q", "--hard", "HEAD"]);
+					await exec("git", ["-C", repo, "clean", "-fdq"]);
 				} catch {
 					/* best effort */
 				}

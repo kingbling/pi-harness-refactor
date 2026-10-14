@@ -9,7 +9,7 @@ import { conflictFilesNote, rebaseOnMain, restoreUnitWork } from "../src/run/run
 const git = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
 
 describe("a unit whose merge conflicts keeps its reviewed code", () => {
-	it("puts the unit's commit back on the new main: clean files applied, clashing files with both sides", () => {
+	it("puts the unit's commit back on the new main: clean files applied, clashing files with both sides", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-conflict-"));
 		const repo = join(root, "repo");
 		execFileSync("git", ["init", "-q", "-b", "main", repo]);
@@ -17,7 +17,7 @@ describe("a unit whose merge conflicts keeps its reviewed code", () => {
 		git(repo, "add", "-A");
 		git(repo, "commit", "-q", "-m", "init");
 		const wt = join(root, "wt");
-		addWorktree(repo, wt, "unit/U1");
+		await addWorktree(repo, wt, "unit/U1");
 		writeFileSync(join(wt, "App.tsx"), "routes: home, users\n");
 		writeFileSync(join(wt, "UsersPage.tsx"), "users page\n");
 		// another unit lands on main and touches the same line of App.tsx
@@ -25,14 +25,14 @@ describe("a unit whose merge conflicts keeps its reviewed code", () => {
 		git(repo, "add", "-A");
 		git(repo, "commit", "-q", "-m", "another unit");
 		const config = { target: { path: repo, git: { branch: "main" } } } as any;
-		expect(() => rebaseOnMain(config, wt, "unit/U1", "feat: U1")).toThrow(/merge conflict/);
+		await expect(rebaseOnMain(config, wt, "unit/U1", "feat: U1")).rejects.toThrow(/merge conflict/);
 		// the aborted rebase leaves the unit's commit as the worktree head: that is what goes back
-		const sha = headOf(wt)!;
+		const sha = (await headOf(wt))!;
 		expect(git(wt, "log", "-1", "--format=%s")).toBe("feat: U1");
-		removeWorktree(repo, wt);
+		await removeWorktree(repo, wt);
 		git(repo, "branch", "-q", "-D", "unit/U1");
-		addWorktree(repo, wt, "unit/U1");
-		expect(restoreUnitWork(wt, sha)).toEqual(["App.tsx"]);
+		await addWorktree(repo, wt, "unit/U1");
+		expect(await restoreUnitWork(wt, sha)).toEqual(["App.tsx"]);
 		expect(readFileSync(join(wt, "UsersPage.tsx"), "utf8")).toBe("users page\n");
 		expect(readFileSync(join(wt, "App.tsx"), "utf8")).toMatch(/<<<<<<< HEAD\nroutes: home, offers\n=======\nroutes: home, users\n>>>>>>> /);
 		// uncommitted and no cherry-pick left in progress: the next merge commits it as usual

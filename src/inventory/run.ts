@@ -28,7 +28,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	process.env["BR_WORKSPACE"] ??= _root;
 
 	// Source is read-only: we only record where it stands. A later re-run detects drift per file hash.
-	const sourceCommit = headOf(srcRoot);
+	const sourceCommit = await headOf(srcRoot);
 	const previousCommit = ledger.getMeta("source_commit");
 	const previousHashes = new Map((ledger.db.prepare("SELECT path, hash FROM files").all() as Array<{ path: string; hash: string }>).map((r) => [r.path, r.hash]));
 	const drift = { changed: [] as string[], added: [] as string[], removed: [] as string[], staleUnits: [] as string[] };
@@ -425,7 +425,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	}
 	ledger.setMeta("drift_pending", "[]");
 	if (sourceCommit) ledger.setMeta("source_commit", sourceCommit);
-	ledger.setMeta("source_is_git", isRepo(srcRoot) ? "1" : "0");
+	ledger.setMeta("source_is_git", await isRepo(srcRoot) ? "1" : "0");
 
 	const inv = ledger.checkInvariants();
 	const report: InventoryReport = {

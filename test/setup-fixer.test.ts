@@ -67,8 +67,8 @@ describe("setup fixes during the run", () => {
 		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
 		const { ensureRepo, commitAll } = await import("../src/git.ts");
 		const { root, target, adapter, config } = stack({ id: "runfix" } as never);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		let calls = 0;
 		const fixer: SetupFixer = async (o) => {
 			calls++;
@@ -97,14 +97,14 @@ describe("setup fixes during the run: tests and migrated code stay as they are",
 		const { existsSync, readFileSync } = await import("node:fs");
 		const { root, target, adapter, config } = stack({ id: "keepcode" } as never);
 		// the first commit is the generator's; the code folders come later
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "scaffold");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "scaffold");
 		mkdirSync(join(target, "src", "features", "orders"), { recursive: true });
 		mkdirSync(join(target, "src", "shared"), { recursive: true });
 		writeFileSync(join(target, "src", "features", "orders", "orders.ts"), "export const a = 1;\n");
 		writeFileSync(join(target, "src", "features", "orders", "orders.spec.ts"), "expect(a).toBe(1)\n");
 		writeFileSync(join(target, "src", "shared", "money.ts"), "export const m = 1;\n");
-		commitAll(target, "init");
+		await commitAll(target, "init");
 		const ledger = new Ledger(":memory:");
 		// orders.ts holds an accepted unit's code (a move points to it); money.ts sits in the shared folder but no unit wrote it
 		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
@@ -149,8 +149,8 @@ describe("setup fixes during the run: no new source folders", () => {
 		const { root, target, adapter, config } = stack({ id: "nostray" } as never);
 		writeFileSync(join(target, "package.json"), "{}\n");
 		writeFileSync(join(target, "src", "main.tsx"), "import './icons'\n");
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "scaffold");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "scaffold");
 		const fixer: SetupFixer = async (o) => {
 			writeFileSync(join(o.projectDir, "package.json"), JSON.stringify({ dependencies: { highcharts: "12" } }));
 			writeFileSync(join(o.projectDir, "src", "highcharts.ts"), "export {};\n");
@@ -177,8 +177,8 @@ describe("setup fixes during the run: a folder the fix made holds no app code", 
 		mkdirSync(join(target, "config", "packages"), { recursive: true });
 		writeFileSync(join(target, "config", "packages", "framework.ts"), "export {};\n");
 		writeFileSync(join(target, "lint.json"), "{}\n");
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "scaffold");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "scaffold");
 		const fixer: SetupFixer = async (o) => {
 			writeFileSync(join(o.projectDir, "lint.json"), JSON.stringify({ bootstrap: "config/lint-bootstrap.ts" }));
 			writeFileSync(join(o.projectDir, "config", "lint-bootstrap.ts"), "export {};\n");
@@ -199,15 +199,15 @@ describe("setup fixes during the run: a note is no fix", () => {
 		const { ensureRepo, commitAll, headOf } = await import("../src/git.ts");
 		const { existsSync } = await import("node:fs");
 		const { root, target, adapter, config } = stack({ id: "notes" } as never);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
-		const head = headOf(target);
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
+		const head = await headOf(target);
 		const fixer: SetupFixer = async (o) => {
 			writeFileSync(join(o.projectDir, "SETUP-NOTES.md"), "nothing to fix: the unit's own code is wrong\n");
 			return "wrote down why nothing was fixed";
 		};
 		expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: "a test fails", fixer })).toBeUndefined();
-		expect(headOf(target)).toBe(head);
+		expect(await headOf(target)).toBe(head);
 		expect(existsSync(join(target, "SETUP-NOTES.md"))).toBe(false);
 	});
 });
@@ -217,8 +217,8 @@ describe("setup fixes during the run: tries per problem", () => {
 		const { fixRunSetup, MAX_RUN_FIXES } = await import("../src/init/setup-fixer.ts");
 		const { ensureRepo, commitAll } = await import("../src/git.ts");
 		const { root, target, adapter, config } = stack({ id: "manyfixes" } as never);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		for (let i = 0; i < MAX_RUN_FIXES + 3; i++) {
 			const fix: SetupFixer = async (o) => (writeFileSync(join(o.projectDir, `setting-${i}.yaml`), `n: ${i}\n`), `wired setting ${i}`);
 			expect(await fixRunSetup({ config, root, adapter, projectDir: target, problem: `problem ${i}`, signature: `problem ${i}`, fixer: fix })).toBe(`wired setting ${i}`);
@@ -231,8 +231,8 @@ describe("setup fixes during the run: tries per problem", () => {
 		const { ensureRepo, commitAll } = await import("../src/git.ts");
 		const { readFileSync } = await import("node:fs");
 		const { root, target, adapter, config } = stack({ id: "perproblem" } as never);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		let calls = 0;
 		const nothing: SetupFixer = async () => (calls++, "looked around");
 		const run = (signature: string, fixer: SetupFixer) => fixRunSetup({ config, root, adapter, projectDir: target, problem: signature, signature, fixer });
@@ -333,8 +333,8 @@ describe("worktree dependency dirs: link or (learned) copy", () => {
 		const { linkedDirs, loadCommandOverrides } = await import("../src/adapters/command-overrides.ts");
 		const { ensureRepo, commitAll } = await import("../src/git.ts");
 		const { root, target, adapter, config } = stack({ id: "copied", toolchain: { isProjectReady: () => true, worktreeLinks: ["vendor", "node_modules"] } } as never);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		type Tool = { execute: (id: string, p: { dir: string; why: string }) => Promise<{ content: Array<{ text: string }> }> };
 		await (worktreeCopyTool(root, adapter) as unknown as Tool).execute("1", { dir: "vendor", why: "autoloader" });
 		expect(linkedDirs(adapter, root)).toEqual(["node_modules"]);
@@ -356,8 +356,8 @@ describe("setup fixes during the run: the test command must still be able to fai
 		const { existsSync } = await import("node:fs");
 		const { execFileSync } = await import("node:child_process");
 		const { root, target, adapter, config } = stack({ id: "nofail" } as never);
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "init");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
 		const fixer: SetupFixer = async (o) => {
 			writeFileSync(join(o.projectDir, "runner.sh"), "exit 0\n");
 			saveCommandOverride(o.root, o.adapter.id, "test", { cmd: "sh", args: ["runner.sh"] }, "a wrapper that swallows the exit code");
@@ -398,10 +398,10 @@ describe("setup fixes during the run: one stack's fix stays in its own project",
 		const probe = { path: "src/probe.spec.txt", content: "expect(1 + 1).toBe(2)\n" };
 		const { root, target, adapter } = stack({ id: "web", probeTest: () => probe } as never);
 		const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["web", "api"] }, models: {} });
-		ensureRepo(target, "migration/main", []);
-		commitAll(target, "scaffold");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "scaffold");
 		for (const [f, t] of Object.entries({ "web/src/probe.spec.txt": probe.content, "api/config.yaml": "a: 1\n" })) (mkdirSync(join(target, f, ".."), { recursive: true }), writeFileSync(join(target, f), t));
-		commitAll(target, "leaked probe");
+		await commitAll(target, "leaked probe");
 		const fixer: SetupFixer = async (o) => {
 			writeFileSync(join(o.projectDir, "vitest.config.ts"), "export default {};\n");
 			writeFileSync(join(target, "api", "config.yaml"), "a: 2\n");

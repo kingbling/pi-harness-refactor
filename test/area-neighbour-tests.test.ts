@@ -42,11 +42,11 @@ beforeEach(() => {
 });
 
 describe("ported tests: the unit's own, and the area's other tests only when the unit broke them", () => {
-	it("own tests are the ones its truth cases link to, plus test files new or changed in the worktree", () => {
+	it("own tests are the ones its truth cases link to, plus test files new or changed in the worktree", async () => {
 		write(join(wt, "tests/new.spec"), "pass\n");
-		expect(ownTests(ledger, "u1", wt, [...TESTS, "tests/new.spec"])).toEqual(["tests/own.spec", "tests/new.spec"]);
+		expect(await ownTests(ledger, "u1", wt, [...TESTS, "tests/new.spec"])).toEqual(["tests/own.spec", "tests/new.spec"]);
 		// nothing of its own found: every test counts, as before
-		expect(ownTests(ledger, "u2", wt, TESTS)).toEqual(TESTS);
+		expect(await ownTests(ledger, "u2", wt, TESTS)).toEqual(TESTS);
 	});
 
 	it("a neighbour already red on main does not block the unit (named as a warning)", async () => {

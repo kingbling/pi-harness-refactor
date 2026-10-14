@@ -20,13 +20,13 @@ import { checkMyCodeTool } from "../src/sessions/tools.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 // the whole-project type check: prints src/errs.txt (one error per line) and fails when it has any
-function setup(errs: string) {
+async function setup(errs: string) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "br-new-errors-")));
 	const target = join(root, "new");
 	mkdirSync(join(target, "src"), { recursive: true });
 	writeFileSync(join(target, "src", "errs.txt"), errs);
-	ensureRepo(target, "migration/main", []);
-	commitAll(target, "init");
+	await ensureRepo(target, "migration/main", []);
+	await commitAll(target, "init");
 	const config = ConfigSchema.parse({ source: { path: root, stack: "php" }, target: { path: target, stacks: ["fake"], git: { branch: "migration/main" } }, models: {} });
 	const tested = join(root, "tested");
 	writeFileSync(tested, "");
@@ -40,11 +40,11 @@ function setup(errs: string) {
 		lint: (_r: string, files: string[]) => ({ cmd: "true", args: files }),
 		test: (_r: string, files: string[]) => ({ cmd: "sh", args: ["-c", `echo "$@" >> ${tested}`, "sh", ...files] }),
 	} as unknown as TargetAdapter;
-	const unit = (name: string, content: string, commit = true) => {
+	const unit = async (name: string, content: string, commit = true) => {
 		const wt = join(root, "wt", name);
 		git(target, ["worktree", "add", "-q", "-b", `unit/${name}`, wt]);
 		writeFileSync(join(wt, "src", "errs.txt"), content);
-		if (commit) commitAll(wt, name);
+		if (commit) await commitAll(wt, name);
 		return wt;
 	};
 	return { root, target, config, adapter, unit, tested: () => readFileSync(tested, "utf8") };
@@ -69,24 +69,24 @@ describe("error lines against main's", () => {
 describe("the merge check on a red main", () => {
 	const MAIN = "src/a.ts(1,1): error TS2741: missing x\n";
 	it("refuses a merge that adds an error, with only the new line", async () => {
-		const s = setup(MAIN);
+		const s = await setup(MAIN);
 		const check = createMergeCheck({ config: s.config, adapters: new Map([["fake", s.adapter]]) });
-		const out = await check("fake", s.unit("u1", `${MAIN}src/b.ts(2,2): error TS2741: missing y\n`));
+		const out = await check("fake", (await s.unit("u1", `${MAIN}src/b.ts(2,2): error TS2741: missing y\n`)));
 		expect(out).toMatch(/main fails it too, these 1 error line\(s\) are new:\nsrc\/b\.ts\(2,2\): error TS2741: missing y/);
 		expect(out).not.toMatch(/a\.ts/);
 	});
 
 	it("lets a merge land that only moves or removes main's errors", async () => {
-		const s = setup(MAIN);
+		const s = await setup(MAIN);
 		const check = createMergeCheck({ config: s.config, adapters: new Map([["fake", s.adapter]]) });
-		expect(await check("fake", s.unit("u1", "src/a.ts(7,3): error TS2741: missing x\n"))).toBeUndefined();
+		expect(await check("fake", (await s.unit("u1", "src/a.ts(7,3): error TS2741: missing x\n")))).toBeUndefined();
 	});
 
 	it("draft: checks the implementer's uncommitted code (check_my_code), with the errors main does not have", async () => {
-		const s = setup(MAIN);
+		const s = await setup(MAIN);
 		const check = createMergeCheck({ config: s.config, adapters: new Map([["fake", s.adapter]]) });
-		const wt = s.unit("u1", `${MAIN}src/b.ts(2,2): error TS1: new\n`, false);
-		const tool = checkMyCodeTool({ ledger: undefined as never, config: undefined as never, unitId: "u1", root: wt, targetProjectDir: wt, adapter: { ...s.adapter, layout: { ...s.adapter.layout, lang: () => undefined } } as never, wholeCheck: () => check("fake", wt, true) });
+		const wt = await s.unit("u1", `${MAIN}src/b.ts(2,2): error TS1: new\n`, false);
+		const tool = checkMyCodeTool({ ledger: undefined as never, config: undefined as never, unitId: "u1", root: wt, targetProjectDir: wt, adapter: { ...s.adapter, layout: { ...s.adapter.layout, lang: () => undefined } } as never, wholeCheck: async () => (await check("fake", wt, true)) });
 		const r = await (tool as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }>; details: any }> }).execute("x", {});
 		expect(r.details).toMatchObject({ ok: false, failed: "whole" });
 		expect(r.content[0]!.text).toMatch(/WHOLE-PROJECT check FAILED[\s\S]*src\/b\.ts\(2,2\): error TS1: new/);
@@ -96,7 +96,7 @@ describe("the merge check on a red main", () => {
 describe("the builder's code job on a red main", () => {
 	const MAIN = "src/a.ts(1,1): error TS1: one\nsrc/a.ts(2,1): error TS1: two\n";
 	async function job(fix: (dir: string) => void) {
-		const s = setup(MAIN);
+		const s = await setup(MAIN);
 		let merged = false;
 		const said = await runCodeJob({
 			config: s.config,
@@ -127,11 +127,11 @@ describe("the builder's code job on a red main", () => {
 	});
 
 	it("runs the accepted tests that import the changed code", async () => {
-		const s = setup("src/a.ts(1,1): error TS1: one\n");
+		const s = await setup("src/a.ts(1,1): error TS1: one\n");
 		mkdirSync(join(s.target, "src", "other"), { recursive: true });
 		writeFileSync(join(s.target, "src", "errs.test.txt"), "import x from './errs'\n");
 		writeFileSync(join(s.target, "src", "other", "none.test.txt"), "import y from './none'\n");
-		commitAll(s.target, "tests");
+		await commitAll(s.target, "tests");
 		await runCodeJob({ config: s.config, root: s.root, ledger: new Ledger(":memory:"), adapter: s.adapter, what: "w", label: "build-fake-2", linkAll: () => {}, mergeFix: async () => undefined, log: () => {}, whole: true, worker: async ({ dir }) => (writeFileSync(join(dir, "src", "errs.txt"), ""), "x") });
 		expect(s.tested()).toMatch(/src\/errs\.test\.txt/);
 		expect(s.tested()).not.toMatch(/none\.test/);
@@ -140,7 +140,7 @@ describe("the builder's code job on a red main", () => {
 
 describe("the builder after a code job that made progress", () => {
 	it("keeps sending jobs: only jobs in a row that merged nothing park the stack", async () => {
-		const s = setup("src/a.ts(1,1): error TS1: one\n");
+		const s = await setup("src/a.ts(1,1): error TS1: one\n");
 		const ledger = new Ledger(":memory:");
 		let n = 0;
 		const b = createBuilder({ config: s.config, root: s.root, ledger, adapters: new Map([["fake", s.adapter]]), log: () => {}, linkAll: () => {}, mergeFix: async () => undefined, repair: false, codeJob: async () => (n++, "fewer errors"), every: { units: 1, minutes: 60 } });

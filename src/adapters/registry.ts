@@ -2,7 +2,7 @@ import type { SourceAdapter, TargetAdapter } from "./types.ts";
 import { phpAdapter } from "./source/php.ts";
 import { fromManifest, loadManifests, restoreManifest } from "./target/generated.ts";
 import { fromSourceManifest, loadSourceManifests } from "./source/generated.ts";
-import { withLayoutRules } from "../rules/layout-rules.ts";
+import { learnGeneratorDirs, withLayoutRules } from "../rules/layout-rules.ts";
 import { withCommandOverrides } from "./command-overrides.ts";
 
 const sources: Record<string, SourceAdapter> = { php: phpAdapter };
@@ -48,10 +48,12 @@ export async function getTargetAdapter(id: string): Promise<TargetAdapter> {
 	const root = process.env["BR_WORKSPACE"];
 	if (!targets[id] && root) registerGeneratedTargets(root);
 	// a fresh start used to leave generated adapters behind in .bigrefactor.old-<time>: bring the stack's back
-	if (!targets[id] && root && restoreManifest(root, id)) registerGeneratedTargets(root);
+	if (!targets[id] && root && await restoreManifest(root, id)) registerGeneratedTargets(root);
 	const f = targets[id];
 	if (!f) throw new Error(`unknown target adapter "${id}" (have: ${Object.keys(targets).join(", ")})`);
-	return offerable(withCommandOverrides(withLayoutRules(await f(), process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]));
+	const adapter = await f();
+	await learnGeneratorDirs(adapter, process.env["BR_WORKSPACE"]);
+	return offerable(withCommandOverrides(withLayoutRules(adapter, process.env["BR_WORKSPACE"]), process.env["BR_WORKSPACE"]));
 }
 
 /** Options setup cannot produce (`unavailable`) are never offered, recommended or resolved: a choice must be installable. */

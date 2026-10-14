@@ -78,9 +78,9 @@ describe("check_ported_tests", () => {
 		expect(out).toMatch(/TESTS FAILED: the implementer's code is in place: a test that fails here is either wrong[\s\S]*FAIL src\/features\/agency\/agency\.service\.spec\.ts u1#1/);
 	});
 
-	it("outside a git checkout every test counts as the unit's own", () => {
+	it("outside a git checkout every test counts as the unit's own", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "br-nogit-"));
-		expect(ownTests(ledger, "u1", dir, [SPEC, LIST])).toEqual([SPEC, LIST]);
+		expect(await ownTests(ledger, "u1", dir, [SPEC, LIST])).toEqual([SPEC, LIST]);
 	});
 });
 
@@ -115,7 +115,7 @@ describe("tests of earlier units in a retest", () => {
 		const gate = async (g: GateInput) => {
 			if (++n === 1) return red(g);
 			sanctioned = g.sanctioned ?? [];
-			flagged = othersTestsChanged(target, "u1", (f) => nestjsAdapter.layout.isTestFile(f), g.sanctioned);
+			flagged = await othersTestsChanged(target, "u1", (f) => nestjsAdapter.layout.isTestFile(f), g.sanctioned);
 			return green(g);
 		};
 		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate, log: () => {} });

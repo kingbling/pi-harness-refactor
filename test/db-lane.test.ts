@@ -362,8 +362,8 @@ describe("DB lane: a failed gate is read by the triage model", () => {
 		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: false, failedStep: "ported_tests_green", steps: [{ name: "ported_tests_green", ok: false, ms: 1, output: 'Error in bootstrap script: Unable to read the ".env" environment file.' }], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
 		const client = new FakeModelClient({ decide: (req) => (req.questions["cause"] ? { cause: "env" } : undefined) });
 		// the setup model commits its fix to the target repo: the target must be its own repo
-		ensureRepo(join(ws, "migrated"), "main", []);
-		commitAll(join(ws, "migrated"), "init");
+		await ensureRepo(join(ws, "migrated"), "main", []);
+		await commitAll(join(ws, "migrated"), "init");
 		const problems: string[] = [];
 		const setupFixer = async (f: { problem: string }) => (problems.push(f.problem), write(join(ws, "migrated", ".gitignore"), "vendor/\n"), "the .env file is now tracked");
 		const r = await runUnit({ ledger, config, root: ws, unitId: "DB_schema_invoice", spawn, gate, client, setupFixer: setupFixer as never, log: () => {} });

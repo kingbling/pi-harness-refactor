@@ -147,10 +147,10 @@ export function dataChanges(before: Record<string, unknown[]>, after: Record<str
  * Send the steps to one running app, in order, with one cookie jar (a login holds). `side` picks the request
  * shape: the old app gets the step as written, the new app the step with its `target` changes.
  */
-export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; base: (s: Step) => string; dump?: () => Record<string, unknown[]> }): Promise<StepResult[]> {
+export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; base: (s: Step) => string; dump?: () => Record<string, unknown[]> | Promise<Record<string, unknown[]>> }): Promise<StepResult[]> {
 	const vars = new Map<string, string>();
 	const jar = new Map<string, string>();
-	let data = o.dump?.();
+	let data = await o.dump?.();
 	const results: StepResult[] = [];
 	for (const s of steps) {
 		const t = o.side === "target" ? s.target ?? {} : {};
@@ -197,7 +197,7 @@ export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; ba
 		}
 		if (o.dump && WRITES(method)) {
 			try {
-				const after = o.dump();
+				const after = await o.dump();
 				r.data = dataChanges(data ?? {}, after);
 				data = after;
 			} catch (e: any) {
@@ -340,7 +340,7 @@ export interface SliceCheck {
 export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const startedAt = new Date().toISOString();
-	const mainAt = headOf(o.config.target.path);
+	const mainAt = await headOf(o.config.target.path);
 	const record = (c: Omit<SliceCheck, "runId">, steps = 0): SliceCheck => {
 		const runId = Number(o.ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, steps, compared, note, started_at, ended_at, commit_sha) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)").run(o.slice, c.outcome, steps, c.compared, c.note, startedAt, mainAt ?? null).lastInsertRowid);
 		const ins = o.ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -396,7 +396,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 			for (const stop of stops) await stop();
 		}
 	} finally {
-		removeWorktree(o.config.target.path, wt);
+		await removeWorktree(o.config.target.path, wt);
 	}
 	// written data is compared only when both apps keep the same tables and both can dump them
 	const withData = o.config.db.strategy === "keep-schema" && !!apps[LEGACY].recipe!.dump && stacks.some((s) => apps[s]!.recipe!.dump);

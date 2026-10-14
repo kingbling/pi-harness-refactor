@@ -157,7 +157,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 
 	// ---- 3. open decisions: Jev picks among each decision's options, with confidence
 	// libraries/classes were judged above; everything else open gets a Jev pick
-	const jevable = openDecisions(ledger, config, source, targets, root, { raw: true }).filter((d) => !advice[d.id] && !d.id.startsWith("lib:") && !d.id.startsWith("fw:") && !d.id.startsWith("stack:") && !d.id.startsWith("target:") && d.options.length > 1);
+	const jevable = (await openDecisions(ledger, config, source, targets, root, { raw: true })).filter((d) => !advice[d.id] && !d.id.startsWith("lib:") && !d.id.startsWith("fw:") && !d.id.startsWith("stack:") && !d.id.startsWith("target:") && d.options.length > 1);
 	if (jevable.length) {
 		// one call per decision, each with its own evidence: a combined call reports the minimum confidence of
 		// unrelated questions and gives Jev no specific facts (observed 0.05–0.14 that way)
@@ -188,7 +188,7 @@ export async function advise(config: Config, root: string, ledger: Ledger, clien
 
 	// ---- 4. every question is phrased for THIS repo by a model that read it; plus decisions code did not foresee
 	const { toPoint } = await import("../inventory/decisions.ts");
-	const raw = openDecisions(ledger, config, source, targets, root, { raw: true });
+	const raw = await openDecisions(ledger, config, source, targets, root, { raw: true });
 	const stale = raw.map(toPoint).filter((p) => file.phrased?.[p.id]?.hash !== pointHash(p));
 	if (stale.length) {
 		const t0 = progress.tally();

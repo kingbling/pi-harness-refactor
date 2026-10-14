@@ -159,6 +159,6 @@ describe("tree scan with PascalCase areas", () => {
 		expect([isAreaFolder(pl, "Metadata"), isAreaFolder(pl, "AuditHistory"), isAreaFolder(pl, "metadata"), isAreaFolder(pl, "Old.tpl")]).toEqual([true, true, false, false]);
 		expect(isAreaFolder({ moduleDir: (a: string) => `src/${a}` }, "audit-history")).toBe(true);
 		// every folder under src/ is an area folder or the shared dir: nothing is out of place
-		expect(checkTree(dir, a)).toEqual([]);
+		expect(await checkTree(dir, a)).toEqual([]);
 	});
 });

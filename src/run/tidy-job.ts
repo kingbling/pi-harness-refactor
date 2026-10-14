@@ -1,11 +1,10 @@
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, commitAll, headOf, mainBranch, removeWorktree } from "../git.ts";
+import { addWorktree, commitAll, headOf, mainBranch, removeWorktree, deleteBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -15,6 +14,7 @@ import { FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
 import { changedFiles, wholeProjectSteps } from "./gate.ts";
 import { checkTree } from "./layout-check.ts";
 import { endTidyTask, onlyCase, tidyMissing, tidyTasks, type TidyTask } from "./tidy.ts";
+import { exec } from "../proc.ts";
 
 /**
  * The tidy job: each approved tidy task runs once, on its own, in a worktree of main. A model does the move and
@@ -87,10 +87,10 @@ export function createTidyJobs(o: {
 		const adapter = o.adapters.get(t.stack)!;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__tidy__${t.id}`);
 		const branch = `tidy/${t.id}`;
-		const reset = () => {
-			removeWorktree(o.config.target.path, wt);
+		const reset = async () => {
+			await removeWorktree(o.config.target.path, wt);
 			try {
-				execFileSync("git", ["-C", o.config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+				await deleteBranch(o.config.target.path, branch);
 			} catch {
 				/* no branch */
 			}
@@ -98,21 +98,21 @@ export function createTidyJobs(o: {
 		o.log(pc.cyan(`tidy ${t.id}: ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}`));
 		// inside the try: a worktree that cannot be made fails the task, it does not stay approved and hold its area
 		try {
-			reset();
-			const base = headOf(o.config.target.path);
-			addWorktree(o.config.target.path, wt, branch);
+			await reset();
+			const base = await headOf(o.config.target.path);
+			await addWorktree(o.config.target.path, wt, branch);
 			await o.linkAll(wt);
 			const dir = join(wt, relative(o.config.target.path, projectDir(o.config, t.stack)));
 			const overrides = keepOverrides(o.root, t.stack); // the gate commands are the setup fixer's, never a tidy job's
 			const said = (await work({ config: o.config, root: o.root, adapter, dir, task: t }).finally(() => overrides.restore() && o.log(pc.yellow(`tidy ${t.id}: the job changed the gate commands file; put back`)))) || "";
-			const changed = changedFiles(dir, adapter.toolchain.ignoredPaths);
+			const changed = await changedFiles(dir, adapter.toolchain.ignoredPaths);
 			const message = `refactor(${t.stack}): tidy ${t.id} ${t.op} ${t.from.join(", ")} → ${t.to.join(", ")}\n\n${said || t.why}`;
 			let problem = await check(adapter, dir, t, changed, projectDir(o.config, t.stack));
 			// main moved while the job ran: a unit merged since may use the old names, so the check runs again on top of it
-			if (!problem && headOf(o.config.target.path) !== base) {
-				commitAll(wt, message);
+			if (!problem && await headOf(o.config.target.path) !== base) {
+				await commitAll(wt, message);
 				try {
-					execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", mainBranch(o.config.target.path, o.config.target.git.branch)], { stdio: "pipe" });
+					await exec("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", await mainBranch(o.config.target.path, o.config.target.git.branch)]);
 				} catch (e: any) {
 					// the half-done rebase goes with the worktree below; the task fails with git's reason
 					throw new Error(`could not rebase onto main: ${String(e?.stderr ?? e?.message).trim().slice(0, 400)}`);
@@ -133,7 +133,7 @@ export function createTidyJobs(o: {
 			endTidyTask(o.ledger, t.id, "failed", String(e?.message ?? e));
 			o.log(pc.yellow(`tidy ${t.id}: failed (${String(e?.message ?? e).split("\n")[0]})`));
 		} finally {
-			reset();
+			await reset();
 		}
 	};
 
@@ -169,7 +169,7 @@ async function check(adapter: TargetAdapter, dir: string, t: TidyTask, changed: 
 	// the same layout check a unit's gate runs on its files: a move may not put a file where the gate refuses it
 	// (only the task's targets: a file touched just for an import keeps its old drift, that is another task's job)
 	const moved = changed.filter((f) => existsSync(join(dir, f)) && t.to.some((p) => f === p || f.startsWith(p.replace(/\/*$/, "/"))));
-	const drift = moved.length ? checkTree(dir, adapter, moved) : [];
+	const drift = moved.length ? await checkTree(dir, adapter, moved) : [];
 	if (drift.length) return `the layout check failed: ${drift.slice(0, 10).join("\n")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));

@@ -1,10 +1,11 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 import { changedFiles, runTests, scopedCheck, trackedFiles } from "./gate.ts";
+import { exec } from "../proc.ts";
 
 /**
  * The ported-test checks code runs on a unit, shared by the orchestrator (coverTruth, the lint pass before the
@@ -71,17 +72,17 @@ export function checkTests(targetProjectDir: string, adapter: TargetAdapter, nam
  * The unit's own ported tests among `tests` (the area's): the files its truth cases are linked to, and test files new
  * or changed in its worktree (the tester's). The rest are other units' tests. No own file found (or no git): all of them count.
  */
-export function ownTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): string[] {
-	const own = onlyOwnTests(ledger, unitId, dir, tests, ignored);
+export async function ownTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): Promise<string[]> {
+	const own = await onlyOwnTests(ledger, unitId, dir, tests, ignored);
 	return own.length ? own : tests;
 }
 
 /** As ownTests, but no own file found is none (what the reviewer judges: other units' tests are not this unit's). Not a git checkout: all of them count. */
-export function onlyOwnTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): string[] {
+export async function onlyOwnTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): Promise<string[]> {
 	const linked = (ledger.db.prepare("SELECT DISTINCT ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL").all(unitId) as Array<{ p: string }>).map((r) => r.p);
 	let changed: string[];
 	try {
-		changed = changedFiles(dir, ignored);
+		changed = await changedFiles(dir, ignored);
 	} catch {
 		return tests; // not a git checkout: all of them count
 	}
@@ -115,7 +116,7 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	const slot = o.slot ?? (<T>(fn: () => Promise<T>) => fn());
 	const test = (dir: string, files: string[]) => slot(() => runTests(o.adapter, dir, files, o.timeoutMs));
 	if (o.tests.length < 2) return test(o.dir, o.tests);
-	const own = ownTests(o.ledger, o.unitId, o.dir, o.tests, o.adapter.toolchain.ignoredPaths);
+	const own = await ownTests(o.ledger, o.unitId, o.dir, o.tests, o.adapter.toolchain.ignoredPaths);
 	const mine = await test(o.dir, own);
 	const others = o.tests.filter((t) => !own.includes(t));
 	if (!mine.ok || !others.length) return mine;
@@ -123,9 +124,9 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	if (n.ok) return { ...mine, output: `${mine.output}\n\nThe area's other ported tests (${others.length} file(s)) still pass.` };
 	const main = o.mainDir && existsSync(o.mainDir) && realpathSync(o.mainDir) !== realpathSync(o.dir) ? o.mainDir : undefined;
 	if (!main) return { ...n, output: `Your own tests pass; the area's other ported tests fail with your code:\n${n.output}` };
-	const treeOf = () => {
+	const treeOf = async () => {
 		try {
-			return execFileSync("git", ["-C", main, "rev-parse", "HEAD^{tree}"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+			return (await exec("git", ["-C", main, "rev-parse", "HEAD^{tree}"])).trim();
 		} catch {
 			return ""; // not a git checkout: nothing kept
 		}
@@ -133,7 +134,7 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	// one run on main at a time (the test command may clear main's caches while another run boots), and a result is
 	// kept only when main did not move during the run
 	const green = await onMain(async () => {
-		const tree = treeOf();
+		const tree = await treeOf();
 		const key = (t: string) => `${main}\0${tree}\0${t}`;
 		const green = new Map(others.filter((t) => tree && greenOnMain.has(key(t))).map((t) => [t, greenOnMain.get(key(t))!] as const));
 		for (const t of others) if (!green.has(t) && !existsSync(join(main, t))) green.set(t, false);
@@ -141,7 +142,7 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 		// all of them at once first; only when main is red too, file by file to find the ones it passes
 		if (present.length && (await test(main, present)).ok) for (const t of present) green.set(t, true);
 		else for (const t of present) green.set(t, (await test(main, [t])).ok);
-		if (tree && treeOf() === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
+		if (tree && (await treeOf()) === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
 		return green;
 	});
 	const greenThere = others.filter((t) => green.get(t));
@@ -171,22 +172,22 @@ export function testsPass(targetProjectDir: string, adapter: TargetAdapter, file
  * before the session, else to HEAD, and a new file is removed. Work already in the tree (an implementer's) stays.
  * Returns the paths it put back.
  */
-export function scopeGuard(dir: string, allowed: string[], ignored: string[] = []): () => string[] {
+export async function scopeGuard(dir: string, allowed: string[], ignored: string[] = []): Promise<() => Promise<string[]>> {
 	const allow = allowed.map(globToRegExp);
-	const outside = () => changedFiles(dir, ignored).filter((f) => !allow.some((r) => r.test(f)));
+	const outside = async () => (await changedFiles(dir, ignored)).filter((f) => !allow.some((r) => r.test(f)));
 	const read = (f: string) => (existsSync(join(dir, f)) && statSync(join(dir, f)).isFile() ? readFileSync(join(dir, f)) : null);
-	const before = new Map(outside().map((f) => [f, read(f)] as const));
-	return () => {
-		const tracked = new Set(trackedFiles(dir));
+	const before = new Map((await outside()).map((f) => [f, read(f)] as const));
+	return async () => {
+		const tracked = new Set(await trackedFiles(dir));
 		const put: string[] = [];
-		for (const f of new Set([...before.keys(), ...outside()])) {
+		for (const f of new Set([...before.keys(), ...(await outside())])) {
 			const now = read(f);
 			const was = before.get(f);
 			if (was !== undefined) {
 				if (now === was || (now && was && now.equals(was))) continue;
 				if (was === null) rmSync(join(dir, f), { force: true });
 				else (mkdirSync(dirname(join(dir, f)), { recursive: true }), writeFileSync(join(dir, f), was));
-			} else if (tracked.has(f)) execFileSync("git", ["checkout", "HEAD", "--", f], { cwd: dir, stdio: "pipe" });
+			} else if (tracked.has(f)) await exec("git", ["checkout", "HEAD", "--", f], { cwd: dir });
 			else rmSync(join(dir, f), { force: true });
 			put.push(f);
 		}

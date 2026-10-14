@@ -1,10 +1,9 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, removeWorktree } from "../git.ts";
+import { addWorktree, deleteBranch, removeWorktree } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -14,6 +13,7 @@ import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
 import { addedLines, changedFiles, importedByTests, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
+import { exec } from "../proc.ts";
 
 /**
  * The code job: app code a unit needs but may not write (outside its files) — an endpoint its screen calls, a
@@ -100,16 +100,16 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	const repo = o.config.target.path;
 	const wt = join(o.root, ".bigrefactor", "worktrees", `__code__${o.label}`);
 	const branch = `code/${o.label}`;
-	const reset = () => {
-		removeWorktree(repo, wt);
+	const reset = async () => {
+		await removeWorktree(repo, wt);
 		try {
-			execFileSync("git", ["-C", repo, "branch", "-q", "-D", branch], { stdio: "pipe" });
+			await deleteBranch(repo, branch);
 		} catch {
 			/* no branch */
 		}
 	};
-	reset();
-	addWorktree(repo, wt, branch);
+	await reset();
+	await addWorktree(repo, wt, branch);
 	const attempt = o.ledger.startAttempt("__code__", `code:${o.adapter.id}`, o.config.models.escalate.id);
 	o.log(pc.cyan(`code job ${o.label} (${o.adapter.id}): ${o.what.split("\n")[0]!.slice(0, 160)}`));
 	try {
@@ -118,7 +118,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		const reply = (await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what: o.what, label: o.label })) || "";
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
 		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
-		const changed = changedFiles(dir, o.adapter.toolchain.ignoredPaths);
+		const changed = await changedFiles(dir, o.adapter.toolchain.ignoredPaths);
 		const problem = changed.length ? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger) : "nothing was changed";
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
@@ -137,16 +137,16 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		o.log(pc.yellow(`code job ${o.label}: failed (${String(e?.message ?? e).split("\n")[0]})`));
 		return undefined;
 	} finally {
-		reset();
+		await reset();
 	}
 }
 
 /** Units whose TODO(br:<unit>) mark the changed files lost (a mark moved to another changed file is kept). */
-function removedMarks(dir: string, changed: string[]): string[] {
+async function removedMarks(dir: string, changed: string[]): Promise<string[]> {
 	const mark = /TODO\(br:([^)\s]+)\)/g;
 	const removed = new Set<string>();
 	const added = new Set<string>();
-	const diff = execFileSync("git", ["diff", "-U0", "HEAD", "--", ...changed], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+	const diff = await exec("git", ["diff", "-U0", "HEAD", "--", ...changed], { cwd: dir, maxBuffer: 64 * 1024 * 1024 });
 	// a file's header lines (--- a/x, +++ b/x) come before its first @@; after it, "--- TODO" is a removed "-- TODO" comment
 	let header = false;
 	for (const l of diff.split("\n")) {
@@ -157,7 +157,7 @@ function removedMarks(dir: string, changed: string[]): string[] {
 		for (const m of into ? l.matchAll(mark) : []) into!.add(m[1]!);
 	}
 	// a new file is not in the diff against HEAD
-	const tracked = new Set(trackedFiles(dir));
+	const tracked = new Set(await trackedFiles(dir));
 	for (const f of changed) if (existsSync(join(dir, f)) && !tracked.has(f)) for (const m of readFileSync(join(dir, f), "utf8").matchAll(mark)) added.add(m[1]!);
 	return [...removed].filter((u) => !added.has(u));
 }
@@ -177,23 +177,24 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
 	// a stub's TODO(br:<unit>) mark tells that unit which files it may edit to replace the stub: it is the unit's to
 	// remove, not a question's job (the builder's job may: it only makes main build)
-	const marks = whole ? [] : removedMarks(dir, changed).filter((u) => (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
+	const marks = whole ? [] : (await removedMarks(dir, changed)).filter((u) => (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
 	if (marks.length) return `stub marks of units not accepted yet were removed: ${marks.slice(0, 5).map((u) => `TODO(br:${u})`).join(", ")}; leave the stubs and their marks to those units`;
 	const config = changed.filter((f) => protectedConfig(adapter, f));
 	if (config.length) return `protected config was changed: ${config.slice(0, 5).join(", ")}`;
 	// the same drift check a unit's gate runs on its files: a note or a misplaced file stays off main. A new file in a
 	// folder outside the layout (src/api/ next to the feature root) too: there the gate's "outside the feature folder" says it
-	const tracked = new Set(trackedFiles(dir));
-	const stray = strayDirs(dir, adapter);
+	const tracked = new Set(await trackedFiles(dir));
+	const stray = await strayDirs(dir, adapter);
 	const outside = changed.filter((f) => !tracked.has(f) && existsSync(join(dir, f)) && stray.some((d) => f.startsWith(d)));
-	const drift = [...checkTree(dir, adapter, changed.filter((f) => existsSync(join(dir, f)))), ...outside.map((f) => `${f}: ${STRAY}; put it in a feature folder or the shared dir`)];
+	const drift = [...(await checkTree(dir, adapter, changed.filter((f) => existsSync(join(dir, f))))), ...outside.map((f) => `${f}: ${STRAY}; put it in a feature folder or the shared dir`)];
 	if (drift.length) return `the layout check failed: ${drift.slice(0, 10).join("\n")}`;
 	const present = changed.filter((f) => existsSync(join(dir, f)) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
 	// no code and no test: nothing for the check to run, and the job was to write code
 	if (!present.length) return `no code was written, only other files: ${changed.slice(0, 5).join(", ")}`;
 	// a comment that silences the type check or the linter hides an error instead of fixing it (the gate's rule, in tests too)
 	const silence = adapter.layout.suppressMarker;
-	const silenced = silence ? present.flatMap((f) => addedLines(dir, f, tracked.has(f)).filter((l) => silence.test(l.text)).map((l) => `${f}:${l.line} (${l.text.trim().slice(0, 80)})`)) : [];
+	const silenced: string[] = [];
+	if (silence) for (const f of present) for (const l of await addedLines(dir, f, tracked.has(f))) if (silence.test(l.text)) silenced.push(`${f}:${l.line} (${l.text.trim().slice(0, 80)})`);
 	if (silenced.length) return `checks were silenced instead of fixed: ${silenced.slice(0, 5).join(", ")}`;
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));

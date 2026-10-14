@@ -37,9 +37,9 @@ describe("decisions during a run", () => {
 		const source = getSourceAdapter("php");
 		const targets = [await getTargetAdapter("nestjs")];
 		// stack/targets/db are whole-target decisions: answer them as onboarding would
-		for (const d of decisionGate(ledger, config, source, targets, ws).global) applyDecision(ledger, config, ws, d.id, d.recommended!, "test");
+		for (const d of (await decisionGate(ledger, config, source, targets, ws)).global) applyDecision(ledger, config, ws, d.id, d.recommended!, "test");
 
-		const g = decisionGate(ledger, config, source, targets, ws);
+		const g = await decisionGate(ledger, config, source, targets, ws);
 		expect(g.global).toEqual([]);
 		const fw = g.scoped.find((x) => x.decision.id === "fw:Registry");
 		expect(fw, JSON.stringify(g.scoped.map((x) => x.decision.id))).toBeTruthy();
@@ -47,7 +47,7 @@ describe("decisions during a run", () => {
 		expect(fw!.units).toEqual([caller]); // only the unit that calls Registry
 
 		// the scheduler's ready list leaves exactly that unit out
-		const readyNow = async (hook?: () => Map<string, string[]>) => {
+		const readyNow = async (hook?: () => Promise<Map<string, string[]>>) => {
 			const logs: string[] = [];
 			await runScheduler({ ledger, config, root: ws, dry: true, blocked: hook, log: (l) => logs.push(l), handleSigint: false });
 			return logs.find((l) => l.includes("ready now"))!;
@@ -61,7 +61,7 @@ describe("decisions during a run", () => {
 		// answering releases it (decisions.json changes → blocks recomputed)
 		await new Promise((r) => setTimeout(r, 20));
 		applyDecision(ledger, config, ws, "fw:Registry", "port", "test");
-		const after = blocked();
+		const after = await blocked();
 		expect(after.get(caller) ?? []).not.toContain("fw:Registry");
 		ledger.close();
 	});
@@ -83,14 +83,14 @@ describe("live decision blocks", () => {
 			return prepare(sql);
 		}) as typeof ledger.db.prepare;
 		const blocked = liveBlocks(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws);
-		expect(blocked().size).toBe(0);
+		expect((await blocked()).size).toBe(0);
 		const tried = reads;
 		expect(tried).toBeGreaterThan(0);
 		busy = false;
-		blocked();
+		await blocked();
 		expect(reads).toBeGreaterThan(tried); // recomputed although decisions.json did not change
 		const after = reads;
-		blocked();
+		await blocked();
 		expect(reads).toBe(after); // and cached again once it worked
 	});
 

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { NEST_LAYOUT } from "../src/adapters/target/ts-structure.ts";
 import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
-import { checkLayoutRules, checkLayoutTree, layoutRulesPath, layoutRulesProblem, loadLayoutRules, normalize, renderLayoutDoc, saveLayoutRules, validateLayoutRules, withLayoutRules, type LayoutRules } from "../src/rules/layout-rules.ts";
+import { checkLayoutRules, checkLayoutTree, learnGeneratorDirs, layoutRulesPath, layoutRulesProblem, loadLayoutRules, normalize, renderLayoutDoc, saveLayoutRules, validateLayoutRules, withLayoutRules, type LayoutRules } from "../src/rules/layout-rules.ts";
 import { execFileSync } from "node:child_process";
 import { examplesProblems } from "../src/rules/owner-layout.ts";
 
@@ -60,9 +60,9 @@ describe("layout rules", () => {
 		]);
 	});
 
-	it("the whole tree: shared, data and scaffold folders under src/ are no feature folders; per-file findings of the stack apply", () => {
+	it("the whole tree: shared, data and scaffold folders under src/ are no feature folders; per-file findings of the stack apply", async () => {
 		const dir = project({ ...BASE, "src/shared/dates/format-date.ts": "x\n", "src/db/schema.ts": "x\n", [`${mod}/extended/a.ts`]: "x\n", "src/billing/billing.service.ts": "export class BillingService {}\nexport class OtherService {}\n" });
-		const out = checkLayoutTree(dir, rules, { ...opts, fileFindings: (_p, f) => (f.endsWith("billing.service.ts") ? [`${f}: two classes`] : []) });
+		const out = await checkLayoutTree(dir, rules, { ...opts, fileFindings: (_p, f) => (f.endsWith("billing.service.ts") ? [`${f}: two classes`] : []) });
 		expect(out).toContainEqual(expect.stringMatching(/^src\/campaign\/extended\/a\.ts: folder "extended"/));
 		expect(out).toContainEqual(expect.stringMatching(/^src\/billing\/: missing billing\.module\.ts/));
 		expect(out).toContain("src/billing/billing.service.ts: two classes");
@@ -93,16 +93,16 @@ describe("layout rules", () => {
 });
 
 describe("every adapter goes through the layout rules", () => {
-	it("without layout.json: the built-in layout; no folder names banned by the tool (the layout writer picks them per stack)", () => {
+	it("without layout.json: the built-in layout; no folder names banned by the tool (the layout writer picks them per stack)", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-lw-"));
 		const a = withLayoutRules(nestjsAdapter, root);
 		expect(a.layout.moduleDir("campaign")).toBe("src/features/campaign");
-		expect(a.layout.checkStructure!(["src/shared/utils/format.ts"], "src/features/campaign", "campaign", root, { isNew: () => true }).join("\n")).not.toMatch(/banned names/);
+		expect((await a.layout.checkStructure!(["src/shared/utils/format.ts"], "src/features/campaign", "campaign", root, { isNew: () => true })).join("\n")).not.toMatch(/banned names/);
 		// a stack whose convention uses core/ (Angular) is not overruled
 		expect(normalize({ moduleDir: "src/app/{area}", forbidDirs: ["misc"] }).forbidDirs).toEqual(["misc"]);
 	});
 
-	it("a layout.json written mid-run applies to the next check (read at call time); a broken file keeps the last good one and is reported", () => {
+	it("a layout.json written mid-run applies to the next check (read at call time); a broken file keeps the last good one and is reported", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-lw-"));
 		const a = withLayoutRules(nestjsAdapter, root); // loaded before the rules exist, as a running scheduler holds it
 		saveLayoutRules(root, "nestjs", rules);
@@ -110,7 +110,7 @@ describe("every adapter goes through the layout rules", () => {
 		expect(a.layout.structureDoc).toMatch(/One feature folder per legacy area: src\/<area>\/ \(from NestJS docs/);
 		expect(a.layout.structureDoc).toContain("Never a folder named extended");
 		const dir = project(BASE);
-		expect(a.layout.checkStructure!([`${mod}/extended/a.ts`], mod, "campaign", dir)).toContainEqual(expect.stringMatching(/folder "extended"/));
+		expect(await a.layout.checkStructure!([`${mod}/extended/a.ts`], mod, "campaign", dir)).toContainEqual(expect.stringMatching(/folder "extended"/));
 		writeFileSync(layoutRulesPath(root, "nestjs"), "{ broken");
 		expect(loadLayoutRules(root, "nestjs")?.moduleDir).toBe("src/{area}");
 		expect(layoutRulesProblem(root, "nestjs")).toMatch(/layout\.json: /);
@@ -135,22 +135,22 @@ describe("review fixes: what an agent can no longer slip through, and what keeps
 		expect(check(dir, [`${mod}/campaign-stats.service.ts`], { isNew: () => false })).toEqual([]); // already there: not new
 	});
 
-	it("required files: a unit writing in its feature folder makes it whole, new folder or older one (nothing else creates a missing file)", () => {
+	it("required files: a unit writing in its feature folder makes it whole, new folder or older one (nothing else creates a missing file)", async () => {
 		const dir = project({ [`${mod}/campaign.module.ts`]: "x\n", [`${mod}/campaign.service.ts`]: "x\n" });
 		expect(check(dir, [`${mod}/campaign.service.ts`], { isNew: () => true })).toContainEqual(expect.stringMatching(/missing campaign\.controller\.ts/));
 		// an older folder (another job started it without the file): the area's next unit is asked for it
 		expect(check(dir, [`${mod}/campaign.service.ts`], { isNew: (f) => f.endsWith("service.ts") })).toContainEqual(expect.stringMatching(/missing campaign\.controller\.ts/));
-		expect(checkLayoutTree(dir, rules, opts)).toContainEqual(expect.stringMatching(/^src\/campaign\/: missing campaign\.controller\.ts/));
+		expect(await checkLayoutTree(dir, rules, opts)).toContainEqual(expect.stringMatching(/^src\/campaign\/: missing campaign\.controller\.ts/));
 		// the drift check on some files (a code job): only a folder those files start must be whole
-		expect(checkLayoutTree(dir, rules, opts, [`${mod}/campaign.service.ts`])).toEqual([]);
-		expect(checkLayoutTree(dir, rules, opts, [`${mod}/campaign.module.ts`, `${mod}/campaign.service.ts`])).toContainEqual(expect.stringMatching(/^src\/campaign\/: missing campaign\.controller\.ts/));
+		expect(await checkLayoutTree(dir, rules, opts, [`${mod}/campaign.service.ts`])).toEqual([]);
+		expect(await checkLayoutTree(dir, rules, opts, [`${mod}/campaign.module.ts`, `${mod}/campaign.service.ts`])).toContainEqual(expect.stringMatching(/^src\/campaign\/: missing campaign\.controller\.ts/));
 	});
 
-	it("rules that contradict themselves or put a placeholder in the parent folders are refused; area folders must be kebab-case", () => {
+	it("rules that contradict themselves or put a placeholder in the parent folders are refused; area folders must be kebab-case", async () => {
 		expect(validateLayoutRules({ ...rules, files: [...rules.files, { path: "utils/{name}.ts", doc: "" }] })).toContainEqual(expect.stringMatching(/"utils\/\{name\}\.ts" uses the banned folder "utils"/));
 		expect(validateLayoutRules({ ...rules, moduleDir: "{area}" })).toContainEqual(expect.stringMatching(/needs a parent folder/));
 		expect(validateLayoutRules({ ...rules, moduleDir: "src/{name}/{area}" })).toContainEqual(expect.stringMatching(/only the last folder may be a placeholder/));
-		expect(checkLayoutTree(project({ "src/Campaign_Old/x.ts": "x\n" }), rules, opts)).toContainEqual(expect.stringMatching(/^src\/Campaign_Old\/: folder "Campaign_Old" does not follow src\/\{area\}/));
+		expect(await checkLayoutTree(project({ "src/Campaign_Old/x.ts": "x\n" }), rules, opts)).toContainEqual(expect.stringMatching(/^src\/Campaign_Old\/: folder "Campaign_Old" does not follow src\/\{area\}/));
 	});
 });
 
@@ -176,9 +176,9 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 	const sym = normalize({ moduleDir: "src/{Area}", files: [{ path: "{Name}.php", doc: "a class" }, { path: "{sub}/{Name}.php", doc: "a sub-feature class" }], require: [], forbidDirs: ["Utils"] });
 	const symOpts = { sharedDirs: ["src/Shared"], isTestFile: (f: string) => /Test\.php$/.test(f), sourceExtensions: [".php"] };
 
-	it("a shared dir without a trailing slash still joins with one slash (no src/Shared<topic>, no configbundles.php)", () => {
+	it("a shared dir without a trailing slash still joins with one slash (no src/Shared<topic>, no configbundles.php)", async () => {
 		const dir = project({ "src/Shared/Money/Amount.php": "<?php\n", "src/Shared/Loose.php": "<?php\n" });
-		const out = checkLayoutTree(dir, sym, symOpts);
+		const out = await checkLayoutTree(dir, sym, symOpts);
 		expect(out).toContainEqual(expect.stringMatching(/^src\/Shared\/Loose\.php: shared files go in src\/Shared\/<topic>\/<name>/));
 		expect(out.join("\n")).not.toMatch(/src\/Shared[A-Z<]/);
 		expect(renderLayoutDoc(sym, ["src/Shared"])).toContain("src/Shared/<topic>/<name>");
@@ -206,16 +206,16 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 		expect(checkLayoutRules(["tests/Plans/PlanTest.php"], "src/Plans", "plans", "/nonexistent", sym, symOpts, NEW)).toEqual([]);
 	});
 
-	it("files that came with the generated project are never drift; one a unit changed is checked again", () => {
+	it("files that came with the generated project are never drift; one a unit changed is checked again", async () => {
 		const dir = project({ "src/Shared/Kernel.php": "<?php\n" });
 		execFileSync("git", ["init", "-q"], { cwd: dir });
 		execFileSync("git", ["add", "-A"], { cwd: dir });
 		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "scaffold"], { cwd: dir });
-		expect(checkLayoutTree(dir, sym, symOpts)).toEqual([]);
+		expect(await checkLayoutTree(dir, sym, symOpts)).toEqual([]);
 		writeFileSync(join(dir, "src/Shared/Kernel.php"), "<?php // changed\n");
-		expect(checkLayoutTree(dir, sym, symOpts)).toContainEqual(expect.stringMatching(/^src\/Shared\/Kernel\.php: shared files go in/));
+		expect(await checkLayoutTree(dir, sym, symOpts)).toContainEqual(expect.stringMatching(/^src\/Shared\/Kernel\.php: shared files go in/));
 	});
-	it("a shared dir the generator made (config/, translations/, tests/ in an older manifest) is the framework's: its files are no findings", () => {
+	it("a shared dir the generator made (config/, translations/, tests/ in an older manifest) is the framework's: its files are no findings", async () => {
 		const dir = project({ "config/packages/framework.yaml": "x\n", "translations/.gitignore": "", "tests/bootstrap.php": "<?php\n", "src/Kernel.php": "<?php\n" });
 		execFileSync("git", ["init", "-q"], { cwd: dir });
 		execFileSync("git", ["add", "-A"], { cwd: dir });
@@ -225,10 +225,11 @@ describe("the live Symfony run: shared dirs, sub-folder spelling, tests, scaffol
 		const base = { ...nestjsAdapter, id: "symfony", layout: { ...nestjsAdapter.layout, ...symOpts, sharedDirs: ["src/Shared", "config", "translations", "tests"], dataDirs: [], wiringFiles: [], fileFindings: undefined, checkTree: undefined, checkStructure: undefined } };
 		const a = withLayoutRules(base as never, root);
 		for (const [f, t] of Object.entries({ "config/phpstan-bootstrap.php": "<?php\n", "translations/app.en.yaml": "a: b\n", "tests/bootstrap.php": "<?php // changed\n", "src/Shared/Money.php": "<?php\n" })) (mkdirSync(dirname(join(dir, f)), { recursive: true }), writeFileSync(join(dir, f), t));
-		expect(a.layout.checkTree!(dir)).toEqual([expect.stringMatching(/^src\/Shared\/Money\.php: shared files go in src\/Shared\/<topic>/)]);
-		expect(a.layout.checkStructure!(["config/phpstan-bootstrap.php", "translations/app.en.yaml"], "src/Plans", "plans", dir, NEW)).toEqual([]);
+		expect(await a.layout.checkTree!(dir)).toEqual([expect.stringMatching(/^src\/Shared\/Money\.php: shared files go in src\/Shared\/<topic>/)]);
+		expect(await a.layout.checkStructure!(["config/phpstan-bootstrap.php", "translations/app.en.yaml"], "src/Plans", "plans", dir, NEW)).toEqual([]);
 		// with the workspace's config the doc, the tidy review and placement name only the units' shared dir too
 		writeFileSync(join(root, "bigrefactor.config.json"), JSON.stringify({ target: { path: dir, stacks: ["symfony"] } }));
+		await learnGeneratorDirs(base as never, root);
 		const w = withLayoutRules(base as never, root);
 		expect(w.layout.sharedDirs).toEqual(["src/Shared/"]);
 		expect(w.layout.structureDoc).toMatch(/Code used by several areas: src\/Shared\/<topic>\/<name> \(topic/);

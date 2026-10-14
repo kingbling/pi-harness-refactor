@@ -336,12 +336,12 @@ describe("a unit with no runtime behaviour", () => {
 		expect(g.steps.find((s) => s.name === "ported_tests_green")!.output).toMatch(/no runtime behaviour to pin.*only the repository contract/);
 	});
 
-	it("an empty case list is accepted only with the tester's reason", () => {
+	it("an empty case list is accepted only with the tester's reason", async () => {
 		const dir = join(ws, ".bigrefactor", "truth", "u1");
 		expect(loadReadTruth(dir).ok).toBe(false);
 		write(join(dir, NO_BEHAVIOUR_FILE), JSON.stringify({ reason: "only declares the AgencyRepository contract" }));
 		expect(loadReadTruth(dir)).toMatchObject({ ok: true, cases: [], none: "only declares the AgencyRepository contract" });
-		expect(verifyTruthOnOld(dir, config, getSourceAdapter("php"), ws)).toMatchObject({ ok: true, none: "only declares the AgencyRepository contract" });
+		expect(await verifyTruthOnOld(dir, config, getSourceAdapter("php"), ws)).toMatchObject({ ok: true, none: "only declares the AgencyRepository contract" });
 	});
 
 	it("the tester declares it; it is recorded as evidence, needs no tests, stands in for truth, and the reviewer sees the reason", async () => {

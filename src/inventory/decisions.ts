@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { effectivePlatform } from "../init/stack.ts";
@@ -10,6 +9,7 @@ import { applySlicePlan, planSlices } from "./slices.ts";
 import { TARGET_ROLES } from "../adapters/registry.ts";
 import { pointHash, type DecisionPoint, type PhrasedQuestion } from "../jev/ask.ts";
 import { JEV_ACT } from "../jev/questions.ts";
+import { exec } from "../proc.ts";
 
 /**
  * Decision gate. Everything the inventory cannot decide from code alone is derived here as a typed
@@ -80,7 +80,7 @@ export function forgetDecision(root: string, id: string): void {
 }
 
 /** `raw` = the code's points without the model's phrasing (input for `br advise`). */
-export function openDecisions(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string, opts: { raw?: boolean } = {}): Decision[] {
+export async function openDecisions(ledger: Ledger, config: Config, source: SourceAdapter, targets: TargetAdapter[], root: string, opts: { raw?: boolean } = {}): Promise<Decision[]> {
 	process.env["BR_WORKSPACE"] = root; // the generated framework profile lives in this workspace
 	const answered = loadDecisions(root).answers;
 	const out: Decision[] = [];
@@ -145,7 +145,7 @@ export function openDecisions(ledger: Ledger, config: Config, source: SourceAdap
 
 	// --- truth environment
 	const compose = findCompose(config.source.path);
-	const runtime = runtimeHere(source.truth.run(config.source.path, "x").cmd);
+	const runtime = await runtimeHere(source.truth.run(config.source.path, "x").cmd);
 	out.push({ id: "truth-env", topic: "truth", question: "Truth needs the old code runnable. How does it run?", evidence: `${compose ? `docker compose found: ${compose}` : "no docker compose found"}; ${runtime}. This is a preference: before the first unit a model checks what really runs on this machine (single units are enough, the whole app need not boot)`, recommended: compose ? "docker-dump" : "local", options: [{ value: "local", label: "with the tools installed on this machine", hint: "single units loaded and called directly; no containers" }, { value: "docker-dump", label: "docker compose + a DB dump I can provide", hint: "recorded HTTP responses + the legacy test suite on the old code" }, { value: "docker-only", label: "docker compose, schema only (no data dump yet)", hint: "unit truth now, goldens later" }, { value: "none", label: "nothing runnable locally", hint: "tester-written characterization tests on pure code only" }] });
 
 	// --- target location
@@ -336,11 +336,11 @@ export function decisionPrompt(d: Decision): string {
 
 const runtimes = new Map<string, string>();
 /** Whether the source adapter's runtime is installed here (a fact for the truth question), cached per process. */
-function runtimeHere(cmd: string): string {
+async function runtimeHere(cmd: string): Promise<string> {
 	if (!runtimes.has(cmd)) {
 		let v = `${cmd} not found on this machine`;
 		try {
-			const out = execFileSync(cmd, ["--version"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"] });
+			const out = await exec(cmd, ["--version"], { timeout: 5000 });
 			v = `${cmd} on this machine: ${out.split("\n")[0]!.trim().slice(0, 80)}`;
 		} catch {
 			/* not installed */

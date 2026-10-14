@@ -62,10 +62,10 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		layout: "preflight: placement dry run, rules vs. adapter layout, the target tree as it is (br run refuses on problems)",
 	};
 	progress.plan(ABOUT);
-	const step = async (name: string, skipWhen: () => string | undefined, run: () => Promise<string | void>) => {
+	const step = async (name: string, skipWhen: () => string | undefined | Promise<string | undefined>, run: () => Promise<string | void>) => {
 		const t0 = Date.now();
 		progress.checkStopped();
-		const skip = skipWhen();
+		const skip = await skipWhen();
 		if (skip) {
 			report.steps.push({ name, status: "skipped", note: skip, ms: 0 });
 			progress.stepEnd(name, "skipped", skip);
@@ -289,7 +289,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				// where each part of the app goes, first: every later question (stack choices, libraries, framework
 				// concerns) depends on it. server, ui, data stores, then whatever else the analysis rated.
 				const rank = (id: string) => (id === "target:server" ? 0 : id === "target:ui" ? 1 : id.startsWith("target:data:") ? 2 : 3);
-				const tqs = openDecisions(l, config, source, targets, root).filter((d) => d.id.startsWith("target:")).sort((a, b) => rank(a.id) - rank(b.id));
+				const tqs = (await openDecisions(l, config, source, targets, root)).filter((d) => d.id.startsWith("target:")).sort((a, b) => rank(a.id) - rank(b.id));
 				let decidedTargets = false;
 				for (const [ti, tq] of tqs.entries()) {
 					let v = yes ? tq.recommended : await askOne(tq, `part ${ti + 1} of ${tqs.length}`);
@@ -318,7 +318,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 						reload();
 					}
 				}
-				let ds = openDecisions(l, config, source, targets, root);
+				let ds = await openDecisions(l, config, source, targets, root);
 				if (!ds.length) return "nothing to decide";
 				const total = ds.length;
 				if (yes) {
@@ -332,7 +332,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 					if (accept === undefined) throw new Error("onboarding cancelled");
 					if (accept === "accept") for (const d of withRec) applyDecision(l, config, root, d.id, d.recommended!, "human (accepted recommendations)");
 					reload();
-					ds = openDecisions(l, config, source, targets, root);
+					ds = await openDecisions(l, config, source, targets, root);
 					for (const [di, d] of ds.entries()) {
 						const v = await askOne(d, `decision ${di + 1} of ${ds.length}`);
 						if (v) applyDecision(l, config, root, d.id, v, "human (onboard)");
@@ -341,7 +341,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 				// every question is answered: now the adapters written meanwhile are built and tested (the slow part)
 				await verifyAdapters();
 				reload();
-				const left = openDecisions(l, config, source, targets, root);
+				const left = await openDecisions(l, config, source, targets, root);
 				report.openDecisions = left.length;
 				if (left.length) log(renderDecisions(left));
 				return left.length ? `${total - left.length} decided, ${left.length} still open` : `${total} decided`;
@@ -373,7 +373,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 
 		// Bootstrapped = every project exists AND setup finished (toolchain checked, committed) for these stacks and
 		// choices. An interrupted setup or one for other choices is redone; setup is idempotent.
-		await step("setup", () => (setupDone(config, root, targets) ? "target already bootstrapped" : undefined), async () => {
+		await step("setup", async () => ((await setupDone(config, root, targets)) ? "target already bootstrapped" : undefined), async () => {
 			// an adapter whose check failed or was interrupted earlier is proven first
 			if (await verifyAdapters()) {
 				registerGeneratedTargets(root);

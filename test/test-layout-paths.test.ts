@@ -22,11 +22,11 @@ const MOD = "src/features/offers";
 const check = (dir: string) => (files: string[]) => checkLayoutRules(files, MOD, "offers", dir, rules, opts, { isNew: () => true });
 
 describe("the tester checks its paths with the layout", () => {
-	it("a test importing a page path the layout does not allow fails; the allowed name passes", () => {
+	it("a test importing a page path the layout does not allow fails; the allowed name passes", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "br-tl-"));
 		const test = `${MOD}/pages/OfferEditPage.test.tsx`;
-		expect(portedLayout(check(dir), [test], [`./${MOD}/pages/OfferEditPage.tsx`])).toEqual([expect.stringMatching(/^src\/features\/offers\/pages\/OfferEditPage\.tsx: not an allowed file/)]);
-		expect(portedLayout(check(dir), [test], [`${MOD}/pages/OffersEditPage.tsx`])).toEqual([]);
+		expect(await portedLayout(check(dir), [test], [`./${MOD}/pages/OfferEditPage.tsx`])).toEqual([expect.stringMatching(/^src\/features\/offers\/pages\/OfferEditPage\.tsx: not an allowed file/)]);
+		expect(await portedLayout(check(dir), [test], [`${MOD}/pages/OffersEditPage.tsx`])).toEqual([]);
 	});
 
 	it("check_ported_tests reports the layout of new imported code files, not of existing ones", async () => {

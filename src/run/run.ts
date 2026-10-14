@@ -1,7 +1,7 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { cp } from "node:fs/promises";
+import { cp, rm } from "node:fs/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
@@ -15,7 +15,7 @@ import pc from "picocolors";
 import { progress } from "../progress.ts";
 import { paidSince } from "../spend.ts";
 import { gateSlots, loadConfig, type Config } from "../config.ts";
-import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree } from "../git.ts";
+import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree, deleteBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import { probeLegacyEnv, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
@@ -44,6 +44,7 @@ import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type 
 import { conflictMarkers, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
+import { exec } from "../proc.ts";
 
 /**
  * The scheduler: many agent sessions, few gate workers, one merge at a time.
@@ -81,7 +82,7 @@ export interface SchedulerOptions {
 	 * Units blocked by open decisions (unit id → decision ids), re-read every scheduling loop so an answer
 	 * releases its units mid-run. See src/run/decisions-gate.ts.
 	 */
-	blocked?: () => Map<string, string[]>;
+	blocked?: () => Map<string, string[]> | Promise<Map<string, string[]>>;
 	/** When only decision-blocked units are left: wait for answers (Pi asks them on the side) instead of ending. */
 	waitForDecisions?: boolean;
 	/** Start despite layout problems (br run --force). The layout preflight is skipped in simulations (spawn injected). */
@@ -160,7 +161,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now') WHERE id = ?").run(a.unit_id);
 			ledger.clearStale(a.unit_id);
 			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', datetime('now'))").run(a.unit_id, u.state);
-			removeWorktree(config.target.path, worktreeDir(o.root, a.unit_id));
+			await removeWorktree(config.target.path, worktreeDir(o.root, a.unit_id));
 		}
 	}
 	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
@@ -177,7 +178,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		})).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
 		// truth written from reading the old code: its scripts run again once the old code's environment changed
 		const { upgradeReadTruth } = await import("./recheck.ts");
-		await waitOn("running read-only truth on the old code again", async () => upgradeReadTruth({ ledger, config, root: o.root, log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
+		await waitOn("running read-only truth on the old code again", async () => await upgradeReadTruth({ ledger, config, root: o.root, log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
 	}
 	// ---- stack knowledge written before the plugin asked for it (notApp, wiringFiles): a model adds just that
 	if (!o.dry && !o.spawn) {
@@ -187,9 +188,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
 	if (!o.dry) await waitOn("placing units: picking each unit's stack and folder", () => resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) }));
 	// ---- layout preflight: one folder per legacy file must be caught before a run scales it
-	if (!o.dry && isRepo(config.target.path)) {
+	if (!o.dry && await isRepo(config.target.path)) {
 		const { resetForNewTarget } = await import("./target-reset.ts");
-		const back = resetForNewTarget(ledger, config, o.root);
+		const back = await resetForNewTarget(ledger, config, o.root);
 		if (back) log(pc.cyan(`↻ the target project was created anew: ${back.length} unit(s) worked on before go back to planned; questions about the old project are dropped`));
 	}
 	if (!o.dry && !o.spawn) {
@@ -214,7 +215,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if (!adapter) return undefined;
 		let merged: string | undefined;
 		let refused: string | undefined;
-		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, onRefused: (p) => (refused = p), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, onRefused: (p) => (refused = p), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 		// a fix on main may unblock quarantined units too, not only the ones waiting on this question
 		if (said && stackId) noteFix(o.root, stackId, merged, `code job q${q.id}: ${said}`);
 		return said ?? (refused ? { refused } : undefined);
@@ -242,10 +243,10 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		if ("applied" in r) noteFix(o.root, stackId, undefined, `layout widened (q${q.id}): ${r.applied}`);
 		return r;
 	};
-	const resubmitParked = () => {
+	const resubmitParked = async () => {
 		// a slip in this pass is logged like the passes below, never the end of the run (units keep their state)
 		try {
-			resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
+			await resubmitParkedUnits(ledger, config, o.root, new Set(running.keys()), log, adapters);
 		} catch (e) {
 			log(pc.yellow(`resubmitting parked units failed: ${(e as Error)?.message ?? e}`));
 		}
@@ -267,9 +268,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// dependency dirs (adapter-declared) are linked into it.
 	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
 	// area folders the plugin now spells differently move in git first, so new units land next to the old code
-	if (!o.dry && isRepo(config.target.path)) {
+	if (!o.dry && await isRepo(config.target.path)) {
 		try {
-			for (const m of renameMisspelledAreaDirs(config, ledger, new Map([...adapters].map(([id, a]) => [id, a.layout])), (id) => projectDir(config, id))) log(pc.cyan(`↻ renamed ${m}`));
+			for (const m of await renameMisspelledAreaDirs(config, ledger, new Map([...adapters].map(([id, a]) => [id, a.layout])), (id) => projectDir(config, id))) log(pc.cyan(`↻ renamed ${m}`));
 		} catch (e) {
 			log(pc.yellow(`renaming area folders failed: ${String((e as Error)?.message ?? e).split("\n")[0]}`));
 		}
@@ -278,7 +279,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		for (const [id, a] of adapters) await linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(o.root, id).worktreeCopy ?? []);
 	};
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
-	excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
+	await excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
 	const agents = new Semaphore(config.run.agentConcurrency);
 	const gates = new Semaphore(gateSlots(config.run));
 	// Lanes are live: `br lanes <n>` / `/br lanes <n>` edits run.agentConcurrency (and gateConcurrency; unset, the gates follow the lanes) in the
@@ -330,12 +331,12 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		// a main the repair could not fix goes to a code job (it may fix test code too), never to the owner
 		codeJob: o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (stackId, what) => {
 			let merged: string | undefined;
-			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log, what, whole: true, mergeFix: (wt, branch, msg) => merge.run(async () => mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log, what, whole: true, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 			if (said) noteFix(o.root, stackId, merged, `builder code job: ${said}`);
 			return said;
 		},
 		mergeFix: (wt, branch, what) =>
-			merge.run(async () => mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => {
+			merge.run(async () => await mergeUnit(config, "builder", wt, branch, "", what)).then((sha) => {
 				pusher.afterMerge();
 				// builder/<stack>: the repair may unblock quarantined units of that stack
 				if (sha) noteFix(o.root, branch.split("/")[1] ?? "", sha, `builder repair: ${what.split("\n").at(-1)}`);
@@ -349,7 +350,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
 	};
 	const parityProbe =
-		o.dry || o.spawn || !isRepo(config.target.path)
+		o.dry || o.spawn || !await isRepo(config.target.path)
 			? undefined
 			: import("./parity.ts")
 					.then(({ probeApps }) => probeApps({ config, root: o.root, linkAll, log, ...probeAsk }))
@@ -389,7 +390,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 					showParity(`asking the ${r.down.stack} setup for a boot check: the new app does not start`);
 					await fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, r.down.stack), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: "boot check", problem: `The new ${r.down.stack} app does not start on main (the parity check started it):\n${r.down.error.slice(-3000)}\nNo whole-project check notices this: the stack has no boot command. Set one with set_gate_command (step boot): the framework's own start or container check, one command that exits, and run it to see that it fails on this now. Do not fix the app's code for it: the builder hands that to a code job.` }).catch((e) => log(pc.yellow(`  setup fix failed: ${e?.message ?? e}`)));
 				}
-				builder.appDown(r.down.stack, r.down.error);
+				await builder.appDown(r.down.stack, r.down.error);
 			}
 			// the old app only redirected to itself on https: its setup is asked once to fix that, then the slice runs again
 			const old = loadApps(o.root)["legacy"];
@@ -430,7 +431,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 	if (parityProbe) {
 		// at the start: finished slices never compared, and slices whose last comparison needs another look
-		const { checked, again } = parityAgain(ledger, headOf(config.target.path));
+		const { checked, again } = parityAgain(ledger, await headOf(config.target.path));
 		const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((x): x is string => !!x));
 		// and slices of units the owner said to retry after they ran out of parity re-opens
 		const answered = applyParityAnswers(ledger);
@@ -438,7 +439,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	}
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
 	// an area is busy while a unit of it runs; a truth-ahead lane (only tests, in its own worktree) never holds a tidy job back
-	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { if (aheadRunning.has(id)) return false; const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
+	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => await mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { if (aheadRunning.has(id)) return false; const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
 	const curate = new Semaphore(1);
 	const ran: UnitRunResult[] = [];
 	const running = new Map<string, Promise<void>>();
@@ -449,8 +450,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
-	if (!o.dry) for (const n of sweepWorktrees(config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
-	const branchNow = mainBranch(config.target.path, config.target.git.branch);
+	if (!o.dry) for (const n of await sweepWorktrees(config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
+	const branchNow = await mainBranch(config.target.path, config.target.git.branch);
 	if (branchNow !== config.target.git.branch) log(pc.yellow(`target branch ${config.target.git.branch} is gone from ${config.target.path}; units merge into ${branchNow} (the checked-out branch). Set target.git.branch to "${branchNow}" to make it permanent.`));
 	if (!o.dry) {
 		const caught = decideOpenFromGoals(ledger, config);
@@ -493,11 +494,11 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	// deps that are no unit any more (a re-inventory regrouped or renamed it) cannot be waited for: said once, then ignored
 	const dangling = ledger.db.prepare("SELECT u.id, d.value AS dep FROM units u, json_each(u.deps) d WHERE NOT EXISTS (SELECT 1 FROM units x WHERE x.id = d.value)").all() as Array<{ id: string; dep: string }>;
 	if (dangling.length) log(pc.yellow(`${dangling.length} dependency(ies) on units that no longer exist are ignored: ${dangling.slice(0, 5).map((x) => `${x.id} → ${x.dep}`).join(", ")}${dangling.length > 5 ? ", …" : ""}`));
-	const ready = (): string[] => {
+	const ready = async (): Promise<string[]> => {
 		applyPlacementAnswers(ledger, config, o.root); // an answered placement question places its unit before it can start
 		syncTaxonomyAnswers({ ledger, root: o.root }); // answered area questions: new area, or the owner excluded the unit
 		const blocked = ledger.blockedUnits();
-		decisionBlocked = o.blocked?.() ?? new Map();
+		decisionBlocked = (await o.blocked?.()) ?? new Map();
 		for (const u of decisionBlocked.keys()) if (!blocked.has(u)) blocked.set(u, []);
 		// one unit per target module at a time: units sharing a write scope would conflict on merge
 		const busyModules = new Set([...running.keys()].map((id) => placementOf(ledger.getUnit(id)!.meta).moduleKey));
@@ -529,7 +530,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	};
 
 	if (o.dry) {
-		const order = ready();
+		const order = await ready();
 		log(`\nready now (${order.length}): ${order.join(", ") || "-"}`);
 		return { ran: [], accepted: 0, quarantined: 0, waiting: order.length, costUsd: 0 };
 	}
@@ -545,18 +546,18 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		const p = agents.run(async () => {
 			const wt = worktreeDir(o.root, unitId) + "-ahead";
 			const branch = `ahead/${unitId}`;
-			const drop = () => {
-				removeWorktree(config.target.path, wt);
+			const drop = async () => {
+				await removeWorktree(config.target.path, wt);
 				try {
-					execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+					await deleteBranch(config.target.path, branch);
 				} catch {
 					/* no branch */
 				}
 			};
 			try {
 				// inside the try: a worktree that cannot be made skips this lane like any other failure
-				drop();
-				addWorktree(config.target.path, wt, branch);
+				await drop();
+				await addWorktree(config.target.path, wt, branch);
 				await linkAll(wt);
 				log(pc.cyan(`◇ ${unitId}`) + pc.dim("  truth ahead (deps still migrating)"));
 				const res = await runUnit({ ledger, config, root: o.root, unitId, client: o.client, accept: false, workDir: wt, truthOnly: true, gateSlot: (fn) => gates.run(fn), log: (l) => log(`  ${l}`), spawn: o.spawn, gate: o.gate });
@@ -565,7 +566,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			} catch (e: any) {
 				log(pc.yellow(`◇ ${unitId}: truth ahead skipped (${String(e?.message ?? e).split("\n")[0]})`));
 			} finally {
-				drop();
+				await drop();
 			}
 		});
 		running.set(unitId, laneDone(unitId, p).finally(() => (running.delete(unitId), aheadRunning.delete(unitId), aheadDone.add(unitId))));
@@ -597,13 +598,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const wt = worktreeDir(o.root, unitId);
 			const branch = `unit/${unitId}`;
 			const fresh = async () => {
-				removeWorktree(config.target.path, wt);
+				await removeWorktree(config.target.path, wt);
 				try {
-					execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+					await deleteBranch(config.target.path, branch);
 				} catch {
 					/* no branch */
 				}
-				addWorktree(config.target.path, wt, branch);
+				await addWorktree(config.target.path, wt, branch);
 				await linkAll(wt);
 				ledger.updateUnit(unitId, { worktree: wt, branch });
 			};
@@ -623,7 +624,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				// inside the try: a worktree that cannot be made (disk full, git lock) counts as a crash, so the unit is
 				// quarantined after the second one instead of being picked first again on every restart
 				await fresh();
-				const restored = restoreKeptWork(ledger, wt, unitId);
+				const restored = await restoreKeptWork(ledger, wt, unitId);
 				log(pc.bold(`▶ ${unitId}`) + pc.dim(`  [${JSON.parse(ledger.getUnit(unitId)!.meta).slice ?? "?"}]${restored ? ` (earlier code kept${restored.length ? `, ${restored.length} file(s) clash with main` : ""})` : ""}`));
 				// what a requeue, heal or recheck left for this unit (diagnosis, owner hint, findings): its first pass reads it
 				carried = [takeRetryNote(ledger, unitId), restored && "The worktree already holds your code from the earlier try, put on top of the current main: fix what failed instead of starting over.", restored?.length && conflictFilesNote(restored)].filter(Boolean).join("\n\n") || undefined;
@@ -660,36 +661,36 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);
 							const adapter = adapters.get(stackId)!;
 							const mainProject = projectDir(config, stackId);
-							rebaseOnMain(config, wt, branch, `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`);
+							await rebaseOnMain(config, wt, branch, `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`);
 							// a merge that adds errors to the stack's whole-project check (red, or new errors on a red main) does not land
 							const broke = await mergeCheck?.(stackId, wt);
 							if (broke) {
-								gitIn(wt, ["reset", "-q", mainBranch(config.target.path, config.target.git.branch)]); // the code stays, uncommitted, on top of main
+								await gitIn(wt, ["reset", "-q", await mainBranch(config.target.path, config.target.git.branch)]); // the code stays, uncommitted, on top of main
 								throw new BreaksMain(stackId, broke);
 							}
-							const sha = fastForwardMain(config, branch);
-							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
+							const sha = await fastForwardMain(config, branch);
+							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${await mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
 							// a success ends the crash count: a later re-open starts with a clean slate
 							ledger.updateUnit(unitId, { meta: { ...(sha ? { commit: sha } : {}), crashes: undefined } });
 							await indexTarget(ledger, adapter, mainProject, res!.gate?.changedFiles).catch(() => 0);
 							// the code is on main now: a slip after this is logged, never a quarantine of a merged unit
 							try {
-								afterAccept(ledger, adapter, mainProject, stackId, placementOf(ledger.getUnit(unitId)!.meta).area, (l) => log(`  ${l}`));
+								await afterAccept(ledger, adapter, mainProject, stackId, placementOf(ledger.getUnit(unitId)!.meta).area, (l) => log(`  ${l}`));
 								// Registration/wiring files are generated by the adapter from what landed, never by agents.
 								if (adapter.generateRegistration) {
 									const changed = await adapter.generateRegistration(mainProject, { ledger }).catch((e) => (log(pc.yellow(`  registration generation failed: ${e?.message ?? e}`)), [] as string[]));
 									if (changed.length) {
 										const files = changed.map((c) => relative(config.target.path, join(mainProject, c)));
 										try {
-											gitIn(config.target.path, ["add", "-A", "--", ...files]);
-											gitIn(config.target.path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `chore: regenerate registration after ${unitId}\n\n${changed.join("\n")}`]);
+											await gitIn(config.target.path, ["add", "-A", "--", ...files]);
+											await gitIn(config.target.path, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `chore: regenerate registration after ${unitId}\n\n${changed.join("\n")}`]);
 										} catch (e) {
 											// put the wiring files back to the last commit: left changed on main, the next accept would regenerate
 											// the same content, see no change and never commit it
-											gitIn(config.target.path, ["reset", "-q", "--", ...files]);
+											await gitIn(config.target.path, ["reset", "-q", "--", ...files]);
 											for (const f of files) {
 												try {
-													gitIn(config.target.path, ["checkout", "-q", "HEAD", "--", f]);
+													await gitIn(config.target.path, ["checkout", "-q", "HEAD", "--", f]);
 												} catch {
 													rmSync(join(config.target.path, f), { force: true }); // new with this regeneration: not in the last commit
 												}
@@ -743,9 +744,9 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 							continue;
 						}
 						// the unit's code passed its checks and review: it goes back on top of the current main, only the clashing files need work
-						const sha = headOf(wt);
+						const sha = await headOf(wt);
 						await fresh();
-						const clash = sha ? restoreUnitWork(wt, sha) : undefined;
+						const clash = sha ? await restoreUnitWork(wt, sha) : undefined;
 						approved.clash = clash ?? [];
 						// only wiring files clash (route table, main module: every unit adds its entry there): one short session
 						// keeps both sides' entries, then the merge (with its stack check) is tried again, no new implement pass or review
@@ -765,7 +766,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 						}
 						if (round === 3) {
 							// back to the unit's commit as it was before the restore: what a quarantine keeps
-							if (sha) gitIn(wt, ["reset", "-q", "--hard", sha]);
+							if (sha) await gitIn(wt, ["reset", "-q", "--hard", sha]);
 							ledger.transitionUnit(unitId, "quarantined", `could not merge: ${String(e?.message).slice(0, 300)}`);
 							log(pc.red(`■ ${unitId}: quarantined (${String(e?.message).split("\n")[0]})${blocksNote(unitId)}`));
 							break;
@@ -801,13 +802,13 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 				// the worktree goes whatever the state: the next run of this unit starts from a fresh one anyway (fresh()),
 				// so a planned unit's would only hold disk space. A quarantined unit's code stays on its branch: a self-heal
 				// requeue starts from it (an owner's requeue drops it)
-				const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? keepUnitWork(wt, unitId) : undefined;
+				const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? await keepUnitWork(wt, unitId) : undefined;
 				if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
-				removeWorktree(config.target.path, wt);
+				await removeWorktree(config.target.path, wt);
 				if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
 				else {
 					try {
-						execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", branch], { stdio: "pipe" });
+						await deleteBranch(config.target.path, branch);
 					} catch {
 						/* branch already gone */
 					}
@@ -846,7 +847,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 		}
 		recent.length = 0;
 		if (fixed) {
-			const back = requeueUnits(ledger, config, o.root, units.filter((u) => ["quarantined", "truth", "implementing", "gating"].includes(ledger.getUnit(u)?.state ?? "") && !running.has(u)), "self-heal", { keepCode: true });
+			const back = await requeueUnits(ledger, config, o.root, units.filter((u) => ["quarantined", "truth", "implementing", "gating"].includes(ledger.getUnit(u)?.state ?? "") && !running.has(u)), "self-heal", { keepCode: true });
 			log(pc.green(`⚕ healed: ${fixed} — ${back.filter((l) => l.endsWith("requeued")).length} unit(s) back in the queue`));
 		} else log(pc.yellow(`⚕ could not heal it here; those units stay quarantined (br requeue after a fix), the run goes on`));
 	};
@@ -942,7 +943,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	let dayCapHit = false;
 
 	// ---- main loop
-	resubmitParked();
+	await resubmitParked();
 	let lastResubmitCheck = Date.now();
 	let lastPlaceCheck = Date.now();
 	// a failing pass never ends the run: the error is shown (once a minute while it repeats) and the next pass tries again
@@ -964,7 +965,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			reloadLanes();
 			saveSlotTotals();
 			if (Date.now() - lastResubmitCheck > 5000) {
-				resubmitParked();
+				await resubmitParked();
 				lastResubmitCheck = Date.now();
 			}
 			// units Jev could not place (call failed, question could not be filed) get another pass
@@ -984,7 +985,7 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 			const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : (diskReason() ?? (await samplePause()));
 			let readyNow = 0;
 			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
-				const candidates = ready();
+				const candidates = await ready();
 				readyNow = candidates.length;
 				for (const id of candidates) {
 					if (running.size >= laneLimit || !underLimit()) break;
@@ -1106,23 +1107,23 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 }
 
 /** Bring the unit branch up to date with the main branch and fast-forward it in. */
-export function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string, message = `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`): string | undefined {
-	rebaseOnMain(config, wt, branch, message);
+export async function mergeUnit(config: Config, unitId: string, wt: string, branch: string, _mainProject: string, message = `feat: migrate ${unitId}\n\nbigrefactor: unit ${unitId}`): Promise<string | undefined> {
+	await rebaseOnMain(config, wt, branch, message);
 	return fastForwardMain(config, branch);
 }
 
 /** Commit the worktree's changes and rebase its branch onto the main branch (a conflict throws "merge conflict …"). */
-export function rebaseOnMain(config: Config, wt: string, branch: string, message: string): void {
-	const main = mainBranch(config.target.path, config.target.git.branch);
-	gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
-	const staged = execFileSync("git", ["-C", wt, "diff", "--cached", "--name-only"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-	if (staged) execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message], { stdio: "pipe" });
+export async function rebaseOnMain(config: Config, wt: string, branch: string, message: string): Promise<void> {
+	const main = await mainBranch(config.target.path, config.target.git.branch);
+	await gitIn(wt, ["add", "-A"]); // the stacks' generated paths are excluded repo-wide via info/exclude (see excludeFromGit)
+	const staged = (await exec("git", ["-C", wt, "diff", "--cached", "--name-only"])).trim();
+	if (staged) await exec("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", message]);
 	try {
-		execFileSync("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", main], { stdio: "pipe" });
+		await exec("git", ["-C", wt, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "rebase", "-q", main]);
 	} catch (e: any) {
 		const msg = String(e?.stderr ?? e?.message).trim();
 		try {
-			execFileSync("git", ["-C", wt, "rebase", "--abort"], { stdio: "pipe" });
+			await exec("git", ["-C", wt, "rebase", "--abort"]);
 		} catch {
 			/* the rebase never started: nothing to abort, the message above says why */
 		}
@@ -1133,10 +1134,10 @@ export function rebaseOnMain(config: Config, wt: string, branch: string, message
 }
 
 /** Fast-forward the main branch to the rebased branch; the new head, or undefined when nothing changed. */
-export function fastForwardMain(config: Config, branch: string): string | undefined {
-	const before = headOf(config.target.path);
-	execFileSync("git", ["-C", config.target.path, "merge", "-q", "--ff-only", branch], { stdio: "pipe" });
-	const after = headOf(config.target.path);
+export async function fastForwardMain(config: Config, branch: string): Promise<string | undefined> {
+	const before = await headOf(config.target.path);
+	await exec("git", ["-C", config.target.path, "merge", "-q", "--ff-only", branch]);
+	const after = await headOf(config.target.path);
 	return after !== before ? after : undefined;
 }
 
@@ -1150,9 +1151,9 @@ class BreaksMain extends Error {
 	}
 }
 
-function gitIn(dir: string, args: string[]): string {
+async function gitIn(dir: string, args: string[]): Promise<string> {
 	try {
-		return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+		return (await exec("git", ["-C", dir, ...args])).trim();
 	} catch (e: any) {
 		throw new Error(`git ${args.join(" ")} failed in ${dir}: ${String(e?.stderr ?? e?.message).trim().slice(0, 500)}`);
 	}
@@ -1163,9 +1164,9 @@ export function worktreeDir(root: string, unitId: string): string {
 }
 
 /** Repo-level excludes shared by all worktrees. A generator's `.gitignore` line `dir/` does not match our symlinked dir. */
-export function excludeFromGit(repo: string, patterns: string[]): void {
+export async function excludeFromGit(repo: string, patterns: string[]): Promise<void> {
 	try {
-		const gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+		const gitDir = (await exec("git", ["-C", repo, "rev-parse", "--git-common-dir"])).trim();
 		const abs = gitDir.startsWith("/") ? gitDir : join(repo, gitDir);
 		const file = join(abs, "info", "exclude");
 		mkdirSync(join(abs, "info"), { recursive: true });
@@ -1192,10 +1193,10 @@ export function freeDiskGb(dir: string): number | undefined {
  * At the start nothing runs yet: every worktree is left over from a crash or a stop (a unit's next run starts from a
  * fresh one, jobs reset theirs) and only holds disk space and its dependency copy.
  */
-export function sweepWorktrees(repo: string, dir: string): string[] {
+export async function sweepWorktrees(repo: string, dir: string): Promise<string[]> {
 	if (!existsSync(dir)) return [];
 	const gone = readdirSync(dir).filter((n) => !n.startsWith("."));
-	for (const n of gone) removeWorktree(repo, join(dir, n));
+	for (const n of gone) await removeWorktree(repo, join(dir, n));
 	return gone;
 }
 
@@ -1251,7 +1252,7 @@ export { errorSignature };
  * Parked units (state kept, attempt closed, waiting on a question) go back to planned as soon as the cause is
  * gone: their question was answered, or (environment failures) the target project or stack config changed.
  */
-export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>): string[] {
+export async function resubmitParkedUnits(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>): Promise<string[]> {
 	let cfg = config;
 	try {
 		cfg = loadConfig(join(root, "bigrefactor.config.json")).config;
@@ -1292,7 +1293,7 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 			const byModel = MODEL_ANSWERERS.includes(q!.answered_by ?? "");
 			ledger.updateUnit(u.id, { meta: { applied: q!.id, healQuestion: 0, ...(byModel ? { parkedWhy: a.hint || `the ${q!.answered_by} left it parked`, parkedAt: Date.now() } : {}) } });
 			ledger.transitionUnit(u.id, "quarantined", `${byModel ? q!.answered_by : "owner"} answered "${q!.answer}" on question #${q!.id}`);
-			removeWorktree(config.target.path, worktreeDir(root, u.id));
+			await removeWorktree(config.target.path, worktreeDir(root, u.id));
 			log(pc.red(`■ ${u.id}: quarantined by the answer to #${q!.id}`));
 			continue;
 		}
@@ -1300,7 +1301,7 @@ export function resubmitParkedUnits(ledger: Ledger, config: Config, root: string
 		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `${MODEL_ANSWERERS.includes(q?.answered_by ?? "") ? "A model's hint (not the owner's)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
 		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
 		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, datetime('now'))").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`);
-		removeWorktree(config.target.path, worktreeDir(root, u.id));
+		await removeWorktree(config.target.path, worktreeDir(root, u.id));
 		parked.push(u);
 	}
 	if (parked.length) log(pc.cyan(`↻ resubmitted ${parked.length} unit(s) whose blocker is resolved: ${parked.map((u) => u.id).slice(0, 5).join(", ")}${parked.length > 5 ? ", …" : ""}`));
@@ -1343,7 +1344,7 @@ export function lastFixAt(config: Config, root: string, manifests: Map<string, {
 }
 
 /** What changed for a stack since `t`, for the decide model: each setup fix logged since (its line and its commit's diff), the other files by name. */
-function changesSince(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string, t: number): string {
+async function changesSince(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string, t: number): Promise<string> {
 	const out: string[] = [];
 	const logFile = setupLogPath(root, stackId);
 	let lines: string[] = [];
@@ -1358,7 +1359,7 @@ function changesSince(config: Config, root: string, manifests: Map<string, { too
 		let diff = "";
 		if (sha && sha !== "override") {
 			try {
-				diff = execFileSync("git", ["-C", config.target.path, "show", "--format=", "--stat", "--patch", sha], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+				diff = await exec("git", ["-C", config.target.path, "show", "--format=", "--stat", "--patch", sha]);
 			} catch {
 				/* the commit is gone */
 			}
@@ -1509,8 +1510,8 @@ const quarantinedUnits = (ledger: Ledger) =>
  * Requeue a quarantined unit; it remembers the failure it heals from and the kinds of failure it was retried on, so
  * the same failure again is not retried blindly.
  */
-function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string, from: string, retriedOn: string[]): void {
-	requeueUnits(ledger, config, root, [id], "self-heal", { keepCode: true });
+async function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string, from: string, retriedOn: string[]): Promise<void> {
+	await requeueUnits(ledger, config, root, [id], "self-heal", { keepCode: true });
 	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion', '$.stuck', '$.parkedWhy'), '$.autoHeals', ?, '$.retryNote', ?, '$.healedFrom', ?, '$.retriedOn', json(?)) WHERE id = ?").run(heals, note, from, JSON.stringify(retriedOn), id);
 }
 
@@ -1566,16 +1567,16 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change), so one
 		// more try, once per park (a park after the try is newer than the plugin)
 		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0)) {
-			backInQueue(ledger, config, root, r.id, heals, `This unit was parked (${meta.parkedWhy}); the migration tool changed since, so it runs again. Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
+			await backInQueue(ledger, config, root, r.id, heals, `This unit was parked (${meta.parkedWhy}); the migration tool changed since, so it runs again. Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
 			back.push(r.id);
 			continue;
 		}
 		if (changed && mayRun) {
 			// a change the decide model already said does not touch this failure is not asked about again
-			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, await changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
 			if (touches) {
 				// something changed since the unit failed that may fix it: worth a try, an open question about it or not
-				backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${parked ? ` It was parked: ${meta.parkedWhy}` : ""}${lastFailure}`, failure, retriedOn);
+				await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${parked ? ` It was parked: ${meta.parkedWhy}` : ""}${lastFailure}`, failure, retriedOn);
 				back.push(r.id);
 				continue;
 			}
@@ -1607,7 +1608,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				log(pc.yellow(`⏸ ${r.id}: stays parked, no automatic try left (br requeue ${r.id} after a change)`));
 				continue;
 			}
-			backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? `the ${q.answered_by}` : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "model's" : "owner's"} hint: ${a.hint}` : ""}${lastFailure}`, failure, retriedOn);
+			await backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? `the ${q.answered_by}` : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "model's" : "owner's"} hint: ${a.hint}` : ""}${lastFailure}`, failure, retriedOn);
 			back.push(r.id);
 			continue;
 		}
@@ -1620,7 +1621,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 			}
 			if (now - ledgerTime(r.at) < config.run.healEveryMinutes * 60_000) continue;
 		}
-		backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
+		await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
 		back.push(r.id);
 	}
 	if (back.length) log(pc.cyan(`⚕ ${back.length} quarantined unit(s) back in the queue: ${back.slice(0, 5).join(", ")}${back.length > 5 ? ", …" : ""}`));
@@ -1682,12 +1683,12 @@ export function keepPortedTests(config: Config, root: string, unitId: string, me
  * A quarantined unit's code, committed on its branch before its worktree goes: a self-heal requeue starts from it
  * instead of from nothing. Returns the commit, or undefined when the unit wrote nothing.
  */
-export function keepUnitWork(wt: string, unitId: string): string | undefined {
+export async function keepUnitWork(wt: string, unitId: string): Promise<string | undefined> {
 	try {
-		gitIn(wt, ["add", "-A"]); // generated paths are excluded repo-wide, as in mergeUnit
-		if (!gitIn(wt, ["diff", "--cached", "--name-only"])) return undefined;
-		gitIn(wt, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `wip: ${unitId} as it was quarantined`]);
-		return headOf(wt);
+		await gitIn(wt, ["add", "-A"]); // generated paths are excluded repo-wide, as in mergeUnit
+		if (!await gitIn(wt, ["diff", "--cached", "--name-only"])) return undefined;
+		await gitIn(wt, ["-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", "commit", "-q", "-m", `wip: ${unitId} as it was quarantined`]);
+		return await headOf(wt);
 	} catch {
 		return undefined; // no worktree: nothing to keep
 	}
@@ -1707,9 +1708,9 @@ export function mayKeepCode(ledger: Ledger, unitId: string): boolean {
  * kept code is used once. The reviewer's open findings point at that code: they carry over only when it does.
  * Returns the files that conflicted with main (they hold both sides), or undefined when nothing was put back.
  */
-export function restoreKeptWork(ledger: Ledger, wt: string, unitId: string): string[] | undefined {
+export async function restoreKeptWork(ledger: Ledger, wt: string, unitId: string): Promise<string[] | undefined> {
 	const keptWork = (JSON.parse(ledger.getUnit(unitId)!.meta) as { keptWork?: string }).keptWork;
-	const conflicts = keptWork ? restoreUnitWork(wt, keptWork) : undefined;
+	const conflicts = keptWork ? await restoreUnitWork(wt, keptWork) : undefined;
 	if (keptWork) ledger.updateUnit(unitId, { meta: { keptWork: undefined } });
 	if (!conflicts) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.reviewFindings') WHERE id = ?").run(unitId);
 	return conflicts;
@@ -1721,25 +1722,25 @@ export function restoreKeptWork(ledger: Ledger, wt: string, unitId: string): str
  * implementer to resolve; the rest applies as it was. Returns the clashing files ([] when all applied), or
  * undefined when the commit could not be applied at all: the worktree is left clean.
  */
-export function restoreUnitWork(wt: string, sha: string): string[] | undefined {
+export async function restoreUnitWork(wt: string, sha: string): Promise<string[] | undefined> {
 	try {
-		gitIn(wt, ["cherry-pick", "--no-commit", sha]);
-		gitIn(wt, ["reset", "-q"]);
+		await gitIn(wt, ["cherry-pick", "--no-commit", sha]);
+		await gitIn(wt, ["reset", "-q"]);
 		return [];
 	} catch {
 		let conflicts: string[] = [];
 		try {
-			conflicts = gitIn(wt, ["diff", "--name-only", "--diff-filter=U"]).split("\n").filter(Boolean);
+			conflicts = (await gitIn(wt, ["diff", "--name-only", "--diff-filter=U"])).split("\n").filter(Boolean);
 		} catch {
 			/* no index to read: nothing was applied */
 		}
 		try {
 			if (conflicts.length) {
 				// a plain reset ends the cherry-pick but keeps its files: the clean ones applied, the clashing ones with both sides
-				gitIn(wt, ["reset", "-q"]);
+				await gitIn(wt, ["reset", "-q"]);
 				return conflicts;
 			}
-			gitIn(wt, ["reset", "-q", "--hard"]);
+			await gitIn(wt, ["reset", "-q", "--hard"]);
 		} catch {
 			/* nothing was applied */
 		}
@@ -1784,7 +1785,7 @@ export function conflictFilesNote(files: string[]): string {
  * interface and the tests again (its interface.md and kept tests go; the truth cases from the old code stay).
  * Returns what happened per id.
  */
-export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean; human?: boolean; keepCode?: boolean } = {}): string[] {
+export async function requeueUnits(ledger: Ledger, config: Config, root: string, ids: string[] | "all", by: string, o: { fresh?: boolean; human?: boolean; keepCode?: boolean } = {}): Promise<string[]> {
 	const stuck = (st: string) => ["quarantined", "truth", "implementing", "gating", "review"].includes(st);
 	const list = ids === "all" ? ledger.listUnits().filter((u) => stuck(u.state)).map((u) => u.id) : ids;
 	const out: string[] = [];
@@ -1794,12 +1795,12 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 			out.push(`${id}: unknown unit`);
 			continue;
 		}
-		const dropDraft = () => {
-			for (const f of ["interface.md", "ported"]) rmSync(join(root, ".bigrefactor", "truth", id, f), { recursive: true, force: true });
+		const dropDraft = async () => {
+			for (const f of ["interface.md", "ported"]) await rm(join(root, ".bigrefactor", "truth", id, f), { recursive: true, force: true });
 		};
 		if (o.fresh && u.state === "planned") {
 			// already waiting in the queue: only its draft goes
-			dropDraft();
+			await dropDraft();
 			out.push(`${id}: requeued`);
 			continue;
 		}
@@ -1808,10 +1809,10 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 			continue;
 		}
 		for (const a of ledger.db.prepare("SELECT id FROM attempts WHERE unit_id = ? AND ended_at IS NULL").all(id) as Array<{ id: number }>) ledger.endAttempt(a.id, { outcome: "aborted:requeue" });
-		removeWorktree(config.target.path, worktreeDir(root, id));
+		await removeWorktree(config.target.path, worktreeDir(root, id));
 		if (!o.keepCode || o.fresh || o.human) {
 			try {
-				execFileSync("git", ["-C", config.target.path, "branch", "-q", "-D", `unit/${id}`], { stdio: "pipe" });
+				await deleteBranch(config.target.path, `unit/${id}`);
 			} catch {
 				/* no branch */
 			}
@@ -1824,7 +1825,7 @@ export function requeueUnits(ledger: Ledger, config: Config, root: string, ids: 
 		// what it waited on no longer holds it: back in the queue it runs, and a late answer cannot act on it any more
 		for (const q of ledger.db.prepare("SELECT id FROM questions WHERE unit_id = ? AND status = 'open' AND point NOT IN ('placement', 'area_taxonomy', 'area_overlap')").all(id) as Array<{ id: number }>) ledger.withdrawQuestion(q.id, `${id} was requeued by ${by}`);
 		ledger.db.prepare("DELETE FROM question_waiters WHERE unit_id = ?").run(id);
-		if (o.fresh) dropDraft();
+		if (o.fresh) await dropDraft();
 		ledger.transitionUnit(id, "planned", `requeued by ${by}${o.fresh ? " (interface and tests drafted again)" : ""}`);
 		out.push(`${id}: requeued`);
 	}

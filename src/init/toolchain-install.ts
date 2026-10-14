@@ -1,4 +1,5 @@
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
+import { exec } from "../proc.ts";
 import type { ModelClient } from "../models/types.ts";
 
 /**
@@ -63,11 +64,11 @@ const INSTALL: Record<Manager, { argv: string[]; sudo: boolean }> = {
 };
 
 /** `command -v` for one tool (injectable for tests). */
-export type Probe = (tool: string) => boolean;
-export const onPath: Probe = (tool) => {
+export type Probe = (tool: string) => boolean | Promise<boolean>;
+export const onPath: Probe = async (tool) => {
 	if (!/^[\w.+-]+$/.test(tool)) return false;
 	try {
-		execFileSync("sh", ["-c", `command -v ${tool}`], { stdio: "pipe" });
+		await exec("sh", ["-c", `command -v ${tool}`]);
 		return true;
 	} catch {
 		return false;
@@ -86,13 +87,21 @@ export interface InstallPlan {
 }
 
 /** The package manager of this machine, first one found (brew before the distro managers). */
-export function packageManager(probe: Probe = onPath, platform = process.platform): Manager | undefined {
+export async function packageManager(probe: Probe = onPath, platform = process.platform): Promise<Manager | undefined> {
 	const order: Manager[] = platform === "win32" ? ["winget"] : platform === "darwin" ? ["brew"] : ["apt-get", "dnf", "pacman", "apk", "brew"];
-	return order.find((m) => probe(m));
+	for (const m of order) if (await probe(m)) return m;
+	return undefined;
 }
 
-export function installPlan(tools: string[], probe: Probe = onPath, platform = process.platform, isRoot = process.getuid?.() === 0): InstallPlan {
-	const manager = packageManager(probe, platform);
+/** The tools the probe does not find, in order. */
+async function missingOf(tools: string[], probe: Probe): Promise<string[]> {
+	const out: string[] = [];
+	for (const t of tools) if (!(await probe(t))) out.push(t);
+	return out;
+}
+
+export async function installPlan(tools: string[], probe: Probe = onPath, platform = process.platform, isRoot = process.getuid?.() === 0): Promise<InstallPlan> {
+	const manager = await packageManager(probe, platform);
 	if (!manager) return { needsSudo: false, unknown: tools };
 	const pkgs = new Set<string>();
 	const unknown: string[] = [];
@@ -171,9 +180,9 @@ export async function ensureTools(o: {
 	const log = o.log ?? o.ui.log;
 	let lastError = "";
 	for (;;) {
-		const missing = o.tools.filter((t) => !probe(t));
+		const missing = await missingOf(o.tools, probe);
 		if (!missing.length) return true;
-		const plan = installPlan(missing, probe, o.platform, o.isRoot);
+		const plan = await installPlan(missing, probe, o.platform, o.isRoot);
 		let display = plan.display;
 		let argv = plan.argv;
 		let viaShell = false;
@@ -198,7 +207,8 @@ export async function ensureTools(o: {
 		if (v === undefined) throw new Error("onboarding cancelled");
 		if (v === OTHER) return false;
 		if (v === CHECK) {
-			lastError = missing.filter((t) => !probe(t)).length ? `still missing: ${missing.filter((t) => !probe(t)).join(", ")}` : "";
+			const still = await missingOf(missing, probe);
+			lastError = still.length ? `still missing: ${still.join(", ")}` : "";
 			continue;
 		}
 		log(`  installing ${missing.join(", ")}: ${display}`);
@@ -208,7 +218,7 @@ export async function ensureTools(o: {
 			log(`  install failed: ${lastError}`);
 			continue;
 		}
-		const still = missing.filter((t) => !probe(t));
+		const still = await missingOf(missing, probe);
 		lastError = still.length ? `installed, but ${still.join(", ")} still not on PATH (open a new shell or add it to PATH)` : "";
 		if (!still.length) log(`  ${missing.join(", ")} installed`);
 	}

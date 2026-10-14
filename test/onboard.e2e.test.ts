@@ -23,7 +23,7 @@ import { ensureRepo, commitAll } from "../src/git.ts";
  */
 const here = resolve(import.meta.dirname, "..");
 
-function workspace(name: string) {
+async function workspace(name: string) {
 	const ws = join(here, ".sim", name);
 	rmSync(ws, { recursive: true, force: true });
 	mkdirSync(join(ws, "legacy"), { recursive: true });
@@ -35,8 +35,8 @@ function workspace(name: string) {
 	writeFileSync(join(target, "package.json"), JSON.stringify({ name: "sim", private: true, dependencies: Object.fromEntries(["prisma", "@prisma/client", "class-validator", "class-transformer", "@nestjs/passport", "passport", "passport-jwt", "@nestjs/jwt", "express-session", "passport-local"].map((p) => [p, "x"])), devDependencies: { vitest: "x" } }, null, 2));
 	writeFileSync(join(target, "nest-cli.json"), "{}");
 	writeFileSync(join(target, ".gitignore"), "node_modules/\n");
-	ensureRepo(target, "migration/main");
-	commitAll(target, "chore: bootstrap (test)");
+	await ensureRepo(target, "migration/main");
+	await commitAll(target, "chore: bootstrap (test)");
 	return { ws, target };
 }
 
@@ -44,7 +44,7 @@ const baseArgs = (ws: string) => ["--source", join(ws, "legacy"), "--stack", "ph
 
 describe("br onboard (e2e, offline)", () => {
 	it("runs every step, leaves artifacts only in the workspace, and is resumable", async () => {
-		const { ws, target } = workspace("onboard-e2e");
+		const { ws, target } = (await workspace("onboard-e2e"));
 		const lines: string[] = [];
 		const r = await onboard({ root: ws, args: [...baseArgs(ws), "--yes"], log: (l) => lines.push(l) });
 		expect(r.ok, lines.join("\n")).toBe(true);
@@ -90,7 +90,7 @@ describe("br onboard (e2e, offline)", () => {
 	}, 120_000);
 
 	it("TUI: a human sees one 'accept recommendations' question, then only decisions without a recommendation", async () => {
-		const { ws } = workspace("onboard-tui");
+		const { ws } = (await workspace("onboard-tui"));
 		const asked: string[] = [];
 		const scripted: InitPrompter = {
 			text: async (_m, initial) => initial,
@@ -151,7 +151,7 @@ describe("br onboard (e2e, offline)", () => {
 		const read = (ws: string) => ({ config: JSON.parse(readFileSync(join(ws, "bigrefactor.config.json"), "utf8")), answers: JSON.parse(readFileSync(join(ws, ".bigrefactor", "decisions.json"), "utf8")).answers });
 
 		it("repairs that gave up: the stack question opens again and the stack leaves the config; missing tools keep the choice", async () => {
-			const { ws } = workspace("onboard-adapter-gave-up");
+			const { ws } = (await workspace("onboard-adapter-gave-up"));
 			expect((await onboard({ root: ws, args: [...baseArgs(ws), "--yes"], log: () => {} })).ok).toBe(true);
 			pickGenerated(ws);
 			try {
