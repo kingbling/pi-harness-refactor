@@ -36,7 +36,7 @@ import { answerValue, askViaModel, decideOpenFromGoals, HINT } from "../jev/ask.
 import { MODEL_ANSWERERS, RESOLVER, resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
-import { findTests } from "./ported.ts";
+import { findTests, warmMainCache } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
@@ -335,7 +335,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	};
 	const merge = new Semaphore(1);
 	// target.git.push "on": main goes to the target repo's remote after merges, on the side
-	const pusher = createPusher({ config, root: o.root, log });
+	const pushes = createPusher({ config, root: o.root, log });
+	// after every merge main's tree is new: the other units' tests lanes asked main about run on it on the side (not
+	// in simulations: no lane waits there)
+	const pusher = { ...pushes, afterMerge: () => (pushes.afterMerge(), o.dry || o.spawn ? undefined : void warmMainCache()) };
 	// a unit's merge that turns its stack's whole-project build or lint red does not land (off in simulations)
 	const mergeCheck = o.dry || o.spawn ? undefined : createMergeCheck({ config, adapters });
 	// whole-project checks run on the side, now and then after merges (never in every unit's gate)

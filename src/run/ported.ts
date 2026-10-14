@@ -4,7 +4,7 @@ import { dirname, join, relative } from "node:path";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
-import { changedFiles, runTests, scopedCheck, trackedFiles } from "./gate.ts";
+import { changedFiles, dropNoticeLists, runTests, scopedCheck, trackedFiles } from "./gate.ts";
 import { exec } from "../proc.ts";
 
 /**
@@ -93,7 +93,9 @@ export async function onlyOwnTests(ledger: Ledger, unitId: string, dir: string, 
 /** The note on a green run that excused other units' tests because main fails them too. */
 export const FAIL_ON_MAIN_TOO = "fail on main too, not counted against this unit";
 
-type TestRun = { ok: boolean; output: string; exitCode?: number };
+/** `mainWaitMs`: how long the run waited for main's answer on the neighbour tests (main's queue and its run there). */
+type TestRun = { ok: boolean; output: string; exitCode?: number; mainWaitMs?: number };
+type Slot = <T>(fn: () => Promise<T>) => Promise<T>;
 /** Neighbour test files that pass on main, per main's tree: main is run again only after it changed. */
 const greenOnMain = new Map<string, boolean>();
 
@@ -105,14 +107,103 @@ function onMain<T>(fn: () => Promise<T>): Promise<T> {
 	return r;
 }
 
+/** What main says about neighbour test files: pass (true) or not, and the commit it ran on. */
+type MainAnswer = { green: Map<string, boolean>; head: string; waitedMs: number };
+type How = { adapter: TargetAdapter; timeoutMs: number; slot: Slot };
+type Ask = How & { files: string[]; at: number; res: (a: MainAnswer) => void; rej: (e: unknown) => void };
+/** Questions to main waiting for its turn, per main dir: one turn answers all of them with one run. */
+const asks = new Map<string, Ask[]>();
+/** Neighbour files lanes asked main about lately (when, and how to run them), per main dir: run again after a merge. */
+const asked = new Map<string, { how: How; files: Map<string, number> }>();
+/** How long a file asked about is run again after merges. */
+const WARM_FOR_MS = 60 * 60_000;
+
+/**
+ * Asks main whether `files` pass there. One run on main at a time (the test command may clear main's caches while
+ * another run boots); lanes that ask while main is busy are answered together by the next turn, with one run of
+ * all their files, instead of one turn each.
+ */
+function askMain(main: string, files: string[], how: How, warm = false): Promise<MainAnswer> {
+	if (!warm) {
+		const seen = asked.get(main) ?? { how, files: new Map<string, number>() };
+		seen.how = how;
+		for (const f of files) seen.files.set(f, Date.now());
+		asked.set(main, seen);
+	}
+	return new Promise((res, rej) => {
+		asks.set(main, [...(asks.get(main) ?? []), { ...how, files, at: Date.now(), res, rej }]);
+		void onMain(async () => {
+			const batch = asks.get(main) ?? [];
+			if (!batch.length) return; // an earlier turn answered it
+			asks.delete(main);
+			const timeoutMs = Math.max(...batch.map((a) => a.timeoutMs));
+			const test = (dir: string, f: string[]) => batch[0]!.slot(() => runTests(batch[0]!.adapter, dir, f, timeoutMs));
+			try {
+				const r = await greenThere(main, [...new Set(batch.flatMap((a) => a.files))], test);
+				for (const a of batch) a.res({ ...r, waitedMs: Date.now() - a.at });
+			} catch (e) {
+				for (const a of batch) a.rej(e);
+			}
+		});
+	});
+}
+
+/**
+ * After a merge main's tree is new and every kept answer is old: the neighbour files lanes asked about in the last
+ * hour run on it now, on the side, so a lane's next gate finds the answer instead of waiting for main's turn.
+ */
+export async function warmMainCache(): Promise<void> {
+	const runs: Array<Promise<unknown>> = [];
+	for (const [main, { how, files }] of asked) {
+		for (const [f, at] of files) if (Date.now() - at > WARM_FOR_MS) files.delete(f);
+		if (files.size && existsSync(main)) runs.push(askMain(main, [...files.keys()], how, true).catch(() => undefined));
+	}
+	await Promise.all(runs);
+}
+
+/** Which of `files` pass on main (its checkout at `main`), from the kept answers for main's tree or a run there. */
+async function greenThere(main: string, files: string[], test: (dir: string, files: string[]) => Promise<TestRun>): Promise<{ green: Map<string, boolean>; head: string }> {
+	const headOf = async () => {
+		try {
+			return (await exec("git", ["-C", main, "rev-parse", "HEAD", "HEAD^{tree}"])).trim().split("\n");
+		} catch {
+			return ["", ""]; // not a git checkout: nothing kept
+		}
+	};
+	const [head, tree] = await headOf();
+	const key = (t: string) => `${main}\0${tree}\0${t}`;
+	const green = new Map(files.filter((t) => tree && greenOnMain.has(key(t))).map((t) => [t, greenOnMain.get(key(t))!] as const));
+	for (const t of files) if (!green.has(t) && !existsSync(join(main, t))) green.set(t, false);
+	const present = files.filter((t) => !green.has(t));
+	// all of them at once first. Red on main too: the files the runner names failing are red, the rest run once
+	// more together; only when the runner names none (or that run is red too) file by file, which is slow with
+	// many files and one main run at a time across lanes
+	const all = present.length ? await test(main, present) : { ok: true, output: "" };
+	if (all.ok) for (const t of present) green.set(t, true);
+	else {
+		const red = all.output.endsWith("[timed out]") ? [] : failingFiles(all.output, present, main);
+		for (const t of red) green.set(t, false);
+		const rest = present.filter((t) => !red.includes(t));
+		if (red.length && rest.length && (await test(main, rest)).ok) for (const t of rest) green.set(t, true);
+		else for (const t of rest) green.set(t, (await test(main, [t])).ok);
+	}
+	// a result is kept only when main did not move during the run
+	if (tree && (await headOf())[1] === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
+	return { green, head: head ?? "" };
+}
+
 /**
  * The gate's ported-test run (check_my_code runs the same). The unit's own tests must pass. The area's other tests
  * then run too: one that fails counts against this unit only if it passes on main (this unit broke it), so a test red
  * on main already never blocks it. Main (`mainDir`, main's project checkout) runs only when a neighbour fails here,
  * and its answer is kept per main's tree. Without `mainDir` every neighbour failure counts.
+ * The worktree may be on an older main than the one asked: a neighbour main fixed since would fail here only for
+ * that. `catchUp` (the gate): main's new commits are brought in under the unit's work and the neighbours run again
+ * before they count; a clash with main counts none of them (the merge puts the code on the current main, and the
+ * gate after it checks them). Without it (the session's own checks) they do not count either: the gate decides.
  * `slot`: the gate pool slot, taken around each test run only, never while waiting for main's turn.
  */
-export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapter: TargetAdapter; dir: string; tests: string[]; mainDir?: string; timeoutMs: number; slot?: <T>(fn: () => Promise<T>) => Promise<T> }): Promise<TestRun> {
+export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapter: TargetAdapter; dir: string; tests: string[]; mainDir?: string; timeoutMs: number; slot?: Slot; catchUp?: boolean }): Promise<TestRun> {
 	const slot = o.slot ?? (<T>(fn: () => Promise<T>) => fn());
 	const test = (dir: string, files: string[]) => slot(() => runTests(o.adapter, dir, files, o.timeoutMs));
 	if (o.tests.length < 2) return test(o.dir, o.tests);
@@ -124,51 +215,107 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	if (n.ok) return { ...mine, output: `${mine.output}\n\nThe area's other ported tests (${others.length} file(s)) still pass.` };
 	const main = o.mainDir && existsSync(o.mainDir) && realpathSync(o.mainDir) !== realpathSync(o.dir) ? o.mainDir : undefined;
 	if (!main) return { ...n, output: `Your own tests pass; the area's other ported tests fail with your code:\n${n.output}` };
-	const treeOf = async () => {
-		try {
-			return (await exec("git", ["-C", main, "rev-parse", "HEAD^{tree}"])).trim();
-		} catch {
-			return ""; // not a git checkout: nothing kept
-		}
-	};
-	// one run on main at a time (the test command may clear main's caches while another run boots), and a result is
-	// kept only when main did not move during the run
-	const green = await onMain(async () => {
-		const tree = await treeOf();
-		const key = (t: string) => `${main}\0${tree}\0${t}`;
-		const green = new Map(others.filter((t) => tree && greenOnMain.has(key(t))).map((t) => [t, greenOnMain.get(key(t))!] as const));
-		for (const t of others) if (!green.has(t) && !existsSync(join(main, t))) green.set(t, false);
-		const present = others.filter((t) => !green.has(t));
-		// all of them at once first. Red on main too: the files the runner names failing are red, the rest run once
-		// more together; only when the runner names none (or that run is red too) file by file, which is slow with
-		// many files and one main run at a time across lanes
-		const all = present.length ? await test(main, present) : { ok: true, output: "" };
-		if (all.ok) for (const t of present) green.set(t, true);
-		else {
-			const fails = all.output.endsWith("[timed out]") ? [] : failureLines(all.output);
-			const red = present.filter((t) => fails.some((l) => l.includes(t)));
-			for (const t of red) green.set(t, false);
-			const rest = present.filter((t) => !red.includes(t));
-			if (red.length && rest.length && (await test(main, rest)).ok) for (const t of rest) green.set(t, true);
-			else for (const t of rest) green.set(t, (await test(main, [t])).ok);
-		}
-		if (tree && (await treeOf()) === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
-		return green;
-	});
-	const greenThere = others.filter((t) => green.get(t));
+	const ans = await askMain(main, others, { adapter: o.adapter, timeoutMs: o.timeoutMs, slot });
+	const mainWaitMs = ans.waitedMs;
+	const greenThere = others.filter((t) => ans.green.get(t));
 	const redThere = others.filter((t) => !greenThere.includes(t));
 	const note = redThere.length ? `\nwarning: ${redThere.length} test file(s) of other units ${FAIL_ON_MAIN_TOO}: ${redThere.join(", ")}` : "";
-	if (!greenThere.length) return { ...mine, output: `${mine.output}${note}` };
+	if (!greenThere.length) return { ...mine, output: `${mine.output}${note}`, mainWaitMs };
+	// the worktree on an older main than the one asked: they may fail here only for what main fixed since
+	if (ans.head && !(await holds(o.dir, ans.head))) {
+		const caught = o.catchUp ? await catchUpWithMain(o.dir, main, ans.head) : undefined;
+		const why = !o.catchUp ? "the gate brings main's new commits into your worktree first and checks them again" : caught && "clash" in caught ? `your code clashes with main's new commits in ${caught.clash.join(", ") || "some files"}: the merge puts it on the current main and they are checked after it` : undefined;
+		if (why) return { ...mine, output: `${mine.output}${note}\nwarning: ${greenThere.length} test file(s) of other units fail here and pass on main, but your worktree is on an older main, so they are ${STALE_NOT_COUNTED}: ${why}: ${greenThere.join(", ")}`, mainWaitMs };
+	}
 	const broke = await test(o.dir, greenThere);
-	if (broke.ok) return { ...mine, output: `${mine.output}${note}` };
-	// name only the files on the runner's failure lines (it may list passing files too), so the failing test still fits in a clipped report
-	const fails = failureLines(broke.output);
-	const named = greenThere.filter((t) => fails.some((l) => l.includes(t)));
-	return { ...broke, output: `Your own tests pass, but other units' tests in the area pass on main and fail with your code (${named.length ? named.join(", ") : `${greenThere.length} file(s)`}): fix your code (they may not be edited; a wrong one: report_migrated_bug with evidence).${note}\n${broke.output}` };
+	if (broke.ok) return { ...mine, output: `${mine.output}${note}`, mainWaitMs };
+	// name only the files the runner shows failing (it may list passing files too), so the failing test still fits in a clipped report
+	const named = failingFiles(broke.output, greenThere, o.dir);
+	return { ...broke, mainWaitMs, output: `Your own tests pass, but other units' tests in the area pass on main and fail with your code (${named.length ? named.join(", ") : `${greenThere.length} file(s)`}): fix your code (they may not be edited; a wrong one: report_migrated_bug with evidence).${note}\n${broke.output}` };
 }
 
-/** The test runner's failure lines in `out` ("FAIL x", "✗ x", "1) x"), without the marker. */
-export const failureLines = (out: string): string[] => [...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gm)].map((m) => m[1]!.trim());
+/** The note on a green run that did not count other units' tests because the worktree was on an older main. */
+export const STALE_NOT_COUNTED = "not counted against this unit yet";
+
+/** The test runner's failure lines in `out` ("FAIL x", "Failed x", "✗ x", "1) x"), without the marker. */
+export const failureLines = (out: string): string[] => [...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gim)].map((m) => m[1]!.trim());
+
+/**
+ * The files among `files` (project paths of a run in `dir`) the runner's output says failed: named on a failure
+ * line ("FAIL tests/a.spec", "Failed tests/ATest.php (exit 2)"), or in the trace of a numbered failure
+ * ("1) App\\Tests\\ATest::testX" … "<dir>/tests/ATest.php:75"), where the runner names the file of a test it calls
+ * by class. The runner's notice and deprecation lists name passing tests the same way: they are left out.
+ */
+export function failingFiles(out: string, files: string[], dir: string): string[] {
+	const lines = dropNoticeLists(out.split("\n")).kept;
+	const fails = failureLines(lines.join("\n"));
+	const dirs = [...new Set([dir, ...(existsSync(dir) ? [realpathSync(dir)] : [])])];
+	// the path itself, not the tail of a longer one (tests/a.spec in src/tests/a.spec), unless the run dir is in front
+	const names = (l: string, t: string) => {
+		for (let i = l.indexOf(t); i >= 0; i = l.indexOf(t, i + 1)) {
+			const before = l.slice(0, i);
+			if ((i === 0 || /[\s'"(\[]$/.test(before) || dirs.some((d) => before.endsWith(`${d}/`))) && !/[\w./-]/.test(l[i + t.length] ?? "")) return true;
+		}
+		return false;
+	};
+	// each numbered failure's lines, up to the next one or the next list heading
+	const traces: string[] = [];
+	for (const l of lines) {
+		if (/^\s*\d+\)\s+\S/.test(l)) traces.push("");
+		else if (/^(?:\d+ tests? triggered|There (?:was|were)) /i.test(l)) traces.push("\0");
+		else if (traces.length && !traces.at(-1)!.startsWith("\0")) traces[traces.length - 1] += `\n${l}`;
+	}
+	const inTrace = (t: string) => traces.some((b) => dirs.some((d) => b.includes(`${d}/${t}:`)));
+	return files.filter((t) => fails.some((l) => names(l, t)) || inTrace(t));
+}
+
+/** `sha` is in the history of the checkout at `dir` (true when git cannot say: nothing to bring in then). */
+async function holds(dir: string, sha: string): Promise<boolean> {
+	try {
+		await exec("git", ["-C", dir, "cat-file", "-e", `${sha}^{commit}`]);
+	} catch {
+		return true; // another repository (a clone): its main is not this one's
+	}
+	try {
+		await exec("git", ["-C", dir, "merge-base", "--is-ancestor", sha, "HEAD"]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Brings main's commits since the worktree was made into it, the work in it kept uncommitted on top as before: it is
+ * committed, the branch rebased onto main (`to`, else the commit main's checkout `mainDir` is on), and the commit
+ * undone. A clash with main leaves the worktree as it was and names the files. Nothing to bring in, or a worktree in
+ * the middle of a git operation: undefined.
+ */
+export async function catchUpWithMain(dir: string, mainDir: string, to?: string): Promise<{ commits: number } | { clash: string[] } | undefined> {
+	const git = async (args: string[]) => (await exec("git", ["-C", dir, "-c", "user.name=bigrefactor", "-c", "user.email=bigrefactor@localhost", ...args])).trim();
+	try {
+		const sha = to ?? (await exec("git", ["-C", mainDir, "rev-parse", "HEAD"])).trim();
+		if (await holds(dir, sha)) return undefined;
+		const busy = await Promise.all(["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"].map(async (p) => existsSync(await git(["rev-parse", "--path-format=absolute", "--git-path", p]))));
+		if (busy.some(Boolean) || (await git(["diff", "--name-only", "--diff-filter=U"]))) return undefined;
+		const before = await git(["rev-parse", "HEAD"]);
+		const commits = Number(await git(["rev-list", "--count", `HEAD..${sha}`]));
+		await git(["add", "-A"]);
+		const work = !!(await git(["diff", "--cached", "--name-only"]));
+		if (work) await git(["commit", "-q", "--no-verify", "-m", "wip: the unit's work while main's new commits are brought in"]);
+		try {
+			await git(["rebase", "-q", sha]);
+		} catch {
+			const clash = (await git(["diff", "--name-only", "--diff-filter=U"]).catch(() => "")).split("\n").filter(Boolean);
+			await git(["rebase", "--abort"]).catch(() => "");
+			await git(["reset", "-q", before]);
+			return { clash };
+		}
+		if (work) await git(["reset", "-q", "HEAD~1"]);
+		return { commits };
+	} catch {
+		return undefined; // no git answer: the worktree stays as it is
+	}
+}
 
 /** Runs the stack's test command on `files`; true when it exits 0 (all given tests pass). */
 export function testsPass(targetProjectDir: string, adapter: TargetAdapter, files: string[]): Promise<boolean> {

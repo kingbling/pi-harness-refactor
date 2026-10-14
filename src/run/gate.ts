@@ -12,7 +12,7 @@ import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
 import { setStep } from "./watchdog.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
-import { FAIL_ON_MAIN_TOO, runPortedTests } from "./ported.ts";
+import { FAIL_ON_MAIN_TOO, runPortedTests, STALE_NOT_COUNTED } from "./ported.ts";
 import { exec } from "../proc.ts";
 
 /**
@@ -68,6 +68,8 @@ export interface GateStep {
 	ms: number;
 	/** Time the step held a gate slot (the wait for one not counted); what `br lanes` measures gate load by. */
 	slotMs?: number;
+	/** ported_tests_green: time spent waiting for main's answer on other units' tests (main's queue and its run there), slots not counted. */
+	mainWaitMs?: number;
 	output: string;
 }
 export interface GateReport {
@@ -102,7 +104,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 				slotMs += Date.now() - t0;
 			}
 		});
-	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number; judged?: boolean }>) => {
+	const step = async (name: EvidenceType, fn: () => Promise<{ ok: boolean; output: string; exitCode?: number; judged?: boolean; mainWaitMs?: number }>) => {
 		setStep(`gate ${g.unitId}: ${name}`);
 		const t0 = Date.now();
 		slotMs = 0;
@@ -110,7 +112,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 		const ms = Date.now() - t0;
 		// cut output is saved whole in the unit's sessions folder: the prompt names the file
 		const full = g.root ? join(g.root, ".bigrefactor", "sessions", `${g.unitId}.${name}.log`) : undefined;
-		steps.push({ name, ok: r.ok, ms, slotMs: holding ? ms : slotMs, output: clipOutput(r.output, 6000, full), exitCode: r.exitCode });
+		steps.push({ name, ok: r.ok, ms, slotMs: holding ? ms : slotMs, ...(r.mainWaitMs ? { mainWaitMs: r.mainWaitMs } : {}), output: clipOutput(r.output, 6000, full), exitCode: r.exitCode });
 		if (r.ok) g.ledger.addEvidence(g.unitId, name, { ms, ...(r.judged === false ? { judged: false, note: r.output.slice(0, 300) } : {}) });
 		return r.ok;
 	};
@@ -211,10 +213,11 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// a unit the tester found without runtime behaviour (a pure contract, constants) has nothing to pin: no tests to run
 	const none = !cases && !g.testFiles.length ? noBehaviour(g.ledger, g.unitId) : undefined;
 	// the check ran exactly the gate's test files: its green run stands (the tree is the same). Not when it excused
-	// another unit's test as red on main too: main may have been fixed since, so the gate asks main again
+	// another unit's test as red on main too (main may have been fixed since, so the gate asks main again), or left
+	// some uncounted because the worktree was on an older main (the gate brings main's new commits in first)
 	const tests = g.testFiles.map((x) => x.path);
-	const checked = !!g.cleanCheck && tests.length > 0 && !g.cleanCheck.text.includes(FAIL_ON_MAIN_TOO) && [...g.cleanCheck.tests].sort().join("\0") === [...tests].sort().join("\0");
-	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : checked ? Promise.resolve({ ok: true, output: `${fromCheck}\n${clipOutput(g.cleanCheck!.text, 1000)}` }) : runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests, mainDir: g.mainDir, timeoutMs: timeout, slot: cpu }))))) return done();
+	const checked = !!g.cleanCheck && tests.length > 0 && !g.cleanCheck.text.includes(FAIL_ON_MAIN_TOO) && !g.cleanCheck.text.includes(STALE_NOT_COUNTED) && [...g.cleanCheck.tests].sort().join("\0") === [...tests].sort().join("\0");
+	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : checked ? Promise.resolve({ ok: true, output: `${fromCheck}\n${clipOutput(g.cleanCheck!.text, 1000)}` }) : runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests, mainDir: g.mainDir, timeoutMs: timeout, slot: cpu, catchUp: true }))))) return done();
 
 	// 8. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
 	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
