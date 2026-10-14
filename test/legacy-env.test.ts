@@ -63,6 +63,14 @@ describe("the old code's environment", () => {
 		expect((await verifyTruthOnOld(truthDir, config, source, root)).error).toMatch(/could not connect/);
 	});
 
+	it("a case with no expected key is refused with a reason (null is a value, a missing key is not)", async () => {
+		const { root, legacy, truthDir, config, source } = workspace();
+		writeFileSync(join(legacy, "app.sh"), `echo '[{"symbol":"a::b","inputs":[],"expected":null},{"symbol":"a::b","inputs":[1]}]'\n`);
+		expect(await verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: false, error: expect.stringMatching(/1 case\(s\) without an "expected" key/) });
+		writeFileSync(join(legacy, "app.sh"), `echo '[{"symbol":"a::b","inputs":[],"expected":null}]'\n`);
+		expect(await verifyTruthOnOld(truthDir, config, source, root)).toMatchObject({ ok: true });
+	});
+
 	it("the run command can change, but must run the script", async () => {
 		const { root, config, source } = workspace();
 		expect((await call(legacyRunTool(root, config), { cmd: "true", args: [], why: "cheat" })).content[0]!.text).toMatch(/refused/);

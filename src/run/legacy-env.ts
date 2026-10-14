@@ -147,8 +147,11 @@ export async function verifyTruthOnOld(truthDirAbs: string, config: Config, sour
 		const cases = lastJsonArray(out) as TruthCase[] | undefined;
 		if (!cases) return { ok: false, cases: [], error: `${source.truth.scriptName} printed no JSON array of cases at its end; its output ends with:\n${out.trim().slice(-800) || "(nothing)"}` };
 		if (!Array.isArray(cases) || !cases.length) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `${source.truth.scriptName} printed no cases ${NO_CASES_HINT}` };
-		const bad = cases.filter((c) => typeof c.symbol !== "string");
+		const bad = cases.filter((c) => typeof c?.symbol !== "string");
 		if (bad.length) return { ok: false, cases: [], error: `${bad.length} cases without a symbol id` };
+		// a case with no expected key cannot be stored or compared (null is a value; a missing key is not)
+		const noExpected = cases.filter((c) => !("expected" in c)).length;
+		if (noExpected) return { ok: false, cases: [], error: `${noExpected} case(s) without an "expected" key: every case prints what the old code returned (null when it returned nothing)` };
 		const invented = legacyFiles ? notFromOldCode(readFileSync(script, "utf8"), cases, legacyFiles) : undefined;
 		if (invented) return { ok: false, cases: [], error: invented };
 		// a value that changes from run to run (a timestamp, a random id, hash order) is no truth: no new code can match it
