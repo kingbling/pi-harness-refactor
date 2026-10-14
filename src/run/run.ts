@@ -1178,10 +1178,16 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	}
 	process.off("SIGINT", onSigint);
 	setStep("finishing the run");
-	if (parityProbe) await waitOn("checking whether the old and the new app start", () => parityProbe);
-	// a stop finishes the running parity check only; otherwise the queued slices are compared before the run ends
-	if (stopRecord) parityStopped = true;
-	while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
+	// a stop (the owner's, new plugin code, Pi gone) does not wait for the comparison with the old app: one check can take
+	// an hour (data dumps, setup fix-ups) and holds the next run back; the next run compares the slices again.
+	// Without a stop the queued slices are compared before the run ends.
+	if (stopRecord) {
+		parityStopped = true;
+		if (parityRunning || parityQueue.length) log(pc.dim("the comparison with the old app is left for the next run"));
+	} else {
+		if (parityProbe) await waitOn("checking whether the old and the new app start", () => parityProbe);
+		while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
+	}
 	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
 	// a stub sweep's code job finishes (it merges on main) before the run ends

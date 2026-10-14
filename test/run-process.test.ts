@@ -30,7 +30,7 @@ const until = async (what: string, ok: () => boolean, ms = 20_000) => {
 };
 
 /** The decisions-during-run workspace: framework decisions left open for the run to ask. */
-async function makeWorkspace(ws: string) {
+async function makeWorkspace(ws: string, run: Record<string, unknown> = {}) {
 	rmSync(ws, { recursive: true, force: true });
 	mkdirSync(join(ws, "legacy", "myfw"), { recursive: true });
 	cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
@@ -39,7 +39,7 @@ async function makeWorkspace(ws: string) {
 	writeFileSync(join(ws, "legacy", "index.php"), `<?php\nrequire 'src/uses_registry.php';\nuses_registry();\n`);
 	mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
 	writeFileSync(join(ws, ".bigrefactor", "framework-profile.json"), JSON.stringify({ id: "myfw", frameworkDirs: ["myfw/"], loaders: [], concerns: [] }));
-	const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+	const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {}, run });
 	writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
 	process.env["BR_WORKSPACE"] = ws;
 	const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
@@ -200,15 +200,40 @@ describe("migration run in its own process", () => {
 		progress.end();
 	}, 60_000);
 
-	it("when Pi goes away the child stops its run and exits", async () => {
+	it("a higher plugin version does not restart a run unless the owner turned that on (run.restartOnNewCode)", async () => {
+		const repo = join(here, ".sim", "plugin-head-off");
+		rmSync(repo, { recursive: true, force: true });
+		mkdirSync(repo, { recursive: true });
+		writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "p", version: "0.1.0" }));
 		const tsx = pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href;
-		const child = fork(join(here, "src", "run", "run-child.ts"), [JSON.stringify({ cwd: ws, flags: [], hasUI: false, job: "migration run" })], { cwd: ws, execArgv: ["--import", tsx], stdio: ["ignore", "pipe", "pipe", "ipc"], env: { ...process.env, BR_RUN_CHILD: "1", BR_RUN_CHILD_SCHEDULER: fake } });
+		const child = fork(join(here, "src", "run", "run-child.ts"), [JSON.stringify({ cwd: ws, flags: [], hasUI: false, job: "migration run", head: "0.1.0" })], { cwd: ws, execArgv: ["--import", tsx], stdio: ["ignore", "pipe", "pipe", "ipc"], env: { ...process.env, BR_RUN_CHILD: "1", BR_RUN_CHILD_SCHEDULER: fake, BR_PLUGIN_DIR: repo, BR_NEW_CODE_CHECK_MS: "100", BR_NEW_CODE_QUIET_MS: "200" } });
+		const exited = new Promise<number | null>((r) => child.on("exit", (code) => r(code)));
+		let started = false;
+		let newCode = false;
+		child.on("message", (m: any) => {
+			started ||= m.type === "progress" && m.snap.steps.some((s: any) => s.name === "U1_fake");
+			newCode ||= m.type === "progress" && m.snap.activity.some((l: string) => l.includes("the plugin has new code"));
+		});
+		await until("the unit step", () => started);
+		writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "p", version: "0.2.0" }));
+		await new Promise((r) => setTimeout(r, 1500));
+		expect(newCode).toBe(false);
+		child.disconnect();
+		expect(await exited).toBe(0);
+	}, 60_000);
+
+	it("when Pi goes away (the owner quit it) the child aborts its units at once and exits", async () => {
+		const tsx = pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href;
+		// a unit that would take 30 s to finish after a plain stop
+		const child = fork(join(here, "src", "run", "run-child.ts"), [JSON.stringify({ cwd: ws, flags: [], hasUI: false, job: "migration run" })], { cwd: ws, execArgv: ["--import", tsx], stdio: ["ignore", "pipe", "pipe", "ipc"], env: { ...process.env, BR_RUN_CHILD: "1", BR_RUN_CHILD_SCHEDULER: fake, BR_FAKE_DRAIN_MS: "30000" } });
 		const exited = new Promise<number | null>((r) => child.on("exit", (code) => r(code)));
 		let started = false;
 		child.on("message", (m: any) => (started ||= m.type === "progress" && m.snap.steps.some((s: any) => s.name === "U1_fake")));
 		await until("the unit step", () => started);
+		const t = Date.now();
 		child.disconnect();
 		expect(await exited).toBe(0);
+		expect(Date.now() - t).toBeLessThan(10_000);
 	}, 60_000);
 });
 
@@ -225,7 +250,8 @@ describe("a run that outlives plugin changes", () => {
 	const has = (s: string) => progress.snapshot().activity.some((l) => l.includes(s));
 	const env = { BR_RUN_CHILD_SCHEDULER: fake, BR_PLUGIN_DIR: repo, BR_NEW_CODE_CHECK_MS: "100", BR_NEW_CODE_QUIET_MS: "300" };
 	beforeAll(async () => {
-		await makeWorkspace(ws);
+		// the owner turned the restart on (it is off by default)
+		await makeWorkspace(ws, { restartOnNewCode: true });
 		rmSync(repo, { recursive: true, force: true });
 		mkdirSync(repo, { recursive: true });
 		commit("one");
@@ -267,7 +293,7 @@ describe("a run that outlives plugin changes", () => {
 
 	it("a decision dialog open across a restart: answered during the drain, the new run process applies it once; the question cards wait for it", async () => {
 		const ws4 = join(here, ".sim", "run-process-restart-dialog");
-		await makeWorkspace(ws4);
+		await makeWorkspace(ws4, { restartOnNewCode: true });
 		process.env["BR_WORKSPACE"] = ws;
 		process.env["BR_FAKE_DRAIN_MS"] = "1500";
 		progress.begin("migration run");

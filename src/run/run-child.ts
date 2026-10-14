@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { join } from "node:path";
 import pc from "picocolors";
 import { findConfigPath, loadConfig, STATE_DIR } from "../config.ts";
@@ -126,7 +127,8 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 		// Only a plain run starts again on new plugin code: a pilot (--limit), --units, --slice or --dry is a
 		// one-off whose count or scope a second process would not know, so it keeps the code it started on.
 		const plain = !dry && !["--limit", "--units", "--slice"].some((f) => flags.includes(f));
-		if (plain) void watchNewCode(a.head);
+		// off unless the owner turns it on (run.restartOnNewCode): a change to the plugin must not restart a run by itself
+		if (plain && loadConfig(cp).config.run.restartOnNewCode) void watchNewCode(a.head);
 		// a run never dies on an error: it starts again after a pause (longer each time), until /br stop
 		// (errors in a pass are caught inside the scheduler; what reaches here happened while no unit ran)
 		let r: Awaited<ReturnType<typeof runScheduler>>;
@@ -188,11 +190,12 @@ async function main(a: ChildArgs) {
 			if (decisionsDone) send({ type: "decisions-done" });
 		}
 	});
-	// Pi is gone: same as /br stop (running units finish), then the process ends; open dialogs get no answer
+	// Pi is gone (the owner quit it): the model sessions and commands end at once, units keep the code they wrote,
+	// and the process ends, so nothing holds the workspace for the next br run; open dialogs get no answer
 	process.on("disconnect", () => {
 		for (const done of answers.values()) done(undefined);
 		answers.clear();
-		if (progress.running && !progress.stopping) void progress.stop("drain");
+		if (progress.running && !progress.aborting) void progress.stop("abort");
 	});
 	// a stray error in a lane must not end the whole run (inside Pi the host caught these)
 	process.on("uncaughtException", (e) => progress.log(pc.red(`run error: ${String(e?.stack ?? e).slice(0, 600)}`)));
@@ -221,7 +224,29 @@ async function main(a: ChildArgs) {
 	if (process.connected) await new Promise((r) => process.send!({ type: "done", ok: !out.error, ...out, ...(restart ? { restart } : {}) } satisfies FromChild, r));
 	// Pi's job ends now; a decision dialog still open there is saved here when answered, then the process ends
 	await asking.catch(() => undefined);
+	// nothing the run started outlives it (a comparison left at a stop may still run a data dump or a model session)
+	await stopLeftovers();
 	process.exit(0);
+}
+
+/** Ends the processes this run process started that are still going (children and their children). */
+export async function stopLeftovers(root = process.pid): Promise<number[]> {
+	const out = await new Promise<string>((done) => execFile("ps", ["-A", "-o", "pid=,ppid="], (_e, so) => done(String(so ?? ""))));
+	const kids = new Map<number, number[]>();
+	for (const l of out.split("\n")) {
+		const [pid, ppid] = l.trim().split(/\s+/).map(Number);
+		if (pid && ppid !== undefined) kids.set(ppid, [...(kids.get(ppid) ?? []), pid]);
+	}
+	const all: number[] = [];
+	for (let next = kids.get(root) ?? []; next.length; next = next.flatMap((p) => kids.get(p) ?? [])) all.push(...next);
+	for (const pid of all) {
+		try {
+			process.kill(pid, "SIGTERM");
+		} catch {
+			// already gone
+		}
+	}
+	return all;
 }
 
 if (process.env["BR_RUN_CHILD"] === "1" && process.send) void main(JSON.parse(process.argv[2] ?? "{}") as ChildArgs);

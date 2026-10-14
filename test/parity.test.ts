@@ -132,7 +132,7 @@ describe("starting the apps for parity", () => {
 		const tick = setInterval(() => ((worst = Math.max(worst, performance.now() - last)), (last = performance.now())), 10);
 		try {
 			const r = dumpData({ ...asRecipe(serverRecipe(port)), dump: { cmd: process.execPath, args: ["-e", `process.stdout.write(JSON.stringify({ t: ['x'.repeat(${bytes})] }))`] } }, legacy);
-			await expect(r).rejects.toThrow(new RegExp(`the dump printed ${MAX_DUMP_MB + 1} MB, more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables`));
+			await expect(r).rejects.toThrow(new RegExp(`the dump printed more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables`));
 		} finally {
 			clearInterval(tick);
 		}

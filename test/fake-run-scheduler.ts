@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import type { SchedulerOptions, SchedulerResult } from "../src/run/run.ts";
 import { startWatchdog } from "../src/run/watchdog.ts";
+import { progress } from "../src/progress.ts";
 
 /**
  * A scripted scheduler for the run process test (BR_RUN_CHILD_SCHEDULER): starts one unit, then waits until the run
@@ -40,7 +41,8 @@ export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult
 	while (!(why = o.shouldStop?.())) await new Promise((r) => setTimeout(r, 50));
 	log(`fake: stop (${why === true ? "/br stop" : why})`);
 	const drain = Number(process.env["BR_FAKE_DRAIN_MS"] ?? 0);
-	if (drain) await new Promise((r) => setTimeout(r, drain));
+	// an abort ends the model sessions at once (a drain lets the unit finish)
+	for (const t = Date.now(); drain && Date.now() - t < drain && !progress.aborting; ) await new Promise((r) => setTimeout(r, 50));
 	log("✓ U1_fake accepted  (fake)");
 	return { ran: [], accepted: 1, quarantined: 0, waiting: 2, costUsd: 0 };
 }

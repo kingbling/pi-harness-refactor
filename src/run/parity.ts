@@ -289,24 +289,33 @@ export const MAX_DUMP_MB = 100;
 export async function dumpData(recipe: AppRecipe, appDir: string): Promise<Record<string, unknown[]>> {
 	if (!recipe.dump) return {};
 	setStep(`parity: data dump of the app in ${appDir}`);
-	// stdout goes to a file, not a buffer: a real database dump is easily bigger than any buffer
-	const tmp = mkdtempSync(join(tmpdir(), "br-dump-"));
-	let outText: string;
-	try {
-		const fd = openSync(join(tmp, "dump.json"), "w");
-		try {
-			// a real database dump takes minutes (all tables as JSON)
-			await exec(recipe.dump.cmd, recipe.dump.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, timeout: 600_000, maxBuffer: 64 * 1024 * 1024, stdout: fd });
-		} finally {
-			closeSync(fd);
-		}
-		// too big: not read at all (the size alone says so), and the setup model learns what to change
-		const mb = statSync(join(tmp, "dump.json")).size / (1024 * 1024);
-		if (mb > MAX_DUMP_MB) throw new Error(`the dump printed ${Math.round(mb)} MB, more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables the app's routes write, not the whole database`);
-		outText = await readFile(join(tmp, "dump.json"), "utf8");
-	} finally {
-		await rm(tmp, { recursive: true, force: true });
-	}
+	// stdout is counted as it comes: a dump over the limit (a whole production database) is stopped there, not written out
+	const outText = await new Promise<string>((done, fail) => {
+		const child = spawn(recipe.dump!.cmd, recipe.dump!.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, stdio: ["ignore", "pipe", "pipe"] });
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let err = "";
+		let tooBig = false;
+		// a real database dump takes minutes (all tables as JSON)
+		const timer = setTimeout(() => child.kill("SIGKILL"), 600_000);
+		child.stdout.on("data", (c: Buffer) => {
+			if (tooBig) return;
+			size += c.length;
+			if (size > MAX_DUMP_MB * 1024 * 1024) {
+				tooBig = true;
+				child.kill("SIGKILL");
+			} else chunks.push(c);
+		});
+		child.stderr.on("data", (c: Buffer) => (err = (err + c.toString()).slice(-4000)));
+		child.on("error", (e) => (clearTimeout(timer), fail(e)));
+		child.on("close", (code, signal) => {
+			clearTimeout(timer);
+			// too big: the setup model learns what to change
+			if (tooBig) fail(new Error(`the dump printed more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables the app's routes write, not the whole database`));
+			else if (code !== 0) fail(new Error(`the dump command failed (${signal ?? `exit ${code}`}): ${err.trim().slice(-1000)}`));
+			else done(Buffer.concat(chunks).toString("utf8"));
+		});
+	});
 	const data = JSON.parse(outText.slice(outText.indexOf("{"))) as unknown;
 	if (!data || typeof data !== "object" || Array.isArray(data) || !Object.values(data).every(Array.isArray)) throw new Error('the dump must print {"table": [rows]}');
 	return data as Record<string, unknown[]>;
