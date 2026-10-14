@@ -207,22 +207,44 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).parkedWhy).toBeUndefined();
 	});
 
-	it("a unit a model parked gets one more try when the plugin changed after the park", async () => {
+	it("a unit a model parked gets one more try when the plugin changed after the park in a way that touches it", async () => {
 		const { root, config, ledger, mk } = await workspace();
 		const { healQuarantined } = await import("../src/run/run.ts");
 		mk("U1", "billing", "implementing");
 		ledger.transitionUnit("U1", "quarantined", "a code job wrote it but was not merged: protected config was changed");
 		const parkedAt = Date.now() - 60_000;
-		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "protected config was changed", parkedAt } });
-		const heal = (pluginChangedAt: number) => healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: 0, pluginChangedAt });
-		expect(await heal(parkedAt - 1000)).toEqual([]); // the plugin is older than the park
-		expect(await heal(parkedAt + 1000)).toEqual(["U1"]);
-		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ retryNote: expect.stringMatching(/^This unit was parked \(protected config was changed\); the migration tool changed since/) });
+		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "protected config was changed", parkedAt, autoHeals: 1 } });
+		const asked: string[] = [];
+		const heal = (pluginChangedAt: number, pluginChanges: string, touches?: boolean) =>
+			healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {
+				since: 0,
+				pluginChangedAt,
+				pluginChanges: async () => pluginChanges,
+				client: touches === undefined ? undefined : new FakeModelClient({ decide: (req) => (asked.push(String((req.state as { changes: string }).changes)), { touches: touches ? 0.9 : 0.1 }) }),
+			});
+		expect(await heal(parkedAt - 1000, "abc1 code jobs may change app config")).toEqual([]); // the plugin is older than the park
+		expect(await heal(parkedAt + 1000, "")).toEqual([]); // newer files but no commit since the park: nothing changed
+		// the plugin's changes do not touch what parked it (the decide model reads them): it stays, and is not asked again for that plugin
+		expect(await heal(parkedAt + 2000, "abc2 the stop reaches running units", false)).toEqual([]);
+		expect(asked).toEqual([expect.stringMatching(/abc2 the stop reaches running units/)]);
+		expect(await heal(parkedAt + 2000, "abc2 the stop reaches running units", true)).toEqual([]);
+		expect(asked).toHaveLength(1);
+		// a later change that touches it: one more try, counted
+		expect(await heal(parkedAt + 3000, "abc3 code jobs may change app config", true)).toEqual(["U1"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 2, retryNote: expect.stringMatching(/^This unit was parked \(protected config was changed\); the migration tool changed since in a way that may fix it, so it runs again \(automatic try 2 of/) });
 		// parked again after that try: the same plugin does not bring it back
 		ledger.transitionUnit("U1", "implementing", "x");
 		ledger.transitionUnit("U1", "quarantined", "still red");
 		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "still red", parkedAt: Date.now() } });
-		expect(await heal(parkedAt + 1000)).toEqual([]);
+		expect(await heal(parkedAt + 3000, "abc3 code jobs may change app config")).toEqual([]);
+		// its automatic tries used up: a plugin change does not bring it back either
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals } });
+		expect(await heal(Date.now() + 1000, "abc4 code jobs may change app config")).toEqual([]);
+	});
+
+	it("the plugin's changes come from its own git history: each commit's subject and files", async () => {
+		const { pluginChangesSince } = await import("../src/run/run.ts");
+		expect(await pluginChangesSince(0)).toMatch(/^[0-9a-f]{7,} \S[\s\S]*\| +\d+/);
 	});
 
 	it("a model's leave on a waiting unit's question parks it with the model's reason; the owner's leave does not", async () => {

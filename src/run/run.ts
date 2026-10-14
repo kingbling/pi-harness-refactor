@@ -1380,6 +1380,21 @@ export const PLUGIN_TIME = (() => {
 	return t;
 })();
 
+/**
+ * What changed in the plugin since `t`: its commits (subject and files) and what is not committed yet. Empty when
+ * nothing did (a newer file time alone, as after a checkout, is no change).
+ */
+export async function pluginChangesSince(t: number): Promise<string> {
+	const repo = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+	try {
+		const commits = (await exec("git", ["-C", repo, "log", `--since=${new Date(t).toISOString()}`, "--format=%h %s", "--stat"])).trim();
+		const open = (await exec("git", ["-C", repo, "diff", "--stat", "HEAD"])).trim();
+		return [commits, open && `not committed yet:\n${open}`].filter(Boolean).join("\n\n");
+	} catch {
+		return PLUGIN_TIME > t ? "the plugin itself was updated (its git history could not be read)" : "";
+	}
+}
+
 /** The files whose change may fix a quarantined unit of one stack: its setup fixes and gate commands, its dependency manifests, the old code's environment. */
 function fixFiles(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string): string[] {
 	return [join(root, ".bigrefactor", "legacy-env.json"), join(root, ".bigrefactor", "legacy-env.log"), ...setupFiles(root, stackId), ...(manifests.get(stackId)?.toolchain.manifestFiles ?? []).map((m) => join(projectDir(config, stackId), m))];
@@ -1422,7 +1437,10 @@ async function changesSince(config: Config, root: string, manifests: Map<string,
 		out.push(`fix: ${line}${diff ? `\n${capText(diff, 4000)}` : ""}`);
 	}
 	for (const f of fixFiles(config, root, manifests, stackId)) if (f !== logFile && mtime(f) > t) out.push(`changed: ${relative(root, f)}`);
-	if (PLUGIN_TIME > t) out.push("the plugin itself was updated");
+	if (PLUGIN_TIME > t) {
+		const plugin = await pluginChangesSince(t);
+		if (plugin) out.push(`the plugin itself changed:\n${capText(plugin, 3000)}`);
+	}
 	return out.join("\n\n");
 }
 
@@ -1594,7 +1612,7 @@ async function changeTouches(d: { ledger: Ledger; config: Config; client: ModelC
  * with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model tries first, one
  * question per kind of failure), and the answer is applied here. A requeue here keeps the unit's code (keepUnitWork).
  */
-export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient; pluginChangedAt?: number } = {}): Promise<string[]> {
+export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient; pluginChangedAt?: number; pluginChanges?: (since: number) => Promise<string> } = {}): Promise<string[]> {
 	const pluginAt = o.pluginChangedAt ?? PLUGIN_TIME;
 	// one change time per stack per pass
 	const sinces = new Map<string, number>();
@@ -1603,7 +1621,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginChecked?: number };
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
 		const failure = errorSignature("quarantine", r.reason ?? "");
@@ -1621,12 +1639,20 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// a unit a model parked waits for a change on main after the park, past its automatic tries (the owner's leave stands)
 		const parked = meta.healQuestion === 0 && !!meta.parkedWhy && since > (meta.parkedAt ?? 0);
 		const mayRun = (meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && (meta.stuck || !meta.healQuestion)) || parked;
-		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change), so one
-		// more try, once per park (a park after the try is newer than the plugin)
-		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0)) {
-			await backInQueue(ledger, config, root, r.id, heals, `This unit was parked (${meta.parkedWhy}); the migration tool changed since, so it runs again. Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
-			back.push(r.id);
-			continue;
+		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change). One
+		// more try when the plugin's own changes since the park touch what parked it (the decide model reads them, as for
+		// a change on main), counted against the automatic tries; asked once per plugin version
+		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0) && (meta.pluginChecked ?? 0) < pluginAt && heals < config.run.maxAutoHeals) {
+			const changes = await (o.pluginChanges ?? pluginChangesSince)(meta.parkedAt ?? 0);
+			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			// the decide model is unavailable: asked next pass
+			if (touches === undefined) continue;
+			if (touches) {
+				await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was parked (${meta.parkedWhy}); the migration tool changed since in a way that may fix it, so it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
+				back.push(r.id);
+				continue;
+			}
+			ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.pluginChecked', ?) WHERE id = ?").run(pluginAt, r.id);
 		}
 		if (changed && mayRun) {
 			// a change the decide model already said does not touch this failure is not asked about again
