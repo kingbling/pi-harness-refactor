@@ -9,7 +9,8 @@ import { FakeModelClient } from "../src/models/fake.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { runUnit } from "../src/run/unit.ts";
 import type { LeafSession, SpawnOptions } from "../src/sessions/spawn.ts";
-import { disputeTestTool, type ToolDeps } from "../src/sessions/tools.ts";
+import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
+import { disputeTestTool, MAX_REPORTS_PER_RUN, reportMigratedBugTool, type ToolDeps } from "../src/sessions/tools.ts";
 
 /**
  * One model tells another to fix things after it handed its work in: the implementer disputes a test (the tester
@@ -424,12 +425,7 @@ describe("models fix each other's work", () => {
 	});
 
 	it("a bug in another unit's accepted code re-opens that unit; this unit waits for it as a dependency", async () => {
-		ledger.db.prepare("INSERT INTO files(path, hash, lang, updated_at) VALUES ('app/money.php', 'h', 'php', 't')").run();
-		ledger.db.prepare("INSERT INTO symbols(id, path, kind, name, state, updated_at) VALUES ('app/money.php::net', 'app/money.php', 'function', 'net', 'accepted', 't')").run();
-		ledger.createUnit({ id: "d1", tier: "T0", deps: [], meta: {}, symbolIds: ["app/money.php::net"] });
-		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'd1'").run();
-		ledger.db.prepare("UPDATE symbols SET state = 'accepted' WHERE id = 'app/money.php::net'").run();
-		ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES ('d1', 'app/money.php::net', 'moved', '[\"src/shared/money/price.ts::netPrice\"]', 'x', 't')").run();
+		acceptedOwner();
 		const calls: Call[] = [];
 		let gates = 0;
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls, { name: "report_migrated_bug", args: { target: "src/shared/money/price.ts::netPrice", problem: "ignores the agency discount", evidence: "money.php line 12 subtracts it" } }), gate: async (g) => (gates++, green(g)), log: () => {} });
@@ -440,5 +436,42 @@ describe("models fix each other's work", () => {
 		expect(ledger.getSymbol("app/money.php::net")!.state).toBe("clustered");
 		expect(JSON.parse(ledger.getUnit("u1")!.deps)).toContain("d1");
 		expect(ledger.hasEvidence("d1", "bug_reported")).toBe(true);
+		// the wait is no fresh set of tries: the reporter's next run goes on counting
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).triesUsed).toBe(1);
+	});
+
+	it("a report on a file the reporter changed itself is refused; so is a third report round in one run", async () => {
+		acceptedOwner();
+		const dir = join(ws, "migrated");
+		write(join(dir, "src/shared/money/price.ts"), "export const netPrice = (p: number) => p;\n");
+		execFileSync("git", ["init", "-q"], { cwd: dir });
+		execFileSync("git", ["add", "-A"], { cwd: dir });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main"], { cwd: dir });
+		const reports: string[] = [];
+		const runStartedAt = new Date(Date.now() - 60_000).toISOString();
+		const tool = reportMigratedBugTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: dir, adapter: nestjsAdapter, runStartedAt, onReport: (r) => reports.push(r.owner) } as ToolDeps) as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }> }> };
+		const report = async () => (await tool.execute("x", { target: "src/shared/money/price.ts::netPrice", problem: "ignores the discount", evidence: "money.php line 12" })).content[0]!.text;
+		write(join(dir, "src/shared/money/price.ts"), "export const netPrice = (p: number) => p * 2;\n");
+		expect(await report()).toMatch(/changed in this unit's own worktree[\s\S]*git diff -- src\/shared\/money\/price\.ts/);
+		expect(reports).toEqual([]);
+		execFileSync("git", ["checkout", "-q", "--", "."], { cwd: dir });
+		// this unit already waited on its reports twice in this run (an earlier run's waits do not count)
+		const wait = (at: string) => ledger.db.prepare("INSERT INTO attempts(unit_id, role, started_at, ended_at, outcome) VALUES ('u1', 'implement', ?, ?, 'waits_on_fix')").run(at, at);
+		wait(new Date(Date.now() - 3_600_000).toISOString());
+		for (let i = 1; i < MAX_REPORTS_PER_RUN; i++) wait(new Date().toISOString());
+		expect(await report()).toMatch(/^reported to d1/);
+		wait(new Date().toISOString());
+		expect(await report()).toMatch(/already waited 2 times this run/);
+		expect(reports).toEqual(["d1"]);
 	});
 });
+
+/** d1 is accepted and wrote src/shared/money/price.ts::netPrice */
+function acceptedOwner() {
+	ledger.db.prepare("INSERT INTO files(path, hash, lang, updated_at) VALUES ('app/money.php', 'h', 'php', 't')").run();
+	ledger.db.prepare("INSERT INTO symbols(id, path, kind, name, state, updated_at) VALUES ('app/money.php::net', 'app/money.php', 'function', 'net', 'accepted', 't')").run();
+	ledger.createUnit({ id: "d1", tier: "T0", deps: [], meta: {}, symbolIds: ["app/money.php::net"] });
+	ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'd1'").run();
+	ledger.db.prepare("UPDATE symbols SET state = 'accepted' WHERE id = 'app/money.php::net'").run();
+	ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES ('d1', 'app/money.php::net', 'moved', '[\"src/shared/money/price.ts::netPrice\"]', 'x', 't')").run();
+}

@@ -146,6 +146,10 @@ describe("parked units resubmit themselves", () => {
 		expect(ledger.openQuestions().some((x) => x.id === q)).toBe(false);
 		expect(JSON.parse(ledger.getUnit(unit)!.meta).parked).toBeUndefined();
 		expect(logs.join("\n")).toMatch(/resubmitted 2 unit/);
+		// its times are ISO like every other ledger time, so a text compare against an ISO time finds them
+		const iso = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+		expect(ledger.transitionsOf("unit", unit).at(-1)!.created_at).toMatch(iso);
+		expect(ledger.getUnit(unit)!.updated_at).toMatch(iso);
 	});
 });
 

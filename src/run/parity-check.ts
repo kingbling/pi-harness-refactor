@@ -342,7 +342,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	const startedAt = new Date().toISOString();
 	const mainAt = await headOf(o.config.target.path);
 	const record = (c: Omit<SliceCheck, "runId">, steps = 0): SliceCheck => {
-		const runId = Number(o.ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, steps, compared, note, started_at, ended_at, commit_sha) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)").run(o.slice, c.outcome, steps, c.compared, c.note, startedAt, mainAt ?? null).lastInsertRowid);
+		const runId = Number(o.ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, steps, compared, note, started_at, ended_at, commit_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(o.slice, c.outcome, steps, c.compared, c.note, startedAt, new Date().toISOString(), mainAt ?? null).lastInsertRowid);
 		const ins = o.ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 		for (const d of c.diffs) ins.run(runId, o.slice, d.step, d.route, d.kind, d.path, JSON.stringify(d.legacy ?? null), JSON.stringify(d.target ?? null));
 		return { ...c, runId };

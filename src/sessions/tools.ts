@@ -45,6 +45,8 @@ export interface ToolDeps {
 	onCheck?: (c: { ok: boolean; failed?: string; text: string; timedOut?: boolean; files: string[]; ran?: Array<"build" | "lint" | "tests">; tests?: string[] }) => void | Promise<void>;
 	/** Implementer: false when the unit's tester has no dispute re-check left (dispute_test then says so). */
 	disputeRecheck?: boolean;
+	/** When this run of the orchestrator started (ISO): report_migrated_bug takes at most MAX_REPORTS_PER_RUN rounds of this unit since then. */
+	runStartedAt?: string;
 	/** Implementer: a bug in another unit's accepted code re-opens that unit; this one waits (see report_migrated_bug). */
 	onReport?: (r: { owner: string; target: string; problem: string; evidence: string }) => void;
 	/** Decision model for cheap judgements in tools (record_quirk: is this quirk already recorded?). */
@@ -422,6 +424,8 @@ export function ownerOf(ledger: Ledger, target: string, except: string): string[
 }
 
 export const MAX_REPORT_REOPENS = 2;
+/** Rounds a unit may wait on units it reported, per run of the orchestrator. */
+export const MAX_REPORTS_PER_RUN = 2;
 
 /** `from` reaches `to` through its deps (directly or through other units). */
 function dependsOn(ledger: Ledger, from: string, to: string): boolean {
@@ -452,6 +456,13 @@ export function reportMigratedBugTool(d: ToolDeps): ToolDefinition {
 			if (reopens >= MAX_REPORT_REOPENS) return text(`${owner} was already re-opened ${reopens} times by reports: not again. Finish this unit with what exists and describe the gap in your final message.`, { error: true });
 			// this unit would wait for the owner while the owner (re-opened) waits for this unit: neither would ever start
 			if (dependsOn(d.ledger, owner, d.unitId)) return text(`${owner} itself depends on this unit, so it cannot be fixed first. Finish this unit with what exists and describe the gap in ${p.target} in your final message.`, { error: true });
+			// this unit changed the file itself: what looks wrong may be its own change, not the owner's code
+			const file = p.target.split("::")[0]!.replace(/^\.\//, "");
+			const mine = await changedFiles(d.targetProjectDir, d.adapter.toolchain.ignoredPaths).catch(() => [] as string[]);
+			if (mine.includes(file)) return text(`${file} is changed in this unit's own worktree, so the problem may come from that change, not from ${owner}'s code. Look at your change (git diff -- ${file}); undo it if it is not yours to make, and report only a bug that is in the code as ${owner} left it.`, { error: true });
+			// a unit that already waited on reports this run finishes with what exists: each round costs a re-open and a wait
+			const rounds = d.runStartedAt ? (d.ledger.db.prepare("SELECT COUNT(*) n FROM attempts WHERE unit_id = ? AND outcome = 'waits_on_fix' AND started_at >= ?").get(d.unitId, d.runStartedAt) as { n: number }).n : 0;
+			if (rounds >= MAX_REPORTS_PER_RUN) return text(`this unit already waited ${rounds} times this run on units it reported: not again in this run. Finish this unit with what exists and describe the gap in ${p.target} in your final message.`, { error: true });
 			d.onReport?.({ owner, ...p });
 			return text(`reported to ${owner}: it is re-opened with your report once this session ends, and this unit waits until it is accepted again. Finish what does not depend on it, then stop.`);
 		},

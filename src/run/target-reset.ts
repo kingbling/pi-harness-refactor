@@ -47,8 +47,8 @@ export async function resetForNewTarget(ledger: Ledger, config: Config, root: st
 	const stuck = (await requeueUnits(ledger, config, root, "all", reason)).filter((l) => l.endsWith(": requeued")).map((l) => l.split(":")[0]!);
 	// planned units still parked on a question about the old project
 	ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.parked', '$.hold', '$.healedFrom', '$.stuck') WHERE state = 'planned'").run();
-	const q = ledger.db.prepare(`UPDATE questions SET status = 'withdrawn', answer = COALESCE(answer || ' — ', '') || ?, answered_at = COALESCE(answered_at, datetime('now')) WHERE point IN (${TARGET_POINTS.map(() => "?").join(",")}) AND status IN ('open', 'answered')`);
-	q.run(`withdrawn: ${reason}`, ...TARGET_POINTS);
+	const q = ledger.db.prepare(`UPDATE questions SET status = 'withdrawn', answer = COALESCE(answer || ' — ', '') || ?, answered_at = COALESCE(answered_at, ?) WHERE point IN (${TARGET_POINTS.map(() => "?").join(",")}) AND status IN ('open', 'answered')`);
+	q.run(`withdrawn: ${reason}`, new Date().toISOString(), ...TARGET_POINTS);
 	ledger.setMeta("layout_sample", "{}");
 	return [...accepted.map((u) => u.id), ...stuck];
 }

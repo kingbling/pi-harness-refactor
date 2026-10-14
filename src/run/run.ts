@@ -178,9 +178,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		ledger.endAttempt(a.id, { outcome: "aborted:crash" });
 		const u = ledger.getUnit(a.unit_id);
 		if (u && ["truth", "implementing", "gating"].includes(u.state)) {
-			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now') WHERE id = ?").run(a.unit_id);
+			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = ? WHERE id = ?").run(new Date().toISOString(), a.unit_id);
 			ledger.clearStale(a.unit_id);
-			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', datetime('now'))").run(a.unit_id, u.state);
+			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', ?)").run(a.unit_id, u.state, new Date().toISOString());
 			await removeWorktree(config.target.path, worktreeDir(o.root, a.unit_id));
 		}
 	}
@@ -482,7 +482,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const caught = decideOpenFromGoals(ledger, config);
 		if (caught) log(pc.cyan(`decided ${caught} open routine question(s) from your goals (br questions lists them; br answer <id> changes one)`));
 	}
-	// A stop drains: running lanes finish their unit, nothing new starts. It is written down (run log + ledger)
+	// A stop drains: running lanes stop their unit at its next step (its code kept, back to planned), nothing new starts. It is written down (run log + ledger)
 	// so the next run and `br status` can say what happened.
 	let stopRecord: { at: string; reason: string; finishing: string[] } | undefined;
 	const requestStop = (reason: string) => {
@@ -493,7 +493,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// the builder starts nothing new from now on (no check, repair or code job while the lanes finish); its running
 		// check is killed, a running repair or code job finishes; the run's end waits for it
 		void builder.stop().catch(() => undefined);
-		log(pc.yellow(`■ stop requested (${reason}): ${stopRecord.finishing.length} running lane(s) finish${stopRecord.finishing.length ? ` (${stopRecord.finishing.join(", ")})` : ""}; no new units start`));
+		log(pc.yellow(`■ stop requested (${reason}): ${stopRecord.finishing.length} running lane(s) stop at their next step, code kept${stopRecord.finishing.length ? ` (${stopRecord.finishing.join(", ")})` : ""}; no new units start`));
 	};
 	const onSigint = () => {
 		requestStop("ctrl-c");
@@ -696,6 +696,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 						spawn: o.spawn,
 						gate: o.gate,
 						approved,
+						// a stop reaches the running unit: it hands its lane back at the next safe point, its code kept
+						stopped: () => stop,
+						runStartedAt: startedAt,
 					});
 					if (!mergeOnly) cost += res!.costUsd;
 					mergeOnly = false;
@@ -827,7 +830,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				if (res && res.state !== "review" && ledger.getUnit(unitId)!.state !== "accepted") {
 					const st = ledger.getUnit(unitId)!.state;
 					const q = ledger.openQuestions().find((x) => x.unit_id === unitId);
-					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined${blocksNote(unitId)}`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
+					log(st === "quarantined" ? pc.red(`■ ${unitId}: quarantined${blocksNote(unitId)}`) : res.stopped ? pc.yellow(`⏸ ${unitId}: back to planned for the stop, its code kept`) : pc.yellow(`⏸ ${unitId}: waiting${q ? ` on question #${q.id}` : ""} (${st})`));
 				}
 			} catch (e: any) {
 				// a crash is not a gate failure: end the open attempts, count it, and stop after the second one so a
@@ -848,7 +851,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				// the worktree goes whatever the state: the next run of this unit starts from a fresh one anyway (fresh()),
 				// so a planned unit's would only hold disk space. A quarantined unit's code stays on its branch: a self-heal
 				// requeue starts from it (an owner's requeue drops it)
-				const kept = st === "quarantined" && mayKeepCode(ledger, unitId) ? await keepUnitWork(wt, unitId) : undefined;
+				// a unit the stop sent back to planned keeps its code the same way: its next run goes on from it
+				const kept = (st === "quarantined" && mayKeepCode(ledger, unitId)) || (st === "planned" && res?.stopped) ? await keepUnitWork(wt, unitId) : undefined;
 				if (st === "quarantined") keepPortedTests(config, o.root, unitId, ledger.getUnit(unitId)!.meta, wt, adapters.get(placementOf(ledger.getUnit(unitId)!.meta).stackId)!.layout);
 				await removeWorktree(config.target.path, wt);
 				if (kept) ledger.updateUnit(unitId, { meta: { keptWork: kept } });
@@ -898,6 +902,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		} else log(pc.yellow(`⚕ could not heal it here; those units stay quarantined (br requeue after a fix), the run goes on`));
 	};
 	const circuit = async (unitId: string, st: string, res: UnitRunResult | undefined, crash?: string) => {
+		// a unit the stop sent back failed nothing: many of them at once are no shared failure to heal
+		if (res?.stopped) return;
 		recent.push(breakerEntry(ledger, unitId, st, res, crash));
 		if (recent.length > 6) recent.shift();
 		if (healing) return;
@@ -1052,7 +1058,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			{
 				const max = laneLimit;
 				const reason = stop
-					? "stopping: running lanes finish, nothing new starts"
+					? "stopping: running lanes stop at their next step, nothing new starts"
 					: dayCapHit
 						? "daily budget cap reached"
 						: sampleReason
@@ -1351,8 +1357,8 @@ export async function resubmitParkedUnits(ledger: Ledger, config: Config, root: 
 		}
 		// what the run learned before parking (diagnosis) and the hint go to the next attempt, labelled by who gave it
 		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `${MODEL_ANSWERERS.includes(q?.answered_by ?? "") ? "A model's hint (not the owner's)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
-		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = datetime('now'), meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(q?.id ?? meta.applied ?? 0, lesson || null, u.id);
-		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, datetime('now'))").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`);
+		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = ?, meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(new Date().toISOString(), q?.id ?? meta.applied ?? 0, lesson || null, u.id);
+		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, ?)").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`, new Date().toISOString());
 		await removeWorktree(config.target.path, worktreeDir(root, u.id));
 		parked.push(u);
 	}
@@ -1376,6 +1382,21 @@ export const PLUGIN_TIME = (() => {
 	}
 	return t;
 })();
+
+/**
+ * What changed in the plugin since `t`: its commits (subject and files) and what is not committed yet. Empty when
+ * nothing did (a newer file time alone, as after a checkout, is no change).
+ */
+export async function pluginChangesSince(t: number): Promise<string> {
+	const repo = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+	try {
+		const commits = (await exec("git", ["-C", repo, "log", `--since=${new Date(t).toISOString()}`, "--format=%h %s", "--stat"])).trim();
+		const open = (await exec("git", ["-C", repo, "diff", "--stat", "HEAD"])).trim();
+		return [commits, open && `not committed yet:\n${open}`].filter(Boolean).join("\n\n");
+	} catch {
+		return PLUGIN_TIME > t ? "the plugin itself was updated (its git history could not be read)" : "";
+	}
+}
 
 /** The files whose change may fix a quarantined unit of one stack: its setup fixes and gate commands, its dependency manifests, the old code's environment. */
 function fixFiles(config: Config, root: string, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, stackId: string): string[] {
@@ -1419,7 +1440,10 @@ async function changesSince(config: Config, root: string, manifests: Map<string,
 		out.push(`fix: ${line}${diff ? `\n${capText(diff, 4000)}` : ""}`);
 	}
 	for (const f of fixFiles(config, root, manifests, stackId)) if (f !== logFile && mtime(f) > t) out.push(`changed: ${relative(root, f)}`);
-	if (PLUGIN_TIME > t) out.push("the plugin itself was updated");
+	if (PLUGIN_TIME > t) {
+		const plugin = await pluginChangesSince(t);
+		if (plugin) out.push(`the plugin itself changed:\n${capText(plugin, 3000)}`);
+	}
 	return out.join("\n\n");
 }
 
@@ -1591,7 +1615,7 @@ async function changeTouches(d: { ledger: Ledger; config: Config; client: ModelC
  * with nothing changed is not retried: the unit is stuck and asked about (askStuckUnits; a model tries first, one
  * question per kind of failure), and the answer is applied here. A requeue here keeps the unit's code (keepUnitWork).
  */
-export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient; pluginChangedAt?: number } = {}): Promise<string[]> {
+export async function healQuarantined(ledger: Ledger, config: Config, root: string, running: Set<string>, log: (l: string) => void, manifests: Map<string, { toolchain: { manifestFiles: string[] } }>, o: { since?: number; now?: number; client?: ModelClient; pluginChangedAt?: number; pluginChanges?: (since: number) => Promise<string> } = {}): Promise<string[]> {
 	const pluginAt = o.pluginChangedAt ?? PLUGIN_TIME;
 	// one change time per stack per pass
 	const sinces = new Map<string, number>();
@@ -1600,7 +1624,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginChecked?: number };
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
 		const failure = errorSignature("quarantine", r.reason ?? "");
@@ -1618,12 +1642,20 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// a unit a model parked waits for a change on main after the park, past its automatic tries (the owner's leave stands)
 		const parked = meta.healQuestion === 0 && !!meta.parkedWhy && since > (meta.parkedAt ?? 0);
 		const mayRun = (meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && (meta.stuck || !meta.healQuestion)) || parked;
-		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change), so one
-		// more try, once per park (a park after the try is newer than the plugin)
-		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0)) {
-			await backInQueue(ledger, config, root, r.id, heals, `This unit was parked (${meta.parkedWhy}); the migration tool changed since, so it runs again. Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
-			back.push(r.id);
-			continue;
+		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change). One
+		// more try when the plugin's own changes since the park touch what parked it (the decide model reads them, as for
+		// a change on main), counted against the automatic tries; asked once per plugin version
+		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0) && (meta.pluginChecked ?? 0) < pluginAt && heals < config.run.maxAutoHeals) {
+			const changes = await (o.pluginChanges ?? pluginChangesSince)(meta.parkedAt ?? 0);
+			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			// the decide model is unavailable: asked next pass
+			if (touches === undefined) continue;
+			if (touches) {
+				await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was parked (${meta.parkedWhy}); the migration tool changed since in a way that may fix it, so it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${lastFailure}`, failure, retriedOn);
+				back.push(r.id);
+				continue;
+			}
+			ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.pluginChecked', ?) WHERE id = ?").run(pluginAt, r.id);
 		}
 		if (changed && mayRun) {
 			// a change the decide model already said does not touch this failure is not asked about again
