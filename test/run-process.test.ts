@@ -56,6 +56,7 @@ describe("migration run in its own process", () => {
 		delete process.env["BR_RUN_CHILD_SCHEDULER"];
 		delete process.env["BR_FAKE_CRASH"];
 		delete process.env["BR_FAKE_HANG"];
+		delete process.env["BR_FAKE_FREEZE"];
 		if (progress.running) progress.end();
 	});
 
@@ -168,6 +169,20 @@ describe("migration run in its own process", () => {
 		expect(out.error).toMatch(/run process ended unexpectedly \(signal SIGKILL\)/);
 		expect(progress.snapshot().activity.some((l) => l.includes("killed"))).toBe(true);
 		progress.end(out.error);
+	}, 60_000);
+
+	it("a freeze in the run process is logged as the run process's, not Pi's", async () => {
+		process.env["BR_RUN_CHILD_SCHEDULER"] = fake;
+		process.env["BR_FAKE_FREEZE"] = "1";
+		rmSync(join(ws, ".bigrefactor", "blocked.log"), { force: true });
+		progress.begin("migration run");
+		const run = runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
+		await until("the unit step", () => progress.snapshot().steps.some((s) => s.name === "U1_fake"));
+		await until("the freeze line", () => progress.snapshot().activity.some((l) => l.includes("was blocked")));
+		await progress.stop("drain");
+		await run;
+		expect(readFileSync(join(ws, ".bigrefactor", "blocked.log"), "utf8")).toMatch(/Z the run process was blocked \d+\.\d s/);
+		progress.end();
 	}, 60_000);
 
 	it("when Pi goes away the child stops its run and exits", async () => {
