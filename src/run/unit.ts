@@ -777,7 +777,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			facts: `The reviewer of ${o.unitId} says something must change outside the unit's files (the implementer may write only ${writeGlobs.join(", ")}), so another attempt cannot fix it.${setupTried}\n${problem.slice(0, 1500)}`,
 			options: [
 				{ value: "retry", facts: "I changed it (or it is not needed — say so in a hint): run the unit again" },
-				{ value: "leave", facts: "leave the unit parked for a human" },
+				{ value: "leave", facts: "leave the unit parked" },
 			],
 			context: { failedStep: "wired_ok", outOfScope: problem.slice(0, 1500) },
 		});

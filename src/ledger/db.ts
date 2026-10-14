@@ -352,6 +352,14 @@ export class Ledger {
 		return this.db.prepare("SELECT * FROM questions WHERE status = 'open' ORDER BY id").all() as unknown as QuestionRow[];
 	}
 	/**
+	 * Open questions that are the owner's: while a run is live only those its resolver model handed on (context.forOwner),
+	 * the others are still with the models. Without a run nobody else answers, so every open question.
+	 */
+	ownerQuestions(runLive: boolean): QuestionRow[] {
+		const open = this.openQuestions();
+		return runLive ? open.filter((q) => q.context && JSON.parse(q.context).forOwner !== undefined) : open;
+	}
+	/**
 	 * Units that must wait for open questions. Everything else keeps running.
 	 *  none → nothing; unit → that unit; dependents → the unit and its transitive dependents; module → every unit sharing its top-level dir.
 	 */

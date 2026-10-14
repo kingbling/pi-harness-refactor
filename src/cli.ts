@@ -60,8 +60,9 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 `);
 	},
 	status: async () => {
-		const { ledger } = open();
-		console.log(renderStatus(ledger));
+		const { ledger, root } = open();
+		const { liveRun } = await import("./run/run-lock.ts");
+		console.log(renderStatus(ledger, { runLive: liveRun(root) !== undefined }));
 	},
 	lanes: async (args) => {
 		const { lanes, parseLanesArgs } = await import("./run/lanes.ts");
@@ -117,15 +118,18 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	start: async (args) => commands.init!(args),
 	resume: async (args) => commands.onboard!(args),
 	questions: async () => {
-		const { ledger } = open();
-		const qs = ledger.openQuestions();
+		const { ledger, root } = open();
+		const { liveRun } = await import("./run/run-lock.ts");
+		const qs = ledger.ownerQuestions(liveRun(root) !== undefined);
+		const handled = ledger.openQuestions().length - qs.length;
 		const own = ledger.ownDecisions();
 		if (own.length) {
 			console.log(pc.dim(`decided by the run from your goals (${own.length}; change one with br answer <id> <text>, or set run.ask to "all" to be asked instead):`));
 			for (const q of own.slice(0, 10)) console.log(pc.dim(`  #${q.id} [${q.point}]${q.unit_id ? ` ${q.unit_id}` : ""} → ${q.answer}`));
 			console.log("");
 		}
-		if (!qs.length) return console.log(pc.green("no open questions"));
+		if (handled) console.log(pc.dim(`${handled} being handled by the models\n`));
+		if (!qs.length) return console.log(pc.green(handled ? "no open questions for you" : "no open questions"));
 		const blocked = ledger.blockedUnits();
 		for (const q of qs) {
 			const waiting = [...blocked.entries()].filter(([, ids]) => ids.includes(q.id)).map(([u]) => u);

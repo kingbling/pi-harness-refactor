@@ -30,6 +30,7 @@ import { findConfigPath, loadConfig, STATE_DIR } from "../config.ts";
 import { renderStatus, renderWhy } from "../dashboard/status.ts";
 import type { InitPrompter, PromptOption } from "../init/init.ts";
 import { Ledger } from "../ledger/db.ts";
+import { liveRun } from "../run/run-lock.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { groupQuestions, optionFor } from "../jev/ask.ts";
 import { fmtUsage, progress, short, StoppedError, type AgentState, type ProgressSnapshot, type StepState } from "../progress.ts";
@@ -211,12 +212,13 @@ let runActive = false;
  * still with the models. Without a run nobody else answers, so every open question counts.
  */
 export function forOwnerCount(ledger: Ledger, running = runActive): number {
-	const open = ledger.openQuestions();
-	return running ? open.filter((q) => q.context && JSON.parse(q.context).forOwner !== undefined).length : open.length;
+	return ledger.ownerQuestions(running).length;
 }
+/** A run is going on here or in a terminal (br run holds the workspace's run lock). */
+const runLive = (root: string) => runActive || liveRun(root) !== undefined;
 export function durable(ledger: Ledger, root: string): Durable {
 	const f = forecast(ledger);
-	return { accepted: f.units.accepted, quarantined: f.units.quarantined, waiting: f.units.waiting, questions: forOwnerCount(ledger), spentUsd: totalSpend(root).usd, forecast: f };
+	return { accepted: f.units.accepted, quarantined: f.units.quarantined, waiting: f.units.waiting, questions: forOwnerCount(ledger, runLive(root)), spentUsd: totalSpend(root).usd, forecast: f };
 }
 let durableCache: { at: number; cwd: string; d: Durable } | undefined;
 /** Cached for the panel, which repaints often: at most one ledger read per 5 s. */
@@ -939,11 +941,15 @@ export default function (pi: ExtensionAPI) {
 				let text: string;
 				if (sub === "why") text = renderWhy(ledger, rest.join(" "), { color: false });
 				else if (sub === "questions") {
-					const qs = ledger.openQuestions();
+					const qs = ledger.ownerQuestions(runLive(loadConfig(findConfigPath(ctx.cwd)!).root));
+					const handled = ledger.openQuestions().length - qs.length;
 					const blocked = ledger.blockedUnits();
-					text = qs.length
-						? qs.map((q) => `#${q.id} [${q.point}] ${q.question}${q.options ? `  (${(JSON.parse(q.options) as string[]).join(" | ")})` : ""}  waiting: ${[...blocked.entries()].filter(([, ids]) => ids.includes(q.id)).map(([u]) => u).join(", ") || "nothing"}`).join("\n") + "\n\n/br answer walks you through them (or /br answer <id> <text>)"
-						: "no open questions";
+					text = [
+						qs.length
+							? qs.map((q) => `#${q.id} [${q.point}] ${q.question}${q.options ? `  (${(JSON.parse(q.options) as string[]).join(" | ")})` : ""}  waiting: ${[...blocked.entries()].filter(([, ids]) => ids.includes(q.id)).map(([u]) => u).join(", ") || "nothing"}`).join("\n") + "\n\n/br answer walks you through them (or /br answer <id> <text>)"
+							: "no open questions for you",
+						...(handled ? [`${handled} being handled by the models`] : []),
+					].join("\n");
 				} else if (sub === "answer") {
 					const [id, ...answer] = rest;
 					if (!id || !answer.length) text = "usage: /br answer (guided) or /br answer <id> <text>";
@@ -970,7 +976,7 @@ export default function (pi: ExtensionAPI) {
 					const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
 					text = await checkLayout(config, root, ledger).then((r) => renderLayout(r).join("\n"), (e) => `layout check failed: ${e?.message ?? e}`);
 				}
-				else text = renderStatus(ledger, { color: false });
+				else text = renderStatus(ledger, { color: false, runLive: runLive(loadConfig(findConfigPath(ctx.cwd)!).root) });
 				show(ctx, sub, text);
 			} finally {
 				ledger.close();

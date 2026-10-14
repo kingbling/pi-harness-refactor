@@ -161,6 +161,26 @@ describe("stubs carry the owning unit; that unit replaces them", () => {
 		expect(renderTaskCard(c, config, { includeSource: false })).toContain("## Stubs waiting for you: earlier units stubbed this unit's code, marked TODO(br:billing) (grep for it). Replace each stub");
 		expect((await card("agency_pay")).waitingStubs).toEqual([]);
 	});
+
+	it("a requeued unit's restored work replaced the marks on disk: its card still lists its stub files", async () => {
+		execFileSync("git", ["init", "-q"], { cwd: api });
+		write("src/features/agency/billing.stub.ts", "// TODO(br:billing) minimal stand-in\nexport class Billing {}\n");
+		execFileSync("git", ["add", "-A"], { cwd: api });
+		// the kept work is restored on disk, not staged (cherry-pick --no-commit, then reset -q)
+		write("src/features/agency/billing.stub.ts", "export class Billing { pay() { return 1; } }\n");
+		expect((await card("billing")).waitingStubs).toEqual(["src/features/agency/billing.stub.ts"]);
+	});
+
+	it("the stub files found once stay the unit's after the marks are gone", async () => {
+		execFileSync("git", ["init", "-q"], { cwd: api });
+		write("src/features/agency/billing.stub.ts", "// TODO(br:billing) minimal stand-in\nexport class Billing {}\n");
+		execFileSync("git", ["add", "-A"], { cwd: api });
+		expect((await card("billing")).waitingStubs).toEqual(["src/features/agency/billing.stub.ts"]);
+		write("src/features/agency/billing.stub.ts", "export class Billing {}\n");
+		execFileSync("git", ["add", "-A"], { cwd: api });
+		expect((await card("billing")).waitingStubs).toEqual(["src/features/agency/billing.stub.ts"]);
+		expect(JSON.parse(ledger.getUnit("billing")!.meta).stubFiles).toEqual(["src/features/agency/billing.stub.ts"]);
+	});
 });
 
 describe("framework classes the owner decided to port", () => {

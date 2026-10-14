@@ -218,6 +218,23 @@ describe("the owner's question count", () => {
 		expect(forOwnerCount(ledger, true)).toBe(1);
 		expect(forOwnerCount(ledger, false)).toBe(2);
 	});
+
+	it("br status lists only the owner's questions while a run is live; the rest as one line for the models", async () => {
+		const { renderStatus } = await import("../src/dashboard/status.ts");
+		const ledger = new Ledger(":memory:");
+		const a = ledger.askQuestion({ point: "gate_env", question: "still with the models", askedBy: "orchestrator" });
+		ledger.askQuestion({ point: "gate_env", question: "also with the models", askedBy: "orchestrator" });
+		const b = ledger.askQuestion({ point: "budget", question: "money", askedBy: "orchestrator" });
+		ledger.markForOwner(b, "money is the owner's call");
+		expect(ledger.ownerQuestions(true).map((q) => q.id)).toEqual([b]);
+		expect(ledger.ownerQuestions(false).map((q) => q.id)).toEqual([a, a + 1, b]);
+		const live = renderStatus(ledger, { color: false, runLive: true });
+		expect(live).toContain("1 open question for you");
+		expect(live).toContain("2 being handled by the models");
+		const idle = renderStatus(ledger, { color: false });
+		expect(idle).toContain("3 open questions for you");
+		expect(idle).not.toContain("being handled by the models");
+	});
 });
 
 describe("a parked unit's question", () => {

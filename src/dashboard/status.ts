@@ -8,7 +8,8 @@ import type { Ledger } from "../ledger/db.ts";
  * Text renderer for the ledger status. Used by `br status` (terminal) and by the Pi extension
  * (`/br status` → transcript entry), so it must stay plain and compact; color: false yields pure text.
  */
-export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): string {
+/** `runLive`: a run is going on, so only the questions its resolver model handed on are the owner's (Ledger.ownerQuestions). */
+export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: boolean } = {}): string {
 	const s = ledger.status();
 	const c = opts.color === false ? plain : pc;
 	const lines: string[] = [];
@@ -79,11 +80,13 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean } = {}): st
 		return note ? [`    ${u.id}: ${(note.split("\n")[1] ?? note).slice(0, 160)}`] : [];
 	});
 	if (weak.length) lines.push(c.yellow(`accepted with tests the reviewer still finds weak (${weak.length}):`), ...weak.slice(0, 8).map((l) => c.dim(l)));
-	const qs = ledger.openQuestions();
+	const qs = ledger.ownerQuestions(!!opts.runLive);
 	if (qs.length) {
 		const waiting = ledger.blockedUnits().size;
 		lines.push(c.yellow(`${qs.length} open question${qs.length > 1 ? "s" : ""} for you (${waiting} unit${waiting === 1 ? "" : "s"} waiting, everything else runs) → br questions`));
 	}
+	const handled = ledger.openQuestions().length - qs.length;
+	if (handled) lines.push(c.dim(`${handled} being handled by the models`));
 	const stale = ledger.listUnits().filter((u) => JSON.parse(u.meta).stale).length;
 	if (stale) lines.push(c.yellow(`${stale} stale unit${stale > 1 ? "s" : ""}: source changed upstream since they were done; nothing redoes them yet → br why <unit>`));
 	const commit = ledger.getMeta("source_commit");

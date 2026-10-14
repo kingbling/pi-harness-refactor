@@ -94,8 +94,11 @@ const MAX_SIBLING_FILES = 6;
 export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): TaskCard {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
-	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]> };
+	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]>; stubFiles?: string[] };
 	const files = meta.files ?? [];
+	// the stub files stay this unit's to edit once found: its restored work or a code job may have removed the marks since
+	const waitingStubs = [...new Set([...(meta.stubFiles ?? []), ...stubsWaitingFor(opts.targetProjectDir, unitId)])];
+	if (waitingStubs.length !== (meta.stubFiles ?? []).length) ledger.updateUnit(unitId, { meta: { stubFiles: waitingStubs } });
 	const db = ledger.db;
 
 	const symbols = (db.prepare("SELECT s.id, s.name, s.kind, s.exported, i.signature, i.line FROM symbols s LEFT JOIN index_symbols i ON i.id = s.id WHERE s.unit_id = ? ORDER BY i.line").all(unitId) as Array<any>).map((r) => ({
@@ -176,7 +179,7 @@ export function buildTaskCard(ledger: Ledger, config: Config, unitId: string, op
 	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs: stubsWaitingFor(opts.targetProjectDir, unitId), callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, callers, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -362,10 +365,13 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	return L.join("\n");
 }
 
-/** Files of the project (relative to it) that carry the mark of a stub left for `unitId`; none when it is not a git repo. */
+/**
+ * Files of the project (relative to it) that carry the mark of a stub left for `unitId`; none when it is not a git repo.
+ * Searches the index, not the disk: a requeued unit's restored work has already replaced the marks on disk.
+ */
 function stubsWaitingFor(projectDir: string, unitId: string): string[] {
 	try {
-		return execFileSync("git", ["grep", "-l", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: projectDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").filter(Boolean);
+		return execFileSync("git", ["grep", "--cached", "-l", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: projectDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").filter(Boolean);
 	} catch {
 		return []; // no match, or not a repo
 	}
