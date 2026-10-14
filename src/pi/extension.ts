@@ -24,6 +24,9 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { setOutputHost } from "../proc.ts";
 import { QuestionCard, type CardAnswer, type CardQuestion } from "./question-card.ts";
 import { existsSync, readFileSync } from "node:fs";
+import { Worker } from "node:worker_threads";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
 import { findConfigPath, loadConfig, STATE_DIR } from "../config.ts";
@@ -221,19 +224,49 @@ export function durable(ledger: Ledger, root: string): Durable {
 	return { accepted: f.units.accepted, quarantined: f.units.quarantined, waiting: f.units.waiting, questions: forOwnerCount(ledger, runLive(root)), spentUsd: totalSpend(root).usd, forecast: f };
 }
 let durableCache: { at: number; cwd: string; d: Durable } | undefined;
-/** Cached for the panel and the footer, which repaint often: at most one ledger read per 5 s (the forecast alone takes ~0.1 s on a big ledger). */
-function durableFor(cwd: string, maxAgeMs = 5000): Durable | undefined {
-	if (durableCache && durableCache.cwd === cwd && Date.now() - durableCache.at < maxAgeMs) return durableCache.d;
+let durableWorker: Worker | undefined;
+let durableAsked: { cwd: string; done: Array<() => void> } | undefined;
+/**
+ * Cached for the panel and the footer, which repaint often. Never read on Pi's thread: a stale cache answers at once
+ * and a worker thread reads the ledger again (node:sqlite holds the thread for every query; the forecast alone took
+ * 0.1–1.7 s on a big ledger while lanes copied worktrees). `fresh` runs once the new totals are in.
+ */
+export function durableFor(cwd: string, maxAgeMs = 5000, fresh?: () => void): Durable | undefined {
+	const cached = durableCache?.cwd === cwd ? durableCache.d : undefined;
+	if (cached && Date.now() - durableCache!.at < maxAgeMs) return cached;
+	if (durableAsked) {
+		if (durableAsked.cwd === cwd && fresh) durableAsked.done.push(fresh);
+		return cached;
+	}
 	const l = locateLedger(cwd);
-	if (!("path" in l)) return undefined;
-	const ledger = new Ledger(l.path);
+	if (!("path" in l)) return cached;
+	const root = dirname(dirname(l.path));
+	durableAsked = { cwd, done: fresh ? [fresh] : [] };
 	try {
-		durableCache = { at: Date.now(), cwd, d: durable(ledger, dirname(dirname(l.path))) };
-		return durableCache.d;
+		if (!durableWorker) {
+			// the package has no build step: the worker loads its .ts through tsx, like bin/br.js does
+			durableWorker = new Worker(new URL("./durable-worker.ts", import.meta.url), { execArgv: ["--import", pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href] });
+			durableWorker.unref();
+			durableWorker.on("error", () => ((durableWorker = undefined), finishDurable()));
+			durableWorker.on("message", (m: { ok: boolean; d?: Durable }) => finishDurable(m.ok ? m.d : undefined));
+		}
+		durableWorker.postMessage({ ledgerPath: l.path, root, running: runLive(root) });
 	} catch {
-		return undefined;
-	} finally {
-		ledger.close();
+		durableAsked = undefined;
+	}
+	return cached;
+}
+function finishDurable(d?: Durable): void {
+	const asked = durableAsked;
+	durableAsked = undefined;
+	if (!asked) return;
+	if (d) durableCache = { at: Date.now(), cwd: asked.cwd, d };
+	for (const f of asked.done) {
+		try {
+			f();
+		} catch {
+			/* a repaint is never a reason to fail */
+		}
 	}
 }
 
@@ -652,8 +685,12 @@ function startRun(pi: ExtensionAPI, ctx: ExtensionContext, flags: string[]): voi
 function refreshStatus(ctx: ExtensionContext, maxAgeMs = 0): void {
 	if (!ctx.hasUI) return;
 	if (!("path" in locateLedger(ctx.cwd))) return ctx.ui.setStatus("bigrefactor", undefined);
-	const d = durableFor(ctx.cwd, maxAgeMs);
-	if (d) ctx.ui.setStatus("bigrefactor", statusText(d));
+	const show = () => {
+		const d = durableCache?.cwd === ctx.cwd ? durableCache.d : undefined;
+		if (d) ctx.ui.setStatus("bigrefactor", statusText(d));
+	};
+	durableFor(ctx.cwd, maxAgeMs, show);
+	show();
 }
 
 function truncate(text: string, more: string): string {

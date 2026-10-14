@@ -235,7 +235,8 @@ describe("truth that changes from run to run", () => {
 		expect(await legacyEnvOutage(root, config, source, wait)).toBe("none");
 		writeFileSync(join(legacy, "down"), "");
 		expect(await legacyEnvOutage(root, config, source, wait)).toBe("down");
-		setTimeout(() => rmSync(join(legacy, "down")), 20);
+		// the runtime comes back after the first red probe (the probe runs async now: a timer could beat it)
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: legacy, mode: "run", run: { cmd: "sh", args: ["-c", 'if [ -e down ]; then rm down; exit 1; fi; sh "$0"', "{script}"] } }));
 		expect(await legacyEnvOutage(root, config, source, wait)).toBe("over");
 		// a workspace that never ran the old code has nothing to compare with
 		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: legacy, mode: "read" }));
