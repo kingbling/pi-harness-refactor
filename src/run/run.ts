@@ -483,6 +483,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		if (stopRecord) return;
 		stop = true;
 		stopRecord = { at: new Date().toISOString(), reason, finishing: [...running.keys()] };
+		// the builder starts nothing new from now on (no check, repair or code job while the lanes finish); its running
+		// check is killed, a running repair or code job finishes; the run's end waits for it
+		void builder.stop().catch(() => undefined);
 		log(pc.yellow(`■ stop requested (${reason}): ${stopRecord.finishing.length} running lane(s) finish${stopRecord.finishing.length ? ` (${stopRecord.finishing.join(", ")})` : ""}; no new units start`));
 	};
 	const onSigint = () => {
