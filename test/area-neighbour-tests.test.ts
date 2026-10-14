@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { catchUpWithMain, failingFiles, ownTests, runPortedTests, STALE_NOT_COUNTED, warmMainCache } from "../src/run/ported.ts";
+import { catchUpWithMain, failingFiles, failureLines, ownTests, runPortedTests, STALE_NOT_COUNTED, warmMainCache } from "../src/run/ported.ts";
 
 /**
  * The gate runs the unit's own ported tests; another unit's test in the same area counts against the unit only when it
@@ -32,6 +32,7 @@ beforeEach(() => {
 	write(join(main, "tests/own.spec"), "pass\n");
 	write(join(main, "tests/n1.spec"), "pass\n"); // another unit's, green on main
 	write(join(main, "tests/n2.spec"), "fail\n"); // another unit's, red on main already
+	write(join(main, "stamp.txt"), `${Math.random()}\n`); // a tree of its own: no answer main kept for an earlier test's tree
 	git(main, "init", "-q");
 	git(main, "add", "-A");
 	git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
@@ -176,6 +177,23 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect(failingFiles(out, ["tests/AOkTest.php", "tests/BTest.php", "tests/CTest.php", "tests/DTest.php"], dir)).toEqual(["tests/BTest.php", "tests/CTest.php"]);
 	});
 
+	it("vitest's FAIL line longer than 160 characters (the file and the whole test title) names the failing file", () => {
+		const file = "src/features/inventory/components/SubnetDetails.U719.test.tsx";
+		const out = [
+			` ❯ ${file} (3 tests | 1 failed) 3240ms`,
+			"     × U719_inc_subnets_tpl#1 displays populated fields and includes hours; null CPM prices omit CPM section 1079ms",
+			` ✓ src/features/inventory/components/SubnetList.test.tsx (2 tests) 40ms`,
+			"",
+			` FAIL  ${file} > SubnetDetails legacy presentation > U719_inc_subnets_tpl#1 displays populated fields and includes hours; null CPM prices omit CPM section`,
+			"TestingLibraryElementError: Unable to find an element with the text: Hours",
+		].join("\n");
+		expect(out.split("\n")[4]!.length).toBeGreaterThan(160);
+		expect(failingFiles(out, [file, "src/features/inventory/components/SubnetList.test.tsx"], "/w/web")).toEqual([file]);
+		// the readable list of failures (triage) stays short
+		expect(failureLines(out).every((l) => l.length <= 160)).toBe(true);
+		expect(failureLines(out)).toHaveLength(2);
+	});
+
 	it("main red too, with a runner that says 'Failed <file> (exit 2)': no run file by file", async () => {
 		const many = Array.from({ length: 6 }, (_, i) => `tests/m${i}.spec`);
 		for (const f of many) write(join(main, f), "pass\n");
@@ -207,6 +225,23 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		// the first lane's run, then one run for the two lanes that waited meanwhile
 		expect(runsIn(main)).toBe(2);
 		expect(Math.max(...runs.map((r) => r.mainWaitMs ?? 0))).toBeGreaterThanOrEqual(250);
+	});
+
+	it("each stack's main checkout has its own turn: a long run on one main does not hold a lane asking the other", async () => {
+		const main2 = join(root, "main2");
+		git(root, "clone", "-q", main, main2);
+		const wt2 = join(root, "wt2");
+		git(root, "clone", "-q", main2, wt2);
+		for (const d of [wt, wt2]) write(join(d, "broken.txt"), "tests/n1.spec\n");
+		const busy = join(root, "main-busy");
+		// on the first main the run takes a while
+		const slow = { ...adapter, test: (d: string, files: string[]) => (d === main ? { ...adapter.test(d, files), args: [adapter.test(d, files).args[0]!, `touch ${busy}; sleep 1.5; ${adapter.test(d, files).args[1]}`, ...adapter.test(d, files).args.slice(2)] } : adapter.test(d, files)) } as TargetAdapter;
+		const first = runPortedTests({ ledger, unitId: "u1", adapter: slow, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 30_000 });
+		for (let i = 0; i < 150 && !existsSync(busy); i++) await new Promise((r) => setTimeout(r, 20));
+		const second = await runPortedTests({ ledger, unitId: "u1", adapter: slow, dir: wt2, tests: TESTS, mainDir: main2, timeoutMs: 30_000 });
+		expect(second.ok).toBe(false);
+		expect(second.mainWaitMs ?? 0).toBeLessThan(1000);
+		expect((await first).ok).toBe(false);
 	});
 
 	it("after a merge the neighbour files lanes asked about run on main's new tree on the side; the next gate finds the answer", async () => {
@@ -300,7 +335,10 @@ describe("ported tests: a worktree on an older main", () => {
 		const r = await gate(false);
 		expect(r.ok).toBe(true);
 		expect(r.output).toContain(STALE_NOT_COUNTED);
+		expect(r.output).toContain("tests/n1.spec");
 		expect(head(lane)).toBe(before);
+		// it is not counted whatever main says: main's answer is not waited for
+		expect(runsIn(main)).toBe(0);
 	});
 
 	it("work that clashes with main's new commits: the worktree stays as it was and the neighbour is left to the merge", async () => {
@@ -314,6 +352,8 @@ describe("ported tests: a worktree on an older main", () => {
 		expect(head(lane)).toBe(before);
 		expect(readFileSync(join(lane, "app.txt"), "utf8")).toBe("the unit's change\n");
 		expect(status(lane)).toMatch(/\?\? src\//);
+		// the clash is known before main's answer would be: main is not asked
+		expect(runsIn(main)).toBe(0);
 	});
 
 	it("catchUpWithMain: nothing to bring in when the worktree already holds main", async () => {

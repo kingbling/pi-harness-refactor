@@ -99,11 +99,11 @@ type Slot = <T>(fn: () => Promise<T>) => Promise<T>;
 /** Neighbour test files that pass on main, per main's tree: main is run again only after it changed. */
 const greenOnMain = new Map<string, boolean>();
 
-/** Runs on main's checkout, one at a time across lanes. */
-let mainQueue: Promise<unknown> = Promise.resolve();
-function onMain<T>(fn: () => Promise<T>): Promise<T> {
-	const r = mainQueue.then(fn, fn);
-	mainQueue = r.catch(() => undefined);
+/** Runs on a main checkout, one at a time across lanes, per checkout: each stack's main has its own caches, so the stacks never wait on each other. */
+const mainQueues = new Map<string, Promise<unknown>>();
+function onMain<T>(main: string, fn: () => Promise<T>): Promise<T> {
+	const r = (mainQueues.get(main) ?? Promise.resolve()).then(fn, fn);
+	mainQueues.set(main, r.catch(() => undefined));
 	return r;
 }
 
@@ -132,7 +132,7 @@ function askMain(main: string, files: string[], how: How, warm = false): Promise
 	}
 	return new Promise((res, rej) => {
 		asks.set(main, [...(asks.get(main) ?? []), { ...how, files, at: Date.now(), warm, res, rej }]);
-		void onMain(async () => {
+		void onMain(main, async () => {
 			const batch = asks.get(main) ?? [];
 			if (!batch.length) return; // an earlier turn answered it
 			asks.delete(main);
@@ -216,17 +216,33 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 	const mine = await test(o.dir, own);
 	const others = o.tests.filter((t) => !own.includes(t));
 	if (!mine.ok || !others.length) return mine;
-	const n = await test(o.dir, others);
-	if (n.ok) return { ...mine, output: `${mine.output}\n\nThe area's other ported tests (${others.length} file(s)) still pass.` };
+	const stillPass = { ...mine, output: `${mine.output}\n\nThe area's other ported tests (${others.length} file(s)) still pass.` };
+	let n = await test(o.dir, others);
+	if (n.ok) return stillPass;
 	const main = o.mainDir && existsSync(o.mainDir) && realpathSync(o.mainDir) !== realpathSync(o.dir) ? o.mainDir : undefined;
 	if (!main) return { ...n, output: `Your own tests pass; the area's other ported tests fail with your code:\n${n.output}` };
+	// the worktree on an older main: main's new commits come in (the gate) or not (the session's checks) before main's
+	// answer is waited for, which a clash would throw away
+	let why: string | undefined;
+	if (o.catchUp) {
+		const caught = await catchUpWithMain(o.dir, main);
+		if (caught && "clash" in caught) why = `your code clashes with main's new commits in ${caught.clash.join(", ") || "some files"}: the merge puts it on the current main and they are checked after it`;
+		else if (caught && (n = await test(o.dir, others)).ok) return stillPass;
+	} else {
+		const sha = await exec("git", ["-C", main, "rev-parse", "HEAD"]).then((s) => s.trim(), () => "");
+		if (sha && !(await holds(o.dir, sha))) why = "the gate brings main's new commits into your worktree first and checks them again";
+	}
+	if (why) {
+		const named = failingFiles(n.output, others, o.dir);
+		return { ...mine, output: `${mine.output}\nwarning: test file(s) of other units fail here (${named.length ? named.join(", ") : `${others.length} file(s)`}), but your worktree is on an older main, so they are ${STALE_NOT_COUNTED}: ${why}` };
+	}
 	const ans = await askMain(main, others, { adapter: o.adapter, timeoutMs: o.timeoutMs, slot });
 	const mainWaitMs = ans.waitedMs;
 	const greenThere = others.filter((t) => ans.green.get(t));
 	const redThere = others.filter((t) => !greenThere.includes(t));
 	const note = redThere.length ? `\nwarning: ${redThere.length} test file(s) of other units ${FAIL_ON_MAIN_TOO}: ${redThere.join(", ")}` : "";
 	if (!greenThere.length) return { ...mine, output: `${mine.output}${note}`, mainWaitMs };
-	// the worktree on an older main than the one asked: they may fail here only for what main fixed since
+	// main moved while its answer was waited for: they may fail here only for what main fixed since
 	if (ans.head && !(await holds(o.dir, ans.head))) {
 		const caught = o.catchUp ? await catchUpWithMain(o.dir, main, ans.head) : undefined;
 		const why = !o.catchUp ? "the gate brings main's new commits into your worktree first and checks them again" : caught && "clash" in caught ? `your code clashes with main's new commits in ${caught.clash.join(", ") || "some files"}: the merge puts it on the current main and they are checked after it` : undefined;
@@ -242,8 +258,11 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 /** The note on a green run that did not count other units' tests because the worktree was on an older main. */
 export const STALE_NOT_COUNTED = "not counted against this unit yet";
 
-/** The test runner's failure lines in `out` ("FAIL x", "Failed x", "✗ x", "1) x"), without the marker. */
-export const failureLines = (out: string): string[] => [...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,160})$/gim)].map((m) => m[1]!.trim());
+/**
+ * The test runner's failure lines in `out` ("FAIL x", "Failed x", "✗ x", "1) x"), without the marker, cut to `max`
+ * characters. A long line is kept, not dropped: vitest puts the file and the whole test title on its FAIL line.
+ */
+export const failureLines = (out: string, max = 160): string[] => [...out.matchAll(/^\s*(?:FAIL|FAILED|✗|×|✕|\d+\))\s+(.{3,})$/gim)].map((m) => m[1]!.trim().slice(0, max));
 
 /**
  * The files among `files` (project paths of a run in `dir`) the runner's output says failed: named on a failure
@@ -253,7 +272,7 @@ export const failureLines = (out: string): string[] => [...out.matchAll(/^\s*(?:
  */
 export function failingFiles(out: string, files: string[], dir: string): string[] {
 	const lines = dropNoticeLists(out.split("\n")).kept;
-	const fails = failureLines(lines.join("\n"));
+	const fails = failureLines(lines.join("\n"), Infinity);
 	const dirs = [...new Set([dir, ...(existsSync(dir) ? [realpathSync(dir)] : [])])];
 	// the path itself, not the tail of a longer one (tests/a.spec in src/tests/a.spec), unless the run dir is in front
 	const names = (l: string, t: string) => {
