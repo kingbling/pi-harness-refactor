@@ -12,7 +12,7 @@ import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { commitAll, mainBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
-import { syntaxErrors } from "../inventory/treesitter.ts";
+import { addedSyntaxErrors } from "../inventory/treesitter.ts";
 import { describeCapabilities } from "../inventory/capabilities.ts";
 import { indexTarget } from "../inventory/target.ts";
 import { askViaModel } from "../jev/ask.ts";
@@ -815,10 +815,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					checkedTree = await treeKey();
 				}, onReport: (r) => reports.push(r) }),
 				transcriptPath: transcriptPath(o.root, o.unitId, role, attempt),
-				validateWrite: async (path, content) => {
+				validateWrite: async (path, content, before) => {
 					const lang = adapter.layout.lang(path);
 					if (!lang) return undefined;
-					const errs = await syntaxErrors(lang, content);
+					const errs = await addedSyntaxErrors(lang, before, content);
 					return errs.length ? `syntax error at line ${errs[0]!.line}: ${errs[0]!.text}` : undefined;
 				},
 				onToolCall: (e) => e.blocked && log(pc.dim(`  implementer blocked: ${e.blocked}`)),

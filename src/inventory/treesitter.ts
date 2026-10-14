@@ -127,3 +127,20 @@ export async function syntaxErrors(lang: string, source: string): Promise<Array<
 	});
 	return out;
 }
+
+/**
+ * Syntax errors the change added: errors already in the file before (a parser gap, or old breakage) are not the
+ * writer's to fix. Errors are matched by their text, since an edit moves line numbers; a new copy of an old error counts.
+ */
+export async function addedSyntaxErrors(lang: string, before: string | undefined, after: string): Promise<Array<{ line: number; text: string }>> {
+	const now = await syntaxErrors(lang, after);
+	if (!now.length || before === undefined) return now;
+	const old = new Map<string, number>();
+	for (const e of await syntaxErrors(lang, before)) old.set(e.text.trim(), (old.get(e.text.trim()) ?? 0) + 1);
+	return now.filter((e) => {
+		const left = old.get(e.text.trim()) ?? 0;
+		if (left <= 0) return true;
+		old.set(e.text.trim(), left - 1);
+		return false;
+	});
+}
