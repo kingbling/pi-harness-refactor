@@ -82,4 +82,13 @@ describe("a unit whose merge conflicts keeps its reviewed code", () => {
 		ledger.transitionUnit("U179", "quarantined", "t");
 		expect(keepsCode(ledger, "U179")).toBe(true);
 	});
+
+	it("a unit parked because the setup model fixed main keeps its code: the fix may wire a class only that code has", async () => {
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "U1765", tier: "T1", symbolIds: [] });
+		ledger.transitionUnit("U1765", "implementing", "t");
+		ledger.updateUnit("U1765", { meta: { parked: { diagnosis: { summary: "the project setup was fixed (wired DbalCategoryStatusPersistence)" } } } });
+		expect(keepsCode(ledger, "U1765")).toBe(true);
+	});
 });

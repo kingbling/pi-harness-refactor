@@ -1801,12 +1801,13 @@ export async function keepUnitWork(wt: string, unitId: string): Promise<string |
 
 /**
  * Whether a unit's code stays on its branch when its lane ends: it is quarantined (a self-heal goes on from it) or
- * waits on a question (a code job for that question starts from it, and so does the unit once answered), and its
- * code is worth keeping (mayKeepCode).
+ * waits (on a question: a code job for that question starts from it, and so does the unit once answered; or after
+ * a setup fix on main: the fix may wire code only this unit has, so the unit goes on from it on the fixed main), and
+ * its code is worth keeping (mayKeepCode).
  */
 export function keepsCode(ledger: Ledger, unitId: string): boolean {
 	const u = ledger.getUnit(unitId)!;
-	const waits = !!(JSON.parse(u.meta) as { parked?: { question?: number } }).parked?.question;
+	const waits = !!(JSON.parse(u.meta) as { parked?: object }).parked;
 	return (u.state === "quarantined" || (waits && u.state !== "accepted")) && mayKeepCode(ledger, unitId);
 }
 

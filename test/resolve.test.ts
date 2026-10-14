@@ -308,6 +308,31 @@ describe("a parked unit's question", () => {
 		expect(JSON.parse(ledger.getQuestion(g)!.context!).forOwner).toBe("nothing left");
 	});
 
+	it("a reviewer's finding outside the unit's files: the first retry (the reviewer may be wrong) goes through, a second one with a hint does not", async () => {
+		const { retryRefused } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["react"] }, models: {} });
+		ledger.createUnit({ id: "u487", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const options = ["retry — I changed it (or it is not needed): run the unit again", "leave — leave the unit parked"];
+		const context = { failedStep: "wired_ok", outOfScope: "web/src/features/players/components/DeliveryWidget.tsx must render the chart", sameAs: "sig" };
+		const ask = () => ledger.askQuestion({ unitId: "u487", point: "gate_env", question: "the reviewer asks for a change outside the unit's files", options, askedBy: "orchestrator", context });
+		const hinted = { answer: "retry", why: "write-scope rejection", hint: "Treat DeliveryWidget.tsx as this unit's own file" };
+		const a = ask();
+		expect(retryRefused(ledger.getQuestion(a)!, "retry", "the reviewer is wrong")).toBeUndefined();
+		const seen: Array<number | undefined> = [];
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver: async (o) => (seen.push(o.retried), hinted) });
+		expect(ledger.getQuestion(a)!.answer).toMatch(/^retry/);
+		// the same finding came back: another retry, hint or not, is refused and the model is told to call a job
+		const b = ask();
+		expect(retryRefused(ledger.getQuestion(b)!, "retry", "Authorize DeliveryWidget.tsx", 1)).toMatch(/never lets the unit write a file outside its list[\s\S]*code_job/);
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver: async (o) => (seen.push(o.retried), hinted) });
+		expect(seen).toEqual([0, 1]);
+		expect(ledger.getQuestion(b)!.answer).toMatch(/^leave[\s\S]*never lets the unit write a file outside its list/);
+		// another kind of gate_env question of the same unit is not held to it
+		const c = ledger.askQuestion({ unitId: "u487", point: "gate_env", question: "the database is down", options, askedBy: "orchestrator", context: { failedStep: "ported_tests_green" } });
+		expect(retryRefused(ledger.getQuestion(c)!, "retry", "it is up again", 1)).toBeUndefined();
+	});
+
 	it("a hint typed after retry counts as a hint, a capital Retry is still a retry, and a resolver that keeps failing parks the unit", async () => {
 		const { MAX_RESOLVER_FAILURES, retryRefused } = await import("../src/jev/resolve.ts");
 		const ledger = new Ledger(":memory:");

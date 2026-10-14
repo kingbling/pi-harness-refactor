@@ -242,12 +242,26 @@ function removeProbe(adapter: TargetAdapter, projectDir: string): void {
 	if ([probe.content, probe.failing].some((c) => c !== undefined && c.trim() === text)) rmSync(at, { force: true });
 }
 
+/** The stack's start-up check on main: its command and its error output (none when it passed), or undefined when the stack has none. */
+async function bootCheck(adapter: TargetAdapter, root: string, projectDir: string): Promise<{ command: string; error?: string } | undefined> {
+	const b = withCommandOverrides(adapter, root).boot?.(projectDir);
+	if (!b?.cmd) return undefined;
+	const command = [b.cmd, ...b.args].join(" ");
+	try {
+		await exec(b.cmd, b.args, { cwd: projectDir, timeout: 20 * 60_000 });
+		return { command };
+	} catch (e: any) {
+		return { command, error: `${e?.stdout ?? ""}\n${e?.stderr ?? ""}`.trim().slice(-3000) || String(e?.message ?? e) };
+	}
+}
+
 /**
  * A gate failure diagnosed as a setup problem of the new project: the setup model fixes the stack's main project
  * (not the unit's worktree) and the change is committed, so every unit started from now on has it. One fix per
  * stack at a time: units failing meanwhile wait for that fix instead of starting their own. Each different problem
  * (`signature`, the same error in different units) gets its own tries. Changes to test files and migrated code are
- * put back before the commit, and the commit runs under the run's merge lock (`lock`). A fix is logged to the
+ * put back before the commit, and a fix that stops the app's start-up check passing on main is put back whole. The
+ * whole session, from the model's first edit to the commit, runs under the run's merge lock (`lock`). A fix is logged to the
  * stack's fixes log, which wakes the units parked on a setup problem, and kept in the ledger as a `__setup__`
  * attempt (what changed, what was put back, what the model said). Returns what changed, or undefined when nothing did.
  */
@@ -261,32 +275,46 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 	if ((fixes.get(problemKey) ?? 0) >= MAX_FIXES_PER_PROBLEM || (fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return undefined;
 	fixes.set(problemKey, (fixes.get(problemKey) ?? 0) + 1);
 	const wasted = () => fixes.set(key, (fixes.get(key) ?? 0) + 1);
-	const p = (async () => {
+	const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
+	// the model edits main's own checkout: the merge lock is held from before its first edit until the commit, so no
+	// merge runs on a half-edited main ("your local changes would be overwritten")
+	const p = lock(async () => {
 		// the why text is only a note: a fix that adds to it alone changed nothing
 		const settings = () => JSON.stringify({ ...loadCommandOverrides(o.root, key), why: undefined });
 		const before = settings();
 		const overrides = keepOverrides(o.root, key);
 		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
+		// main's start-up check before the fix: a fix must not leave an app that started unable to start
+		const bootBefore = await bootCheck(o.adapter, o.root, o.projectDir);
 		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000) } });
 			wasted();
 			throw e;
 		});
 		const repo = o.config.target.path;
-		const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
 		// the target must be its own repo: inside another checkout, undo and commit would act on the parent's files
 		if (!await isRepoRoot(repo)) {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "no_change", gateReport: { said, error: `${repo} is not its own git repo: nothing undone or committed` } });
 			wasted();
 			return undefined;
 		}
-		const { sha, undone, changed, cannotFail } = await lock(async () => {
+		let bootBroken = false;
+		const { sha, undone, changed, cannotFail } = await (async () => {
 			try {
 				const migrated = o.ledger ? new Set((o.ledger.db.prepare("SELECT target_symbols FROM moves WHERE op != 'dropped'").all() as Array<{ target_symbols: string }>).flatMap((r) => (JSON.parse(r.target_symbols) as string[]).map((t) => t.split("::")[0]!))) : undefined;
 				const undone = await undoMigratedCode(repo, o.projectDir, o.adapter, migrated);
 				// a fix may change the test command or its config so that nothing can fail any more: the probe test with a
 				// wrong expected value must still fail, else the whole fix is put back (it would turn every gate green)
-				const cannotFail = await testCannotFail(o.config, withCommandOverrides(o.adapter, o.root)).catch((e) => (console.log(pc.yellow(`  setup fix: could not check that the test command can still fail (${e?.message ?? e})`)), undefined));
+				let cannotFail = await testCannotFail(o.config, withCommandOverrides(o.adapter, o.root)).catch((e) => (console.log(pc.yellow(`  setup fix: could not check that the test command can still fail (${e?.message ?? e})`)), undefined));
+				// the same start-up check that passed before the fix fails after it (e.g. wiring for a class only a unit's
+				// worktree has): the whole fix is put back, main keeps starting
+				if (!cannotFail && bootBefore && bootBefore.error === undefined) {
+					const now = await bootCheck(o.adapter, o.root, o.projectDir);
+					if (now?.command === bootBefore.command && now.error !== undefined) {
+						bootBroken = true;
+						cannotFail = `the app started on main before this fix and does not start after it (${now.command}):\n${now.error}`;
+					}
+				}
 				if (cannotFail) {
 					overrides.restore(true);
 					await exec("git", ["-C", repo, "checkout", "HEAD", "--", o.projectDir]);
@@ -294,10 +322,11 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 					return { sha: undefined, undone, changed: [], cannotFail };
 				}
 				removeProbe(o.adapter, o.projectDir);
-				// another stack's project is never committed by this fix: its changes there are put back unless that
-				// stack's own fix is running (whose edits they may be)
+				// another stack's project is never committed by this fix: its changes there are put back. Under the merge
+				// lock one fix runs at a time, so another stack's queued fix has made no edits yet: always put back. Only
+				// without a lock (the start-up call) may that stack's own fix be running now, whose edits they may be
 				const others = o.config.target.stacks.filter((s) => s !== key).map((s) => ({ s, dir: relative(repo, stackDir(o.config, s)) })).filter((x) => x.dir && !x.dir.startsWith(".."));
-				for (const x of others.filter((x) => !fixing.has(x.s))) {
+				for (const x of others.filter((x) => o.lock || !fixing.has(x.s))) {
 					const there = (await exec("git", ["-C", repo, "status", "--porcelain", "-uall", "--", x.dir])).split("\n").filter(Boolean).map((l) => l.slice(3));
 					if (!there.length) continue;
 					try {
@@ -328,10 +357,10 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 				wasted();
 				throw e;
 			}
-		});
+		})();
 		if (cannotFail) {
-			console.log(pc.red(`  setup fix put back: ${cannotFail}`));
-			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "probe_failed", gateReport: { said, error: cannotFail, problem: o.problem.slice(0, 2000) } });
+			console.log(pc.red(`  setup fix put back: ${cannotFail.slice(0, 500)}`));
+			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: bootBroken ? "boot_broken" : "probe_failed", gateReport: { said, error: cannotFail, problem: o.problem.slice(0, 2000) } });
 			wasted();
 			return undefined;
 		}
@@ -343,7 +372,7 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		noteFix(o.root, key, sha, what);
 		if (o.unitId && o.ledger) o.ledger.updateUnit(o.unitId, { meta: { setupParks: parks() + 1 } });
 		return what;
-	})().finally(() => fixing.delete(key));
+	}).finally(() => fixing.delete(key));
 	fixing.set(key, p);
 	return p;
 }

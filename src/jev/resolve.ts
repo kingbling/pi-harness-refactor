@@ -24,13 +24,19 @@ export const MAX_RESOLVER_TRIES = 3;
 export const MAX_RESOLVER_FAILURES = 3;
 const RESOLVER_RETRY_MS = 5 * 60_000;
 
-/** Why a retry answer is no answer to this question (askStuckUnits' context.retry), or undefined when it is one. */
-export function retryRefused(q: QuestionRow, answer: string, hint?: string): string | undefined {
+/**
+ * Why a retry answer is no answer to this question (askStuckUnits' context.retry), or undefined when it is one.
+ * `retried`: the resolver's earlier retries on this unit's out-of-scope review questions (triedBefore).
+ */
+export function retryRefused(q: QuestionRow, answer: string, hint?: string, retried = 0): string | undefined {
   if (answerValue(answer).toLowerCase() !== "retry") return undefined;
   // "retry: <text>" carries its hint inline (optionFor, applyParkedAnswer read it the same way)
   const inline = /^retry: /i.test(answer) ? answer.slice(7).trim() : "";
-  const ctx = q.context ? (JSON.parse(q.context) as { retry?: string; failureKind?: string }) : {};
+  const ctx = q.context ? (JSON.parse(q.context) as { retry?: string; failureKind?: string; outOfScope?: string }) : {};
   if (ctx.retry === "none") return "the unit's automatic tries are used up: a retry is no answer; a job (code_job, fix_job, layout_job) that changes main is";
+  // the reviewer wants a file changed that the unit may not write: no hint widens the files a unit may write, so a
+  // retry that came back once comes back again
+  if (ctx.outOfScope && retried > 0) return "the unit was already retried on the reviewer's finding outside its files and it came back: a retry or a hint never lets the unit write a file outside its list. If the change is needed, call code_job (app code) or fix_job (setup) to make it on main";
   if (ctx.retry && !hint?.trim() && !inline) return `the unit was already retried on this kind of failure (${ctx.failureKind}) and it came back: a plain retry runs it again blind. Give a hint that changes the attempt (what to do differently, or what changed on main and how to use it), or call a job`;
   return undefined;
 }
@@ -79,6 +85,8 @@ export type Resolver = (o: {
   q: QuestionRow;
   /** the models' earlier answers on this point for this unit (and, marked with their unit, for others with the same problem), oldest first */
   earlier?: string[];
+  /** the resolver's earlier retries on this unit's out-of-scope review questions (retryRefused) */
+  retried?: number;
 }) => Promise<Resolution | undefined>;
 
 export async function resolveOpenQuestions(d: {
@@ -107,7 +115,7 @@ export async function resolveOpenQuestions(d: {
     // the resolver failed on it lately (provider outage, rate limit): wait a little longer after each failure
     const failed = ctx.resolverFailed ?? 0;
     if (failed && Date.now() - (ctx.resolverFailedAt ?? 0) < failed * RESOLVER_RETRY_MS) continue;
-    const { earlier, tries } = triedBefore(d.ledger, q);
+    const { earlier, tries, retried } = triedBefore(d.ledger, q);
     // what only a person can do, in those words: not "retry or leave"
     const askOwnerTo = (why: string) =>
       d.ledger.db.prepare("UPDATE questions SET question = ?, options = ? WHERE id = ?").run(`${q.unit_id} is parked until you do this: ${why}`, JSON.stringify(["retry — done, run it again", "leave — leave it parked"]), q.id);
@@ -146,6 +154,7 @@ export async function resolveOpenQuestions(d: {
       root: d.root,
       q,
       earlier,
+      retried,
     }).catch((e) => ({ failed: `the resolver model failed: ${e?.message ?? e}` }));
     if (d.ledger.getQuestion(q.id)?.status !== "open") continue; // answered meanwhile (owner, setup model …)
     if (!r || "failed" in r) {
@@ -218,7 +227,7 @@ export async function resolveOpenQuestions(d: {
     }
     if ("answer" in r && parks(q)) {
       // the code holds the line the prompt draws: a retry that changes nothing is not an answer
-      const refused = retryRefused(q, r.answer, r.hint);
+      const refused = retryRefused(q, r.answer, r.hint, retried);
       if (refused) {
         park(`${refused} (the resolver model answered retry anyway)`);
         continue;
@@ -244,24 +253,26 @@ export async function resolveOpenQuestions(d: {
 /** Who answers for the run's models: their "retry" is one more try, never the owner's fresh set of tries. */
 export const MODEL_ANSWERERS: readonly string[] = [RESOLVER, FIX_JOB, CODE_JOB, LAYOUT_JOB];
 
-function triedBefore(ledger: Ledger, q: QuestionRow): { earlier: string[]; tries: number } {
+function triedBefore(ledger: Ledger, q: QuestionRow): { earlier: string[]; tries: number; retried: number } {
   // a problem several units share (sameAs): the model sees what other units got, but only this unit's own answers count
   // as its tries; a resolver "leave" is no try either (it sends nothing back, it keeps the unit parked)
   const sameAs = q.context ? (JSON.parse(q.context) as { sameAs?: string }).sameAs : undefined;
   const rows = (
     ledger.db
       .prepare(
-        `SELECT unit_id, answered_at, answer, answered_by FROM questions WHERE id != ? AND point = ? AND (unit_id IS ? OR json_extract(context, '$.sameAs') = ?) AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
+        `SELECT unit_id, answered_at, answer, answered_by, json_extract(context, '$.outOfScope') IS NOT NULL AS outOfScope FROM questions WHERE id != ? AND point = ? AND (unit_id IS ? OR json_extract(context, '$.sameAs') = ?) AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
       )
-      .all(q.id, q.point, q.unit_id, sameAs ?? null, ...MODEL_ANSWERERS) as Array<{ unit_id: string | null; answered_at: string; answer: string; answered_by: string }>
+      .all(q.id, q.point, q.unit_id, sameAs ?? null, ...MODEL_ANSWERERS) as Array<{ unit_id: string | null; answered_at: string; answer: string; answered_by: string; outOfScope: number }>
   ).filter((r) => !(r.answered_by === RESOLVER && answerValue(r.answer).toLowerCase() === "leave"));
+  const own = rows.filter((r) => r.unit_id === q.unit_id);
   return {
     earlier: rows.map((r) => `${r.answered_at}${r.unit_id === q.unit_id ? "" : ` (unit ${r.unit_id})`}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`),
-    tries: rows.filter((r) => r.unit_id === q.unit_id).length,
+    tries: own.length,
+    retried: own.filter((r) => r.outOfScope && r.answered_by === RESOLVER && answerValue(r.answer).toLowerCase() === "retry").length,
   };
 }
 
-export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) => {
+export const resolveWithModel: Resolver = async ({ config, root, q, earlier, retried }) => {
   let result: Resolution | undefined;
   const tool = (
     name: string,
@@ -298,7 +309,7 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier }) =
         Type.Object({ answer: Type.String(), why: Type.String(), hint: Type.Optional(Type.String()) }),
         (p) => ({ answer: p.answer, why: p.why, hint: p.hint }),
         // a retry that changes nothing goes back to the model: it picks a job, a real hint, or says what is left
-        (p) => (parks(q) ? retryRefused(q, p.answer, p.hint) : undefined),
+        (p) => (parks(q) ? retryRefused(q, p.answer, p.hint, retried) : undefined),
       ),
       tool(
         "fix_job",
@@ -341,7 +352,8 @@ Read the files the question is about with your tools, then call exactly one tool
 - When the unit's own saved test is wrong (it contradicts itself or the legacy code), answer_question with retry and a hint naming the test and the exact change: the tester checks it again on the retry. fix_job and code_job cannot edit a unit's saved tests.
 - fix_job when the cause is in the project setup and a model can change it (a missing file a config loads, a package, a service binding, a tool config, an env file): the fix runs first, the question waits; never send the owner a setup fix a model can make.
 - code_job when app code is missing outside the unit's files (an endpoint, a service, wiring, a fixture the unit's tests need): a model writes it, the question waits. Missing code is never the owner's job, and "leave parked" or "retry" do not make it appear.
-- A "write outside unit scope" red is never a code_job: the unit's own files (its stubs too) are its to write; answer_question with retry and a hint fixes it.
+- The gate's "write outside unit scope" red (the unit wrote a file outside its own list) is never a code_job: answer_question with retry and a hint to keep its changes inside its own files (its stubs too).
+- The reviewer's finding outside the unit's files (the facts carry outOfScope) is the opposite case: a file the unit may not write must change. A retry or a hint never lets the unit write a file outside the list the facts give; nothing "authorizes" it. If the change is needed, call code_job (app code) or fix_job (setup) to make it on main. Answer retry only when the file is on the unit's list after all, or the reviewer is wrong and the change is not needed; the hint says which and why.
 - layout_job when the folder check ("not an allowed file") keeps refusing a path and moving the file is wrong: look on main where code of the same kind already lives. A retry or a hint to "move it" does not help when nowhere allowed fits.
 - needs_owner only when it needs something only a person can do or decide (credentials, money, a business choice, something outside the code). Missing code, a missing wiring or a red check is never that.${parks(q) ? "\n- leave_parked when nothing a model can do is left and nothing needs a person: the unit stays parked, the owner is not asked." : ""}${goalsText(config.goals) ? `\n\n${goalsText(config.goals)}` : ""}`,
   });
