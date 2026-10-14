@@ -30,8 +30,27 @@ describe("the freeze watchdog", () => {
 			stop();
 		}
 		expect(logged).toHaveLength(1);
-		expect(logged[0]).toMatch(/^\d{4}-\d\d-\d\dT\S+Z Pi was blocked \d+\.\d s \(last step: parity: data reset\)$/);
+		expect(logged[0]).toMatch(/^\d{4}-\d\d-\d\dT\S+Z Pi was blocked \d+\.\d s \(last step: parity: data reset\)(; held by: .+)?$/);
 		expect(readFileSync(join(root, ".bigrefactor", "blocked.log"), "utf8")).toBe(logged[0] + "\n");
+	});
+
+	it("names the function that held the thread, not only the last step another lane set", async () => {
+		const root = mkdtempSync(join(tmpdir(), "br-watchdog-"));
+		const logged: string[] = [];
+		const stop = startWatchdog(root, (l) => logged.push(l));
+		function holdTheThreadForTheTest() {
+			busy(1500);
+		}
+		try {
+			setStep("scheduling pass");
+			await tick(300);
+			holdTheThreadForTheTest();
+			await tick(450);
+		} finally {
+			stop();
+		}
+		expect(logged).toHaveLength(1);
+		expect(logged[0]).toMatch(/\(last step: scheduling pass\); held by: .*holdTheThreadForTheTest/);
 	});
 
 	it("stops watching when stopped", async () => {
