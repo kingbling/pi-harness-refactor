@@ -493,6 +493,9 @@ describe("runUnit wiring", () => {
 			expect(qs.map((q) => [q.point, q.status])).toEqual([["gate_env", "open"]]);
 			expect(qs[0]!.question).toContain("autoload map does not cover src/Agency");
 			expect(JSON.parse(ledger.getUnit("u1")!.meta).parked.question).toBe(ledger.openQuestions()[0]!.id);
+			// leaving it parked is not a human's job: the resolver may pick it
+			expect(ledger.openQuestions()[0]!.options).toContain("leave the unit parked");
+			expect(ledger.openQuestions()[0]!.options).not.toContain("for a human");
 		});
 
 		it("app code outside the unit (not the setup, says the reviewer) skips the setup fixer: straight to one question", async () => {

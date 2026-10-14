@@ -13,7 +13,7 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] } } = {}) {
+	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean } = {}) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
@@ -37,10 +37,11 @@ describe("the code job", () => {
 		const said = await runCodeJob({
 			config,
 			root,
-			ledger: new Ledger(":memory:"),
+			ledger: o.ledger ?? new Ledger(":memory:"),
 			adapter,
 			what: "make the test pass",
-			label: "q1",
+			label: o.whole ? "build-fake-1" : "q1",
+			whole: o.whole,
 			linkAll: () => {},
 			mergeFix: async () => ((merged = true), undefined),
 			log: () => {},
@@ -104,5 +105,38 @@ describe("the code job", () => {
 	it("a build red here and green on main is refused", async () => {
 		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "b.txt"), "BROKEN\n"), "added b"), [], undefined, [], { build: { cmd: "sh", args: ["-c", "! grep -rn BROKEN src"] } });
 		expect(r.merged).toBe(false);
+	});
+	it("a question's job may not remove the stub mark of a unit not accepted yet: that unit replaces its stub", async () => {
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "billing", tier: "T1", symbolIds: [] });
+		const main = { main: { "src/stub.txt": "// TODO(br:billing) stand-in\n", "src/other.txt": "// TODO(br:billing) stand-in\n" }, ledger };
+		const unmark = (dir: string) => (code(dir), writeFileSync(join(dir, "src", "stub.txt"), "real\n"), "replaced the stub");
+		const r = await job(unmark, [], undefined, [], main);
+		expect(r.merged).toBe(false);
+		expect(r.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:billing\)/);
+		// adding code next to the stubs is fine
+		expect((await job((dir) => (code(dir), "added b"), [], undefined, [], main)).merged).toBe(true);
+		// the unit is accepted: its marks are anyone's to remove
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'billing'").run();
+		expect((await job(unmark, [], undefined, [], main)).merged).toBe(true);
+	});
+	it("a removed SQL comment stub mark (-- TODO(br:u)) counts as removed, though its diff line starts with ---", async () => {
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "u", tier: "T1", symbolIds: [] });
+		const main = { main: { "src/stub.sql": "select 1;\n-- TODO(br:u) stand-in\n" }, ledger };
+		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "stub.sql"), "select 1;\n"), "replaced the stub"), [], undefined, [], main);
+		expect(r.merged).toBe(false);
+		expect(r.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:u\)/);
+	});
+	it("the builder's job has its own turn: a question's job does not wait behind it", async () => {
+		let release = () => {};
+		const builderHolds = new Promise<void>((r) => (release = r));
+		const order: string[] = [];
+		const builder = job(async () => (await builderHolds, order.push("builder"), "nothing"), [], undefined, [], { whole: true });
+		await new Promise((r) => setTimeout(r, 50));
+		await job((dir) => (code(dir), order.push("question"), "added b"));
+		release();
+		await builder;
+		expect(order).toEqual(["question", "builder"]);
 	});
 });

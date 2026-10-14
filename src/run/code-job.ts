@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
@@ -62,7 +62,8 @@ function protectedConfig(adapter: TargetAdapter, f: string): boolean {
 	return !adapter.layout.isTestFile(f) && !isWiringFile(f, wiring) && adapter.protectedGlobs.some((g) => globToRegExp(g).test(f));
 }
 
-/** Code jobs for one question at a time per stack: two would change main at once. */
+/** Code jobs for one question at a time per stack: two would change main at once. The builder's job has its own turn
+ * (a question's job need not wait behind it); the merge lock still puts their merges one after the other. */
 const busy = new Map<string, Promise<string | undefined>>();
 
 export async function runCodeJob(o: {
@@ -84,7 +85,7 @@ export async function runCodeJob(o: {
 	/** told why the check refused what the job wrote (it returns undefined then) */
 	onRefused?: (problem: string) => void;
 }): Promise<string | undefined> {
-	const key = o.adapter.id;
+	const key = o.whole ? `${o.adapter.id}:build` : o.adapter.id;
 	while (busy.has(key)) await busy.get(key)!.catch(() => undefined);
 	const p = run(o);
 	busy.set(key, p);
@@ -118,7 +119,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
 		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
 		const changed = changedFiles(dir, o.adapter.toolchain.ignoredPaths);
-		const problem = changed.length ? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole) : "nothing was changed";
+		const problem = changed.length ? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger) : "nothing was changed";
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
@@ -140,6 +141,27 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	}
 }
 
+/** Units whose TODO(br:<unit>) mark the changed files lost (a mark moved to another changed file is kept). */
+function removedMarks(dir: string, changed: string[]): string[] {
+	const mark = /TODO\(br:([^)\s]+)\)/g;
+	const removed = new Set<string>();
+	const added = new Set<string>();
+	const diff = execFileSync("git", ["diff", "-U0", "HEAD", "--", ...changed], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+	// a file's header lines (--- a/x, +++ b/x) come before its first @@; after it, "--- TODO" is a removed "-- TODO" comment
+	let header = false;
+	for (const l of diff.split("\n")) {
+		if (l.startsWith("diff --git ")) header = true;
+		else if (l.startsWith("@@")) header = false;
+		if (header) continue;
+		const into = l.startsWith("-") ? removed : l.startsWith("+") ? added : undefined;
+		for (const m of into ? l.matchAll(mark) : []) into!.add(m[1]!);
+	}
+	// a new file is not in the diff against HEAD
+	const tracked = new Set(trackedFiles(dir));
+	for (const f of changed) if (existsSync(join(dir, f)) && !tracked.has(f)) for (const m of readFileSync(join(dir, f), "utf8").matchAll(mark)) added.add(m[1]!);
+	return [...removed].filter((u) => !added.has(u));
+}
+
 /**
  * Code's check: the changed files follow the layout, the changed code files build, there is a test among the changed files when code changed, and the
  * changed tests pass. Undefined = green. Only what the job changed is checked: the rest of main is not its job, except
@@ -149,10 +171,14 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
  * than main and none main does not have: a job that fixes part of a big red main is not thrown away. Any other job's
  * failing steps run again on main (`mainDir`): it fails only on a step green on main or error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean, ledger: Ledger): Promise<string | undefined> {
 	// a deleted test checks nothing: the job may not make the check green by removing what was red
 	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
+	// a stub's TODO(br:<unit>) mark tells that unit which files it may edit to replace the stub: it is the unit's to
+	// remove, not a question's job (the builder's job may: it only makes main build)
+	const marks = whole ? [] : removedMarks(dir, changed).filter((u) => (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
+	if (marks.length) return `stub marks of units not accepted yet were removed: ${marks.slice(0, 5).map((u) => `TODO(br:${u})`).join(", ")}; leave the stubs and their marks to those units`;
 	const config = changed.filter((f) => protectedConfig(adapter, f));
 	if (config.length) return `protected config was changed: ${config.slice(0, 5).join(", ")}`;
 	// the same drift check a unit's gate runs on its files: a note or a misplaced file stays off main. A new file in a
