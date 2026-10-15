@@ -161,7 +161,7 @@ describe("judging parity differences", () => {
 		const add = (slice: string, outcome: string) => ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES (?, ?, datetime('now'))").run(slice, outcome);
 		add("auth", "error");
 		add("users", "same");
-		expect(parityAgain(ledger)).toEqual({ checked: new Set(["auth", "users"]), again: new Set(["auth"]) });
+		expect(parityAgain(ledger)).toEqual({ checked: new Set(["auth", "users"]), again: new Set(["auth"]), fixed: new Set() });
 		for (let i = 1; i < MAX_PARITY_ERRORS; i++) add("auth", "error");
 		expect(parityAgain(ledger).again.has("auth")).toBe(false); // errored too often in a row: left alone
 		// differences nobody judged (the judge failed): compared again
@@ -174,6 +174,53 @@ describe("judging parity differences", () => {
 		const r2 = run([{ step: "one", path: "body.total", legacy: 10, target: 11 }]);
 		ledger.db.prepare("UPDATE parity_diffs SET status = 'bug', quirk_id = ? WHERE id = ?").run(quirk, ids(r2)[0]!);
 		expect(parityAgain(ledger).again.has("invoices")).toBe(false);
+	});
+
+	it("an app that did not start here never counts as an error of the code: such a slice is compared again", () => {
+		const { ledger } = workspace();
+		const add = (slice: string, outcome: string) => ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES (?, ?, datetime('now'))").run(slice, outcome);
+		for (let i = 0; i < MAX_PARITY_ERRORS + 2; i++) add("auth", "setup");
+		expect(parityAgain(ledger).again.has("auth")).toBe(true);
+		// setup runs between real errors neither count nor reset the count
+		add("auth", "error");
+		add("auth", "setup");
+		for (let i = 1; i < MAX_PARITY_ERRORS; i++) add("auth", "error");
+		expect(parityAgain(ledger).again.has("auth")).toBe(false);
+	});
+
+	it("a fix of a unit the last comparison blamed, accepted after it, is compared: again at run start and on its accept, even after too many errors", () => {
+		const { ledger } = workspace();
+		const id = Number(ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at, ended_at, commit_sha) VALUES ('invoices', 'differs', '2026-10-14T23:36:00.000Z', '2026-10-14T23:47:00.000Z', 'aaa')").run().lastInsertRowid);
+		ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target, status, unit_id) VALUES (?, 'invoices', 's1', 'GET /x', 'status', 'status', '302', '503', 'bug', 'U1')").run(id);
+		const accepted = (unit: string, at: string) => ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, created_at) VALUES ('unit', ?, 'review', 'accepted', ?)").run(unit, at);
+		accepted("U1", "2026-10-14T20:00:00.000Z"); // before the comparison: already in it
+		accepted("U2", "2026-10-15T01:00:00.000Z"); // not blamed
+		expect(parityAgain(ledger).fixed.has("invoices")).toBe(false);
+		expect(parityAgain(ledger, "aaa").again.has("invoices")).toBe(false);
+		accepted("U1", "2026-10-15T01:21:31.985Z");
+		expect(parityAgain(ledger).fixed.has("invoices")).toBe(true);
+		expect(parityAgain(ledger, "aaa").again.has("invoices")).toBe(true);
+		// the comparisons after the fix errored too often: left alone again, until the next fix
+		for (let i = 0; i < MAX_PARITY_ERRORS; i++) ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES ('invoices', 'error', ?)").run(`2026-10-15T02:0${i}:00.000Z`);
+		expect(parityAgain(ledger).again.has("invoices")).toBe(false);
+		expect(parityAgain(ledger).fixed.has("invoices")).toBe(false);
+		accepted("U1", "2026-10-15T03:00:00.000Z");
+		expect(parityAgain(ledger).again.has("invoices")).toBe(true);
+	});
+
+	it("older ledgers: comparisons an app's start or data reset stopped are turned into setup once", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "br-paritymig-")), "ledger.sqlite");
+		const first = new Ledger(path);
+		const add = (note: string) => first.db.prepare("INSERT INTO parity_runs(slice, outcome, note, started_at) VALUES ('s', 'error', ?, datetime('now'))").run(note);
+		add("the old app did not start: the data reset failed: …");
+		add("the new symfony app did not start: the data reset failed: OrbStack is already running.");
+		add("the new symfony app did not start: no answer on http://127.0.0.1:18081/ after 180s");
+		add("this slice has no routes of its own to compare");
+		first.db.prepare("DELETE FROM meta WHERE key = 'parity_setup_outcome'").run();
+		first.close();
+		const again = new Ledger(path);
+		expect((again.db.prepare("SELECT outcome FROM parity_runs ORDER BY id").all() as Array<{ outcome: string }>).map((r) => r.outcome)).toEqual(["setup", "setup", "error", "error"]);
+		again.close();
 	});
 
 	it("at run start: a slice compared on an older main is compared again; the same main or an unknown one is not", () => {

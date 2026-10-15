@@ -9,7 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
-import { appRoot, bootApp, dumpData, fixUpLeft, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe } from "./parity.ts";
+import { appRoot, bootApp, dumpData, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe, type Booted } from "./parity.ts";
 
 /**
  * Differential parity for one slice: the same requests go to the old app (twice) and to the new app, code compares
@@ -264,17 +264,19 @@ export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[
 
 // ---- the tester that writes the steps ---------------------------------------------------------------------
 
-/** Start the old app (data reset first), send the steps, stop it. */
-async function runOnOld(config: Config, root: string, steps: Step[]): Promise<StepResult[] | string> {
-	const recipe = loadApps(root)[LEGACY]?.recipe;
-	if (!recipe) return "the old app has no start recipe (br parity --probe)";
+/** Starts one side's app with its saved recipe (read again: a setup fix may have saved a new one). */
+type Boot = (side: string) => Promise<Booted>;
+const plainBoot = (config: Config, root: string): Boot => async (side) => {
+	const recipe = loadApps(root)[side]?.recipe;
+	return recipe ? bootApp(recipe, appRoot(config, root, side)) : { ok: false, stage: "setup", error: "it has no start recipe (br parity --probe)" };
+};
+
+/** Start the old app (data reset first), send the steps, stop it. A string says why it did not start. */
+async function runOnOld(config: Config, root: string, steps: Step[], boot: Boot = plainBoot(config, root)): Promise<StepResult[] | string> {
+	const b = await boot(LEGACY);
+	if (!b.ok) return `the old app did not start: ${b.error}`;
+	const recipe = loadApps(root)[LEGACY]!.recipe!;
 	const dir = appRoot(config, root, LEGACY);
-	const b = await bootApp(recipe, dir);
-	if (!b.ok) {
-		// it started when it was set up: its setup here (data reset, start) is asked to fix that
-		if (fixUpLeft(loadApps(root)[LEGACY], "setup") && !loadApps(root)[LEGACY]?.setupProblem) saveApp(root, LEGACY, { setupProblem: `the old app did not start for a slice check: ${String(b.error).slice(0, 1000)}` });
-		return `the old app did not start: ${b.error}`;
-	}
 	try {
 		return await runSteps(steps, { side: "legacy", base: () => recipe.ready, dump: recipe.dump ? () => dumpData(recipe, dir) : undefined });
 	} finally {
@@ -332,7 +334,8 @@ export const writeStepsWithModel: StepWriter = async (o) => {
 
 export interface SliceCheck {
 	runId?: number;
-	outcome: "same" | "differs" | "error";
+	/** setup = an app could not be started here (its data reset or start), even after its setup was asked to fix it: says nothing about the code. */
+	outcome: "same" | "differs" | "error" | "setup";
 	diffs: Diff[];
 	compared: number;
 	note: string;
@@ -344,7 +347,10 @@ export interface SliceCheck {
  * Compare one slice: steps (written once, `rewrite` writes them anew), the old app run twice, the new app once in a
  * fresh worktree of main, differences into the ledger. Needs both apps' recipes (br parity --probe).
  */
-export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
+/** How often one slice check hands an app that did not start to its setup fixer before it records that. */
+export const MAX_SETUP_RETRIES = 2;
+
+export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void; fixSetup?: (side: string, error: string) => Promise<boolean> }): Promise<SliceCheck> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const startedAt = new Date().toISOString();
 	const mainAt = await headOf(o.config.target.path);
@@ -355,9 +361,30 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		return { ...c, runId };
 	};
 	const fail = (note: string) => (log(pc.yellow(`parity ${o.slice}: ${note}`)), record({ outcome: "error", diffs: [], compared: 0, note }));
+	const setupFail = (note: string) => (log(pc.yellow(`parity ${o.slice}: not compared, ${note}`)), record({ outcome: "setup", diffs: [], compared: 0, note: `setup: ${note}` }));
+	// an app that does not start here goes to its setup fixer with what failed, then is started again (a few times per
+	// check at most). The old app's code never changes, so any failure of it is setup; the new app's only before its
+	// own start command (ready URL, port, data reset): a start that fails is main's code, the builder's
+	let fixes = 0;
+	const name = (side: string) => (side === LEGACY ? "the old app" : `the new ${side} app`);
+	const boot: Boot = async (side) => {
+		for (;;) {
+			const b = await plainBoot(o.config, o.root)(side);
+			const a = loadApps(o.root)[side];
+			if (b.ok) {
+				// it starts again: the next failure gets its own fixes
+				if (a?.bootProbes || a?.bootProblem) saveApp(o.root, side, { bootProbes: undefined, bootProblem: undefined });
+				return b;
+			}
+			if ((side !== LEGACY && b.stage === "start") || !o.fixSetup || fixes >= MAX_SETUP_RETRIES) return b;
+			fixes++;
+			log(pc.yellow(`parity ${o.slice}: ${name(side)} did not start (${b.error.split("\n")[0]!.slice(0, 200)}): its setup is asked to fix it`));
+			if (!(await o.fixSetup(side, b.error).catch(() => false))) return b;
+		}
+	};
 
-	const apps = loadApps(o.root);
-	if (!apps[LEGACY]?.up || !apps[LEGACY].recipe) return fail("the old app does not start here (br parity --probe)");
+	let apps = loadApps(o.root);
+	if (!apps[LEGACY]?.up || !apps[LEGACY].recipe) return setupFail("the old app does not start here (br parity --probe)");
 	const { routes, files } = sliceFacts(o.ledger, o.slice);
 	if (!routes.length) return fail("this slice has no routes of its own to compare");
 
@@ -379,24 +406,26 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	const { steps } = loadSteps(o.root, o.slice)!;
 
 	// the old app twice (what differs between those two runs is noise), then the new app
-	const old1 = await runOnOld(o.config, o.root, steps);
-	if (typeof old1 === "string") return fail(old1);
-	const old2 = await runOnOld(o.config, o.root, steps);
-	if (typeof old2 === "string") return fail(old2);
+	const old1 = await runOnOld(o.config, o.root, steps, boot);
+	if (typeof old1 === "string") return setupFail(old1);
+	const old2 = await runOnOld(o.config, o.root, steps, boot);
+	if (typeof old2 === "string") return setupFail(old2);
 	const stacks = [...new Set(steps.map((s) => s.target?.stack ?? o.serverStack))];
 	const down = stacks.filter((s) => !apps[s]?.up || !apps[s]!.recipe);
-	if (down.length) return fail(`the new ${down.join(", ")} app does not start here (br parity --probe)`);
+	if (down.length) return setupFail(`the new ${down.join(", ")} app does not start here (br parity --probe)`);
 	const wt = await prepareTargetCopy(o.config, o.root, o.linkAll);
 	let neu: StepResult[];
 	try {
-		const recipes = new Map(stacks.map((s) => [s, apps[s]!.recipe as AppRecipe]));
 		const stops: Array<() => Promise<void>> = [];
 		try {
-			for (const [s, r] of recipes) {
-				const b = await bootApp(r, appRoot(o.config, o.root, s));
-				if (!b.ok) return { ...fail(`the new ${s} app did not start: ${b.error}`), down: { stack: s, error: b.error } };
+			for (const s of stacks) {
+				const b = await boot(s);
+				if (!b.ok) return b.stage === "start" ? { ...fail(`the new ${s} app did not start: ${b.error}`), down: { stack: s, error: b.error } } : setupFail(`the new ${s} app did not start: ${b.error}`);
 				stops.push(b.stop);
 			}
+			// the recipes as they are now: a setup fix may have saved new ones
+			apps = loadApps(o.root);
+			const recipes = new Map(stacks.map((s) => [s, apps[s]!.recipe as AppRecipe]));
 			const withDump = [...recipes].find(([, r]) => r.dump);
 			neu = await runSteps(steps, { side: "target", base: (s) => recipes.get(s.target?.stack ?? o.serverStack)!.ready, dump: withDump ? () => dumpData(withDump[1], appRoot(o.config, o.root, withDump[0])) : undefined });
 		} finally {
@@ -406,11 +435,11 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		await removeWorktree(o.config.target.path, wt);
 	}
 	// written data is compared only when both apps keep the same tables and both can dump them
-	const withData = o.config.db.strategy === "keep-schema" && !!apps[LEGACY].recipe!.dump && stacks.some((s) => apps[s]!.recipe!.dump);
+	const withData = o.config.db.strategy === "keep-schema" && !!apps[LEGACY]?.recipe?.dump && stacks.some((s) => apps[s]!.recipe!.dump);
 	const c = compareRuns(steps, old1, old2, neu, withData);
 	// the old app's setup is asked (once) to let plain http reach its handlers
 	const hop = steps.findIndex((s, i) => s.compare !== "none" && selfRedirect(old1[i]!));
-	if (hop >= 0 && !apps[LEGACY].selfRedirect) saveApp(o.root, LEGACY, { selfRedirect: `${steps[hop]!.method} ${steps[hop]!.path} → ${old1[hop]!.status} ${old1[hop]!.location}` });
+	if (hop >= 0 && !apps[LEGACY]?.selfRedirect) saveApp(o.root, LEGACY, { selfRedirect: `${steps[hop]!.method} ${steps[hop]!.path} → ${old1[hop]!.status} ${old1[hop]!.location}` });
 	const note = [`${c.compared} step(s) compared`, withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : ""].filter(Boolean).join("; ");
 	const res = record({ outcome: c.diffs.length ? "differs" : c.compared ? "same" : "error", diffs: c.diffs, compared: c.compared, note }, steps.length);
 	log(c.diffs.length ? pc.yellow(`parity ${o.slice}: ${c.diffs.length} difference(s) in ${new Set(c.diffs.map((d) => d.step)).size} step(s) — ${note}`) : pc.green(`parity ${o.slice}: the new app answers like the old one — ${note}`));

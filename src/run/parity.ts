@@ -69,6 +69,10 @@ export interface AppState {
 	setupProbed?: boolean;
 	/** How often the app was probed again over such a problem (at most MAX_FIXUPS). */
 	setupProbes?: number;
+	/** A slice check could not start this app (its data reset or start failed): what failed, for its setup to fix. */
+	bootProblem?: string;
+	/** How often its setup was asked to fix that since the app last started for a slice check (at most MAX_FIXUPS). */
+	bootProbes?: number;
 	at?: string;
 }
 
@@ -76,15 +80,28 @@ export const LEGACY = "legacy";
 
 /** An app that is up is probed again over the same kind of problem at most this often (a model that gave up once may not twice). */
 export const MAX_FIXUPS = 3;
-const fixUps = (a: AppState, kind: "data" | "redirect" | "setup") =>
-	kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
+type FixKind = "data" | "redirect" | "setup" | "boot";
+const fixUps = (a: AppState, kind: FixKind) =>
+	kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : kind === "boot" ? (a.bootProbes ?? 0) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
 /** Whether the app may still be probed again over this kind of problem. */
-export const fixUpLeft = (a: AppState | undefined, kind: "data" | "redirect" | "setup") => !!a && fixUps(a, kind) < MAX_FIXUPS;
+export const fixUpLeft = (a: AppState | undefined, kind: FixKind) => !!a && fixUps(a, kind) < MAX_FIXUPS;
 
 /** A command's error for a person or a model: no colour codes, the start (the tool's own message) and the end (a traceback's last line). */
 export function clipError(e: any, n = 1_200): string {
 	const t = ([e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n") || String(e?.message ?? e)).replace(/\x1b\[[0-9;]*m/g, "");
 	return t.length <= n ? t : `${t.slice(0, Math.floor(n * 0.4))}\n…\n${t.slice(-Math.ceil(n * 0.6))}`;
+}
+
+/**
+ * How a command ended, from exec's error. Only this decides a failure: a tool that prints a notice ("OrbStack is
+ * already running") and exits 0 is fine, so its output alone never says what went wrong.
+ */
+export function howEnded(e: any, timeoutMs?: number): string {
+	if (e?.code === "ETIMEDOUT") return `it did not finish${timeoutMs ? ` within ${Math.round(timeoutMs / 1000)} s` : ""} and was stopped`;
+	if (e?.code === "ENOBUFS") return "it printed more output than is read and was stopped";
+	if (typeof e?.code === "string") return `it could not be run (${e.code})`;
+	if (e?.signal) return `it was stopped (${e.signal})`;
+	return `it exited with status ${e?.status ?? "unknown"}`;
 }
 
 /**
@@ -150,7 +167,8 @@ export async function prepareTargetCopy(config: Config, root: string, linkAll: (
 
 // ---- starting and stopping an app ------------------------------------------------------------------------
 
-export type Booted = { ok: true; stop: () => Promise<void> } | { ok: false; error: string };
+/** `stage` says where it failed: "setup" = before the app's own start command (ready URL, port, folder, data reset), "start" = the start command or no answer. */
+export type Booted = { ok: true; stop: () => Promise<void> } | { ok: false; error: string; stage: "setup" | "start" };
 
 const isLocal = (url: string) => {
 	try {
@@ -197,17 +215,19 @@ process.on("exit", () => {
  * container started in the background) is fine; one that exits non-zero before the app answers is a failure.
  * Something already answering on the ready URL is refused: it would make any recipe look green.
  */
-export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number } = {}): Promise<Booted> {
-	if (!isLocal(recipe.ready)) return { ok: false, error: `the ready URL must be on this machine (http://localhost:<port>/…), got ${recipe.ready}` };
-	if (await answers(recipe.ready)) return { ok: false, error: `something already answers on ${recipe.ready} before the app was started: pick a free port (or stop what runs there)` };
+export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number; resetTimeoutMs?: number } = {}): Promise<Booted> {
+	if (!isLocal(recipe.ready)) return { ok: false, stage: "setup", error: `the ready URL must be on this machine (http://localhost:<port>/…), got ${recipe.ready}` };
+	if (await answers(recipe.ready)) return { ok: false, stage: "setup", error: `something already answers on ${recipe.ready} before the app was started: pick a free port (or stop what runs there)` };
 	const cwd = resolve(appDir, recipe.dir);
 	setStep(`parity: data reset and start of the app in ${cwd}`);
-	if (!existsSync(cwd)) return { ok: false, error: `folder ${cwd} does not exist` };
+	if (!existsSync(cwd)) return { ok: false, stage: "setup", error: `folder ${cwd} does not exist` };
+	// the reset is judged by its exit status alone; its output only helps say why
+	const resetMs = o.resetTimeoutMs ?? 300_000;
 	if (recipe.reset)
 		try {
-			await exec(recipe.reset.cmd, recipe.reset.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: 300_000 });
+			await exec(recipe.reset.cmd, recipe.reset.args, { cwd, env: { ...process.env, ...recipe.env }, timeout: resetMs });
 		} catch (e: any) {
-			return { ok: false, error: `the data reset failed: ${clipError(e)}` };
+			return { ok: false, stage: "setup", error: `the data reset failed (${[recipe.reset.cmd, ...recipe.reset.args].join(" ")}: ${howEnded(e, resetMs)}); its output: ${clipError(e)}` };
 		}
 	const tail: string[] = [];
 	const child = spawn(recipe.start.cmd, recipe.start.args, { cwd, detached: true, env: { ...process.env, ...recipe.env, CI: "1" }, stdio: ["ignore", "pipe", "pipe"] });
@@ -251,19 +271,19 @@ export async function bootApp(recipe: AppRecipe, appDir: string, o: { timeoutMs?
 	};
 	const deadline = Date.now() + (o.timeoutMs ?? 180_000);
 	while (Date.now() < deadline) {
-		if (spawnError) return (await stop(), { ok: false, error: `could not start ${recipe.start.cmd}: ${spawnError}` });
-		if (exit !== undefined && exit !== 0) return (await stop(), { ok: false, error: `the start command exited with ${exit} before the app answered:\n${tail.join("\n")}` });
+		if (spawnError) return (await stop(), { ok: false, stage: "start", error: `could not start ${recipe.start.cmd}: ${spawnError}` });
+		if (exit !== undefined && exit !== 0) return (await stop(), { ok: false, stage: "start", error: `the start command exited with ${exit} before the app answered:\n${tail.join("\n")}` });
 		if (await answers(recipe.ready)) return { ok: true, stop };
 		await new Promise((r) => setTimeout(r, 1_000));
 	}
 	await stop();
-	return { ok: false, error: `no answer on ${recipe.ready} after ${Math.round((o.timeoutMs ?? 180_000) / 1000)}s:\n${tail.join("\n")}` };
+	return { ok: false, stage: "start", error: `no answer on ${recipe.ready} after ${Math.round((o.timeoutMs ?? 180_000) / 1000)}s:\n${tail.join("\n")}` };
 }
 
 /** Start, check, stop: what code (and the model's check_app_boot) runs to decide a recipe works. */
 export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeoutMs?: number; selfRedirect?: string } = {}): Promise<{ ok: boolean; error?: string; dumpFailed?: boolean; redirectFailed?: boolean }> {
 	const b = await bootApp(recipe, appDir, o);
-	if (!b.ok) return b;
+	if (!b.ok) return { ok: false, error: b.error };
 	let still: string | undefined;
 	try {
 		// the request a slice check saw redirected to the app itself: plain http must reach its handler now
@@ -462,14 +482,17 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const redirect = cur.up === true && !!cur.recipe && !!cur.selfRedirect && fixUpLeft(cur, "redirect");
 	// a slice check blamed how this app runs here (a difference, or it did not start): it is asked to fix that
 	const setup = cur.up === true && !!cur.recipe && !!cur.setupProblem && fixUpLeft(cur, "setup");
+	// a slice check could not start it (its data reset or start failed): it is asked to fix that
+	const boot = cur.up === true && !!cur.recipe && !!cur.bootProblem && fixUpLeft(cur, "boot");
 	// each kind at most MAX_FIXUPS times, whatever came of it
-	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup;
+	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup || boot;
 	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
 	const missing = [
 		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
 		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy. Switch off the app's or its web server's setting that forces https, in the copy's local config only (never the app's code): the comparison sends the same plain-http requests to both apps and compares what the handlers answer, it does not check the https rule, so keeping that rule on here only hides every handler. check_app_boot sends that request again and says whether it still redirects`] : []),
 		...(setup ? [`a slice check found a problem that only its setup here causes (${cur.setupProblem}): fix that in its setup (start, data reset, data dump, local config), not in the app's code`] : []),
+		...(boot ? [`it did not start for a slice check just now (${cur.bootProblem}). Find out why with your tools (is each service and container it needs running, does its reset script still work, what does the command print when you run it). Fix that in its setup here (start, data reset, the services it needs, local config), not in the app's code; check_app_boot shows whether it starts again`] : []),
 	];
 	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
 	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem }).catch((e) => `setup model failed: ${e?.message ?? e}`);
@@ -484,8 +507,8 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		const kept = res.ok || (res.redirectFailed && !res.dumpFailed) ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
 		// the redirect is gone when the check sent the request again and it was not redirected (also when only the dump failed)
 		const redirectGone = redirect && !!recipe && !bad && !res.redirectFailed && (res.ok || !!res.dumpFailed);
-		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}) });
-		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}) });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${boot ? `; did not start for a slice check: ${res.ok ? "starts again" : "still does not start"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
 	}
@@ -527,3 +550,13 @@ export async function probeApps(o: { config: Config; root: string; linkAll: (wt:
 	}
 	return up;
 }
+
+/**
+ * For a slice check: an app that did not start (its data reset or start failed) goes to its setup model with what
+ * failed (MAX_FIXUPS times at most until it starts for a slice check again). True when code then sees it start.
+ */
+export const setupFixer = (o: { config: Config; root: string; fixer?: AppFixer; log?: (l: string) => void }) => async (side: string, error: string): Promise<boolean> => {
+	saveApp(o.root, side, { bootProblem: error.slice(0, 1_500) });
+	await probeApp({ config: o.config, root: o.root, side, fixer: o.fixer, log: o.log });
+	return !loadApps(o.root)[side]?.bootProblem;
+};

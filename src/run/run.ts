@@ -435,7 +435,11 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			if (!sliceDone(slice)) return;
 			showParity(`comparing ${slice} with the old app`);
 			const { checkSlice } = await import("./parity-check.ts");
-			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log });
+			const { setupFixer } = await import("./parity.ts");
+			// an app that does not start here (its data reset or start) goes to its setup model first, then the check goes on
+			const fix = setupFixer({ config, root: o.root, log });
+			const fixSetup = (side: string, error: string) => (showParity(`setting up ${side === "legacy" ? "the old app" : `the new ${side} app`} again: it did not start`), fix(side, error));
+			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log, fixSetup });
 			// the new app does not start on main: a red main the builder fixes, not only a parity error. A stack with no
 			// boot check gets one from the setup model first, so the merge check and the builder see it from now on
 			if (r.down && adapters.has(r.down.stack)) {
@@ -454,7 +458,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				await probeApp({ config, root: o.root, side: "legacy", log, ...probeAsk });
 				if (!loadApps(o.root)["legacy"]?.selfRedirect) parityQueue.push(slice);
 			}
-			parityLast = `${slice}: ${r.outcome === "same" ? "answers like the old app" : r.outcome === "error" ? `not compared (${r.note.slice(0, 80)})` : `${r.diffs.length} difference(s)`}`;
+			parityLast = `${slice}: ${r.outcome === "same" ? "answers like the old app" : r.outcome === "error" || r.outcome === "setup" ? `not compared (${r.note.slice(0, 80)})` : `${r.diffs.length} difference(s)`}`;
 			if (r.runId !== undefined && r.outcome === "differs") {
 				showParity(`judging ${r.diffs.length} difference(s) in ${slice}`);
 				const { judgeRun } = await import("./parity-judge.ts");
@@ -794,8 +798,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 							pusher.afterMerge();
 							void stubSweep?.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							// only a route owner's accept changes what is compared; a slice never compared is queued once
+							// and so does the fix of a unit its last comparison blamed
 							const sl = sliceOf(unitId);
-							if (sl && (routeOwners(ledger, sl).some((u) => u.id === unitId) || !parityAgain(ledger).checked.has(sl))) queueParity(sl);
+							const pa = sl ? parityAgain(ledger) : undefined;
+							if (sl && (routeOwners(ledger, sl).some((u) => u.id === unitId) || !pa!.checked.has(sl) || pa!.fixed.has(sl))) queueParity(sl);
 						}
 						// living rules: proposals from units are curated into a new rules version once enough piled up
 						await curate.run(() => maybeCurateRules({ ledger, config, root: o.root, client: o.client })).then((r) => {
@@ -1610,22 +1616,29 @@ export const MAX_PARITY_ERRORS = 3;
  * Slices compared before (`checked`), and those whose last comparison needs another look at run start (`again`): it
  * ended in an error (a few times in a row at most), left differences nobody judged, holds quirks the owner has
  * decided since, or ran on an older main than `head` (later units, tidy jobs and repairs change shared code). Only the last run counts: once a later run judged a decided quirk, the slice is not queued again.
+ * An app that did not start here ("setup") says nothing about the code: it never counts as an error, and such a slice
+ * is compared again. `fixed`: a unit the last real comparison blamed was accepted after it (a fix not compared yet);
+ * that also gives a slice that errored too often its tries back.
  */
-export function parityAgain(ledger: Ledger, head?: string): { checked: Set<string>; again: Set<string> } {
+export function parityAgain(ledger: Ledger, head?: string): { checked: Set<string>; again: Set<string>; fixed: Set<string> } {
 	const rows = ledger.db
 		.prepare(
-			`SELECT r.slice, r.outcome, r.commit_sha,
-			   (SELECT COUNT(*) FROM parity_runs e WHERE e.slice = r.slice AND e.outcome = 'error'
-			      AND e.id > COALESCE((SELECT MAX(g.id) FROM parity_runs g WHERE g.slice = r.slice AND g.outcome != 'error'), 0)) AS errors,
+			`SELECT x.*, (SELECT COUNT(*) FROM parity_runs e WHERE e.slice = x.slice AND e.outcome = 'error' AND e.id > x.compared_id
+			   AND (x.fixed_at IS NULL OR e.started_at > x.fixed_at)) AS errors
+			 FROM (SELECT r.slice, r.outcome, r.commit_sha, COALESCE(c.id, 0) AS compared_id,
+			   (SELECT MAX(t.created_at) FROM parity_diffs d JOIN transitions t ON t.entity = 'unit' AND t.entity_id = d.unit_id AND t.to_state = 'accepted'
+			      WHERE d.run_id = c.id AND d.status = 'bug' AND t.created_at > COALESCE(c.ended_at, c.started_at)) AS fixed_at,
 			   EXISTS (SELECT 1 FROM parity_diffs d WHERE d.run_id = r.id AND d.status = 'open') AS unjudged,
 			   EXISTS (SELECT 1 FROM parity_diffs d JOIN quirks q ON q.id = d.quirk_id WHERE d.run_id = r.id AND d.status = 'quirk' AND q.status IN ('kept', 'dropped')) AS decided
-			 FROM parity_runs r WHERE r.id = (SELECT MAX(id) FROM parity_runs WHERE slice = r.slice)`,
+			 FROM parity_runs r LEFT JOIN parity_runs c ON c.id = (SELECT MAX(g.id) FROM parity_runs g WHERE g.slice = r.slice AND g.outcome IN ('same', 'differs'))
+			 WHERE r.id = (SELECT MAX(id) FROM parity_runs WHERE slice = r.slice)) x`,
 		)
-		.all() as Array<{ slice: string; outcome: string; commit_sha: string | null; errors: number; unjudged: number; decided: number }>;
+		.all() as Array<{ slice: string; outcome: string; commit_sha: string | null; compared_id: number | null; fixed_at: string | null; errors: number; unjudged: number; decided: number }>;
 	// a run from before commits were recorded has none: it is not compared again just for that
 	const moved = (r: (typeof rows)[number]) => !!head && !!r.commit_sha && r.commit_sha !== head;
-	const again = rows.filter((r) => (r.outcome === "error" ? r.errors < MAX_PARITY_ERRORS : r.unjudged || r.decided || moved(r))).map((r) => r.slice);
-	return { checked: new Set(rows.map((r) => r.slice)), again: new Set(again) };
+	const fixed = rows.filter((r) => !!r.fixed_at && (r.outcome !== "error" || r.errors < MAX_PARITY_ERRORS)).map((r) => r.slice);
+	const again = rows.filter((r) => (r.outcome === "setup" ? true : r.outcome === "error" ? r.errors < MAX_PARITY_ERRORS : r.unjudged || r.decided || moved(r) || !!r.fixed_at)).map((r) => r.slice);
+	return { checked: new Set(rows.map((r) => r.slice)), again: new Set(again), fixed: new Set(fixed) };
 }
 
 const ledgerTime = (s: string) => Date.parse(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
