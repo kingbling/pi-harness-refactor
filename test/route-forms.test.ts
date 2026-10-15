@@ -44,13 +44,25 @@ describe("route forms from the framework profile", () => {
 		// an index from before: only the profile's own class counted, and no marker
 		ledger.db.prepare("DELETE FROM index_routes WHERE path != 'users/list'").run();
 		ledger.db.prepare("DELETE FROM meta WHERE key = ?").run(ROUTE_SUBCLASSES);
+		// a planned unit the rebuild no longer produces is dropped; its open question has nothing left to decide
+		ledger.createUnit({ id: "U-gone", tier: "T2", meta: { files: ["app/old.php"] }, symbolIds: [] });
+		const q = ledger.askQuestion({ unitId: "U-gone", point: "test", question: "?", askedBy: "test" });
 		const log: string[] = [];
 		await healStackKnowledge({ ledger, config, root: ws, log: (l) => log.push(l) });
 		expect(routes()).toHaveLength(3);
+		expect(ledger.getUnit("U-gone")).toBeUndefined();
+		expect(ledger.db.prepare("SELECT status FROM questions WHERE id = ?").get(q)).toEqual({ status: "withdrawn" });
 		expect(log.join("\n")).toMatch(/1 → 3 routes \(AgencyForwardRoute, AgencyRoute\)/);
 		// once: the next run start leaves it
 		const again: string[] = [];
 		await healStackKnowledge({ ledger, config, root: ws, log: (l) => again.push(l) });
 		expect(again.join("\n")).not.toMatch(/routes/);
+
+		// a rebuild that throws is logged, not passed on (the later heals still run), and tried again next run start
+		ledger.db.prepare("DELETE FROM meta WHERE key = ?").run(ROUTE_SUBCLASSES);
+		rmSync(join(ws, "legacy"), { recursive: true, force: true });
+		const failed: string[] = [];
+		await expect(healStackKnowledge({ ledger, config, root: ws, log: (l) => failed.push(l) })).resolves.toBeUndefined();
+		expect(failed.join("\n")).toMatch(/could not be rebuilt with the app's own route classes/);
 	});
 });

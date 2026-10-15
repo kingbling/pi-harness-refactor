@@ -30,6 +30,18 @@ import { requeueUnits } from "./run.ts";
  */
 const NOT_APP_PENDING = "not_app_heal_pending";
 
+/** The inventory again; open questions about units it drops are withdrawn (nothing left to decide). The dropped ids. */
+async function inventoryAgain(o: { ledger: Ledger; config: Config; root: string }, why: string): Promise<Set<string>> {
+	// read now: a unit the inventory deletes loses the link (unit_id is set to null)
+	const open = o.ledger.db.prepare("SELECT id, unit_id FROM questions WHERE unit_id IS NOT NULL AND status = 'open'").all() as Array<{ id: number; unit_id: string }>;
+	const before = new Set(o.ledger.listUnits().map((u) => u.id));
+	await inventory(o.config, o.root, o.ledger);
+	const gone = new Set([...before].filter((id) => !o.ledger.getUnit(id)));
+	const q = o.ledger.db.prepare("UPDATE questions SET status = 'withdrawn', answer = COALESCE(answer || ' — ', '') || ?, answered_at = COALESCE(answered_at, ?) WHERE id = ? AND status = 'open'");
+	for (const r of open) if (gone.has(r.unit_id)) q.run(why, new Date().toISOString(), r.id);
+	return gone;
+}
+
 export async function healStackKnowledge(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; spawn?: typeof spawnLeaf; log: (l: string) => void }): Promise<void> {
 	const { ledger, config } = o;
 	// the profile keeps notApp as soon as the session wrote it; a requeue + inventory that did not finish (stopped,
@@ -48,14 +60,7 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		const units = ledger.listUnits().filter((u) => u.state !== "planned" && !isDbUnitKind(u.kind) && outside(u));
 		const started = units.filter((u) => u.state !== "accepted").map((u) => u.id);
 		if (started.length) await requeueUnits(ledger, config, o.root, started, "run start: their files are not app code");
-		// open questions per unit, read now: a unit the inventory deletes loses the link (unit_id is set to null)
-		const open = ledger.db.prepare("SELECT id, unit_id FROM questions WHERE unit_id IS NOT NULL AND status = 'open'").all() as Array<{ id: number; unit_id: string }>;
-		const before = new Set(ledger.listUnits().map((u) => u.id));
-		await inventory(config, o.root, ledger);
-		const gone = new Set([...before].filter((id) => !ledger.getUnit(id)));
-		// questions about units that are gone have nothing left to decide
-		const q = ledger.db.prepare("UPDATE questions SET status = 'withdrawn', answer = COALESCE(answer || ' — ', '') || ?, answered_at = COALESCE(answered_at, ?) WHERE id = ? AND status = 'open'");
-		for (const r of open) if (gone.has(r.unit_id)) q.run("withdrawn: the unit's files are not app code", new Date().toISOString(), r.id);
+		const gone = await inventoryAgain(o, "withdrawn: the unit's files are not app code");
 		o.log(pc.cyan(`  ${gone.size} unit(s) dropped from the plan: their files are not app code`));
 		const accepted = units.filter((u) => u.state === "accepted").map((u) => u.id);
 		if (accepted.length) o.log(pc.yellow(`  ${accepted.length} accepted unit(s) hold code that is not the app's: ${accepted.slice(0, 20).join(", ")}${accepted.length > 20 ? ", …" : ""} (left as they are)`));
@@ -65,8 +70,10 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 	if (ledger.getMeta("inventory_at") && ledger.getMeta(ROUTE_SUBCLASSES) === undefined && getSourceAdapter(config.source.stack).routeClassTest?.()) {
 		const count = () => (ledger.db.prepare("SELECT COUNT(*) n FROM index_routes WHERE side = 'source'").get() as { n: number }).n;
 		const before = count();
-		await inventory(config, o.root, ledger);
-		o.log(pc.cyan(`↻ the source index now counts the app's own route classes: ${before} → ${count()} routes (${JSON.parse(ledger.getMeta(ROUTE_SUBCLASSES) ?? "[]").join(", ") || "none"})`));
+		// a throw is logged, not passed on: the heals below still run, and the next run start tries again
+		await inventoryAgain(o, "withdrawn: the unit was regrouped when the app's own route classes were indexed")
+			.then((gone) => o.log(pc.cyan(`↻ the source index now counts the app's own route classes: ${before} → ${count()} routes (${JSON.parse(ledger.getMeta(ROUTE_SUBCLASSES) ?? "[]").join(", ") || "none"})${gone.size ? `; ${gone.size} planned unit(s) regrouped` : ""}`)))
+			.catch((e) => o.log(pc.yellow(`the source index could not be rebuilt with the app's own route classes: ${e?.message ?? e} (tried again next run start)`)));
 	}
 	if (o.client) {
 		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });

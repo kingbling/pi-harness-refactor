@@ -9,7 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
-import { holdBack, waitingRoutes } from "./parity-partial.ts";
+import { holdBack, readyRoutes, waitingRoutes } from "./parity-partial.ts";
 import { appRoot, bootApp, dumpData, fixUpLeft, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe } from "./parity.ts";
 
 /**
@@ -359,8 +359,14 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 
 	const apps = loadApps(o.root);
 	if (!apps[LEGACY]?.up || !apps[LEGACY].recipe) return fail("the old app does not start here (br parity --probe)");
-	const { routes, files } = sliceFacts(o.ledger, o.slice);
-	if (!routes.length) return fail("this slice has no routes of its own to compare");
+	const facts = sliceFacts(o.ledger, o.slice);
+	if (!facts.routes.length) return fail("this slice has no routes of its own to compare");
+	// `onlyAccepted` (the run): a slice not finished yet gets steps for, and compares, only the routes whose unit is
+	// accepted; the others get their steps once their new code exists
+	const waiting = o.onlyAccepted ? waitingRoutes(o.ledger, o.slice) : new Map<string, string>();
+	const { files } = facts;
+	const routes = readyRoutes(facts.routes, waiting);
+	if (!routes.length) return { outcome: "error", diffs: [], compared: 0, note: `not compared yet: the units of its routes are not accepted (${[...new Set(waiting.values())].join(", ")})` };
 
 	// the steps: written once per slice by the tester, checked by code
 	const dir = sliceDir(o.root, o.slice);
@@ -368,7 +374,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	let problem = o.rewrite || !existsSync(stepsPath(o.root, o.slice)) ? "" : stepsProblem(loadSteps(o.root, o.slice)!, routes, o.config.target.stacks);
 	if (o.rewrite || !existsSync(stepsPath(o.root, o.slice)) || problem) {
 		const writer = o.writer ?? writeStepsWithModel;
-		const ask = `Slice "${o.slice}". Its routes on the old app: ${routes.join(", ")}. The old handlers and the code they use (relative to ${o.config.source.path}): ${files.join(", ")}. The new project: ${o.config.target.path} (stacks ${o.config.target.stacks.join(", ")}; requests go to ${o.serverStack} unless a step's target.stack says otherwise). Write steps.json and try it on the old app until every step does what you meant.`;
+		const ask = `Slice "${o.slice}". Its routes on the old app: ${routes.join(", ")}. The old handlers and the code they use (relative to ${o.config.source.path}): ${files.join(", ")}. The new project: ${o.config.target.path} (stacks ${o.config.target.stacks.join(", ")}; requests go to ${o.serverStack} unless a step's target.stack says otherwise). Write steps.json and try it on the old app until every step does what you meant.${waiting.size ? ` The slice's other routes get their steps later, once their new code exists.` : ""}`;
 		for (let i = 0; i < 2; i++) {
 			await writer({ config: o.config, root: o.root, slice: o.slice, dir, problem: problem ? `${ask}\n\nThe steps.json you wrote cannot be used: ${problem}` : ask }).catch((e) => log(pc.yellow(`parity ${o.slice}: step writer failed: ${e?.message ?? e}`)));
 			const f = loadSteps(o.root, o.slice);
@@ -377,8 +383,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		}
 		if (problem) return fail(`no usable steps: ${problem}`);
 	}
-	// `onlyAccepted` (the run): a slice not finished yet compares only the steps of routes whose unit is accepted
-	const { steps, held } = o.onlyAccepted ? holdBack(loadSteps(o.root, o.slice)!.steps, waitingRoutes(o.ledger, o.slice)) : { steps: loadSteps(o.root, o.slice)!.steps, held: [] };
+	const { steps, held } = holdBack(loadSteps(o.root, o.slice)!.steps, waiting);
 	if (!steps.some((s) => s.compare !== "none")) return { outcome: "error", diffs: [], compared: 0, note: `not compared yet: the units of its routes are not accepted (${held.join(", ")})` };
 
 	// the old app twice (what differs between those two runs is noise), then the new app

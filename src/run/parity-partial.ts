@@ -24,16 +24,22 @@ export function waitingRoutes(ledger: Ledger, slice: string): Map<string, string
 /** A route with or without its method word and leading slash ("ANY dashboard/ajax" = "dashboard/ajax"), as stepsProblem counts it. */
 const routeKey = (r: unknown) => String(r ?? "").trim().replace(/^[A-Z]+(?:\|[A-Z]+)*\s+/, "").replace(/^\/+/, "");
 
+/** The routes not waiting for their unit: the ones the step writer covers and stepsProblem checks. */
+export const readyRoutes = (routes: string[], waiting: Map<string, string>) => routes.filter((r) => !waiting.has(routeKey(r)));
+
 /**
- * Steps of waiting routes are still sent (a later step may need what they save) but not compared. `held` says
+ * Steps of waiting routes are still sent (a later step may need what they save) but not compared. A step that uses a
+ * "{{value}}" last saved by a held step waits too: the new app's unfinished route does not give it. `held` says
  * which, for the run's note.
  */
 export function holdBack(steps: Step[], waiting: Map<string, string>): { steps: Step[]; held: string[] } {
 	const held: string[] = [];
+	const heldVar = new Map<string, string>(); // a saved value → the unit it waits for, while a held step saved it last
 	const out = steps.map((s) => {
-		const unit = s.compare === "none" ? undefined : waiting.get(routeKey(s.route));
+		const unit = waiting.get(routeKey(s.route)) ?? [...JSON.stringify(s).matchAll(/\{\{(\w+)\}\}/g)].map((m) => heldVar.get(m[1]!)).find(Boolean);
+		for (const n of Object.keys(s.save ?? {})) unit ? heldVar.set(n, unit) : heldVar.delete(n);
 		if (!unit) return s;
-		held.push(`${s.id} (${unit})`);
+		if (s.compare !== "none") held.push(`${s.id} (${unit})`);
 		return { ...s, compare: "none" as const };
 	});
 	return { steps: out, held };
