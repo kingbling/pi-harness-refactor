@@ -9,6 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
+import { holdBack, readyRoutes, waitingRoutes } from "./parity-partial.ts";
 import { appRoot, bootApp, dumpData, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe, type Booted } from "./parity.ts";
 
 /**
@@ -352,7 +353,7 @@ export interface SliceCheck {
 /** How often one slice check hands an app that did not start to its setup fixer before it records that. */
 export const MAX_SETUP_RETRIES = 2;
 
-export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void; fixSetup?: (side: string, error: string) => Promise<boolean> }): Promise<SliceCheck> {
+export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; onlyAccepted?: boolean; log?: (l: string) => void; fixSetup?: (side: string, error: string) => Promise<boolean> }): Promise<SliceCheck> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const startedAt = new Date().toISOString();
 	const mainAt = await headOf(o.config.target.path);
@@ -387,8 +388,14 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 
 	let apps = loadApps(o.root);
 	if (!apps[LEGACY]?.up || !apps[LEGACY].recipe) return setupFail("the old app does not start here (br parity --probe)", LEGACY);
-	const { routes, files } = sliceFacts(o.ledger, o.slice);
-	if (!routes.length) return fail("this slice has no routes of its own to compare");
+	const facts = sliceFacts(o.ledger, o.slice);
+	if (!facts.routes.length) return fail("this slice has no routes of its own to compare");
+	// `onlyAccepted` (the run): a slice not finished yet gets steps for, and compares, only the routes whose unit is
+	// accepted; the others get their steps once their new code exists
+	const waiting = o.onlyAccepted ? waitingRoutes(o.ledger, o.slice) : new Map<string, string>();
+	const { files } = facts;
+	const routes = readyRoutes(facts.routes, waiting);
+	if (!routes.length) return { outcome: "error", diffs: [], compared: 0, note: `not compared yet: the units of its routes are not accepted (${[...new Set(waiting.values())].join(", ")})` };
 
 	// the steps: written once per slice by the tester, checked by code
 	const dir = sliceDir(o.root, o.slice);
@@ -396,7 +403,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	let problem = o.rewrite || !existsSync(stepsPath(o.root, o.slice)) ? "" : stepsProblem(loadSteps(o.root, o.slice)!, routes, o.config.target.stacks);
 	if (o.rewrite || !existsSync(stepsPath(o.root, o.slice)) || problem) {
 		const writer = o.writer ?? writeStepsWithModel;
-		const ask = `Slice "${o.slice}". Its routes on the old app: ${routes.join(", ")}. The old handlers and the code they use (relative to ${o.config.source.path}): ${files.join(", ")}. The new project: ${o.config.target.path} (stacks ${o.config.target.stacks.join(", ")}; requests go to ${o.serverStack} unless a step's target.stack says otherwise). Write steps.json and try it on the old app until every step does what you meant.`;
+		const ask = `Slice "${o.slice}". Its routes on the old app: ${routes.join(", ")}. The old handlers and the code they use (relative to ${o.config.source.path}): ${files.join(", ")}. The new project: ${o.config.target.path} (stacks ${o.config.target.stacks.join(", ")}; requests go to ${o.serverStack} unless a step's target.stack says otherwise). Write steps.json and try it on the old app until every step does what you meant.${waiting.size ? ` The slice's other routes get their steps later, once their new code exists.` : ""}`;
 		for (let i = 0; i < 2; i++) {
 			await writer({ config: o.config, root: o.root, slice: o.slice, dir, problem: problem ? `${ask}\n\nThe steps.json you wrote cannot be used: ${problem}` : ask }).catch((e) => log(pc.yellow(`parity ${o.slice}: step writer failed: ${e?.message ?? e}`)));
 			const f = loadSteps(o.root, o.slice);
@@ -405,7 +412,8 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		}
 		if (problem) return fail(`no usable steps: ${problem}`);
 	}
-	const { steps } = loadSteps(o.root, o.slice)!;
+	const { steps, held } = holdBack(loadSteps(o.root, o.slice)!.steps, waiting);
+	if (!steps.some((s) => s.compare !== "none")) return { outcome: "error", diffs: [], compared: 0, note: `not compared yet: the units of its routes are not accepted (${held.join(", ")})` };
 
 	// the old app twice (what differs between those two runs is noise), then the new app
 	const old1 = await runOnOld(o.config, o.root, steps, boot);
@@ -442,7 +450,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// the old app's setup is asked (once) to let plain http reach its handlers
 	const hop = steps.findIndex((s, i) => s.compare !== "none" && selfRedirect(old1[i]!));
 	if (hop >= 0 && !apps[LEGACY]?.selfRedirect) saveApp(o.root, LEGACY, { selfRedirect: `${steps[hop]!.method} ${steps[hop]!.path} → ${old1[hop]!.status} ${old1[hop]!.location}` });
-	const note = [`${c.compared} step(s) compared`, withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : ""].filter(Boolean).join("; ");
+	const note = [`${c.compared} step(s) compared`, withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : "", held.length ? `not compared yet (unit not accepted): ${held.join(", ")}` : ""].filter(Boolean).join("; ");
 	const res = record({ outcome: c.diffs.length ? "differs" : c.compared ? "same" : "error", diffs: c.diffs, compared: c.compared, note }, steps.length);
 	log(c.diffs.length ? pc.yellow(`parity ${o.slice}: ${c.diffs.length} difference(s) in ${new Set(c.diffs.map((d) => d.step)).size} step(s) — ${note}`) : pc.green(`parity ${o.slice}: the new app answers like the old one — ${note}`));
 	return res;

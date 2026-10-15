@@ -416,7 +416,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			: import("./parity.ts")
 					.then(({ probeApps }) => probeApps({ config, root: o.root, linkAll, log, ...probeAsk }))
 					.catch((e) => log(pc.yellow(`parity probe failed: ${e?.message ?? e} (the run goes on without comparing the apps)`)));
-	// parity checks: a slice whose units are all accepted is compared old vs new on the side, one slice at a time;
+	// parity checks: a slice's routes whose units are accepted are compared old vs new on the side, one slice at a time;
 	// the judge re-opens the units whose answers differ and turns odd old behaviour into quirks for the owner
 	const serverStack = [...adapters].find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
 	const parityQueue: string[] = [];
@@ -425,11 +425,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	let parityLast: string | undefined;
 	const showParity = (what?: string) => (what && setStep(`parity: ${what}`), progress.setParity({ now: what ? { what, since: Date.now() } : undefined, queued: parityQueue.length, last: parityLast }));
 	const sliceOf = (unitId: string) => (JSON.parse(ledger.getUnit(unitId)?.meta ?? "{}") as { slice?: string }).slice;
-	// a slice can be compared once the units that answer its routes are accepted: its pages and helpers may still be open
-	const sliceDone = (slice: string) => {
-		const owners = routeOwners(ledger, slice);
-		return owners.length > 0 && owners.every((u) => u.state === "accepted");
-	};
+	// a slice can be compared once a unit that answers one of its routes is accepted: only those routes' steps are
+	// compared (checkSlice onlyAccepted), and each later route owner's accept compares it again
+	const sliceDone = (slice: string) => routeOwners(ledger, slice).some((u) => u.state === "accepted");
 	const pumpParity = () => {
 		if (parityRunning || parityStopped || !parityQueue.length) return;
 		const slice = parityQueue.shift()!;
@@ -449,7 +447,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			// an app that does not start here (its data reset, start or no answer) goes to its setup model first, then the check goes on
 			const fix = setupFixer({ config, root: o.root, log, answer: probeAsk.answer });
 			const fixSetup = (side: string, error: string) => (showParity(`setting up ${side === "legacy" ? "the old app" : `the new ${side} app`} again: it did not start`), fix(side, error));
-			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, log, fixSetup });
+			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, log, fixSetup });
 			// its setup ran out of fixes: a person must look, asked once
 			if (r.setup) await askBootOwner({ root: o.root, side: r.setup.side, error: r.note, ask: probeAsk.ask });
 			// the new app does not start on main: a red main the builder fixes, not only a parity error. A stack with no

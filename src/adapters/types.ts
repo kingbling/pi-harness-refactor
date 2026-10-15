@@ -199,6 +199,10 @@ export interface SourceAdapter {
 	traits?: SourceTraits;
 	/** Route table extraction when it is not derivable per file (framework route files, CLI dumps). */
 	indexRoutes?(root: string): Promise<IndexedRoute[]>;
+	/** Routes built as objects (`new XRoute('url', …)`): the profile's test for a route class name; undefined when the profile names none. */
+	routeClassTest?(): ((name: string) => boolean) | undefined;
+	/** The app's own subclasses of those route classes (the inventory finds them in the index): they declare routes too. */
+	setRouteSubclasses?(names: string[]): void;
 	/** T2 (HTTP/UI-facing) from the symbol's own shape; T0/T1 come from deps alone, so lower answers are ignored. */
 	classifyTier?(sym: IndexedSymbol, file: FileIndex): "T0" | "T1" | "T2" | "T3" | undefined;
 	/** Unit kind from file shape (template, routes, data_access, ...); deps/tier fill the rest. */

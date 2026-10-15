@@ -55,6 +55,8 @@ interface PhpFrameworkProfile {
 }
 
 let activeProfile: PhpFrameworkProfile | undefined | null = null; // null = not detected yet
+/** The app's own subclasses of the profile's route classes (lowercase; set by the inventory from the index). */
+let routeSubclasses = new Set<string>();
 let activeKey = ""; // workspace|source root|profile mtime the cached profile belongs to
 /**
  * The framework profile is the generated `.bigrefactor/framework-profile.json` of the workspace (written by
@@ -509,7 +511,7 @@ export const phpAdapter: SourceAdapter = {
 					deps.push({ from, to: c.node.text, kind: "new" });
 					// routes registered in code: new ExactMatchRoute('https://booking/partner/list', $this, 'agency_list', …)
 					const prof = profileFor(root);
-					if (prof?.routeClass?.test(c.node.text)) {
+					if (prof?.routeClass?.test(c.node.text) || routeSubclasses.has(c.node.text.replace(/^\\/, "").split("\\").pop()!.toLowerCase())) {
 						const args = stringArgs(c.node.parent);
 						const url = args[0];
 						const handler = args.slice(1).find((a) => typeof a === "string");
@@ -623,10 +625,17 @@ export const phpAdapter: SourceAdapter = {
 	reloadProfile() {
 		activeProfile = null;
 	},
+	routeClassTest() {
+		const re = profileFor(process.env["BR_SOURCE_ROOT"] ?? "")?.routeClass;
+		return re ? (name: string) => re.test(name) : undefined;
+	},
+	setRouteSubclasses(names) {
+		routeSubclasses = new Set(names.map((n) => n.toLowerCase()));
+	},
 	profileExample() {
 		return {
 			example: exampleProfileJson(),
-			schemaDoc: `The file is JSON with: id (string); frameworkDirs (string[] path prefixes of the framework, relative to the legacy root, trailing slash); loaders (array of {scope: string|null, method: string, globs: string[], each?: boolean}) — scope is the class, module or namespace that qualifies the call (Load::models, Load.models, load.models; null for plain functions), method its name; impliedDeps (array of {match: regex over a file path, globs: string[] with $1… from the match groups}); entryPoint (regex over the file paths that run without other code including them: web front controllers, CLI/console and cron scripts, scripts that deploy or shell scripts call, and files the framework discovers by directory scan at boot; files nothing reaches are treated as dead code); legacyWords (string[], lowercase: the dotted file-name parts and extensions that mark a LEGACY file kind, e.g. "tpl" for x.tpl.php; only parts a well-named new codebase would never use, never ordinary words like controller, model, service, test, handler); routeClass (regex over class names whose constructor takes the URL as first string literal and the handler method name as the next string literal); concerns (array of {match: regex over class/interface/function names, also the dotted or qualified names the app imports, extends or builds from an installed framework package (e.g. django.db.models, ActiveRecord::Base, org.springframework), concern: one of loading|orm|routing|auth|rendering|commands|cache|mail|jobs|events|helpers|i18n|logging|http|install|tests|misc, legacy: short description, verdict: platform|port|drop|review}).`,
+			schemaDoc: `The file is JSON with: id (string); frameworkDirs (string[] path prefixes of the framework, relative to the legacy root, trailing slash); loaders (array of {scope: string|null, method: string, globs: string[], each?: boolean}) — scope is the class, module or namespace that qualifies the call (Load::models, Load.models, load.models; null for plain functions), method its name; impliedDeps (array of {match: regex over a file path, globs: string[] with $1… from the match groups}); entryPoint (regex over the file paths that run without other code including them: web front controllers, CLI/console and cron scripts, scripts that deploy or shell scripts call, and files the framework discovers by directory scan at boot; files nothing reaches are treated as dead code); legacyWords (string[], lowercase: the dotted file-name parts and extensions that mark a LEGACY file kind, e.g. "tpl" for x.tpl.php; only parts a well-named new codebase would never use, never ordinary words like controller, model, service, test, handler); routeClass (regex over the route class names whose constructor takes the URL as first string literal and the handler method name as the next string literal: every route class the framework and the app construct; the app's own subclasses of a class it matches count as routes too); concerns (array of {match: regex over class/interface/function names, also the dotted or qualified names the app imports, extends or builds from an installed framework package (e.g. django.db.models, ActiveRecord::Base, org.springframework), concern: one of loading|orm|routing|auth|rendering|commands|cache|mail|jobs|events|helpers|i18n|logging|http|install|tests|misc, legacy: short description, verdict: platform|port|drop|review}).`,
 		};
 	},
 	validateProfile(json) {
