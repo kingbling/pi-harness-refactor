@@ -434,7 +434,9 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 		cwd: opts.cwd,
 		agentDir: getAgentDir(),
 		extensionFactories: [guard],
-		// Leaf sessions get exactly our prompt; no user-level AGENTS.md/skills leaking in.
+		// Leaf sessions get exactly our prompt and tools; no user-level extensions, AGENTS.md or skills leaking in
+		// (loading the owner's extensions also compiled them on the run's thread at each lane's first session).
+		noExtensions: true,
 		systemPromptOverride: () => opts.systemPrompt,
 		agentsFilesOverride: () => ({ agentsFiles: [] }),
 		skillsOverride: () => ({ skills: [], diagnostics: [] }),

@@ -306,6 +306,7 @@ CREATE TABLE IF NOT EXISTS quirks (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS quirks_unit ON quirks(unit_id);
+CREATE INDEX IF NOT EXISTS quirks_question ON quirks(question_id);
 
 -- Living rules: units propose additions/changes to a stack's rules; a curator merges them into a new version.
 CREATE TABLE IF NOT EXISTS rule_proposals (
