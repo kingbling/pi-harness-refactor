@@ -53,6 +53,32 @@ describe("the freeze watchdog", () => {
 		expect(logged[0]).toMatch(/\(last step: scheduling pass\); held by: .*holdTheThreadForTheTest/);
 	});
 
+	it("names each freeze from its own samples, and its own profiling never shows up as a freeze", async () => {
+		const root = mkdtempSync(join(tmpdir(), "br-watchdog-"));
+		const logged: string[] = [];
+		const stop = startWatchdog(root, (l) => logged.push(l));
+		function firstFreeze() {
+			busy(1300);
+		}
+		function secondFreeze() {
+			busy(1300);
+		}
+		try {
+			await tick(300);
+			firstFreeze();
+			await tick(1000);
+			secondFreeze();
+			await tick(1000);
+		} finally {
+			stop();
+		}
+		expect(logged).toHaveLength(2);
+		expect(logged[0]).toMatch(/held by: .*firstFreeze/);
+		expect(logged[0]).not.toMatch(/secondFreeze/);
+		expect(logged[1]).toMatch(/held by: .*secondFreeze/);
+		expect(logged[1]).not.toMatch(/firstFreeze|node:inspector/);
+	});
+
 	it("stops watching when stopped", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-watchdog-"));
 		const logged: string[] = [];
