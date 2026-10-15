@@ -487,7 +487,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	if (parityProbe) {
 		// at the start: finished slices never compared, and slices whose last comparison needs another look
 		const { checked, again } = parityAgain(ledger, await headOf(config.target.path));
-		const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((x): x is string => !!x));
+		// the slice names straight from SQL: reading and parsing every unit's meta held the run's thread at start
+		const slices = new Set((ledger.db.prepare("SELECT DISTINCT json_extract(meta, '$.slice') AS s FROM units WHERE json_extract(meta, '$.slice') IS NOT NULL").all() as Array<{ s: unknown }>).map((r) => r.s).filter((x): x is string => typeof x === "string" && !!x));
 		// and slices of units the owner said to retry after they ran out of parity re-opens
 		const answered = applyParityAnswers(ledger);
 		for (const sl of slices) if (!checked.has(sl) || again.has(sl) || answered.includes(sl)) queueParity(sl);
