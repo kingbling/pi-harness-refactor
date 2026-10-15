@@ -71,6 +71,20 @@ export function updateShared(ledger: Ledger, id: string, patch: Partial<SharedCa
 }
 /** At run start: a job cut off by the end of the last run is open again. */
 export const resumeShared = (ledger: Ledger) => sharedCauses(ledger).filter((c) => c.status === "running").forEach((c) => updateShared(ledger, c.id, { status: "open" }));
+/**
+ * One code job for the first open shared cause (`job` runs it and says whether it merged a fix). Returns the slices to
+ * compare again (landed: on the fix; failed for good: so the judge re-opens the units), or undefined when none is open.
+ */
+export async function runSharedJob(ledger: Ledger, job: (c: SharedCause) => Promise<boolean>, log: (l: string) => void = () => {}): Promise<{ id: string; slices: string[] } | undefined> {
+	const c = sharedCauses(ledger).find((x) => x.status === "open");
+	if (!c) return undefined;
+	const n = c.jobs + 1;
+	updateShared(ledger, c.id, { status: "running", jobs: n });
+	const landed = await job({ ...c, jobs: n }).catch((e) => (log(`parity shared cause ${c.id}: ${e?.message ?? e}`), false));
+	updateShared(ledger, c.id, landed ? { status: "landed", landedAt: new Date().toISOString() } : { status: n >= MAX_SHARED_JOBS ? "failed" : "open" });
+	const slices = sharedCauses(ledger).find((x) => x.id === c.id)?.slices ?? c.slices;
+	return { id: c.id, slices: landed || n >= MAX_SHARED_JOBS ? slices : [] };
+}
 /** What the code job for a shared cause is told. */
 export const sharedJobText = (c: SharedCause) =>
 	`The new app answers differently from the old one in the same way across slices ${c.slices.join(", ")} (parity check: the same requests sent to both apps). One cause in code those pages share, not in one page's own code:\n${c.problem}${c.fix ? `\nFix: ${c.fix}` : ""}\nSome of the differences:\n${c.examples.map((e) => `- ${e}`).join("\n")}\nRead the old code to see what it does, and fix it once in the shared code (or config) of the new app, so every route behaves like the old app here; do not change each page's code. Test the shared behaviour.`;
@@ -172,6 +186,8 @@ export async function judgeRun(o: {
 		const all = sharedCauses(o.ledger);
 		let c = all.find((x) => x.id === g.shared);
 		if (c?.status === "failed") return false;
+		// a slice a failed cause showed in takes no new cause: its jobs did not fix it, the units do (bounds the jobs)
+		if (!c && all.some((x) => x.status === "failed" && x.slices.includes(o.slice))) return false;
 		const examples = these.map((d) => `${o.slice}: ${describe(d)}`);
 		if (!c) {
 			c = { id: `S${all.length + 1}`, problem: g.problem, fix: g.fix, slices: [], examples: [], status: "open", jobs: 0 };
@@ -196,14 +212,14 @@ export async function judgeRun(o: {
 	if (open.length) {
 		const { units, files } = sliceFacts(o.ledger, o.slice);
 		const steps = loadSteps(o.root, o.slice)?.steps ?? [];
-		const known = o.shared ? sharedCauses(o.ledger).filter((c) => c.status !== "failed") : [];
+		const known = o.shared ? sharedCauses(o.ledger) : [];
 		const unitList = units.map((u) => `${u.id} (${u.state}): ${(JSON.parse(o.ledger.getUnit(u.id)!.meta) as { files?: string[] }).files?.join(", ") ?? ""}`);
 		const facts = [
 			`Slice "${o.slice}". Its units and their legacy files (relative to the old repo):\n${unitList.join("\n")}`,
 			`The requests (steps.json; "target" = how the new app was asked differently):\n${JSON.stringify(steps, null, 1).slice(0, 12_000)}`,
 			`How each app runs here (its setup model's words):\n${Object.entries(loadApps(o.root)).map(([side, a]) => `${side}: ready at ${a.recipe?.ready ?? "?"}; ${a.said ?? ""}`).join("\n")}`,
 			`The differences:\n${open.map((d) => `#${d.id} ${describe(d)}`).join("\n")}`,
-			...(o.shared ? [`Shared causes (a bug in code many pages share; set "shared" on a bug group: a known id when it is the same behaviour, "new" for another one):\n${known.map((c) => `${c.id} (slices ${c.slices.join(", ")}): ${c.problem}`).join("\n") || "none known yet"}`] : []),
+			...(o.shared ? [`Shared causes (a bug in code many pages share; set "shared" on a bug group: a known id when it is the same behaviour, "new" for another one):\n${known.map((c) => `${c.id} (slices ${c.slices.join(", ")})${c.status === "failed" ? " FAILED: its jobs did not fix it, so its bugs go to the units; do not set shared for it" : ""}: ${c.problem}`).join("\n") || "none known yet"}`] : []),
 		].join("\n\n");
 		const groups = await (o.judge ?? judgeWithModel)({ config: o.config, root: o.root, slice: o.slice, facts, units: units.map((u) => u.id) }).catch((e) => (log(pc.yellow(`parity ${o.slice}: judge failed: ${e?.message ?? e}`)), undefined));
 		const openIds = new Set(open.map((d) => d.id));

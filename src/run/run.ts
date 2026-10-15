@@ -41,7 +41,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
 import { createStubSweep } from "./stub-sweep.ts";
-import { MAX_PARITY_REOPENS, MAX_SHARED_JOBS, resumeShared, sharedCauses, sharedJobText, updateShared } from "./parity-judge.ts";
+import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 import { conflictMarkers, wholeProjectSteps } from "./gate.ts";
@@ -490,22 +490,19 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const sharedOn = !(o.setupFixer === false || (!o.setupFixer && o.spawn));
 	let sharedRunning: Promise<void> | undefined;
 	const pumpShared = () => {
-		if (sharedRunning || parityStopped || !sharedOn || !adapters.has(serverStack)) return;
-		const c = sharedCauses(ledger).find((x) => x.status === "open");
-		if (!c) return;
-		updateShared(ledger, c.id, { status: "running", jobs: c.jobs + 1 });
-		sharedRunning = (async () => {
-			let merged: string | undefined;
-			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(serverStack)!, label: `parity-${c.id}-${c.jobs + 1}`, linkAll, log, what: sharedJobText(c), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
-			const now = sharedCauses(ledger).find((x) => x.id === c.id) ?? c;
-			if (said && merged) {
-				noteFix(o.root, serverStack, merged, `parity shared cause ${c.id}: ${said}`);
-				updateShared(ledger, c.id, { status: "landed", landedAt: new Date().toISOString() });
-			} else updateShared(ledger, c.id, { status: c.jobs + 1 >= MAX_SHARED_JOBS ? "failed" : "open" });
-			// landed: compared again on the fix; failed for good: compared again so the judge re-opens the units
-			if ((said && merged) || c.jobs + 1 >= MAX_SHARED_JOBS) for (const sl of now.slices) queueParity(sl);
-		})()
-			.catch((e) => (log(pc.yellow(`parity shared cause ${c.id}: ${e?.message ?? e}`)), updateShared(ledger, c.id, { status: c.jobs + 1 >= MAX_SHARED_JOBS ? "failed" : "open" })))
+		if (sharedRunning || parityStopped || !sharedOn || !adapters.has(serverStack) || !sharedCauses(ledger).some((x) => x.status === "open")) return;
+		sharedRunning = runSharedJob(
+			ledger,
+			async (c) => {
+				let merged: string | undefined;
+				const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(serverStack)!, label: `parity-${c.id}-${c.jobs}`, linkAll, log, what: sharedJobText(c), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+				if (said && merged) noteFix(o.root, serverStack, merged, `parity shared cause ${c.id}: ${said}`);
+				return !!(said && merged);
+			},
+			(l) => log(pc.yellow(l)),
+		)
+			.then((r) => r?.slices.forEach((sl) => queueParity(sl)))
+			.catch((e) => log(pc.yellow(`parity shared cause: ${e?.message ?? e}`)))
 			.finally(() => {
 				sharedRunning = undefined;
 				pumpShared();
@@ -1217,10 +1214,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		if (parityRunning || parityQueue.length) log(pc.dim("the comparison with the old app is left for the next run"));
 	} else {
 		if (parityProbe) await waitOn("checking whether the old and the new app start", () => parityProbe);
-		while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
 	}
-	// a shared cause's code job merges on main: it finishes before the run ends (no new one starts after a stop)
-	while (sharedRunning) await waitOn("a code job is fixing a difference many slices share", () => sharedRunning!);
+	// a shared cause's code job merges on main: it finishes before the run ends (no new one starts after a stop). Without
+	// a stop the slices it queues are compared too, and a job that comparison opens: both are awaited until neither runs
+	while (sharedRunning || (!stopRecord && parityRunning))
+		if (parityRunning && !stopRecord) await waitOn("comparing finished slices with the old app", () => parityRunning!);
+		else await waitOn("a code job is fixing a difference many slices share", () => sharedRunning!);
 	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
 	// a stub sweep's code job finishes (it merges on main) before the run ends
