@@ -106,6 +106,24 @@ describe("starting the apps for parity", () => {
 		expect(problems).toHaveLength(3);
 	});
 
+	it("a data reset is checked once for a full copy of a large database; a recipe saved without it keeps no reset, and no reset is asked for again", async () => {
+		const { root, config: base } = workspace();
+		const config = ConfigSchema.parse({ ...base, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" } });
+		const port = await freePort();
+		const dump = { dumpCmd: process.execPath, dumpArgs: ["-e", "process.stdout.write('{}')"] };
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), resetCmd: process.execPath, resetArgs: ["-e", "0"], ...dump }), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		const problems: string[] = [];
+		const drop: AppFixer = async (o) => (problems.push(o.problem), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), ...dump }), "dropped the reset");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: drop, log: () => {} })).toBe(true);
+		expect(problems[0]).toMatch(/full second copy[\s\S]*take the reset out of the recipe/);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, resetSpaceChecked: true });
+		expect(loadApps(root)[LEGACY]!.recipe!.reset).toBeUndefined();
+		// decided: the app has a dump, so no reset is asked for again
+		expect(await probeApp({ config, root, side: LEGACY, fixer: drop, log: () => {} })).toBe(true);
+		expect(problems).toHaveLength(1);
+	});
+
 	it("a new recipe whose reset works but whose dump fails keeps its reset; a dump bigger than any buffer is read whole", async () => {
 		const { root, legacy, config: base } = workspace();
 		const config = ConfigSchema.parse({ ...base, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" } });

@@ -75,6 +75,8 @@ export interface AppState {
 	bootProbes?: number;
 	/** The owner question asked once those fixes ran out: slice checks wait for it, "retry" gives the setup its tries back. */
 	bootQuestion?: number;
+	/** Set once its setup checked whether the data reset keeps a full second copy of a large database (which is then dropped). */
+	resetSpaceChecked?: boolean;
 	at?: string;
 }
 
@@ -457,7 +459,7 @@ function problemFor(config: Config, root: string, side: string): string {
 		.filter(([s, a]) => s !== side && a.recipe)
 		.map(([s, a]) => `${s} uses port ${portOf(a.recipe!.ready)}`);
 	const db = config.db.strategy !== "none" && (config.db.from.length || config.db.schemaFiles.length || config.db.snapshot)
-		? ` The app uses ${config.db.from.join(" + ") || "a database"}${config.db.to && side !== LEGACY ? ` (the new app: ${config.db.to})` : ""}; schema/data inputs from setup (relative to the old repo ${config.source.path}): ${[...config.db.schemaFiles, ...(config.db.snapshot ? [config.db.snapshot] : [])].join(", ") || "none given"}. Start a database with that schema (and data, when there is a snapshot) if the app needs one to answer. Then also give the recipe a reset (puts that data back to its starting state, so every run starts the same) and a dump (prints the data as JSON {"table": [rows ordered by primary key]}): the tool compares what each app writes.`
+		? ` The app uses ${config.db.from.join(" + ") || "a database"}${config.db.to && side !== LEGACY ? ` (the new app: ${config.db.to})` : ""}; schema/data inputs from setup (relative to the old repo ${config.source.path}): ${[...config.db.schemaFiles, ...(config.db.snapshot ? [config.db.snapshot] : [])].join(", ") || "none given"}. Start a database with that schema (and data, when there is a snapshot) if the app needs one to answer. Then also give the recipe a dump (prints the data as JSON {"table": [rows ordered by primary key]}): the tool compares what each app writes. Add a reset (puts that data back to its starting state before every run) only when it is cheap: never keep a second full copy of a large database (more than a few GB) just to restore it; then leave the reset out, the data then stays as the runs leave it.`
 		: "";
 	const where = side === LEGACY ? `The old app's root (after make_legacy_copy): the copy.` : `The new project is at ${appRoot(config, root, side)} (a worktree of the migration's main branch; its dependencies are linked in).`;
 	return `Find out whether this app can be started here as a local server that answers HTTP requests on this machine. ${where}${db}${ports.length ? ` Both apps run at the same time: ${ports.join(", ")}; use another port.` : ""} The app does not have to be complete: any answer on the ready URL (a login page, a redirect, a 404 from the framework) proves it runs. When the app is no HTTP server at all (a command-line tool, a library), say so and stop. Try more than one way before giving up.`;
@@ -478,8 +480,10 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const retry = cur.up === false && cur.probeQuestion !== undefined && o.answer?.(cur.probeQuestion) === "retry";
 	const commit = o.side === LEGACY ? undefined : await headOf(o.config.target.path);
 	const moved = cur.up === false && commit !== undefined && commit !== cur.commit && (cur.redProbes ?? 0) < MAX_RED_PROBES;
-	// an app that starts but cannot reset or dump its data: written data is never compared, so it is asked once to add them
-	const lacksData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && (!cur.recipe.reset || !cur.recipe.dump);
+	// an app that starts but cannot dump its data: written data is never compared, so it is asked to add a dump (a reset is optional)
+	const lacksData = cur.up === true && !!cur.recipe && o.config.db.strategy === "keep-schema" && !cur.recipe.dump;
+	// once per app: a reset that restores from a full second copy of a large database costs that much disk, so it is dropped
+	const space = cur.up === true && !!cur.recipe?.reset && !cur.resetSpaceChecked;
 	// an app that only redirects to itself on https: no request reaches a handler, so it is asked to fix that (and the data, if missing)
 	const redirect = cur.up === true && !!cur.recipe && !!cur.selfRedirect && fixUpLeft(cur, "redirect");
 	// a slice check blamed how this app runs here (a difference, or it did not start): it is asked to fix that
@@ -487,13 +491,14 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	// a slice check could not start it (its data reset or start failed): it is asked to fix that
 	const boot = cur.up === true && !!cur.recipe && !!cur.bootProblem && fixUpLeft(cur, "boot");
 	// each kind at most MAX_FIXUPS times, whatever came of it
-	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup || boot;
+	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup || boot || space;
 	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
 	const missing = [
 		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
 		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy. Switch off the app's or its web server's setting that forces https, in the copy's local config only (never the app's code): the comparison sends the same plain-http requests to both apps and compares what the handlers answer, it does not check the https rule, so keeping that rule on here only hides every handler. check_app_boot sends that request again and says whether it still redirects`] : []),
 		...(setup ? [`a slice check found a problem that only its setup here causes (${cur.setupProblem}): fix that in its setup (start, data reset, data dump, local config), not in the app's code`] : []),
+		...(space ? [`its data reset (${[cur.recipe!.reset!.cmd, ...cur.recipe!.reset!.args].join(" ")}) may restore from a full second copy of the data (a copied database, volume or folder). Find out with your tools what it restores from and how much disk that takes. When it is a full copy of a large database (more than a few GB), take the reset out of the recipe (save it without resetCmd), or, when the reset also does other work the app needs (such as writing local config back), only the restore from that copy; once check_app_boot shows the app still starts, delete that copy: only that copy, never the data the app runs on or anything another project uses. When the reset costs little disk, keep it`] : []),
 		...(boot ? [`it did not start for a slice check just now (${cur.bootProblem}). Find out why with your tools (is each service and container it needs running, does its reset script still work, what does the command print when you run it). Fix that in its setup here (start, data reset, the services it needs, local config), not in the app's code; check_app_boot shows whether it starts again. When the cause is the app's own code, change nothing and say so: that goes to whoever fixes the code`] : []),
 	];
 	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
@@ -509,8 +514,8 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		const kept = res.ok || (res.redirectFailed && !res.dumpFailed) ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
 		// the redirect is gone when the check sent the request again and it was not redirected (also when only the dump failed)
 		const redirectGone = redirect && !!recipe && !bad && !res.redirectFailed && (res.ok || !!res.dumpFailed);
-		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}) });
-		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${boot ? `; did not start for a slice check: ${res.ok ? "starts again" : "still does not start"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}), ...(space ? { resetSpaceChecked: true } : {}) });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${boot ? `; did not start for a slice check: ${res.ok ? "starts again" : "still does not start"}` : ""}${space ? `; data reset: ${kept.reset ? "kept" : "dropped (it kept a full copy of the data)"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
 	}
