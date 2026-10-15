@@ -352,7 +352,8 @@ function fakeSpawn(ledger: Ledger, plan: Script[string], attemptsSeen: Map<strin
 /** Real symbolproof + anti-gaming (pure code); scripted build/lint/tests so L1 needs no toolchain. */
 function fakeGate(plan: Script[string], attemptsSeen: Map<string, number>) {
 	return async (g: GateInput): Promise<GateReport> => {
-		const real = await runGate({ ...g, adapter: { ...g.adapter, build: () => ({ cmd: "true", args: [] }), lint: () => ({ cmd: "true", args: [] }), test: () => ({ cmd: "true", args: [] }) } });
+		// no reviewer model in L1: a scripted verdict; build and lint take the unit's files (an unjudged step is never accepted)
+		const real = await runGate({ ...g, review: g.review ?? (async () => ({ ok: true, output: "simulated review: real, connected", judged: true })), adapter: { ...g.adapter, build: (_d: string, files: string[]) => ({ cmd: "true", args: files }), lint: (_d: string, files: string[]) => ({ cmd: "true", args: files }), test: () => ({ cmd: "true", args: [] }) } });
 		if (!real.ok) return real;
 		const n = attemptsSeen.get(`${g.unitId}:implement`) ?? 0;
 		const esc = attemptsSeen.get(`${g.unitId}:escalate`) ?? 0;

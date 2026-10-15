@@ -185,6 +185,16 @@ export function reopenUnit(ledger: Ledger, unitId: string, note: string, reason:
 }
 
 /**
+ * Accepted units whose wiring no reviewer ever judged (wired_ok stored as "not judged"): back to planned with their
+ * code kept, so their next pass gets the reviewer's verdict. A pass on top of what is there, not a redo.
+ */
+export function reopenUnjudgedWiring(ledger: Ledger): string[] {
+	const ids = (ledger.db.prepare("SELECT u.id FROM units u JOIN evidence e ON e.id = (SELECT max(id) FROM evidence WHERE unit_id = u.id AND type = 'wired_ok') WHERE u.state = 'accepted' AND json_extract(e.payload, '$.judged') = 0").all() as Array<{ id: string }>).map((r) => r.id);
+	for (const id of ids) reopenUnit(ledger, id, "This unit was accepted before without a wiring verdict: no reviewer judged whether its code is real and reached from the app's entry point. Its code stays on the branch: start from it, check it against the legacy code and fix what is missing; the reviewer judges it this time.", "wired_ok was never judged: back for the reviewer's verdict");
+	return ids;
+}
+
+/**
  * The unit's files on main now, relative to its stack's project `dir`: the files its moves point to, plus the files
  * of its commit (repo-relative in git, so only those inside `dir`) that still exist.
  */

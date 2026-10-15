@@ -45,7 +45,8 @@ export interface GateInput {
 	legacyWords?: string[];
 	/**
 	 * wired_ok: a reviewer model with tools judges whether the new code is real (no stubs), connected (reached by
-	 * the framework, uses the migrated code) and on the chosen stack. Without one the step passes as "not judged".
+	 * the framework, uses the migrated code) and on the chosen stack. Without one the step is stored as not judged:
+	 * the ledger accepts no unit without a wiring verdict.
 	 * `nearDuplicates`: classes whose names only look alike (Repo/Repository …) — facts for the reviewer to judge.
 	 */
 	review?: (changedFiles: string[], nearDuplicates?: string[]) => Promise<{ ok: boolean; output: string; judged: boolean }>;
@@ -142,8 +143,9 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	const fromCheck = "from check_my_code on the same tree";
 	const scopedStep = (name: "build" | "lint") => () => {
 		const c = scopedCheck(g.adapter, g.targetProjectDir, name, unitFiles);
-		// skipped is not a pass: it is stored as not judged, so nobody reads a 0 ms build_ok as a green build
-		if ("skip" in c) return Promise.resolve({ ok: true, output: c.skip, judged: false });
+		// a whole-project command is deferred, not passed: stored as not judged, the merge check judges it before the
+		// unit lands (judgedAtMerge) and the ledger refuses to accept it before. No files of the stack's language: nothing to build
+		if ("skip" in c) return Promise.resolve({ ok: true, output: c.skip, ...(c.deferred ? { judged: false } : {}) });
 		if (g.cleanCheck?.ran.includes(name)) return Promise.resolve({ ok: true, output: fromCheck });
 		return run(c.cmd, c.args, g.targetProjectDir, timeout);
 	};
@@ -173,7 +175,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : checked ? Promise.resolve({ ok: true, output: `${fromCheck}\n${clipOutput(g.cleanCheck!.text, 1000)}` }) : runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests, mainDir: g.mainDir, timeoutMs: timeout, slot: cpu, catchUp: true }))))) return done();
 
 	// 8. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
-	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: "not judged: no reviewer in this run", judged: false }))))) return done();
+	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: NO_REVIEWER, judged: false }))))) return done();
 
 	return done();
 
@@ -738,10 +740,37 @@ export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ 
  * The stack's build or lint on the given files, or why it does not run per unit: a command that ignores the files
  * checks the whole project, and the builder runs it after merges. Shared by the gate and the tester's checks.
  */
-export function scopedCheck(adapter: TargetAdapter, dir: string, name: "build" | "lint", files: string[]): { cmd: string; args: string[] } | { skip: string } {
-	if (wholeProjectSteps(adapter, dir).some((w) => w.step === name)) return { skip: `whole-project ${name}: the builder runs it after merges` };
+export function scopedCheck(adapter: TargetAdapter, dir: string, name: "build" | "lint", files: string[]): { cmd: string; args: string[] } | { skip: string; deferred?: boolean } {
+	if (wholeProjectSteps(adapter, dir).some((w) => w.step === name)) return { skip: `whole-project ${name}: the builder runs it after merges, the merge check before the unit lands`, deferred: true };
 	if (!files.length) return { skip: `no files to ${name}` };
 	return name === "build" ? adapter.build(dir, files) : adapter.lint(dir, files);
+}
+
+/** wired_ok without a reviewer: stored as not judged, so the ledger refuses to accept the unit until a reviewer judges it. */
+export const NO_REVIEWER = "not judged: no reviewer in this run; the unit cannot be accepted without a wiring verdict";
+
+/**
+ * The merge check ran the stack's whole-project build and lint on the unit's code on top of main and found no error
+ * main does not have: the build_ok / lint_ok the gate deferred (not judged) get their verdict. `note` says how main was.
+ */
+export function judgedAtMerge(ledger: Ledger, unitId: string, note: string): EvidenceType[] {
+	const out: EvidenceType[] = [];
+	for (const u of ledger.unjudged(unitId)) {
+		if (u.type !== "build_ok" && u.type !== "lint_ok") continue;
+		ledger.addEvidence(unitId, u.type, { by: "merge check", note });
+		out.push(u.type);
+	}
+	return out;
+}
+
+/**
+ * Right before a unit lands on main: the build/lint the gate deferred get the merge check's verdict (when one ran on
+ * it); what is still not judged then (no reviewer, no merge check) is why it does not land, or undefined.
+ */
+export function verdictsAtMerge(ledger: Ledger, unitId: string, mergeCheckRan: boolean, mainRed: boolean): string | undefined {
+	if (mergeCheckRan) judgedAtMerge(ledger, unitId, mainRed ? "main already fails its whole-project checks; this unit adds no error to them" : "no whole-project error with this unit on top of main");
+	const left = ledger.unjudged(unitId);
+	return left.length ? `not judged: ${left.map((u) => `${u.type} (${u.note})`).join(", ")}; it does not land on main without that verdict` : undefined;
 }
 
 /** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */
