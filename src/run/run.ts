@@ -198,9 +198,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			ask: async (q) => (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "truth_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
 			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
 		})).catch((e) => log(pc.yellow(`truth probe failed: ${e?.message ?? e} (units try running the old code one by one)`)));
-		// truth written from reading the old code: its scripts run again once the old code's environment changed
+		// truth written from reading the old code: its scripts run again once the old code's environment changed (units not
+		// accepted here, before a lane takes them; accepted ones on the side once the lanes run)
 		const { upgradeReadTruth } = await import("./recheck.ts");
-		await waitOn("running read-only truth on the old code again", async () => await upgradeReadTruth({ ledger, config, root: o.root, log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
+		await waitOn("running read-only truth on the old code again", async () => await upgradeReadTruth({ ledger, config, root: o.root, states: ["planned", "quarantined"], log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
 	}
 	// ---- stack knowledge written before the plugin asked for it (notApp, wiringFiles): a model adds just that
 	if (!o.dry && !o.spawn) {
@@ -534,11 +535,15 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		process.once("SIGINT", () => process.exit(130));
 	};
 	if (o.handleSigint !== false) process.once("SIGINT", onSigint);
-	// accepted units with only read truth and no script: the tester writes one, a few per run, one at a time on the side
+	// accepted units with only read truth, on the side: their scripts run on the old code (a few at once, capped), then the
+	// tester writes a script for those with none (capped; one at a time, more while lanes are free). A stop ends both.
 	const truthScripts = o.dry || o.spawn
 		? undefined
 		: import("./recheck.ts")
-				.then(({ writeTruthScripts }) => writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, log }))
+				.then(async ({ upgradeReadTruth, writeTruthScripts }) => {
+					if (config.run.truthUpgradesPerRun > 0) await upgradeReadTruth({ ledger, config, root: o.root, states: ["accepted"], cap: config.run.truthUpgradesPerRun, stopped: () => !!stopRecord, log });
+					await writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, freeLanes: () => (stopRecord ? 0 : laneLimit - running.size), log });
+				})
 				.catch((e) => log(pc.yellow(`truth scripts: ${e?.message ?? e}`)));
 
 	let decisionBlocked = new Map<string, string[]>();
