@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { renderStatus } from "../src/dashboard/status.ts";
-import { judgeRun, MAX_PARITY_REOPENS, type ParityJudge } from "../src/run/parity-judge.ts";
+import { judgeRun, MAX_PARITY_REOPENS, MAX_SHARED_JOBS, runSharedJob, sharedCauses, sharedJobText, updateShared, type ParityJudge } from "../src/run/parity-judge.ts";
 import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain, parityOnAccept } from "../src/run/run.ts";
 import { RESOLVER } from "../src/jev/resolve.ts";
 import { routeOwners } from "../src/run/parity-check.ts";
@@ -257,5 +257,71 @@ describe("judging parity differences", () => {
 		add("auth", null); // from before commits were recorded
 		expect(parityAgain(ledger, "bbb").again).toEqual(new Set(["invoices"]));
 		expect(parityAgain(ledger).again).toEqual(new Set());
+	});
+	it("one cause in shared code across slices is recorded once for one code job; no unit is re-opened for it", async () => {
+		const { root, config, ledger, run, ids, status, accept } = workspace();
+		// the same logged-out redirect differs in a second slice
+		const other = () => {
+			const id = Number(ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES ('dashboard', 'differs', ?)").run(new Date().toISOString()).lastInsertRowid);
+			ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target) VALUES (?, 'dashboard', 's1', 'GET /dashboard', 'status', '', '302', '401')").run(id);
+			return id;
+		};
+		const r1 = run([{ step: "one", path: "", legacy: 302, target: 401 }]);
+		const first: ParityJudge = async (o) => (expect(o.facts).toMatch(/Shared causes[\s\S]*none known yet/), [{ diffs: ids(r1), verdict: "bug", unit: "U1", problem: "a logged-out request gets 401, the old app redirects to /login", fix: "redirect to /login in the auth layer", shared: "new" }]);
+		const res = await judgeRun({ ledger, config, root, runId: r1, slice: "invoices", judge: first, log: () => {}, shared: true });
+		expect(res).toMatchObject({ reopened: [], bugs: 1, shared: ["S1"] });
+		expect(status(r1)).toEqual(["bug"]);
+		expect(ledger.getUnit("U1")!.state).toBe("accepted");
+		// the judge of another slice sees the known cause and says it is the same one
+		const r2 = other();
+		const second: ParityJudge = async (o) => (expect(o.facts).toMatch(/S1 \(slices invoices\): a logged-out request/), [{ diffs: (ledger.db.prepare("SELECT id FROM parity_diffs WHERE run_id = ?").all(r2) as Array<{ id: number }>).map((d) => d.id), verdict: "bug", unit: "U2", problem: "401 instead of the login redirect", shared: "S1" }]);
+		expect((await judgeRun({ ledger, config, root, runId: r2, slice: "dashboard", judge: second, log: () => {}, shared: true })).reopened).toEqual([]);
+		const [c] = sharedCauses(ledger);
+		expect(sharedCauses(ledger)).toHaveLength(1);
+		expect(c).toMatchObject({ id: "S1", slices: ["invoices", "dashboard"], status: "open", jobs: 0 });
+		expect(sharedJobText(c!)).toMatch(/slices invoices, dashboard[\s\S]*redirect to \/login in the auth layer[\s\S]*dashboard: step s1/);
+
+		// a job landed, yet a later comparison still differs: open for another job; after the last one the units go back
+		for (let job = 1; job <= MAX_SHARED_JOBS; job++) {
+			updateShared(ledger, "S1", { status: "landed", jobs: job, landedAt: "2000-01-01T00:00:00.000Z" });
+			const r = run([{ step: "one", path: "", legacy: 302, target: 401 }]);
+			const again: ParityJudge = async () => [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "still 401", shared: "S1" }];
+			const j = await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge: again, log: () => {}, shared: true });
+			if (job < MAX_SHARED_JOBS) expect([j.reopened, sharedCauses(ledger)[0]!.status]).toEqual([[], "open"]);
+			else expect([j.reopened, sharedCauses(ledger)[0]!.status]).toEqual([["U1"], "failed"]);
+		}
+		// after the failure the judge is told S1 failed; a "new" cause for the same slice goes to the unit, no S2 and no more jobs
+		accept("U1");
+		const r3 = run([{ step: "one", path: "", legacy: 302, target: 401 }]);
+		const after: ParityJudge = async (o) => (expect(o.facts).toMatch(/S1 \(slices invoices, dashboard\) FAILED/), [{ diffs: ids(r3), verdict: "bug", unit: "U1", problem: "still 401", shared: "new" }]);
+		expect((await judgeRun({ ledger, config, root, runId: r3, slice: "invoices", judge: after, log: () => {}, shared: true })).reopened).toEqual(["U1"]);
+		expect(sharedCauses(ledger).map((x) => [x.id, x.status])).toEqual([["S1", "failed"]]);
+	});
+
+	it("a shared cause's code job: landed → its slices are compared again; not fixed after the last job → failed, slices compared again for the units", async () => {
+		const { ledger } = workspace();
+		ledger.setMeta("parity_shared", JSON.stringify([{ id: "S1", problem: "401 for logged-out", slices: ["invoices", "dashboard"], examples: [], status: "open", jobs: 0 }]));
+		const seen: number[] = [];
+		// the job sees the cause as running, with its job number
+		expect(await runSharedJob(ledger, async (c) => (seen.push(c.jobs), expect(sharedCauses(ledger)[0]!.status).toBe("running"), true))).toEqual({ id: "S1", slices: ["invoices", "dashboard"] });
+		expect(sharedCauses(ledger)[0]).toMatchObject({ status: "landed", jobs: 1 });
+		expect(await runSharedJob(ledger, async () => true)).toBeUndefined(); // none open
+		// the judge opened it again (still differs on the fix): a job that merges nothing, then one that throws
+		updateShared(ledger, "S1", { status: "open" });
+		expect(await runSharedJob(ledger, async (c) => (seen.push(c.jobs), false))).toEqual({ id: "S1", slices: ["invoices", "dashboard"] });
+		expect(sharedCauses(ledger)[0]).toMatchObject({ status: "failed", jobs: MAX_SHARED_JOBS });
+		expect(seen).toEqual([1, 2]);
+		updateShared(ledger, "S1", { status: "open", jobs: 0 });
+		const said: string[] = [];
+		expect(await runSharedJob(ledger, async () => { throw new Error("boom"); }, (l) => said.push(l))).toEqual({ id: "S1", slices: [] });
+		expect([sharedCauses(ledger)[0]!.status, said]).toEqual(["open", ["parity shared cause S1: boom"]]);
+	});
+
+	it("without code jobs a shared cause re-opens its unit like any bug", async () => {
+		const { root, config, ledger, run, ids } = workspace();
+		const r = run([{ step: "one", path: "", legacy: 302, target: 401 }]);
+		const judge: ParityJudge = async (o) => (expect(o.facts).not.toMatch(/Shared causes/), [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "401", shared: "new" }]);
+		expect((await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge, log: () => {} })).reopened).toEqual(["U1"]);
+		expect(sharedCauses(ledger)).toEqual([]);
 	});
 });
