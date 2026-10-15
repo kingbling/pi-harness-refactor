@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
@@ -216,47 +216,72 @@ async function committedFiles(repo: string, sha: string): Promise<string[]> {
  * Truth written from reading the old code while it could not run here, now that it can: each unit whose tester
  * also left a script has it run on the old code. Green with the same expected values → the cases count as run on
  * the old code. Green with other values → the recorded truth was wrong: the unit is redone from running it (an
- * accepted one goes back to planned with its code kept). Red → left as it is, tried again once the old code's
- * environment changes. Units with only cases.json are counted, not touched (they need a tester session each).
+ * accepted one goes back to planned with its code kept, see judgeRunTruth). Red → left as it is, tried again once the
+ * old code's environment changes (a setup fix counts). Units with only cases.json are counted, not touched (they need
+ * a tester session each: writeTruthScripts). `states`: which units (the run does accepted ones on the side, the rest
+ * before its lanes start); `cap` units per call, most useful first, a few at once; `stopped` ends it between units.
  */
-export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; log?: (l: string) => void }): Promise<{ upgraded: string[]; redone: string[]; red: number; noScript: number }> {
+export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; states?: string[]; cap?: number; stopped?: () => boolean; log?: (l: string) => void }): Promise<{ upgraded: string[]; redone: string[]; red: number; noScript: number; left: number; down: boolean }> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const source = o.source ?? getSourceAdapter(o.config.source.stack);
-	const env = envHash(o.root, o.config);
-	const ids = (o.ledger.db.prepare("SELECT DISTINCT unit_id AS id FROM evidence WHERE type = 'truth_read' AND unit_id NOT IN (SELECT unit_id FROM evidence WHERE type = 'truth_green_on_old')").all() as Array<{ id: string }>).map((r) => r.id);
+	const env = runEnvHash(o.root, o.config);
+	const states = o.states ?? ["accepted", "planned", "quarantined"];
 	const upgraded: string[] = [];
 	const redone: string[] = [];
 	let red = 0;
 	let noScript = 0;
-	for (const [i, id] of ids.entries()) {
+	const todo: string[] = [];
+	for (const [i, id] of readTruthUnits(o.ledger, states).entries()) {
 		// thousands of units: Pi draws in between
 		if (i % 50 === 49) await new Promise((r) => setImmediate(r));
-		const u = o.ledger.getUnit(id);
-		if (!u || !["accepted", "planned", "quarantined"].includes(u.state)) continue;
-		const meta = JSON.parse(u.meta) as { files?: string[]; truthUpgradeEnv?: string };
-		const truthDir = join(o.root, ".bigrefactor", "truth", id);
-		if (!existsSync(join(truthDir, source.truth.scriptName))) {
-			noScript++;
-			continue;
-		}
-		if (meta.truthUpgradeEnv === env) continue;
-		const ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		if (!existsSync(join(o.root, ".bigrefactor", "truth", id, source.truth.scriptName))) noScript++;
+		else if ((JSON.parse(o.ledger.getUnit(id)!.meta) as { truthUpgradeEnv?: string }).truthUpgradeEnv !== env) todo.push(id);
+	}
+	const left = Math.max(0, todo.length - (o.cap ?? Infinity));
+	const queue = byValue(o.ledger, todo).slice(0, o.cap ?? Infinity);
+	if (queue.length > 20) log(pc.cyan(`truth upgrade: ${queue.length} unit(s) with read-only truth run their script on the old code${left ? ` (${left} in later runs)` : ""}`));
+	let down = false;
+	const one = async (id: string) => {
+		const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { files?: string[] };
+		const ran = await verifyTruthOnOld(join(o.root, ".bigrefactor", "truth", id), o.config, source, o.root, meta.files ?? []);
 		// red, and the probe does not run either: the old code's runtime is down, so no unit counts as tried
 		if (!ran.ok && (await probeRunsNow(o.root, o.config, source)) === false) {
-			log(pc.yellow(`truth upgrade: the old code's runtime is down (the probe does not run either); tried again at the next run`));
-			break;
+			if (!down) log(pc.yellow(`truth upgrade: the old code's runtime is down (the probe does not run either); tried again at the next run`));
+			down = true;
+			return;
 		}
+		// the unit moved on meanwhile (a lane took it, a re-open): not this job's any more; tried again later
+		const now = o.ledger.getUnit(id);
+		if (!now || !states.includes(now.state)) return;
 		o.ledger.updateUnit(id, { meta: { truthUpgradeEnv: env } });
-		if (!ran.ok) {
-			red++;
-			continue;
-		}
+		if (!ran.ok) return void red++;
 		const r = judgeRunTruth(o.ledger, o.root, source, id, ran.cases);
 		if (r === "upgraded") upgraded.push(id);
 		else if (r === "redone") redone.push(id);
-	}
-	if (upgraded.length || redone.length || red) log(pc.cyan(`truth upgrade: ${upgraded.length} unit(s) now run green on the old code${redone.length ? `, ${redone.length} redone (the old code returns other values)` : ""}${red ? `, ${red} still red` : ""}${noScript ? `; ${noScript} have only read cases (no script)` : ""}`));
-	return { upgraded, redone, red, noScript };
+	};
+	// a few at once: each run starts the old code's runtime (a container, maybe)
+	const worker = async () => {
+		for (let id = queue.shift(); id && !down && !o.stopped?.(); id = queue.shift()) await one(id);
+	};
+	await Promise.all([1, 2, 3].map(worker));
+	if (upgraded.length || redone.length || red) log(pc.cyan(`truth upgrade: ${upgraded.length} unit(s) now run green on the old code${redone.length ? `, ${redone.length} back to planned (the old code returns other values)` : ""}${red ? `, ${red} still red` : ""}${noScript ? `; ${noScript} have only read cases (no script)` : ""}`));
+	return { upgraded, redone, red, noScript, left, down };
+}
+
+/** Units in `states` with a truth case only read from the old code (never run on it). */
+const readTruthUnits = (ledger: Ledger, states: string[]) =>
+	(ledger.db.prepare(`SELECT DISTINCT t.unit_id AS id FROM truth_cases t JOIN units u ON u.id = t.unit_id WHERE t.verified_on_old = 0 AND u.state IN (${states.map(() => "?").join(", ")}) ORDER BY t.unit_id`).all(...states) as Array<{ id: string }>).map((r) => r.id);
+
+/**
+ * Most useful first: units of slices already compared with the old app (their results lean on these tests), then the
+ * units most others depend on, then by id. One pass over the units' slices and deps.
+ */
+export function byValue(ledger: Ledger, ids: string[]): string[] {
+	if (ids.length < 2) return ids;
+	const rows = ledger.db.prepare("WITH dep AS (SELECT d.value AS id, COUNT(*) AS n FROM units x, json_each(x.deps) d GROUP BY d.value) SELECT u.id, COALESCE(json_extract(u.meta, '$.slice') IN (SELECT slice FROM parity_runs WHERE compared > 0), 0) AS compared, COALESCE(dep.n, 0) AS needed FROM units u LEFT JOIN dep ON dep.id = u.id").all() as Array<{ id: string; compared: number; needed: number }>;
+	const value = new Map(rows.map((r) => [r.id, r]));
+	const v = (id: string) => value.get(id) ?? { compared: 0, needed: 0 };
+	return [...ids].sort((a, b) => v(b).compared - v(a).compared || v(b).needed - v(a).needed || (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**
@@ -295,6 +320,20 @@ function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: 
 /** Bump when how scripts are run changes (2: absolute legacy-repo paths made relative), so scripts tried before are tried again. */
 const RUN_RULES = 2;
 const envHash = (root: string, config: Config) => createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(root, config), why: undefined, rules: RUN_RULES })).digest("hex").slice(0, 12);
+/**
+ * The same plus the setup fixes made since (each one that worked adds a line to legacy-env.log; a fix often changes
+ * only files of the old code's copy, not legacy-env.json): a script red here because of the environment, not its
+ * code, runs again after the next fix. Running a script costs no model, so it may run again often; writing one may not.
+ */
+const runEnvHash = (root: string, config: Config) => {
+	let fixes = 0;
+	try {
+		fixes = statSync(join(root, ".bigrefactor", "legacy-env.log")).size;
+	} catch {
+		/* no fix yet */
+	}
+	return `${envHash(root, config)}.${fixes}`;
+};
 
 /** Writes the unit's cases script into `truthDir` (the recorded cases' symbols and inputs, never their expected values); returns its last sentence. `failed`: why the script already there does not do it. */
 export type TruthScriptWriter = (o: { config: Config; root: string; source: SourceAdapter; unitId: string; truthDir: string; legacyFiles: string[]; cases: Array<{ symbol: string; inputs: unknown }>; failed?: string }) => Promise<string | void>;
@@ -321,49 +360,83 @@ export const writeTruthScriptWithModel: TruthScriptWriter = async (o) => {
 /**
  * Accepted units whose truth was only read from the old code and that have no script to run it, or one the truth
  * upgrade already ran in this environment without it counting: once the old code runs here, the tester writes or
- * fixes that script (told why the old one failed), a few units per run (`cap`), one at a time on the side. Code runs it on
- * the old code and judges it like upgradeReadTruth. A unit is tried once per environment of the old code.
+ * fixes that script (told why the old one failed), `cap` units per run, most useful first (byValue), on the side: one
+ * at a time, plus one more per lane the run leaves free (`freeLanes`, checked every `tickMs`). Code runs it on the
+ * old code and judges it like upgradeReadTruth. A unit is tried once per environment of the old code; one red while
+ * the old code's runtime is down is not counted as tried, and the job stops. `stopped` ends it between units.
  */
-export async function writeTruthScripts(o: { ledger: Ledger; config: Config; root: string; cap: number; source?: SourceAdapter; writer?: TruthScriptWriter; stopped?: () => boolean; log?: (l: string) => void }): Promise<{ tried: number; upgraded: string[]; redone: string[]; red: number; left: number }> {
+export async function writeTruthScripts(o: { ledger: Ledger; config: Config; root: string; cap: number; source?: SourceAdapter; writer?: TruthScriptWriter; stopped?: () => boolean; freeLanes?: () => number; tickMs?: number; log?: (l: string) => void }): Promise<{ tried: number; upgraded: string[]; redone: string[]; red: number; left: number }> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const res = { tried: 0, upgraded: [] as string[], redone: [] as string[], red: 0, left: 0 };
 	if (loadLegacyEnv(o.root, o.config).mode !== "run" || o.cap <= 0) return res;
 	const source = o.source ?? getSourceAdapter(o.config.source.stack);
 	const env = envHash(o.root, o.config);
-	const ids = (o.ledger.db.prepare("SELECT DISTINCT e.unit_id AS id FROM evidence e JOIN units u ON u.id = e.unit_id WHERE e.type = 'truth_read' AND u.state = 'accepted' AND e.unit_id NOT IN (SELECT unit_id FROM evidence WHERE type = 'truth_green_on_old') ORDER BY e.unit_id").all() as Array<{ id: string }>)
-		.map((r) => r.id)
-		.filter((id) => {
-			const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { truthScriptEnv?: string; truthUpgradeEnv?: string };
-			// a script run here that is still read truth: red, or it printed other cases
-			return meta.truthScriptEnv !== env && (!existsSync(join(o.root, ".bigrefactor", "truth", id, source.truth.scriptName)) || meta.truthUpgradeEnv === env);
-		});
+	const runEnv = runEnvHash(o.root, o.config);
+	const ids = readTruthUnits(o.ledger, ["accepted"]).filter((id) => {
+		const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { truthScriptEnv?: string; truthUpgradeEnv?: string };
+		// a script run here that is still read truth: red, or it printed other cases
+		return meta.truthScriptEnv !== env && (!existsSync(join(o.root, ".bigrefactor", "truth", id, source.truth.scriptName)) || meta.truthUpgradeEnv === runEnv);
+	});
 	res.left = Math.max(0, ids.length - o.cap);
 	if (!ids.length) return res;
-	log(pc.cyan(`truth scripts: ${Math.min(ids.length, o.cap)} of ${ids.length} accepted unit(s) with read-only truth get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
-	for (const id of ids.slice(0, o.cap)) {
-		if (o.stopped?.()) break;
+	const queue = byValue(o.ledger, ids).slice(0, o.cap);
+	log(pc.cyan(`truth scripts: ${queue.length} of ${ids.length} accepted unit(s) with read-only truth get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
+	let down = false;
+	const one = async (id: string) => {
 		const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { files?: string[] };
 		const truthDir = join(o.root, ".bigrefactor", "truth", id);
 		const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(id) as Array<{ symbol_id: string; inputs: string }>).map((c) => ({ symbol: c.symbol_id, inputs: JSON.parse(c.inputs) as unknown }));
-		if (!cases.length) continue;
+		if (!cases.length) return;
 		res.tried++;
 		const before = existsSync(join(truthDir, source.truth.scriptName)) ? await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []) : undefined;
 		const failed = before && (before.ok ? `it runs, but its cases do not match the recorded ones (other symbols or inputs, or other keys in expected); it printed these (expected left out): ${JSON.stringify(before.cases.map((c) => ({ symbol: c.symbol, inputs: c.inputs }))).slice(0, 1000)}` : before.error ?? "it does not run");
 		const said = await (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases, failed }).catch((e) => `failed: ${e?.message ?? e}`);
-		o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
 		// the unit may have been re-opened meanwhile (parity, a bug report): then its truth is redone anyway
-		if (o.ledger.getUnit(id)?.state !== "accepted") continue;
+		if (o.ledger.getUnit(id)?.state !== "accepted") return void o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
 		const ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		// red because the old code's runtime is down, not because of the script: tried again later, nothing more starts now
+		if (!ran.ok && (await probeRunsNow(o.root, o.config, source)) === false) {
+			if (!down) log(pc.yellow(`truth scripts: the old code's runtime is down (the probe does not run either); the rest wait for the next run`));
+			down = true;
+			return void res.tried--;
+		}
+		// tried here: the truth upgrade does not run the same script again in this environment
+		o.ledger.updateUnit(id, { meta: { truthScriptEnv: env, truthUpgradeEnv: runEnv } });
 		if (!ran.ok) {
 			res.red++;
 			log(pc.dim(`  ${id}: the script does not run green on the old code (${String(ran.error ?? said).split("\n")[0]!.slice(0, 160)})`));
-			continue;
+			return;
 		}
 		const r = judgeRunTruth(o.ledger, o.root, source, id, ran.cases);
 		if (r === "upgraded") res.upgraded.push(id);
 		else if (r === "redone") res.redone.push(id);
-		log(r === "upgraded" ? pc.green(`  ${id}: its read truth runs green on the old code`) : r === "redone" ? pc.yellow(`  ${id}: the old code returns other values; back to planned, truth made again`) : pc.dim(`  ${id}: the script ran other cases than the recorded ones; left as read`));
+		log(r === "upgraded" ? pc.green(`  ${id}: its read truth runs green on the old code`) : r === "redone" ? pc.yellow(`  ${id}: the old code returns other values; back to planned for its tests, code kept`) : pc.dim(`  ${id}: the script ran other cases than the recorded ones; left as read`));
+	};
+	let busy = 0;
+	// the first worker always; each extra one only while the run has a lane free for it, and it stops once that lane is taken
+	const worker = async (extra: boolean) => {
+		busy++;
+		try {
+			while (queue.length && !down && !o.stopped?.()) {
+				if (extra && busy - 1 > (o.freeLanes?.() ?? 0)) return;
+				await one(queue.shift()!);
+			}
+		} finally {
+			busy--;
+		}
+	};
+	const extras: Array<Promise<void>> = [];
+	const timer = o.freeLanes
+		? setInterval(() => {
+				while (queue.length && !down && !o.stopped?.() && busy - 1 < o.freeLanes!()) extras.push(worker(true));
+			}, o.tickMs ?? 30_000)
+		: undefined;
+	try {
+		await worker(false);
+	} finally {
+		clearInterval(timer);
 	}
-	log(pc.cyan(`truth scripts: ${res.upgraded.length} upgraded, ${res.redone.length} redone, ${res.red} red${res.left ? `, ${res.left} left for later runs` : ""}`));
+	await Promise.all(extras);
+	log(pc.cyan(`truth scripts: ${res.upgraded.length} upgraded, ${res.redone.length} back to planned, ${res.red} red${res.left ? `, ${res.left} left for later runs` : ""}`));
 	return res;
 }
