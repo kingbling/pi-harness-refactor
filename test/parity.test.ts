@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { appBootTools, bootApp, clipError, dumpData, LEGACY, loadApps, MAX_DUMP_MB, MAX_FIXUPS, probeApp, saveApp, setupFixer, type AppFixer } from "../src/run/parity.ts";
+import { appBootTools, askBootOwner, bootApp, bootWaits, clipError, dumpData, LEGACY, loadApps, MAX_DUMP_MB, MAX_FIXUPS, probeApp, saveApp, setupFixer, type AppFixer } from "../src/run/parity.ts";
 
 /**
  * Differential parity starts with: can each app run here as a local server? The setup model saves a recipe;
@@ -289,5 +289,37 @@ describe("starting the apps for parity", () => {
 		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, bootProbes: MAX_FIXUPS, bootProblem: "still fails" });
 		// the working recipe was kept, not the broken one
 		expect(loadApps(root)[LEGACY]!.recipe!.reset).toBeUndefined();
+	});
+
+	it("once its setup ran out of fixes the owner is asked once; checks wait for the answer and \"retry\" gives the setup its tries back", async () => {
+		const { root, config } = workspace();
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		const asked: string[] = [];
+		const ask = async (q: { facts: string }) => (asked.push(q.facts), 7);
+		// fixes left: nobody is asked
+		saveApp(root, LEGACY, { bootProblem: "no answer on http://localhost/ after 180s" });
+		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(false);
+		expect(asked).toEqual([]);
+		// used up: asked once, checks wait until the answer is "retry"
+		saveApp(root, LEGACY, { bootProbes: MAX_FIXUPS });
+		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(true);
+		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(true);
+		expect(asked).toHaveLength(1);
+		expect(asked[0]).toMatch(/the old app stopped starting .* no answer after 180s/);
+		let answer: string | undefined;
+		expect(bootWaits(loadApps(root), () => answer)).toBe(LEGACY);
+		answer = "skip";
+		expect(bootWaits(loadApps(root), () => answer)).toBe(LEGACY);
+		answer = "retry";
+		expect(bootWaits(loadApps(root), () => answer)).toBeUndefined();
+		// the next failure after "retry": the setup model is asked again
+		const problems: string[] = [];
+		const look: AppFixer = async (o) => (problems.push(o.problem), "the database was stopped; started it");
+		expect(await setupFixer({ config, root, fixer: look, log: () => {}, answer: () => answer })(LEGACY, "no answer after 180s")).toBe(true);
+		expect(problems).toHaveLength(1);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ bootProbes: 1 });
+		expect(loadApps(root)[LEGACY]!.bootQuestion).toBeUndefined();
 	});
 });

@@ -341,6 +341,8 @@ export interface SliceCheck {
 	note: string;
 	/** The new app of this stack did not start on main: a main problem for the builder, not only a parity error. */
 	down?: { stack: string; error: string };
+	/** outcome setup: the app that did not start ("legacy" or a stack), even after its setup fixer tried. */
+	setup?: { side: string };
 }
 
 /**
@@ -361,11 +363,11 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		return { ...c, runId };
 	};
 	const fail = (note: string) => (log(pc.yellow(`parity ${o.slice}: ${note}`)), record({ outcome: "error", diffs: [], compared: 0, note }));
-	const setupFail = (note: string) => (log(pc.yellow(`parity ${o.slice}: not compared, ${note}`)), record({ outcome: "setup", diffs: [], compared: 0, note: `setup: ${note}` }));
-	// an app that does not start here goes to its setup fixer with what failed, then is started again (a few times per
-	// check at most). The old app's code never changes, so any failure of it is setup; the new app's only before its
-	// own start command (ready URL, port, data reset): a start that fails is main's code, the builder's
-	let fixes = 0;
+	const setupFail = (note: string, side: string) => (log(pc.yellow(`parity ${o.slice}: not compared, ${note}`)), { ...record({ outcome: "setup", diffs: [], compared: 0, note: `setup: ${note}` }), setup: { side } });
+	// an app that does not start here (data reset, start, no answer) goes to its setup fixer with what failed, then is
+	// started again (a few times per check at most): a hung server is as often a stopped database as broken code. Only
+	// a new app whose own start still fails after that is main's code, the builder's
+	const fixes = new Map<string, number>();
 	const name = (side: string) => (side === LEGACY ? "the old app" : `the new ${side} app`);
 	const boot: Boot = async (side) => {
 		for (;;) {
@@ -373,18 +375,18 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 			const a = loadApps(o.root)[side];
 			if (b.ok) {
 				// it starts again: the next failure gets its own fixes
-				if (a?.bootProbes || a?.bootProblem) saveApp(o.root, side, { bootProbes: undefined, bootProblem: undefined });
+				if (a?.bootProbes || a?.bootProblem || a?.bootQuestion !== undefined) saveApp(o.root, side, { bootProbes: undefined, bootProblem: undefined, bootQuestion: undefined });
 				return b;
 			}
-			if ((side !== LEGACY && b.stage === "start") || !o.fixSetup || fixes >= MAX_SETUP_RETRIES) return b;
-			fixes++;
+			if (!o.fixSetup || (fixes.get(side) ?? 0) >= MAX_SETUP_RETRIES) return b;
+			fixes.set(side, (fixes.get(side) ?? 0) + 1);
 			log(pc.yellow(`parity ${o.slice}: ${name(side)} did not start (${b.error.split("\n")[0]!.slice(0, 200)}): its setup is asked to fix it`));
 			if (!(await o.fixSetup(side, b.error).catch(() => false))) return b;
 		}
 	};
 
 	let apps = loadApps(o.root);
-	if (!apps[LEGACY]?.up || !apps[LEGACY].recipe) return setupFail("the old app does not start here (br parity --probe)");
+	if (!apps[LEGACY]?.up || !apps[LEGACY].recipe) return setupFail("the old app does not start here (br parity --probe)", LEGACY);
 	const { routes, files } = sliceFacts(o.ledger, o.slice);
 	if (!routes.length) return fail("this slice has no routes of its own to compare");
 
@@ -407,12 +409,12 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 
 	// the old app twice (what differs between those two runs is noise), then the new app
 	const old1 = await runOnOld(o.config, o.root, steps, boot);
-	if (typeof old1 === "string") return setupFail(old1);
+	if (typeof old1 === "string") return setupFail(old1, LEGACY);
 	const old2 = await runOnOld(o.config, o.root, steps, boot);
-	if (typeof old2 === "string") return setupFail(old2);
+	if (typeof old2 === "string") return setupFail(old2, LEGACY);
 	const stacks = [...new Set(steps.map((s) => s.target?.stack ?? o.serverStack))];
 	const down = stacks.filter((s) => !apps[s]?.up || !apps[s]!.recipe);
-	if (down.length) return setupFail(`the new ${down.join(", ")} app does not start here (br parity --probe)`);
+	if (down.length) return setupFail(`the new ${down.join(", ")} app does not start here (br parity --probe)`, down[0]!);
 	const wt = await prepareTargetCopy(o.config, o.root, o.linkAll);
 	let neu: StepResult[];
 	try {
@@ -420,7 +422,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		try {
 			for (const s of stacks) {
 				const b = await boot(s);
-				if (!b.ok) return b.stage === "start" ? { ...fail(`the new ${s} app did not start: ${b.error}`), down: { stack: s, error: b.error } } : setupFail(`the new ${s} app did not start: ${b.error}`);
+				if (!b.ok) return b.stage === "start" ? { ...fail(`the new ${s} app did not start${fixes.has(s) ? " (its setup could not fix it)" : ""}: ${b.error}`), down: { stack: s, error: b.error } } : setupFail(`the new ${s} app did not start: ${b.error}`, s);
 				stops.push(b.stop);
 			}
 			// the recipes as they are now: a setup fix may have saved new ones

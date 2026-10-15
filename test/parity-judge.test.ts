@@ -6,7 +6,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { renderStatus } from "../src/dashboard/status.ts";
 import { judgeRun, MAX_PARITY_REOPENS, type ParityJudge } from "../src/run/parity-judge.ts";
-import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain } from "../src/run/run.ts";
+import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain, parityOnAccept } from "../src/run/run.ts";
 import { RESOLVER } from "../src/jev/resolve.ts";
 import { routeOwners } from "../src/run/parity-check.ts";
 import { LEGACY, loadApps, saveApp } from "../src/run/parity.ts";
@@ -206,6 +206,32 @@ describe("judging parity differences", () => {
 		expect(parityAgain(ledger).fixed.has("invoices")).toBe(false);
 		accepted("U1", "2026-10-15T03:00:00.000Z");
 		expect(parityAgain(ledger).again.has("invoices")).toBe(true);
+	});
+
+	it("a fix is told from an accept before the comparison when the run's times are in the older space format", () => {
+		const { ledger } = workspace();
+		// older runs: 'YYYY-MM-DD HH:MM:SS' (UTC); accepts: ISO with a T. Compared as text, every same-day accept looks later
+		const id = Number(ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at, ended_at) VALUES ('invoices', 'differs', '2026-10-13 17:30:00', '2026-10-13 17:43:15')").run().lastInsertRowid);
+		ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target, status, unit_id) VALUES (?, 'invoices', 's1', 'GET /x', 'status', 'status', '302', '503', 'bug', 'U1')").run(id);
+		const accepted = (at: string) => ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, created_at) VALUES ('unit', 'U1', 'review', 'accepted', ?)").run(at);
+		accepted("2026-10-13T09:00:00.000Z");
+		expect(parityAgain(ledger).fixed.has("invoices")).toBe(false);
+		accepted("2026-10-13T21:50:33.347Z");
+		expect(parityAgain(ledger).fixed.has("invoices")).toBe(true);
+	});
+
+	it("an accept queues its slice's comparison: a route owner's, a slice never compared, or a unit the last comparison blamed", () => {
+		const { ledger } = workspace();
+		// U1 answers the slice's route, U2 is a helper of it
+		ledger.db.prepare("INSERT INTO index_routes(side, method, path, handler_symbol) VALUES ('source', 'GET', '/invoices', 'src/U1.php::f')").run();
+		const [owner, other] = ["U1", "U2"];
+		expect(parityOnAccept(ledger, "invoices", other!)).toBe(true); // never compared
+		const id = Number(ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at, ended_at) VALUES ('invoices', 'differs', '2026-10-14T23:36:00.000Z', '2026-10-14T23:47:00.000Z')").run().lastInsertRowid);
+		expect(parityOnAccept(ledger, "invoices", other!)).toBe(false);
+		expect(parityOnAccept(ledger, "invoices", owner!)).toBe(true);
+		ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target, status, unit_id) VALUES (?, 'invoices', 's1', 'GET /x', 'status', 'status', '302', '503', 'bug', ?)").run(id, other!);
+		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, created_at) VALUES ('unit', ?, 'review', 'accepted', '2026-10-15T01:21:31.985Z')").run(other!);
+		expect(parityOnAccept(ledger, "invoices", other!)).toBe(true);
 	});
 
 	it("older ledgers: comparisons an app's start or data reset stopped are turned into setup once", () => {

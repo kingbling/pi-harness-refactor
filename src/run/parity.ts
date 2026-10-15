@@ -63,7 +63,7 @@ export interface AppState {
 	/** How often the old app was probed again over that redirect (at most MAX_FIXUPS). */
 	redirectProbes?: number;
 	/** A slice check found a problem that only this app's setup here causes (what and why): a difference the parity
-	 * judge blamed on the setup, or the old app not starting (its data reset failing). */
+	 * judge blamed on the setup (an app not starting is bootProblem). */
 	setupProblem?: string;
 	/** Set once the app was probed again over such a problem (older workspaces; now setupProbes). */
 	setupProbed?: boolean;
@@ -73,6 +73,8 @@ export interface AppState {
 	bootProblem?: string;
 	/** How often its setup was asked to fix that since the app last started for a slice check (at most MAX_FIXUPS). */
 	bootProbes?: number;
+	/** The owner question asked once those fixes ran out: slice checks wait for it, "retry" gives the setup its tries back. */
+	bootQuestion?: number;
 	at?: string;
 }
 
@@ -492,7 +494,7 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
 		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy. Switch off the app's or its web server's setting that forces https, in the copy's local config only (never the app's code): the comparison sends the same plain-http requests to both apps and compares what the handlers answer, it does not check the https rule, so keeping that rule on here only hides every handler. check_app_boot sends that request again and says whether it still redirects`] : []),
 		...(setup ? [`a slice check found a problem that only its setup here causes (${cur.setupProblem}): fix that in its setup (start, data reset, data dump, local config), not in the app's code`] : []),
-		...(boot ? [`it did not start for a slice check just now (${cur.bootProblem}). Find out why with your tools (is each service and container it needs running, does its reset script still work, what does the command print when you run it). Fix that in its setup here (start, data reset, the services it needs, local config), not in the app's code; check_app_boot shows whether it starts again`] : []),
+		...(boot ? [`it did not start for a slice check just now (${cur.bootProblem}). Find out why with your tools (is each service and container it needs running, does its reset script still work, what does the command print when you run it). Fix that in its setup here (start, data reset, the services it needs, local config), not in the app's code; check_app_boot shows whether it starts again. When the cause is the app's own code, change nothing and say so: that goes to whoever fixes the code`] : []),
 	];
 	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
 	const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side: o.side, appDir, problem }).catch((e) => `setup model failed: ${e?.message ?? e}`);
@@ -554,9 +556,42 @@ export async function probeApps(o: { config: Config; root: string; linkAll: (wt:
 /**
  * For a slice check: an app that did not start (its data reset or start failed) goes to its setup model with what
  * failed (MAX_FIXUPS times at most until it starts for a slice check again). True when code then sees it start.
+ * The owner's "retry" on the question asked once the fixes ran out gives them back.
  */
-export const setupFixer = (o: { config: Config; root: string; fixer?: AppFixer; log?: (l: string) => void }) => async (side: string, error: string): Promise<boolean> => {
-	saveApp(o.root, side, { bootProblem: error.slice(0, 1_500) });
+export const setupFixer = (o: { config: Config; root: string; fixer?: AppFixer; log?: (l: string) => void; answer?: ProbeAnswer }) => async (side: string, error: string): Promise<boolean> => {
+	const q = loadApps(o.root)[side]?.bootQuestion;
+	const retry = q !== undefined && o.answer?.(q) === "retry";
+	saveApp(o.root, side, { bootProblem: error.slice(0, 1_500), ...(retry ? { bootProbes: undefined, bootQuestion: undefined } : {}) });
 	await probeApp({ config: o.config, root: o.root, side, fixer: o.fixer, log: o.log });
 	return !loadApps(o.root)[side]?.bootProblem;
 };
+
+/**
+ * An app its setup could not get to start for slice checks, MAX_FIXUPS times: a person must look (a container tool or
+ * database not running, say). Asked once; until the answer, `bootWaits` holds the slice checks (each would only fail
+ * the same way). Returns whether a question is open now.
+ */
+export async function askBootOwner(o: { root: string; side: string; error: string; ask?: ProbeAsker }): Promise<boolean> {
+	const a = loadApps(o.root)[o.side];
+	if (!a?.bootProblem || fixUpLeft(a, "boot")) return false;
+	if (a.bootQuestion !== undefined) return true;
+	const name = o.side === LEGACY ? "the old app" : `the new ${o.side} app`;
+	const qid = await o
+		.ask?.({
+			facts: `To compare the old and the new app, both must start here. ${name} stopped starting for slice checks, and its setup model tried ${MAX_FIXUPS} times to fix that without success. What failed last: ${o.error.slice(0, 600)} The migration goes on; slice comparisons wait until this is answered.`,
+			options: [
+				{ value: "retry", facts: "I fixed what it needs (started the service, the container tool, the database): try again" },
+				{ value: "skip", facts: "keep going without comparing the apps" },
+			],
+			recommended: "retry",
+		})
+		.catch(() => undefined);
+	if (qid === undefined) return false;
+	saveApp(o.root, o.side, { bootQuestion: qid });
+	return true;
+}
+
+/** The app whose start the owner was asked about and has not said "retry" yet: slice checks wait for that answer. */
+export function bootWaits(apps: Record<string, AppState>, answer: ProbeAnswer): string | undefined {
+	return Object.entries(apps).find(([, a]) => a.bootQuestion !== undefined && answer(a.bootQuestion) !== "retry")?.[0];
+}

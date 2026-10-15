@@ -223,7 +223,7 @@ describe("comparing the old and the new app", () => {
 		asked.length = 0;
 		const r = await check(async (side, error) => (asked.push(`${side}: ${error}`), true));
 		expect(asked).toHaveLength(MAX_SETUP_RETRIES);
-		expect(r).toMatchObject({ outcome: "setup", compared: 0 });
+		expect(r).toMatchObject({ outcome: "setup", compared: 0, setup: { side: LEGACY } });
 		expect(r.note).toMatch(/^setup: the old app did not start: the data reset failed/);
 		expect(ledger.db.prepare("SELECT outcome FROM parity_runs WHERE id = ?").get(r.runId!)).toEqual({ outcome: "setup" });
 		// the new app's data reset failing is its setup too, not a main the builder must fix
@@ -232,8 +232,24 @@ describe("comparing the old and the new app", () => {
 		writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: newOnly } }));
 		asked.length = 0;
 		const n = await check(async (side, error) => (asked.push(`${side}: ${error}`), false));
-		expect(n.outcome).toBe("setup");
+		expect(n).toMatchObject({ outcome: "setup", setup: { side: "nestjs" } });
 		expect(n.down).toBeUndefined();
 		expect(asked).toEqual([expect.stringMatching(/^nestjs: the data reset failed .*status 3/)]);
-	}, 60_000);
+		// the new app's own start failing (a stopped database makes it exit, say) goes to its setup first too: fixed, compared
+		const down = join(root, "db-down");
+		const starts = (port: number) => ({ ...recipe(port), reset: undefined, start: { cmd: process.execPath, args: ["-e", `if (require('fs').existsSync(${JSON.stringify(down)})) process.exit(5); require('http').createServer((q, s) => s.end('[1]')).listen(Number(process.argv[1]))`, String(port)] } });
+		writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: starts(newPort) } }));
+		writeFileSync(down, "");
+		asked.length = 0;
+		expect(await check(async (side, error) => (asked.push(`${side}: ${error}`), rmSync(down), true))).toMatchObject({ outcome: "same", compared: 1 });
+		expect(asked).toEqual([expect.stringMatching(/^nestjs: the start command exited with 5/)]);
+		// one its setup cannot fix: after MAX_SETUP_RETRIES tries it is main's code, the builder's
+		writeFileSync(down, "");
+		asked.length = 0;
+		const s = await check(async (side, error) => (asked.push(`${side}: ${error}`), true));
+		expect(asked).toHaveLength(MAX_SETUP_RETRIES);
+		expect(s).toMatchObject({ outcome: "error", down: { stack: "nestjs" } });
+		expect(s.note).toMatch(/its setup could not fix it/);
+		expect(s.setup).toBeUndefined();
+	}, 90_000);
 });
