@@ -8,6 +8,7 @@ import { projectDir } from "../init/init.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
 import { healNotApp, leftOut, loadNotApp } from "../inventory/not-app.ts";
 import { inventory } from "../inventory/run.ts";
+import { ROUTE_SUBCLASSES } from "../inventory/route-forms.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import type { spawnLeaf } from "../sessions/spawn.ts";
@@ -24,6 +25,8 @@ import { requeueUnits } from "./run.ts";
  *   tried on main's project (healBoot), so the builder and the tidy and code-job checks catch an app that no longer starts.
  * - A generated adapter without checkConfigGlobs (the files that decide how the checks run): one question to the
  *   model (healCheckConfig); code jobs may change the other protected files from then on.
+ * - A source index built before the app's own subclasses of the profile's route classes counted as routes: the
+ *   inventory runs again once (no model), so those routes reach slices and parity steps.
  */
 const NOT_APP_PENDING = "not_app_heal_pending";
 
@@ -57,6 +60,13 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		const accepted = units.filter((u) => u.state === "accepted").map((u) => u.id);
 		if (accepted.length) o.log(pc.yellow(`  ${accepted.length} accepted unit(s) hold code that is not the app's: ${accepted.slice(0, 20).join(", ")}${accepted.length > 20 ? ", …" : ""} (left as they are)`));
 		ledger.setMeta(NOT_APP_PENDING, "0");
+	}
+	// an index built before the app's own route classes counted misses the routes they declare: built again once
+	if (ledger.getMeta("inventory_at") && ledger.getMeta(ROUTE_SUBCLASSES) === undefined && getSourceAdapter(config.source.stack).routeClassTest?.()) {
+		const count = () => (ledger.db.prepare("SELECT COUNT(*) n FROM index_routes WHERE side = 'source'").get() as { n: number }).n;
+		const before = count();
+		await inventory(config, o.root, ledger);
+		o.log(pc.cyan(`↻ the source index now counts the app's own route classes: ${before} → ${count()} routes (${JSON.parse(ledger.getMeta(ROUTE_SUBCLASSES) ?? "[]").join(", ") || "none"})`));
 	}
 	if (o.client) {
 		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });

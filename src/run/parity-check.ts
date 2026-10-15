@@ -9,6 +9,7 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
+import { holdBack, waitingRoutes } from "./parity-partial.ts";
 import { appRoot, bootApp, dumpData, fixUpLeft, LEGACY, loadApps, prepareTargetCopy, saveApp, type AppRecipe } from "./parity.ts";
 
 /**
@@ -344,7 +345,7 @@ export interface SliceCheck {
  * Compare one slice: steps (written once, `rewrite` writes them anew), the old app run twice, the new app once in a
  * fresh worktree of main, differences into the ledger. Needs both apps' recipes (br parity --probe).
  */
-export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
+export async function checkSlice(o: { ledger: Ledger; config: Config; root: string; slice: string; linkAll: (wt: string) => void | Promise<void>; serverStack: string; writer?: StepWriter; rewrite?: boolean; onlyAccepted?: boolean; log?: (l: string) => void }): Promise<SliceCheck> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const startedAt = new Date().toISOString();
 	const mainAt = await headOf(o.config.target.path);
@@ -376,7 +377,9 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		}
 		if (problem) return fail(`no usable steps: ${problem}`);
 	}
-	const { steps } = loadSteps(o.root, o.slice)!;
+	// `onlyAccepted` (the run): a slice not finished yet compares only the steps of routes whose unit is accepted
+	const { steps, held } = o.onlyAccepted ? holdBack(loadSteps(o.root, o.slice)!.steps, waitingRoutes(o.ledger, o.slice)) : { steps: loadSteps(o.root, o.slice)!.steps, held: [] };
+	if (!steps.some((s) => s.compare !== "none")) return { outcome: "error", diffs: [], compared: 0, note: `not compared yet: the units of its routes are not accepted (${held.join(", ")})` };
 
 	// the old app twice (what differs between those two runs is noise), then the new app
 	const old1 = await runOnOld(o.config, o.root, steps);
@@ -411,7 +414,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// the old app's setup is asked (once) to let plain http reach its handlers
 	const hop = steps.findIndex((s, i) => s.compare !== "none" && selfRedirect(old1[i]!));
 	if (hop >= 0 && !apps[LEGACY].selfRedirect) saveApp(o.root, LEGACY, { selfRedirect: `${steps[hop]!.method} ${steps[hop]!.path} → ${old1[hop]!.status} ${old1[hop]!.location}` });
-	const note = [`${c.compared} step(s) compared`, withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : ""].filter(Boolean).join("; ");
+	const note = [`${c.compared} step(s) compared`, withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : "", held.length ? `not compared yet (unit not accepted): ${held.join(", ")}` : ""].filter(Boolean).join("; ");
 	const res = record({ outcome: c.diffs.length ? "differs" : c.compared ? "same" : "error", diffs: c.diffs, compared: c.compared, note }, steps.length);
 	log(c.diffs.length ? pc.yellow(`parity ${o.slice}: ${c.diffs.length} difference(s) in ${new Set(c.diffs.map((d) => d.step)).size} step(s) — ${note}`) : pc.green(`parity ${o.slice}: the new app answers like the old one — ${note}`));
 	return res;

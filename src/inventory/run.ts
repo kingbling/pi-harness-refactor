@@ -14,6 +14,7 @@ import { answerValue } from "../jev/ask.ts";
 import { leftOut, loadNotApp } from "./not-app.ts";
 import { isDbUnitKind, wireDbDeps } from "./db.ts";
 import { resolveCodeMap, writeCodeMap } from "./codemap.ts";
+import { ROUTE_SUBCLASSES, routeSubclasses } from "./route-forms.ts";
 
 export type Tier = "T0" | "T1" | "T2" | "T3";
 
@@ -48,6 +49,19 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	for (const rel of files) {
 		const source = readFileSync(join(srcRoot, rel), "utf8");
 		indexes.push(await adapter.indexFile(srcRoot, rel, source));
+	}
+	// route classes: the profile names them; the app's own subclasses (found from the extends edges) declare routes the
+	// same way, so the files that build one are indexed again with them known
+	const isRoute = adapter.routeClassTest?.();
+	const subs = isRoute ? routeSubclasses(indexes, isRoute, adapter.names?.caseInsensitive) : [];
+	adapter.setRouteSubclasses?.(subs);
+	if (subs.length) {
+		const bare = (n: string) => (n.replace(/^\\/, "").split("\\").pop() ?? n).toLowerCase();
+		const built = new Set(subs.map(bare));
+		for (let i = 0; i < indexes.length; i++) {
+			const f = indexes[i]!;
+			if (f.deps.some((d) => d.kind === "new" && built.has(bare(d.to)))) indexes[i] = await adapter.indexFile(srcRoot, f.path, readFileSync(join(srcRoot, f.path), "utf8"));
+		}
 	}
 	// routes: declared in code (per file) and/or in a routes table the adapter knows how to read
 	const routes = [...indexes.flatMap((f) => f.routes), ...(adapter.indexRoutes ? await adapter.indexRoutes(srcRoot) : [])];
@@ -440,6 +454,7 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		}
 	}
 	ledger.setMeta("drift_pending", "[]");
+	ledger.setMeta(ROUTE_SUBCLASSES, JSON.stringify(subs));
 	if (sourceCommit) ledger.setMeta("source_commit", sourceCommit);
 	ledger.setMeta("source_is_git", await isRepo(srcRoot) ? "1" : "0");
 
