@@ -203,6 +203,9 @@ export class Ledger {
 		if (to === "accepted") {
 			const missing = REQUIRED_FOR_ACCEPTED.filter((t) => !this.hasEvidence(id, t));
 			if (missing.length) throw new LedgerError(`unit ${id} cannot be accepted; missing evidence: ${missing.join(", ")}`);
+			// a skipped step (whole-project build not run yet, no reviewer) is no pass: it needs its verdict first
+			const unjudged = this.unjudged(id);
+			if (unjudged.length) throw new LedgerError(`unit ${id} cannot be accepted; not judged: ${unjudged.map((u) => `${u.type} (${u.note})`).join(", ")}`);
 			const unproven = this.symbolsOfUnit(id).filter((s) => !["mapped", "dropped", "tested", "accepted"].includes(s.state));
 			if (unproven.length) throw new LedgerError(`unit ${id} cannot be accepted; unproven symbols: ${unproven.map((s) => s.id).join(", ")}`);
 		}
@@ -303,6 +306,12 @@ export class Ledger {
 	}
 	hasEvidence(unitId: string, type: EvidenceType): boolean {
 		return !!this.db.prepare("SELECT 1 FROM evidence WHERE unit_id = ? AND type = ? LIMIT 1").get(unitId, type);
+	}
+	/** Required steps whose latest evidence says "not judged" (skipped, deferred, no reviewer): not a pass yet. */
+	unjudged(unitId: string): Array<{ type: EvidenceType; note: string }> {
+		const rows = this.db.prepare(`SELECT type, payload FROM evidence WHERE unit_id = ? AND type IN (${REQUIRED_FOR_ACCEPTED.map(() => "?").join(",")}) ORDER BY id`).all(unitId, ...REQUIRED_FOR_ACCEPTED) as Array<{ type: EvidenceType; payload: string }>;
+		const last = new Map(rows.map((r) => [r.type, JSON.parse(r.payload) as { judged?: boolean; note?: string }]));
+		return [...last].filter(([, p]) => p.judged === false).map(([type, p]) => ({ type, note: (p.note ?? "not judged").slice(0, 120) }));
 	}
 	evidenceOf(unitId: string) {
 		return this.db.prepare("SELECT * FROM evidence WHERE unit_id = ? ORDER BY id").all(unitId) as Array<{ id: number; type: EvidenceType; payload: string; created_at: string }>;

@@ -8,6 +8,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { addWorktree, mainBranch, removeWorktree, whitespaceOnly, deleteBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
+import { placeUnit } from "./placement.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
@@ -23,11 +24,13 @@ import { setStep } from "./watchdog.ts";
  * The builder: whole-project checks (a type check of everything, a linter that cannot take files, all tests) do not run in
  * every unit's gate, they grew with the project. One builder runs them on the side, now and then after merges, in
  * its own worktree of main. When they fail (units that each passed on their own, together they do not), the big
- * model fixes the code there, code re-runs the checks, and the fix is merged like a unit. Lanes never wait for it.
+ * model fixes the code there, code re-runs the checks, and the fix is merged like a unit. Lanes wait for it only to merge on a red main.
  * What it cannot fix goes to a code job (which may fix test code too; it merges when main gets fewer errors and no new
  * ones); after MAX_BUILD_CODE_JOBS of those in a row that merged nothing the stack is parked quietly (br status shows
  * it), never a "fix or ignore" question to the owner. Errors only in files a code job may not change (those that decide
- * how the checks run) go to the setup model instead.
+ * how the checks run) go to the setup model instead. While main is red (and not parked) a unit's merge waits for the
+ * builder's repair (repairFirst) instead of landing on top as if it were green; a green main gives the accepted units
+ * whose build the gate deferred their verdict.
  */
 
 /** Returns the model's one-sentence account of what it changed. */
@@ -56,6 +59,25 @@ export const buildParkedKey = (stackId: string) => `build_parked:${stackId}`;
  * count; a main whose check fails with other errors (its code changed where it matters) starts a new count.
  */
 export const buildJobsKey = (stackId: string) => `build_jobs:${stackId}`;
+/** Ledger meta: main fails the stack's whole-project checks (when, first error line); cleared once it is green. Merges wait for the builder's repair while it is set. */
+export const buildRedKey = (stackId: string) => `build_red:${stackId}`;
+
+/**
+ * Main passed the stack's whole-project checks: accepted units whose build_ok / lint_ok the gate deferred to them
+ * get their verdict. Only units accepted before the check started (`before`): a later one was not in the tree checked.
+ */
+export function judgeDeferred(ledger: Ledger, config: Config, root: string, stackId: string, before: string): string[] {
+	const rows = ledger.db
+		.prepare("SELECT u.id, u.meta FROM units u WHERE u.state = 'accepted' AND u.updated_at < ? AND EXISTS (SELECT 1 FROM evidence e WHERE e.id IN ((SELECT max(id) FROM evidence WHERE unit_id = u.id AND type = 'build_ok'), (SELECT max(id) FROM evidence WHERE unit_id = u.id AND type = 'lint_ok')) AND json_extract(e.payload, '$.judged') = 0)")
+		.all(before) as Array<{ id: string; meta: string }>;
+	const out: string[] = [];
+	for (const r of rows) {
+		if (placeUnit(config, r.meta, root).stackId !== stackId) continue;
+		for (const u of ledger.unjudged(r.id)) if (u.type === "build_ok" || u.type === "lint_ok") ledger.addEvidence(r.id, u.type, { by: "builder", note: "main passed the whole-project checks" });
+		out.push(r.id);
+	}
+	return out;
+}
 
 /** Files of the project (tracked, relative to `dir`) the error lines of a check name. */
 export function errorFiles(output: string, dir: string, tracked: string[]): string[] {
@@ -158,6 +180,11 @@ export interface Builder {
 	afterMerge(stackId: string): void;
 	/** The stack's new app did not start on main (parity found it): a main problem, built once per main tree. */
 	appDown(stackId: string, error: string): Promise<void>;
+	/**
+	 * Before a unit of this stack merges: while main fails its whole-project checks (and the builder has not parked
+	 * it), the builder's repair goes first; resolves once its cycle is done. True when it waited.
+	 */
+	repairFirst(stackId: string): Promise<boolean>;
 	/** At the end of the run: one last build of what was merged since the last one. */
 	finish(): Promise<void>;
 	/**
@@ -249,6 +276,8 @@ export function createBuilder(o: {
 			}
 		};
 		await reset();
+		// units accepted before this moment are in the tree checked below
+		const checkStart = new Date().toISOString();
 		await addWorktree(o.config.target.path, wt, branch);
 		try {
 			await o.linkAll(wt);
@@ -278,8 +307,13 @@ export function createBuilder(o: {
 			const green = () => {
 				jobs.delete(stackId);
 				o.ledger.setMeta(buildParkedKey(stackId), "");
+				o.ledger.setMeta(buildRedKey(stackId), "");
+				const judged = judgeDeferred(o.ledger, o.config, o.root, stackId, checkStart);
+				if (judged.length) o.log(pc.dim(`builder ${stackId}: ${judged.length} accepted unit(s) whose whole-project build was not judged yet now have it`));
 			};
 			if (!problem) return green(), o.log(pc.green(`builder ${stackId}: whole project ok`)), false;
+			// red: merges of this stack wait for the repair below (repairFirst)
+			if (!o.ledger.getMeta(buildRedKey(stackId))) o.ledger.setMeta(buildRedKey(stackId), `${new Date().toISOString()} ${(problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? "").slice(0, 200)}`);
 			const errors = errorKeys(problem, dir).length;
 			if (again && errors >= (jobFrom.get(stackId) ?? Infinity)) return o.log(pc.yellow(`builder ${stackId}: main has no fewer errors after the last code job (${errors}); the next one after the next merges`)), false;
 			const sig = errorSignature(`build:${stackId}`, problem);
@@ -376,6 +410,15 @@ export function createBuilder(o: {
 			down.set(stackId, error);
 			merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
 			start(true);
+		},
+		async repairFirst(stackId) {
+			if (stopped || !o.ledger.getMeta(buildRedKey(stackId)) || o.ledger.getMeta(buildParkedKey(stackId))) return false;
+			if (!running) {
+				merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
+				start(true);
+			}
+			await running;
+			return true;
 		},
 		async finish() {
 			await running;

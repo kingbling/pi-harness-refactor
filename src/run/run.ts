@@ -8,7 +8,7 @@ import { dirname, join, relative } from "node:path";
 import { linkedDirs, loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
-import { createBuilder, createMergeCheck, filesNamed, type Repairer } from "./builder.ts";
+import { buildRedKey, createBuilder, createMergeCheck, filesNamed, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
@@ -44,7 +44,7 @@ import { createStubSweep } from "./stub-sweep.ts";
 import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
-import { conflictMarkers, wholeProjectSteps } from "./gate.ts";
+import { conflictMarkers, judgedAtMerge, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { exec } from "../proc.ts";
@@ -187,6 +187,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		}
 	}
 	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
+	// accepted with no wiring verdict (no reviewer ran then): back for the reviewer's judgement, code kept
+	if (!o.dry && !o.spawn) {
+		const { reopenUnjudgedWiring } = await import("./recheck.ts");
+		const back = reopenUnjudgedWiring(ledger);
+		if (back.length) log(pc.yellow(`${back.length} accepted unit(s) never had their wiring judged: back to planned (code kept) for the reviewer`));
+	}
 	// ---- truth: can the old code run here? decided once per workspace (run → truth from running it, read → from reading it)
 	if (!o.dry && !o.spawn) {
 		await waitOn("checking whether the old code runs here", () => probeLegacyEnv({
@@ -739,6 +745,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					testsNote = undefined;
 					if (res!.state !== "review") break;
 					try {
+						// main fails its whole-project checks: the builder's repair goes first, this merge after it
+						if (!o.dry && (await builder.repairFirst(placementOf(ledger.getUnit(unitId)!.meta).stackId))) log(pc.dim(`  ${unitId}: main is red: waited for the builder's repair before merging`));
 						await merge.run(async () => {
 							setStep(`merging ${unitId}`);
 							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);
@@ -751,6 +759,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 								await gitIn(wt, ["reset", "-q", await mainBranch(config.target.path, config.target.git.branch)]); // the code stays, uncommitted, on top of main
 								throw new BreaksMain(stackId, broke);
 							}
+							// the whole-project build and lint the gate deferred: judged by that check just now
+							if (mergeCheck) judgedAtMerge(ledger, unitId, ledger.getMeta(buildRedKey(stackId)) ? "main already fails its whole-project checks; this unit adds no error to them" : "no whole-project error with this unit on top of main");
 							const sha = await fastForwardMain(config, branch);
 							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${await mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
 							// a success ends the crash count: a later re-open starts with a clean slate

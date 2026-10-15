@@ -133,6 +133,9 @@ describe("page wiring: callers by view name, choices and wiring for the implemen
 		await reviewWithModel({ ledger, config, root: dir, unitId: "U1482", adapter: reactAdapter, targetProjectDir: dir, moduleDir: "src/features/offers", legacyFiles: [tpl], changedFiles: [], spawn });
 		expect(tools).toEqual(expect.arrayContaining(["target_lookup", "find_capability"]));
 		expect(system).toMatch(/a registered page that gets its data through that seam, marked TODO\(br:<that unit>\), is connected, and the seam's shape, name or typing is never a finding/);
+		// a route line is not enough: the path from the app's real entry point must hand the page its data
+		expect(system).toMatch(/A route or registration line is not enough: follow the path at runtime from the app's real entry point \(find it with your tools/);
+		expect(system).toMatch(/nothing on the path supplies[^.]*placeholder branch when the app runs\) is not connected/);
 		expect(system).toMatch(/no shared data seam yet[^.]*put it in outOfScope \(setup = false\)/);
 		expect(system).toMatch(/A choice applies only when the unit's legacy code has that concern/);
 		expect(system).toMatch(/Asking for a choice where the legacy code has no such concern is not a finding/);
