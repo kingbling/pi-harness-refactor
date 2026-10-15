@@ -167,6 +167,8 @@ CREATE TABLE IF NOT EXISTS units (
   meta TEXT NOT NULL DEFAULT '{}',    -- JSON: difficulty, needs_db, has_ui, ...
   updated_at TEXT NOT NULL
 );
+-- each scheduling pass looks for the few units in work by state: without it, every unit's meta was read
+CREATE INDEX IF NOT EXISTS units_state ON units(state);
 
 CREATE TABLE IF NOT EXISTS attempts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
