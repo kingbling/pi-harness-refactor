@@ -201,7 +201,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// truth written from reading the old code: its scripts run again once the old code's environment changed (units not
 		// accepted here, before a lane takes them; accepted ones on the side once the lanes run)
 		const { upgradeReadTruth } = await import("./recheck.ts");
-		await waitOn("running read-only truth on the old code again", async () => await upgradeReadTruth({ ledger, config, root: o.root, states: ["planned", "quarantined"], log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
+		await waitOn("running read-only truth on the old code again", async () => await upgradeReadTruth({ ledger, config, root: o.root, states: ["planned", "quarantined"], cap: config.run.truthUpgradesPerRun, stopped: () => !!o.shouldStop?.(), log })).catch((e) => log(pc.yellow(`truth upgrade failed: ${e?.message ?? e}`)));
 	}
 	// ---- stack knowledge written before the plugin asked for it (notApp, wiringFiles): a model adds just that
 	if (!o.dry && !o.spawn) {
@@ -541,7 +541,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		? undefined
 		: import("./recheck.ts")
 				.then(async ({ upgradeReadTruth, writeTruthScripts }) => {
-					if (config.run.truthUpgradesPerRun > 0) await upgradeReadTruth({ ledger, config, root: o.root, states: ["accepted"], cap: config.run.truthUpgradesPerRun, stopped: () => !!stopRecord, log });
+					// the old code's runtime is down: writing scripts now would only pay models to chase the outage
+					if (config.run.truthUpgradesPerRun > 0 && (await upgradeReadTruth({ ledger, config, root: o.root, states: ["accepted"], cap: config.run.truthUpgradesPerRun, stopped: () => !!stopRecord, log })).down) return;
 					await writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, freeLanes: () => (stopRecord ? 0 : laneLimit - running.size), log });
 				})
 				.catch((e) => log(pc.yellow(`truth scripts: ${e?.message ?? e}`)));

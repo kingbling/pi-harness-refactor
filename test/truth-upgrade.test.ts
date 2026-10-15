@@ -124,6 +124,9 @@ describe("scripts for read-only truth with none", () => {
 		const r = await writeTruthScripts({ ledger, config, root, source, cap: 5, writer, log: () => {} });
 		expect(seen).toEqual(["a"]);
 		expect(r.red).toBe(0);
+		expect(r.tried).toBe(0);
 		expect(JSON.parse(ledger.getUnit("a")!.meta).truthScriptEnv).toBeUndefined();
+		// the upgrade pass says the runtime is down, so the run skips the script writer
+		expect((await upgradeReadTruth({ ledger, config, root, source, states: ["accepted"], log: () => {} })).down).toBe(true);
 	});
 });

@@ -211,7 +211,7 @@ async function committedFiles(repo: string, sha: string): Promise<string[]> {
  * a tester session each: writeTruthScripts). `states`: which units (the run does accepted ones on the side, the rest
  * before its lanes start); `cap` units per call, most useful first, a few at once; `stopped` ends it between units.
  */
-export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; states?: string[]; cap?: number; stopped?: () => boolean; log?: (l: string) => void }): Promise<{ upgraded: string[]; redone: string[]; red: number; noScript: number; left: number }> {
+export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root: string; source?: SourceAdapter; states?: string[]; cap?: number; stopped?: () => boolean; log?: (l: string) => void }): Promise<{ upgraded: string[]; redone: string[]; red: number; noScript: number; left: number; down: boolean }> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const source = o.source ?? getSourceAdapter(o.config.source.stack);
 	const env = runEnvHash(o.root, o.config);
@@ -255,7 +255,7 @@ export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root
 	};
 	await Promise.all([1, 2, 3].map(worker));
 	if (upgraded.length || redone.length || red) log(pc.cyan(`truth upgrade: ${upgraded.length} unit(s) now run green on the old code${redone.length ? `, ${redone.length} back to planned (the old code returns other values)` : ""}${red ? `, ${red} still red` : ""}${noScript ? `; ${noScript} have only read cases (no script)` : ""}`));
-	return { upgraded, redone, red, noScript, left };
+	return { upgraded, redone, red, noScript, left, down };
 }
 
 /** Units in `states` with a truth case only read from the old code (never run on it). */
@@ -388,7 +388,7 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 		if (!ran.ok && (await probeRunsNow(o.root, o.config, source)) === false) {
 			if (!down) log(pc.yellow(`truth scripts: the old code's runtime is down (the probe does not run either); the rest wait for the next run`));
 			down = true;
-			return;
+			return void res.tried--;
 		}
 		// tried here: the truth upgrade does not run the same script again in this environment
 		o.ledger.updateUnit(id, { meta: { truthScriptEnv: env, truthUpgradeEnv: runEnv } });
