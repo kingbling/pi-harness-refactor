@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import { Session } from "node:inspector";
+import { Session, console as v8console } from "node:inspector";
 import { join } from "node:path";
 
 /**
@@ -8,7 +8,7 @@ import { join } from "node:path";
  * more than a second is written to .bigrefactor/blocked.log with the step the run was in, so a freeze can be traced.
  * The step is process-wide (whatever lane set it last), so the line also names what really held the thread: V8's
  * sampling profiler runs all along (one sample every 20 ms, cheap) and the samples of the held stretch name the
- * functions it was in.
+ * functions it was in. The watchdog's own work is never counted as a freeze.
  */
 let step = "starting";
 
@@ -22,23 +22,40 @@ type Profile = { nodes: Array<{ id: number; callFrame: Frame; children?: number[
 
 const SAMPLE_US = 20_000;
 
-/** V8's sampling profiler on this thread; `take` hands over the samples so far and starts a fresh profile. */
-function sampler(): { take(cb: (p: Profile | undefined) => void): void; stop(): void } | undefined {
+let watchdogs = 0;
+
+/**
+ * V8's sampling profiler on this thread, cut into one short profile per check: `take` starts the next profile and
+ * ends the current one, handing it over. Starting the profiler is what costs (V8 lists all compiled code: over a
+ * second on a big heap), and so does handing over a long profile (a busy minute is 400 ms). So the profiler is never
+ * stopped while the watchdog runs: the next profile starts while the current one still runs, which V8 does without
+ * listing the code again, and the profile handed over covers one check (or the freeze), so it stays small.
+ */
+function sampler(): { take(): Profile | undefined; stop(): void } | undefined {
 	try {
 		const s = new Session();
 		s.connect();
 		s.post("Profiler.enable");
 		s.post("Profiler.setSamplingInterval", { interval: SAMPLE_US });
-		s.post("Profiler.start");
+		// two profiles at once go through the inspector's console (Profiler.start keeps one); a title per watchdog
+		const name = `bigrefactor watchdog ${process.pid}.${++watchdogs}`;
+		let n = 0;
+		let done: Profile | undefined;
+		s.on("Profiler.consoleProfileFinished", (m) => {
+			const p = (m as unknown as { params: { title?: string; profile: Profile } }).params;
+			if (p.title === `${name}/${n - 2}`) done = p.profile;
+		});
+		v8console.profile(`${name}/${n++}`);
 		return {
-			take(cb) {
-				s.post("Profiler.stop", (err, r) => {
-					s.post("Profiler.start");
-					cb(err ? undefined : (r as { profile: Profile }).profile);
-				});
+			take() {
+				done = undefined;
+				v8console.profile(`${name}/${n++}`);
+				v8console.profileEnd(`${name}/${n - 2}`); // the finished profile arrives within this call
+				return done;
 			},
 			stop() {
-				s.post("Profiler.stop", () => s.disconnect());
+				v8console.profileEnd(`${name}/${n - 1}`);
+				s.disconnect();
 			},
 		};
 	} catch {
@@ -95,7 +112,6 @@ export function startWatchdog(root: string, log: (line: string) => void, o: { ev
 	const every = o.everyMs ?? 200;
 	const limit = o.blockedMs ?? 1000;
 	const prof = sampler();
-	let profiledSince = performance.now();
 	let last = performance.now();
 	const write = (line: string) => {
 		try {
@@ -107,23 +123,17 @@ export function startWatchdog(root: string, log: (line: string) => void, o: { ev
 		log(line);
 	};
 	const timer = setInterval(() => {
-		const now = performance.now();
-		const late = now - last - every;
-		last = now;
-		if (late <= limit) {
-			// a fresh profile each minute: the samples kept stay few
-			if (prof && now - profiledSince > 60_000) (prof.take(() => {}), (profiledSince = now));
-			return;
-		}
-		// the run lives in its own process under Pi: its freezes do not hold Pi's screen
-		const who = process.env["BR_RUN_CHILD"] === "1" ? "the run process" : "Pi";
-		const line = `${new Date().toISOString()} ${who} was blocked ${(late / 1000).toFixed(1)} s (last step: ${o.step ?? step})`;
-		if (!prof) return write(line);
-		profiledSince = now;
-		prof.take((p) => {
+		const late = performance.now() - last - every;
+		// the profile since the last check: a few samples, or when the thread was held, the samples of that stretch
+		const p = prof?.take();
+		if (late > limit) {
+			// the run lives in its own process under Pi: its freezes do not hold Pi's screen
+			const who = process.env["BR_RUN_CHILD"] === "1" ? "the run process" : "Pi";
+			const line = `${new Date().toISOString()} ${who} was blocked ${(late / 1000).toFixed(1)} s (last step: ${o.step ?? step})`;
 			const held = p && heldBy(p, late);
 			write(held ? `${line}; held by: ${held}` : line);
-		});
+		}
+		last = performance.now(); // the watchdog's own work is not a freeze
 	}, every);
 	timer.unref();
 	return () => {
