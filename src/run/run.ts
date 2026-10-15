@@ -546,7 +546,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	// urgency: how many units wait on a unit and the best slice among them (deps barely change in a run: once)
 	let urgency: ReturnType<typeof blockingOrder> | undefined;
 	const urgencyOf = (id: string) => {
-		if (!urgency?.has(id)) urgency = blockingOrder(ledger.listUnits().map((u) => ({ id: u.id, deps: JSON.parse(u.deps) as string[], rank: (JSON.parse(u.meta) as { sliceRank?: number }).sliceRank ?? 99 })));
+		// only the columns it needs: parsing every unit's meta held the run's thread at its first pass
+		if (!urgency?.has(id)) urgency = blockingOrder((ledger.db.prepare("SELECT id, deps, json_extract(meta, '$.sliceRank') AS rank FROM units").all() as Array<{ id: string; deps: string; rank: number | null }>).map((u) => ({ id: u.id, deps: JSON.parse(u.deps) as string[], rank: u.rank ?? 99 })));
 		return urgency.get(id) ?? { rank: 99, blocks: 0 };
 	};
 	const blocksNote = (id: string) => {

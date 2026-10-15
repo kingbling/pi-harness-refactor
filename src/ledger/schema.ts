@@ -241,6 +241,7 @@ CREATE TABLE IF NOT EXISTS questions (
   answered_at TEXT
 );
 CREATE INDEX IF NOT EXISTS questions_status ON questions(status);
+CREATE INDEX IF NOT EXISTS questions_point ON questions(point, unit_id);
 
 CREATE TABLE IF NOT EXISTS transitions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
