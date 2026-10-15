@@ -6,8 +6,9 @@ import { getTargetAdapter } from "../src/adapters/registry.ts";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { BIG_TABLE_INDEXES } from "../src/ledger/schema.ts";
-import { placementDir, placeUnit } from "../src/run/placement.ts";
+import { applyPlacementAnswers, placementDir, placeUnit } from "../src/run/placement.ts";
 import { recordLostRun } from "../src/run/run.ts";
+import { syncTaxonomyAnswers } from "../src/run/taxonomy.ts";
 import { buildTaskCard } from "../src/sessions/taskcard.ts";
 
 /**
@@ -41,7 +42,7 @@ function record(l: Ledger): void {
 }
 
 /** Full scans of the growing tables in the plans of the statements seen (aliases resolved to their table). */
-function fullScans(l: Ledger): string[] {
+function fullScans(l: Ledger, tables = GROWING): string[] {
 	const out = new Set<string>();
 	const raw = l.db.prepare.bind(l.db);
 	for (const { sql, args } of seen) {
@@ -53,8 +54,8 @@ function fullScans(l: Ledger): string[] {
 			if (!m || (m[1] === "SCAN" ? m[3]!.includes("USING COVERING INDEX") : m[3]!.includes("USING"))) continue;
 			const name = m[2]!;
 			// "SCAN d" names an alias: the table it stands for in the statement
-			const table = GROWING.includes(name) ? name : new RegExp(`\\b(?:FROM|JOIN)\\s+(\\w+)\\s+(?:AS\\s+)?${name}\\b`, "i").exec(sql)?.[1];
-			if (table && GROWING.includes(table)) out.add(`${table}: ${sql.replace(/\s+/g, " ").slice(0, 140)} → ${detail}`);
+			const table = tables.includes(name) ? name : new RegExp(`\\b(?:FROM|JOIN)\\s+(\\w+)\\s+(?:AS\\s+)?${name}\\b`, "i").exec(sql)?.[1];
+			if (table && tables.includes(table)) out.add(`${table}: ${sql.replace(/\s+/g, " ").slice(0, 140)} → ${detail}`);
 		}
 	}
 	return [...out];
@@ -116,5 +117,21 @@ describe("ledger reads on the run's thread", () => {
 
 		const q = ledger.askQuestion({ unitId: "a", point: "x", question: "?", blocks: "dependents", askedBy: "test" });
 		expect([...ledger.blockedUnits()]).toEqual([["a", [q]], ["b", [q]], ["c", [q]]]);
+	});
+
+	it("each scheduling pass picks up placement and area answers without reading every unit's meta", () => {
+		// the placement answer join on every unit's meta held the run's thread 2.2 s per pass on a real ledger
+		for (const id of ["a", "b", "c"]) ledger.createUnit({ id, tier: "leaf", meta: { files: [`legacy/${id}.php`] }, symbolIds: [] });
+		const q = ledger.askQuestion({ unitId: "b", point: "placement", question: "?", blocks: "unit", askedBy: "placement" });
+		ledger.updateUnit("b", { meta: { placeQuestion: q } });
+		const waiting = ledger.askQuestion({ unitId: "c", point: "placement", question: "?", blocks: "unit", askedBy: "placement" });
+		ledger.updateUnit("c", { meta: { placeQuestion: waiting } });
+		ledger.answerQuestion(q, "nestjs:agency", "human");
+
+		record(ledger);
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["b"]);
+		syncTaxonomyAnswers({ ledger, root: ws }); // no area question answered: no unit is read
+		expect(JSON.parse(ledger.getUnit("b")!.meta).place).toMatchObject({ stack: "nestjs", area: "agency", source: "answer" });
+		expect(fullScans(ledger, ["units"])).toEqual([]);
 	});
 });

@@ -398,8 +398,10 @@ function treeFacts(units: Array<{ id: string; deps: string; m: Meta }>, surfaceO
 
 /** Answered taxonomy questions → placement (apply), unchanged (keep) or excluded units. */
 export function syncTaxonomyAnswers(d: Pick<Deps, "ledger" | "root">): number {
-	const rows = d.ledger.db.prepare("SELECT id, meta FROM units WHERE json_extract(meta,'$.taxonomyQuestion') IS NOT NULL").all() as Array<{ id: string; meta: string }>;
 	let n = syncOverlapAnswer(d) ? 1 : 0;
+	// every scheduling pass calls this: every unit's meta is read only once an area question has an answer (one index lookup)
+	if (!d.ledger.db.prepare("SELECT 1 FROM questions WHERE point = 'area_taxonomy' AND status IN ('answered', 'auto') LIMIT 1").get()) return n;
+	const rows = d.ledger.db.prepare("SELECT id, meta FROM units WHERE json_extract(meta,'$.taxonomyQuestion') IS NOT NULL").all() as Array<{ id: string; meta: string }>;
 	const rules: Array<{ prefix: string; area: string; stack?: string; shared?: boolean }> = [];
 	for (const r of rows) {
 		const meta = JSON.parse(r.meta) as Meta & { taxonomyQuestion: number };
