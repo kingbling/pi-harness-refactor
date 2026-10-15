@@ -22,6 +22,10 @@ import { reopenUnit } from "./recheck.ts";
  *
  * Code applies what was decided before the judge is asked: a difference at a place where the owner dropped the
  * quirk is allowed; where the owner kept it, the new app must match, so it is a bug of that quirk's unit.
+ *
+ * A bug whose cause is in code many slices share (how a logged-out request is answered, redirects, HTTPS) is a shared
+ * cause: the judge names it once (a known one from the facts when it is the same behaviour, else a new one), and ONE
+ * code job fixes it on main instead of a re-open of every unit; the slices it showed in are compared again after.
  */
 
 export interface JudgeGroup {
@@ -39,7 +43,37 @@ export interface JudgeGroup {
 	/** quirk: why it looks unintended or intended, and whether to keep it. */
 	why?: string;
 	opinion?: "drop" | "keep";
+	/** bug: the cause is in shared code, not this unit's own: the id of a known shared cause, or "new". */
+	shared?: string;
 }
+
+/** A bug cause in code many slices share: one code job fixes it (ledger meta `parity_shared`). */
+export interface SharedCause {
+	id: string;
+	problem: string;
+	fix?: string;
+	/** the slices it showed in: compared again once the job lands */
+	slices: string[];
+	/** a few of the differences, for the job */
+	examples: string[];
+	/** open = waiting for a job; landed = a job merged a fix (at `landedAt`); failed = the jobs did not fix it, units are re-opened */
+	status: "open" | "running" | "landed" | "failed";
+	jobs: number;
+	landedAt?: string;
+}
+
+/** Code jobs one shared cause gets; after that its differences re-open the units as before. */
+export const MAX_SHARED_JOBS = 2;
+const SHARED_KEY = "parity_shared";
+export const sharedCauses = (ledger: Ledger): SharedCause[] => JSON.parse(ledger.getMeta(SHARED_KEY) ?? "[]") as SharedCause[];
+export function updateShared(ledger: Ledger, id: string, patch: Partial<SharedCause>): void {
+	ledger.setMeta(SHARED_KEY, JSON.stringify(sharedCauses(ledger).map((c) => (c.id === id ? { ...c, ...patch } : c))));
+}
+/** At run start: a job cut off by the end of the last run is open again. */
+export const resumeShared = (ledger: Ledger) => sharedCauses(ledger).filter((c) => c.status === "running").forEach((c) => updateShared(ledger, c.id, { status: "open" }));
+/** What the code job for a shared cause is told. */
+export const sharedJobText = (c: SharedCause) =>
+	`The new app answers differently from the old one in the same way across slices ${c.slices.join(", ")} (parity check: the same requests sent to both apps). One cause in code those pages share, not in one page's own code:\n${c.problem}${c.fix ? `\nFix: ${c.fix}` : ""}\nSome of the differences:\n${c.examples.map((e) => `- ${e}`).join("\n")}\nRead the old code to see what it does, and fix it once in the shared code (or config) of the new app, so every route behaves like the old app here; do not change each page's code. Test the shared behaviour.`;
 
 export type ParityJudge = (o: { config: Config; root: string; slice: string; facts: string; units: string[] }) => Promise<JudgeGroup[] | undefined>;
 
@@ -66,6 +100,7 @@ export const judgeWithModel: ParityJudge = async (o) => {
 					fix: Type.Optional(Type.String()),
 					why: Type.Optional(Type.String()),
 					opinion: Type.Optional(Type.Union([Type.Literal("drop"), Type.Literal("keep")])),
+					shared: Type.Optional(Type.String({ description: "bug only, when the facts list shared causes: the cause is in code many pages share (how a logged-out request is answered, redirects, HTTPS, headers every route gets), not in this unit's own code. The id of a known shared cause when it is the same behaviour, else \"new\". One job fixes it once; no unit is re-opened for it." })),
 				}),
 			),
 		}),
@@ -81,7 +116,7 @@ export const judgeWithModel: ParityJudge = async (o) => {
 		writeGlobs: [],
 		customTools: [verdictTool],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__parity__.${o.slice}.judge.${Date.now()}.jsonl`),
-		systemPrompt: `You judge differences between an OLD app (${o.config.source.stack}, at ${o.config.source.path}) and the NEW app migrated from it (${o.config.target.stacks.join(" + ")}, at ${o.config.target.path}). The same requests went to both; code compared the answers and what each wrote, and left out everything that differs between two runs of the old app. Read the old and the new code to find each difference's cause. A comment in the new code explaining a difference is a claim, not evidence: decide from what the old code does. Every difference is a bug (the new app is wrong), a quirk (the old app does something odd) or setup (only how one app runs here causes it: its address, its config, a database it lacks; the facts say how each app was set up); a difference in form alone is still a bug or a quirk (a new app answering 303 where the old one answered 302 changes what clients see: a bug, unless the old behaviour is itself odd). Setup only when no unit's code would change it. Name a unit from the list for each bug or quirk. Answer with parity_verdict once.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You judge differences between an OLD app (${o.config.source.stack}, at ${o.config.source.path}) and the NEW app migrated from it (${o.config.target.stacks.join(" + ")}, at ${o.config.target.path}). The same requests went to both; code compared the answers and what each wrote, and left out everything that differs between two runs of the old app. Read the old and the new code to find each difference's cause. A comment in the new code explaining a difference is a claim, not evidence: decide from what the old code does. Every difference is a bug (the new app is wrong), a quirk (the old app does something odd) or setup (only how one app runs here causes it: its address, its config, a database it lacks; the facts say how each app was set up); a difference in form alone is still a bug or a quirk (a new app answering 303 where the old one answered 302 changes what clients see: a bug, unless the old behaviour is itself odd). Setup only when no unit's code would change it. Name a unit from the list for each bug or quirk. When the facts list shared causes, a bug caused by code many pages share (not one page's own) is marked shared, so one job fixes it once. Answer with parity_verdict once.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		await session.run(o.facts);
@@ -95,7 +130,18 @@ export const judgeWithModel: ParityJudge = async (o) => {
 /**
  * Judge the open differences of one parity run and act on them. Returns what happened, for the log.
  */
-export async function judgeRun(o: { ledger: Ledger; config: Config; root: string; runId: number; slice: string; judge?: ParityJudge; client?: ModelClient; log?: (l: string) => void }): Promise<{ reopened: string[]; bugs: number; quirks: number; setup: number; allowed: number; open: number }> {
+export async function judgeRun(o: {
+	ledger: Ledger;
+	config: Config;
+	root: string;
+	runId: number;
+	slice: string;
+	judge?: ParityJudge;
+	client?: ModelClient;
+	log?: (l: string) => void;
+	/** a code job can take shared causes (off: their units are re-opened like any bug) */
+	shared?: boolean;
+}): Promise<{ reopened: string[]; bugs: number; quirks: number; setup: number; allowed: number; open: number; shared: string[] }> {
 	const log = o.log ?? ((l: string) => console.log(l));
 	const db = o.ledger.db;
 	const rows = () => db.prepare("SELECT * FROM parity_diffs WHERE run_id = ? AND status = 'open' ORDER BY id").all(o.runId) as unknown as DiffRow[];
@@ -118,24 +164,54 @@ export async function judgeRun(o: { ledger: Ledger; config: Config; root: string
 		} else if (before) set.run("quirk", before.unit_id, before.quirk_id, "waiting for the owner's keep/drop", d.id), quirks++;
 	}
 
+	// a shared cause takes the group unless its jobs did not fix it: then its units are re-opened as before
+	const sharedIds = new Set<string>();
+	let sharedBugs = 0;
+	const startedAt = (db.prepare("SELECT started_at FROM parity_runs WHERE id = ?").get(o.runId) as { started_at: string } | undefined)?.started_at ?? "";
+	const sharedCause = (g: JudgeGroup, these: DiffRow[]): boolean => {
+		const all = sharedCauses(o.ledger);
+		let c = all.find((x) => x.id === g.shared);
+		if (c?.status === "failed") return false;
+		const examples = these.map((d) => `${o.slice}: ${describe(d)}`);
+		if (!c) {
+			c = { id: `S${all.length + 1}`, problem: g.problem, fix: g.fix, slices: [], examples: [], status: "open", jobs: 0 };
+			all.push(c);
+		}
+		if (!c.slices.includes(o.slice)) c.slices.push(o.slice);
+		c.examples = [...c.examples, ...examples].slice(-12);
+		// still differs on a main that has the fix: another job, a few at most, then the units
+		if (c.status === "landed" && !(Date.parse(startedAt) <= Date.parse(c.landedAt ?? ""))) {
+			if (c.jobs >= MAX_SHARED_JOBS) c.status = "failed";
+			else c.status = "open";
+		}
+		o.ledger.setMeta(SHARED_KEY, JSON.stringify(all));
+		if (c.status === "failed") return false;
+		for (const d of these) set.run("bug", g.unit || null, null, `shared cause ${c.id}: ${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`, d.id);
+		sharedIds.add(c.id);
+		sharedBugs++;
+		return true;
+	};
+
 	const open = rows();
 	if (open.length) {
 		const { units, files } = sliceFacts(o.ledger, o.slice);
 		const steps = loadSteps(o.root, o.slice)?.steps ?? [];
+		const known = o.shared ? sharedCauses(o.ledger).filter((c) => c.status !== "failed") : [];
 		const unitList = units.map((u) => `${u.id} (${u.state}): ${(JSON.parse(o.ledger.getUnit(u.id)!.meta) as { files?: string[] }).files?.join(", ") ?? ""}`);
 		const facts = [
 			`Slice "${o.slice}". Its units and their legacy files (relative to the old repo):\n${unitList.join("\n")}`,
 			`The requests (steps.json; "target" = how the new app was asked differently):\n${JSON.stringify(steps, null, 1).slice(0, 12_000)}`,
 			`How each app runs here (its setup model's words):\n${Object.entries(loadApps(o.root)).map(([side, a]) => `${side}: ready at ${a.recipe?.ready ?? "?"}; ${a.said ?? ""}`).join("\n")}`,
 			`The differences:\n${open.map((d) => `#${d.id} ${describe(d)}`).join("\n")}`,
+			...(o.shared ? [`Shared causes (a bug in code many pages share; set "shared" on a bug group: a known id when it is the same behaviour, "new" for another one):\n${known.map((c) => `${c.id} (slices ${c.slices.join(", ")}): ${c.problem}`).join("\n") || "none known yet"}`] : []),
 		].join("\n\n");
 		const groups = await (o.judge ?? judgeWithModel)({ config: o.config, root: o.root, slice: o.slice, facts, units: units.map((u) => u.id) }).catch((e) => (log(pc.yellow(`parity ${o.slice}: judge failed: ${e?.message ?? e}`)), undefined));
 		const openIds = new Set(open.map((d) => d.id));
-		const known = new Set(o.ledger.listUnits().map((u) => u.id));
+		const unitIds = new Set(o.ledger.listUnits().map((u) => u.id));
 		const apps = loadApps(o.root);
 		for (const g of groups ?? []) {
 			const ids = g.diffs.filter((id) => openIds.has(id));
-			if (!ids.length || (g.verdict === "setup" ? !g.app || !apps[g.app] : !known.has(g.unit) || !["bug", "quirk"].includes(g.verdict))) continue;
+			if (!ids.length || (g.verdict === "setup" ? !g.app || !apps[g.app] : !unitIds.has(g.unit) || !["bug", "quirk"].includes(g.verdict))) continue;
 			for (const id of ids) openIds.delete(id);
 			const these = open.filter((d) => ids.includes(d.id));
 			if (g.verdict === "setup") {
@@ -143,6 +219,8 @@ export async function judgeRun(o: { ledger: Ledger; config: Config; root: string
 				for (const d of these) set.run("setup", null, null, `${g.app}: ${g.problem}`, d.id);
 				if (fixUpLeft(apps[g.app!], "setup")) saveApp(o.root, g.app!, { setupProblem: `${these.map(describe).join("; ").slice(0, 1000)} — ${g.problem}` });
 				setup += these.length;
+			} else if (g.verdict === "bug" && o.shared && g.shared && sharedCause(g, these)) {
+				// recorded once for the code job; no unit is re-opened for it
 			} else if (g.verdict === "bug") {
 				for (const d of these) set.run("bug", g.unit, null, `${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`, d.id);
 				(bugs.get(g.unit) ?? bugs.set(g.unit, []).get(g.unit)!).push(`${these.map(describe).join("; ")} — ${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`);
@@ -176,10 +254,10 @@ export async function judgeRun(o: { ledger: Ledger; config: Config; root: string
 			).catch(() => undefined);
 		}
 	}
-	const bugCount = [...bugs.values()].reduce((a, b) => a + b.length, 0);
+	const bugCount = [...bugs.values()].reduce((a, b) => a + b.length, 0) + sharedBugs;
 	const stillOpen = (db.prepare("SELECT COUNT(*) AS n FROM parity_diffs WHERE run_id = ? AND status = 'open'").get(o.runId) as { n: number }).n;
-	log(pc.cyan(`parity ${o.slice}: ${bugCount} bug(s)${reopened.length ? ` → re-opened ${reopened.join(", ")}` : ""}, ${quirks} quirk(s) for the owner, ${allowed} allowed${setup ? `, ${setup} from the test setup` : ""}${stillOpen ? `, ${stillOpen} not judged` : ""}`));
-	return { reopened, bugs: bugCount, quirks, setup, allowed, open: stillOpen };
+	log(pc.cyan(`parity ${o.slice}: ${bugCount} bug(s)${reopened.length ? ` → re-opened ${reopened.join(", ")}` : ""}${sharedIds.size ? ` → shared cause ${[...sharedIds].join(", ")} (one code job)` : ""}, ${quirks} quirk(s) for the owner, ${allowed} allowed${setup ? `, ${setup} from the test setup` : ""}${stillOpen ? `, ${stillOpen} not judged` : ""}`));
+	return { reopened, bugs: bugCount, quirks, setup, allowed, open: stillOpen, shared: [...sharedIds] };
 }
 
 const short = (v: string | null, n = 200) => (v && v.length > n ? `${v.slice(0, n)}…` : (v ?? "null"));

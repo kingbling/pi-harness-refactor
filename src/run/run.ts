@@ -41,7 +41,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
 import { createStubSweep } from "./stub-sweep.ts";
-import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
+import { MAX_PARITY_REOPENS, MAX_SHARED_JOBS, resumeShared, sharedCauses, sharedJobText, updateShared } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 import { conflictMarkers, wholeProjectSteps } from "./gate.ts";
@@ -458,8 +458,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			if (r.runId !== undefined && r.outcome === "differs") {
 				showParity(`judging ${r.diffs.length} difference(s) in ${slice}`);
 				const { judgeRun } = await import("./parity-judge.ts");
-				const j = await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log });
-				parityLast = `${slice}: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you${j.allowed ? `, ${j.allowed} allowed` : ""}${j.setup ? `, ${j.setup} from the test setup` : ""}`;
+				const j = await judgeRun({ ledger, config, root: o.root, runId: r.runId, slice, client: o.client, log, shared: sharedOn });
+				pumpShared();
+				parityLast = `${slice}: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}${j.shared.length ? ` → shared ${j.shared.join(", ")}` : ""}, ${j.quirks} quirk(s) for you${j.allowed ? `, ${j.allowed} allowed` : ""}${j.setup ? `, ${j.setup} from the test setup` : ""}`;
 			}
 			// a problem only an app's setup here causes (a difference the judge blamed on it, or the old app not starting):
 			// that setup is asked to fix it (a few times at most), then the slice runs again
@@ -484,7 +485,35 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		if (parityRunning) progress.setParity({ ...progress.snapshot().parity, queued: parityQueue.length });
 		pumpParity();
 	};
+	// a bug cause the judge found in code many slices share: ONE code job on the server stack fixes it (one at a time,
+	// on the side), not a re-open of every unit; its slices are compared again once it lands
+	const sharedOn = !(o.setupFixer === false || (!o.setupFixer && o.spawn));
+	let sharedRunning: Promise<void> | undefined;
+	const pumpShared = () => {
+		if (sharedRunning || parityStopped || !sharedOn || !adapters.has(serverStack)) return;
+		const c = sharedCauses(ledger).find((x) => x.status === "open");
+		if (!c) return;
+		updateShared(ledger, c.id, { status: "running", jobs: c.jobs + 1 });
+		sharedRunning = (async () => {
+			let merged: string | undefined;
+			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(serverStack)!, label: `parity-${c.id}-${c.jobs + 1}`, linkAll, log, what: sharedJobText(c), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+			const now = sharedCauses(ledger).find((x) => x.id === c.id) ?? c;
+			if (said && merged) {
+				noteFix(o.root, serverStack, merged, `parity shared cause ${c.id}: ${said}`);
+				updateShared(ledger, c.id, { status: "landed", landedAt: new Date().toISOString() });
+			} else updateShared(ledger, c.id, { status: c.jobs + 1 >= MAX_SHARED_JOBS ? "failed" : "open" });
+			// landed: compared again on the fix; failed for good: compared again so the judge re-opens the units
+			if ((said && merged) || c.jobs + 1 >= MAX_SHARED_JOBS) for (const sl of now.slices) queueParity(sl);
+		})()
+			.catch((e) => (log(pc.yellow(`parity shared cause ${c.id}: ${e?.message ?? e}`)), updateShared(ledger, c.id, { status: c.jobs + 1 >= MAX_SHARED_JOBS ? "failed" : "open" })))
+			.finally(() => {
+				sharedRunning = undefined;
+				pumpShared();
+			});
+	};
 	if (parityProbe) {
+		resumeShared(ledger);
+		pumpShared();
 		// at the start: finished slices never compared, and slices whose last comparison needs another look
 		const { checked, again } = parityAgain(ledger, await headOf(config.target.path));
 		// the slice names straight from SQL: reading and parsing every unit's meta held the run's thread at start
@@ -1190,6 +1219,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		if (parityProbe) await waitOn("checking whether the old and the new app start", () => parityProbe);
 		while (parityRunning) await waitOn("comparing finished slices with the old app", () => parityRunning!);
 	}
+	// a shared cause's code job merges on main: it finishes before the run ends (no new one starts after a stop)
+	while (sharedRunning) await waitOn("a code job is fixing a difference many slices share", () => sharedRunning!);
 	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
 	// a stub sweep's code job finishes (it merges on main) before the run ends
