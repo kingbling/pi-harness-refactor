@@ -44,7 +44,7 @@ import { createStubSweep } from "./stub-sweep.ts";
 import { MAX_PARITY_REOPENS } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
-import { conflictMarkers, judgedAtMerge, wholeProjectSteps } from "./gate.ts";
+import { conflictMarkers, verdictsAtMerge, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { exec } from "../proc.ts";
@@ -759,8 +759,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 								await gitIn(wt, ["reset", "-q", await mainBranch(config.target.path, config.target.git.branch)]); // the code stays, uncommitted, on top of main
 								throw new BreaksMain(stackId, broke);
 							}
-							// the whole-project build and lint the gate deferred: judged by that check just now
-							if (mergeCheck) judgedAtMerge(ledger, unitId, ledger.getMeta(buildRedKey(stackId)) ? "main already fails its whole-project checks; this unit adds no error to them" : "no whole-project error with this unit on top of main");
+							// the whole-project build and lint the gate deferred: judged by that check just now; anything still not
+							// judged stops here, before main changes
+							const notJudged = verdictsAtMerge(ledger, unitId, !!mergeCheck, !!ledger.getMeta(buildRedKey(stackId)));
+							if (notJudged) throw new Error(notJudged);
 							const sha = await fastForwardMain(config, branch);
 							ledger.transitionUnit(unitId, "accepted", sha ? `merged ${sha.slice(0, 7)} into ${await mainBranch(config.target.path, config.target.git.branch)}` : "merged (no changes)");
 							// a success ends the crash count: a later re-open starts with a clean slate

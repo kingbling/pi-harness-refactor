@@ -763,6 +763,16 @@ export function judgedAtMerge(ledger: Ledger, unitId: string, note: string): Evi
 	return out;
 }
 
+/**
+ * Right before a unit lands on main: the build/lint the gate deferred get the merge check's verdict (when one ran on
+ * it); what is still not judged then (no reviewer, no merge check) is why it does not land, or undefined.
+ */
+export function verdictsAtMerge(ledger: Ledger, unitId: string, mergeCheckRan: boolean, mainRed: boolean): string | undefined {
+	if (mergeCheckRan) judgedAtMerge(ledger, unitId, mainRed ? "main already fails its whole-project checks; this unit adds no error to them" : "no whole-project error with this unit on top of main");
+	const left = ledger.unjudged(unitId);
+	return left.length ? `not judged: ${left.map((u) => `${u.type} (${u.note})`).join(", ")}; it does not land on main without that verdict` : undefined;
+}
+
 /** The anti-gaming problem the implementer causes and fixes itself: triage retries it, never asks the owner. */
 export const NOTHING_WRITTEN = "no production files were written";
 /** Also the implementer's own to fix: a stub an earlier unit left for this unit, still in place. */

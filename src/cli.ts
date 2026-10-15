@@ -188,14 +188,17 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!id) throw new Error("usage: br unit <unit-id> [--accept] [--reuse-truth]");
 		const { runUnit } = await import("./run/unit.ts");
 		const { config, root, ledger } = open();
-		const r = await runUnit({ ledger, config, root, unitId: id, client: makeClient(), accept: args.includes("--accept"), reuseTruth: args.includes("--reuse-truth"), retry: args.includes("--retry") });
+		// --accept goes through br accept: its build and wiring verdicts are checked before anything is committed
+		const r = await runUnit({ ledger, config, root, unitId: id, client: makeClient(), accept: false, reuseTruth: args.includes("--reuse-truth"), retry: args.includes("--retry") });
 		console.log(`${r.unitId}: ${r.state} after ${r.attempts} attempt(s), $${r.costUsd.toFixed(4)}`);
 		process.exitCode = r.state === "review" || r.state === "accepted" ? 0 : 1;
+		if (r.state === "review" && args.includes("--accept")) await commands.accept!([id]);
 	},
 	accept: async (args) => {
 		const id = args[0];
 		if (!id) throw new Error("usage: br accept <unit-id>");
 		const { acceptUnit, afterAccept } = await import("./run/unit.ts");
+		const { judgeBeforeAccept } = await import("./run/accept-judged.ts");
 		const { getTargetAdapter } = await import("./adapters/registry.ts");
 		const { placeUnit } = await import("./run/placement.ts");
 		const { projectDir } = await import("./init/init.ts");
@@ -204,8 +207,12 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		if (!u) throw new Error(`unknown unit ${id}`);
 		if (u.state !== "review") throw new Error(`unit ${id} is ${u.state}, not in review`);
 		const { stackId, area } = placeUnit(config, u.meta, root);
+		const adapter = await getTargetAdapter(stackId);
+		// checked before the commit: a refused accept leaves main as it was
+		const why = await judgeBeforeAccept(ledger, adapter, projectDir(config, stackId), id);
+		if (why) throw new Error(`unit ${id} cannot be accepted; ${why}`);
 		const sha = await acceptUnit({ ledger, config, unitId: id }, projectDir(config, stackId), area);
-		await afterAccept(ledger, await getTargetAdapter(stackId), projectDir(config, stackId), stackId, area, (l) => console.log(l));
+		await afterAccept(ledger, adapter, projectDir(config, stackId), stackId, area, (l) => console.log(l));
 		console.log(pc.green(`accepted ${id}${sha ? ` @ ${sha.slice(0, 7)}` : ""}`));
 	},
 	simulate: async (args) => {

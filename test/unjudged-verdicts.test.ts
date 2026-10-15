@@ -8,8 +8,9 @@ import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo } from "../src/git.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { buildParkedKey, buildRedKey, createBuilder } from "../src/run/builder.ts";
-import { judgedAtMerge, scopedCheck } from "../src/run/gate.ts";
-import { reopenUnjudgedWiring } from "../src/run/recheck.ts";
+import { judgeBeforeAccept } from "../src/run/accept-judged.ts";
+import { judgedAtMerge, scopedCheck, verdictsAtMerge } from "../src/run/gate.ts";
+import { reopenUnit, reopenUnjudgedWiring } from "../src/run/recheck.ts";
 
 /**
  * A skipped verdict is no pass: a build the gate deferred to the whole-project check, or a wiring nobody reviewed,
@@ -56,6 +57,31 @@ describe("an unjudged verdict is no pass", () => {
 		expect(JSON.parse(l.getUnit("U1")!.meta).retryNote).toMatch(/without a wiring verdict/);
 		expect(l.getUnit("U2")!.state).toBe("accepted");
 	});
+
+	it("at the merge: the merge check judges the deferred build; anything still not judged stops the unit before main changes", () => {
+		const l = new Ledger(":memory:");
+		unitWith(l, "U1", ["build_ok", "lint_ok"]);
+		unitWith(l, "U2", ["build_ok"]);
+		unitWith(l, "U3", ["wired_ok"]);
+		expect(verdictsAtMerge(l, "U1", true, true)).toBeUndefined();
+		expect(l.evidenceOf("U1").filter((e) => e.type === "build_ok").at(-1)!.payload).toMatch(/main already fails/);
+		// no merge check ran (spawned test runs): the deferred build stays unjudged
+		expect(verdictsAtMerge(l, "U2", false, false)).toMatch(/^not judged: build_ok .*does not land on main/);
+		// the merge check never judges the wiring
+		expect(verdictsAtMerge(l, "U3", true, false)).toMatch(/^not judged: wired_ok/);
+	});
+
+	it("a recheck's wrong re-open is undone with the builder's build verdict still owed, never with an unjudged wiring", () => {
+		const l = new Ledger(":memory:");
+		unitWith(l, "U1", ["build_ok"]);
+		unitWith(l, "U2", ["wired_ok"]);
+		l.db.prepare("UPDATE units SET state = 'accepted' WHERE id IN ('U1', 'U2')").run();
+		for (const id of ["U1", "U2"]) reopenUnit(l, id, "recheck found something", "recheck: x");
+		l.undoReopen("U1", "recheck: clean when judged again");
+		expect(l.getUnit("U1")!.state).toBe("accepted");
+		expect(() => l.undoReopen("U2", "recheck: clean when judged again")).toThrow(/not judged: wired_ok/);
+		expect(l.getUnit("U2")!.state).toBe("planned");
+	});
 });
 
 describe("a red main: the builder's repair comes first", () => {
@@ -81,14 +107,16 @@ describe("a red main: the builder's repair comes first", () => {
 		const ledger = new Ledger(":memory:");
 		const jobs: string[] = [];
 		// the code job fixes main
-		const codeJob = async (_s: string, what: string) => {
+		const codeJob = async (_s: string, what: string): Promise<string | undefined> => {
 			jobs.push(what);
 			writeFileSync(join(target, "src", "a.txt"), "ok\n");
 			await commitAll(target, "fixed by the code job");
 			return "fixed a.txt";
 		};
-		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix: async () => undefined, repair: false, codeJob, every: { units: 100, minutes: 600 } });
-		return { root, target, ledger, b, jobs };
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix: async () => undefined, repair: false, codeJob: (st, what) => (job ?? codeJob)(st, what), every: { units: 100, minutes: 600 } });
+		// a test swaps the code job
+		let job: typeof codeJob | undefined;
+		return { root, target, ledger, b, jobs, adapter, setJob: (j: typeof codeJob) => (job = j) };
 	}
 
 	it("a merge on a red main waits for the builder's cycle; green again judges the deferred builds of accepted units", async () => {
@@ -105,6 +133,60 @@ describe("a red main: the builder's repair comes first", () => {
 		expect(s.ledger.getMeta(buildRedKey("fake"))).toBe("");
 		expect(s.ledger.unjudged("U1")).toEqual([]);
 		expect(git(s.target, ["log", "-1", "--format=%s"])).toBe("fixed by the code job");
+	});
+
+	it("a merge waits cycle after cycle while main stays red, not only for one", async () => {
+		const s = await setup();
+		let calls = 0;
+		// the first job merges nothing, the second fixes main
+		s.setJob(async () => {
+			if (++calls === 1) return undefined;
+			writeFileSync(join(s.target, "src", "a.txt"), "ok\n");
+			await commitAll(s.target, "fixed by the second job");
+			return "fixed a.txt";
+		});
+		s.ledger.setMeta(buildRedKey("fake"), "red");
+		expect(await s.b.repairFirst("fake")).toBe(true);
+		expect(calls).toBe(2);
+		expect(s.ledger.getMeta(buildRedKey("fake"))).toBe("");
+	});
+
+	it("a main no code job can fix: the merge waits until the builder parks it, then goes on", async () => {
+		const s = await setup();
+		let calls = 0;
+		s.setJob(async () => (calls++, undefined));
+		s.ledger.setMeta(buildRedKey("fake"), "red");
+		expect(await s.b.repairFirst("fake")).toBe(true);
+		expect(calls).toBe(3);
+		expect(s.ledger.getMeta(buildParkedKey("fake"))).toMatch(/parked|stops/);
+		expect(s.ledger.getMeta(buildRedKey("fake"))).not.toBe("");
+	});
+
+	it("a stop while a merge waits for the repair hands the lane back", async () => {
+		const s = await setup();
+		let release!: () => void;
+		let started!: () => void;
+		const inJob = new Promise<void>((r) => (started = r));
+		s.setJob(async () => (started(), await new Promise<void>((r) => (release = r)), undefined));
+		s.ledger.setMeta(buildRedKey("fake"), "red");
+		const waiting = s.b.repairFirst("fake");
+		await inJob;
+		const stopping = s.b.stop();
+		release();
+		await stopping;
+		expect(await waiting).toBe(true);
+	});
+
+	it("a hand accept runs the deferred whole-project build first: red refuses before any commit, green judges it", async () => {
+		const s = await setup();
+		unitWith(s.ledger, "U1", ["build_ok"]);
+		expect(await judgeBeforeAccept(s.ledger, s.adapter, s.target, "U1")).toMatch(/whole-project check fails .*grep -q ok/s);
+		expect(s.ledger.unjudged("U1").map((u) => u.type)).toEqual(["build_ok"]);
+		writeFileSync(join(s.target, "src", "a.txt"), "ok\n");
+		expect(await judgeBeforeAccept(s.ledger, s.adapter, s.target, "U1")).toBeUndefined();
+		expect(s.ledger.unjudged("U1")).toEqual([]);
+		unitWith(s.ledger, "U2", ["wired_ok"]);
+		expect(await judgeBeforeAccept(s.ledger, s.adapter, s.target, "U2")).toMatch(/^not judged: wired_ok/);
 	});
 
 	it("a parked red main does not hold merges (nothing is working on it)", async () => {

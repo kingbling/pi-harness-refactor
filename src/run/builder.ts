@@ -182,7 +182,8 @@ export interface Builder {
 	appDown(stackId: string, error: string): Promise<void>;
 	/**
 	 * Before a unit of this stack merges: while main fails its whole-project checks (and the builder has not parked
-	 * it), the builder's repair goes first; resolves once its cycle is done. True when it waited.
+	 * it), the builder's repair goes first; resolves once main is green, parked, the run stops, or after
+	 * MAX_BUILD_CODE_JOBS + 2 cycles that left it red. True when it waited.
 	 */
 	repairFirst(stackId: string): Promise<boolean>;
 	/** At the end of the run: one last build of what was merged since the last one. */
@@ -412,12 +413,18 @@ export function createBuilder(o: {
 			start(true);
 		},
 		async repairFirst(stackId) {
-			if (stopped || !o.ledger.getMeta(buildRedKey(stackId)) || o.ledger.getMeta(buildParkedKey(stackId))) return false;
-			if (!running) {
-				merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
-				start(true);
+			const red = () => !stopped && !!o.ledger.getMeta(buildRedKey(stackId)) && !o.ledger.getMeta(buildParkedKey(stackId));
+			if (!red()) return false;
+			// cycle after cycle until main is green or parked (MAX_BUILD_CODE_JOBS cycles without progress park it); a
+			// cycle that ends in an error changes nothing, so the wait is capped too and the merge goes on under the merge
+			// check's rule (no new errors)
+			for (let i = 0; i <= MAX_BUILD_CODE_JOBS + 1 && red(); i++) {
+				if (!running) {
+					merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
+					start(true);
+				}
+				await running;
 			}
-			await running;
 			return true;
 		},
 		async finish() {

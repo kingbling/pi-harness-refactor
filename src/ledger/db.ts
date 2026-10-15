@@ -197,14 +197,15 @@ export class Ledger {
 		this.db.prepare("UPDATE units SET meta = json_remove(meta, '$.stale', '$.staleReason') WHERE id = ?").run(id);
 	}
 
-	transitionUnit(id: string, to: UnitState, reason?: string): void {
+	/** `keepDeferredBuild`: a unit put back to accepted (undoReopen) keeps a build/lint deferred to the builder, which judges it on a green main. */
+	transitionUnit(id: string, to: UnitState, reason?: string, opts?: { keepDeferredBuild?: boolean }): void {
 		const u = this.getUnit(id);
 		if (!u) throw new LedgerError(`unknown unit ${id}`);
 		if (to === "accepted") {
 			const missing = REQUIRED_FOR_ACCEPTED.filter((t) => !this.hasEvidence(id, t));
 			if (missing.length) throw new LedgerError(`unit ${id} cannot be accepted; missing evidence: ${missing.join(", ")}`);
 			// a skipped step (whole-project build not run yet, no reviewer) is no pass: it needs its verdict first
-			const unjudged = this.unjudged(id);
+			const unjudged = this.unjudged(id).filter((u) => !opts?.keepDeferredBuild || u.type === "wired_ok");
 			if (unjudged.length) throw new LedgerError(`unit ${id} cannot be accepted; not judged: ${unjudged.map((u) => `${u.type} (${u.note})`).join(", ")}`);
 			const unproven = this.symbolsOfUnit(id).filter((s) => !["mapped", "dropped", "tested", "accepted"].includes(s.state));
 			if (unproven.length) throw new LedgerError(`unit ${id} cannot be accepted; unproven symbols: ${unproven.map((s) => s.id).join(", ")}`);
@@ -441,7 +442,8 @@ export class Ledger {
 				this.db.prepare("UPDATE symbols SET state = 'accepted', updated_at = ? WHERE id = ?").run(now(), s.id);
 				this.recordTransition("symbol", s.id, "clustered", "accepted", reason);
 			}
-			this.transitionUnit(unitId, "accepted", reason);
+			// it was accepted with these verdicts before: a build the builder still owes stays owed, a wiring nobody judged does not pass
+			this.transitionUnit(unitId, "accepted", reason, { keepDeferredBuild: true });
 			this.db.exec("COMMIT");
 		} catch (e) {
 			this.db.exec("ROLLBACK");
