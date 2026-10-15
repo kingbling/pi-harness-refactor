@@ -11,7 +11,7 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
-import { addedLines, changedFiles, importedByTests, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { addedLines, changedFiles, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
 import { exec } from "../proc.ts";
 
@@ -274,7 +274,7 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	const addedOrMoved = changed.some((f) => adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && (!tracked.has(f) || !existsSync(join(dir, f))));
 	const wholeSteps: string[] = whole ? wholeProjectSteps(adapter, dir).map((w) => w.step) : addedOrMoved && adapter.boot?.(dir)?.cmd ? ["boot"] : [];
 	// the builder's job: also the tests of accepted units that import the changed code
-	const related = whole && code.length ? [...tracked].filter((t) => adapter.layout.isTestFile(t) && adapter.layout.sourceExtensions.some((e) => t.endsWith(e)) && !tests.includes(t) && importedByTests(dir, [t], code.map((f) => `${f}: changed`)).length) : [];
+	const related = whole && code.length ? await testsImporting(dir, [...tracked].filter((t) => adapter.layout.isTestFile(t) && adapter.layout.sourceExtensions.some((e) => t.endsWith(e)) && !tests.includes(t)), code) : [];
 	// each step with the files it checks (none: the whole project), so the same step can run on main
 	const steps: Array<{ step: string; files?: string[] }> = [...wholeSteps.map((step) => ({ step })), ...(code.length && !wholeSteps.includes("build") ? [{ step: "build", files: code }] : []), ...(tests.length + related.length ? [{ step: "test", files: [...tests, ...related] }] : [])];
 	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.step === "boot" ? adapter.boot!(d)! : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === s.step)!);

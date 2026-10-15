@@ -6,7 +6,7 @@ import { nestjsAdapter } from "../src/adapters/target/nestjs.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
-import { importedByTests } from "../src/run/gate.ts";
+import { importedByTests, testsImporting } from "../src/run/gate.ts";
 import { triageGate } from "../src/run/triage.ts";
 import { checkLayoutRules, normalize } from "../src/rules/layout-rules.ts";
 import { checkPortedTestsTool, missingTestImports, portedLayout } from "../src/sessions/tools.ts";
@@ -77,6 +77,16 @@ describe("a layout finding on a path a test imports goes to the tester", () => {
 		write(join(dir, `${MOD}/offers.test.tsx`), 'import { x } from "@/features/offers/pages/OfferShowPage";\n');
 		const findings = [`${MOD}/pages/OfferEditPage.tsx: not an allowed file`, `${MOD}/pages/OfferShowPage.tsx: not an allowed file`, `${MOD}/pages/OfferOther.tsx: not an allowed file`];
 		expect(importedByTests(dir, [`${MOD}/pages/OfferEditPage.test.tsx`, `${MOD}/offers.test.tsx`], findings)).toEqual([`${MOD}/pages/OfferEditPage.tsx`, `${MOD}/pages/OfferShowPage.tsx`]);
+	});
+
+	it("the builder's job finds the tests that import changed code the same way, reading them without holding the thread", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "br-tl-"));
+		write(join(dir, `${MOD}/pages/OfferEditPage.test.tsx`), "import { OfferEditPage } from './OfferEditPage';\n");
+		write(join(dir, `${MOD}/offers.test.tsx`), 'import { x } from "@/features/offers/pages/OfferShowPage";\n');
+		write(join(dir, `${MOD}/other.test.tsx`), "import { y } from './other';\n");
+		const tests = [`${MOD}/pages/OfferEditPage.test.tsx`, `${MOD}/offers.test.tsx`, `${MOD}/other.test.tsx`, `${MOD}/gone.test.tsx`];
+		expect(await testsImporting(dir, tests, [`${MOD}/pages/OfferEditPage.tsx`, `${MOD}/pages/OfferShowPage.tsx`])).toEqual([`${MOD}/pages/OfferEditPage.test.tsx`, `${MOD}/offers.test.tsx`]);
+		expect(await testsImporting(dir, tests, [`${MOD}/pages/OfferOther.tsx`])).toEqual([]);
 	});
 
 	it("triage retests without asking a model; after a retest that did not help it goes the usual way", async () => {
