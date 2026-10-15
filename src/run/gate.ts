@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative } from "node:path";
 import type { TargetAdapter, TargetSymbol } from "../adapters/types.ts";
@@ -278,15 +279,30 @@ export function importedByTests(projectDir: string, tests: string[], findings: s
 	const paths = [...new Set(findings.map((l) => /^([^\s:]+\.[A-Za-z0-9]+):/.exec(l)?.[1]).filter((p): p is string => !!p && !tests.includes(p)))];
 	if (!paths.length || !tests.length) return [];
 	const texts = tests.map((t) => ({ t, text: existsSync(join(projectDir, t)) ? readFileSync(join(projectDir, t), "utf8") : "" }));
-	return paths.filter((p) => {
-		const noExt = p.replace(/\.[A-Za-z0-9]+$/, "");
-		return texts.some(({ t, text }) => {
-			let rel = relative(dirname(t), noExt);
-			if (!rel.startsWith(".")) rel = `./${rel}`;
-			const tail = noExt.split("/").slice(1).join("/");
-			return ["\"", "'"].some((q) => [rel, `${rel}${p.slice(noExt.length)}`].some((s) => text.includes(`${q}${s}${q}`)) || (tail.includes("/") && text.includes(`/${tail}${q}`)));
-		});
-	});
+	return paths.filter((p) => texts.some(({ t, text }) => imports(t, text, p)));
+}
+
+/** Test file `t` (its text) imports project path `p`, the way importedByTests reads an import. */
+function imports(t: string, text: string, p: string): boolean {
+	const noExt = p.replace(/\.[A-Za-z0-9]+$/, "");
+	let rel = relative(dirname(t), noExt);
+	if (!rel.startsWith(".")) rel = `./${rel}`;
+	const tail = noExt.split("/").slice(1).join("/");
+	return ["\"", "'"].some((q) => [rel, `${rel}${p.slice(noExt.length)}`].some((s) => text.includes(`${q}${s}${q}`)) || (tail.includes("/") && text.includes(`/${tail}${q}`)));
+}
+
+/**
+ * The tests that import one of `files` (project-relative), the way importedByTests reads an import. The builder's job
+ * asks this of every tracked test (thousands of files): each is read without holding the run's thread.
+ */
+export async function testsImporting(projectDir: string, tests: string[], files: string[]): Promise<string[]> {
+	const paths = files.filter((p) => /^[^\s:]+\.[A-Za-z0-9]+$/.test(p));
+	const out: string[] = [];
+	for (const t of tests) {
+		const text = await readFile(join(projectDir, t), "utf8").catch(() => "");
+		if (paths.some((p) => p !== t && imports(t, text, p))) out.push(t);
+	}
+	return out;
 }
 
 /** Changed files (project-relative) that still hold a git conflict marker line, as "file:line". */
