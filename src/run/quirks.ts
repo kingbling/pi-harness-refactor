@@ -127,10 +127,13 @@ export async function askPendingQuirks(d: AskDeps & { root: string }, unitId?: s
  * from a summary and answers the run gave itself are left out: they only repeat a recommendation.
  */
 export function ownerQuirkAnswers(d: Pick<AskDeps, "ledger">, limit = 15): string {
+	// the answered ids come from the small questions_answered index: reading the question rows (long texts) of every
+	// answered question held the run's thread for seconds on a cold ledger; only the matches' answers are read
 	const rows = d.ledger.db
-		.prepare("SELECT q.kind, q.symbol_id, q.behaviour, x.answer FROM quirks q JOIN questions x ON x.id = q.question_id WHERE x.status = 'answered' AND x.answered_by NOT LIKE '%accepted the summary%' ORDER BY x.id DESC LIMIT ?")
-		.all(limit) as Array<{ kind: string; symbol_id: string; behaviour: string; answer: string }>;
-	return rows.map((r) => `- ${r.kind} in ${r.symbol_id}: ${r.behaviour} → ${answerValue(r.answer)}`).join("\n");
+		.prepare("SELECT q.kind, q.symbol_id, q.behaviour, q.question_id FROM quirks q WHERE q.question_id IN (SELECT id FROM questions WHERE status = 'answered' AND answered_by NOT LIKE '%accepted the summary%') ORDER BY q.question_id DESC LIMIT ?")
+		.all(limit) as Array<{ kind: string; symbol_id: string; behaviour: string; question_id: number }>;
+	const answerOf = d.ledger.db.prepare("SELECT answer FROM questions WHERE id = ?");
+	return rows.map((r) => `- ${r.kind} in ${r.symbol_id}: ${r.behaviour} → ${answerValue((answerOf.get(r.question_id) as { answer: string } | undefined)?.answer)}`).join("\n");
 }
 
 /** Copy answered quirk questions into the quirk table. Returns units whose tests follow a different decision. */

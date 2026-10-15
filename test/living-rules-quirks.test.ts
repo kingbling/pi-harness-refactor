@@ -6,7 +6,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { answerValue, askViaModel, decideOpenFromGoals, discoverDecisions, phraseDecisions, pointHash } from "../src/jev/ask.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
-import { askPendingQuirks, markQuirksApplied, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
+import { askPendingQuirks, markQuirksApplied, ownerQuirkAnswers, quirkRetestNote, quirksOf, recordQuirk } from "../src/run/quirks.ts";
 import { rulesText } from "../src/run/prompts.ts";
 import { activeRuleFiles, renderLayoutSection, rulesDir, validateRulesLayout } from "../src/rules/layout.ts";
 import { CURATOR_VERSION, maybeCurateRules, proposeRule, refreshRulesLayout, saveRulesVersion } from "../src/rules/living.ts";
@@ -88,6 +88,12 @@ describe("quirk file", () => {
 		markQuirksApplied({ ledger }, "U1");
 		expect(quirkRetestNote({ ledger, root }, "U1")).toBeUndefined();
 		expect(ledger.blockedUnits().size).toBe(0);
+		// the owner's own answer is shown to the next quirk question; an answer from accepting a summary is not
+		expect(ownerQuirkAnswers({ ledger })).toBe("- suspected_bug in app/x.php::total: total of [] is '0' (string) → keep");
+		const c = recordQuirk({ ledger, root }, { unitId: "U1", symbolId: "app/x.php::isEmpty", kind: "intentional", behaviour: "isEmpty(' ') is false", opinion: "keep", why: "trim" });
+		await askPendingQuirks({ ledger, config, root }, "U1");
+		ledger.answerQuestion(quirksOf({ ledger }, "U1").find((x) => x.id === c.id)!.question_id!, "keep", "human (accepted the summary)");
+		expect(ownerQuirkAnswers({ ledger }).split("\n")).toHaveLength(1);
 	});
 });
 
