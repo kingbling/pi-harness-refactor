@@ -8,7 +8,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { checkSlice } from "./parity-check.ts";
 import { judgeRun } from "./parity-judge.ts";
-import { probeApps } from "./parity.ts";
+import { probeApps, setupFixer } from "./parity.ts";
 import { linkDependencies } from "./run.ts";
 
 export const PARITY_USAGE = "parity --probe [--again] | parity <slice> [--rewrite] [--no-judge]";
@@ -24,7 +24,7 @@ export async function parityCommand(o: { ledger: Ledger; config: Config; root: s
 	};
 	if (slice) {
 		const serverStack = adapters.find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
-		const r = await checkSlice({ ledger, config, root, slice, linkAll, serverStack, rewrite: args.includes("--rewrite"), log: o.log });
+		const r = await checkSlice({ ledger, config, root, slice, linkAll, serverStack, rewrite: args.includes("--rewrite"), log: o.log, fixSetup: setupFixer({ config, root, log: o.log }) });
 		const lines = [`${slice}: ${r.outcome} — ${r.note}`];
 		if (r.runId !== undefined && r.outcome === "differs" && !args.includes("--no-judge")) {
 			const j = await judgeRun({ ledger, config, root, runId: r.runId, slice, client, log: o.log });

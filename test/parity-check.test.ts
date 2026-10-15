@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,7 +10,7 @@ import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
 import { LEGACY, loadApps } from "../src/run/parity.ts";
-import { checkSlice, compareRuns, dataChanges, runSteps, selfRedirect, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
+import { checkSlice, compareRuns, dataChanges, MAX_SETUP_RETRIES, runSteps, selfRedirect, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
@@ -179,4 +179,77 @@ describe("comparing the old and the new app", () => {
 		expect(d.outcome).toBe("error");
 		expect(d.down).toMatchObject({ stack: "nestjs", error: expect.stringMatching(/no such mapping dir/) });
 	}, 60_000);
+
+	it("an app whose data reset fails goes to its setup fixer and the check goes on; one never fixed is recorded as setup, not as an error of the code", async () => {
+		const root = mkdtempSync(join(tmpdir(), "br-paritysetup-"));
+		const legacy = join(root, "legacy");
+		cpSync(FIXTURE, legacy, { recursive: true });
+		const [oldPort, newPort] = [await freePort(), await freePort()];
+		const server = (body: string) => `require('http').createServer((q, s) => s.end(${JSON.stringify(body)})).listen(Number(process.argv[2]));\n`;
+		writeFileSync(join(legacy, "server.js"), server("[1]"));
+		const target = join(root, "new");
+		mkdirSync(target, { recursive: true });
+		writeFileSync(join(target, "server.js"), server("[1]"));
+		const git = (...a: string[]) => execFileSync("git", ["-C", target, ...a], { stdio: "pipe" });
+		git("init", "-q");
+		git("add", ".");
+		git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+		const config = ConfigSchema.parse({ source: { path: legacy, stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {}, db: { strategy: "none" } });
+		const ledger = new Ledger(":memory:");
+		await inventory(config, legacy, ledger);
+		applySlicePlan(ledger, planSlices(ledger));
+		await (legacyCopyTool(root, config) as unknown as { execute: (id: string, p: object) => Promise<unknown> }).execute("x", { why: "copy" });
+		mkdirSync(join(root, ".bigrefactor", "parity"), { recursive: true });
+		// the reset prints a notice, and fails while the "broken" file exists (a stopped database, say)
+		const broken = join(root, "broken");
+		const reset = { cmd: process.execPath, args: ["-e", `console.error('OrbStack is already running.'); process.exit(require('fs').existsSync(${JSON.stringify(broken)}) ? 1 : 0)`] };
+		const recipe = (port: number) => ({ dir: ".", start: { cmd: process.execPath, args: ["server.js", String(port)] }, ready: `http://localhost:${port}/invoices`, reset });
+		const apps = () => writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: recipe(newPort) } }));
+		apps();
+		const writer: StepWriter = async (o) => {
+			const steps: Step[] = [{ id: "list", route: "GET /invoices", compare: "data", method: "GET", path: "/invoices" }];
+			writeFileSync(join(o.dir, "steps.json"), JSON.stringify({ steps, skipped: { "GET /invoices/{id}": "t", "POST /invoices": "t" } }));
+		};
+		const check = (fixSetup?: (side: string, error: string) => Promise<boolean>) => checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer, log: () => {}, fixSetup });
+		// the fixer gets the side and what failed, fixes it, the comparison runs
+		writeFileSync(broken, "");
+		const asked: string[] = [];
+		const fixes = async (side: string, error: string) => (asked.push(`${side}: ${error}`), rmSync(broken), true);
+		expect(await check(fixes)).toMatchObject({ outcome: "same", compared: 1 });
+		expect(asked).toHaveLength(1);
+		expect(asked[0]).toMatch(/^legacy: the data reset failed \(.* it exited with status 1\); its output: OrbStack is already running/);
+		// a fixer that says it fixed it but did not: tried MAX_SETUP_RETRIES times, then recorded as setup with what failed
+		writeFileSync(broken, "");
+		asked.length = 0;
+		const r = await check(async (side, error) => (asked.push(`${side}: ${error}`), true));
+		expect(asked).toHaveLength(MAX_SETUP_RETRIES);
+		expect(r).toMatchObject({ outcome: "setup", compared: 0, setup: { side: LEGACY } });
+		expect(r.note).toMatch(/^setup: the old app did not start: the data reset failed/);
+		expect(ledger.db.prepare("SELECT outcome FROM parity_runs WHERE id = ?").get(r.runId!)).toEqual({ outcome: "setup" });
+		// the new app's data reset failing is its setup too, not a main the builder must fix
+		rmSync(broken);
+		const newOnly = { ...recipe(newPort), reset: { cmd: process.execPath, args: ["-e", "process.exit(3)"] } };
+		writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: newOnly } }));
+		asked.length = 0;
+		const n = await check(async (side, error) => (asked.push(`${side}: ${error}`), false));
+		expect(n).toMatchObject({ outcome: "setup", setup: { side: "nestjs" } });
+		expect(n.down).toBeUndefined();
+		expect(asked).toEqual([expect.stringMatching(/^nestjs: the data reset failed .*status 3/)]);
+		// the new app's own start failing (a stopped database makes it exit, say) goes to its setup first too: fixed, compared
+		const down = join(root, "db-down");
+		const starts = (port: number) => ({ ...recipe(port), reset: undefined, start: { cmd: process.execPath, args: ["-e", `if (require('fs').existsSync(${JSON.stringify(down)})) process.exit(5); require('http').createServer((q, s) => s.end('[1]')).listen(Number(process.argv[1]))`, String(port)] } });
+		writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: starts(newPort) } }));
+		writeFileSync(down, "");
+		asked.length = 0;
+		expect(await check(async (side, error) => (asked.push(`${side}: ${error}`), rmSync(down), true))).toMatchObject({ outcome: "same", compared: 1 });
+		expect(asked).toEqual([expect.stringMatching(/^nestjs: the start command exited with 5/)]);
+		// one its setup cannot fix: after MAX_SETUP_RETRIES tries it is main's code, the builder's
+		writeFileSync(down, "");
+		asked.length = 0;
+		const s = await check(async (side, error) => (asked.push(`${side}: ${error}`), true));
+		expect(asked).toHaveLength(MAX_SETUP_RETRIES);
+		expect(s).toMatchObject({ outcome: "error", down: { stack: "nestjs" } });
+		expect(s.note).toMatch(/its setup could not fix it/);
+		expect(s.setup).toBeUndefined();
+	}, 90_000);
 });

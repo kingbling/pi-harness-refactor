@@ -57,7 +57,8 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 			const ids = last.map((r) => r.id);
 			const diffs = ledger.db.prepare(`SELECT status, COUNT(*) AS n FROM parity_diffs WHERE run_id IN (${ids.map(() => "?").join(",")}) GROUP BY status`).all(...ids) as Array<{ status: string; n: number }>;
 			const n = (st: string) => diffs.find((d) => d.status === st)?.n ?? 0;
-			const errors = last.filter((r) => r.outcome === "error").map((r) => r.slice);
+			// "setup": an app did not start here, nothing was compared either
+			const errors = last.filter((r) => r.outcome === "error" || r.outcome === "setup").map((r) => r.slice);
 			lines.push(
 				`parity  slices ${c.green(`same ${by("same")}`)}  ${by("differs") ? c.yellow(`differ ${by("differs")}`) : "differ 0"}  ${errors.length ? c.red(`not compared ${errors.length}`) : "not compared 0"}   differences: bugs ${n("bug")}  quirks ${n("quirk")}  allowed ${n("allowed")}  not judged ${n("open")}` +
 					c.dim(errors.length ? `  (not compared: ${errors.slice(0, 3).join(", ")}${errors.length > 3 ? " …" : ""} → br parity <slice>)` : "  (br parity <slice>)"),

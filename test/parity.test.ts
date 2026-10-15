@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { appBootTools, bootApp, clipError, dumpData, LEGACY, loadApps, MAX_DUMP_MB, probeApp, saveApp, type AppFixer } from "../src/run/parity.ts";
+import { appBootTools, askBootOwner, bootApp, bootWaits, clipError, dumpData, LEGACY, loadApps, MAX_DUMP_MB, MAX_FIXUPS, probeApp, saveApp, setupFixer, type AppFixer } from "../src/run/parity.ts";
 
 /**
  * Differential parity starts with: can each app run here as a local server? The setup model saves a recipe;
@@ -249,5 +249,77 @@ describe("starting the apps for parity", () => {
 		}
 		const far = await bootApp({ ...asRecipe(serverRecipe(port)), ready: "https://example.com/" }, legacy);
 		expect(!far.ok && far.error).toMatch(/on this machine/);
+	});
+
+	it("a data reset is judged by its exit status: a notice it prints never fails it; a failure says how it ended", async () => {
+		const { legacy } = workspace();
+		const port = await freePort();
+		const node = (code: string) => ({ cmd: process.execPath, args: ["-e", code] });
+		// a container tool's notice on stderr and stdout, exit 0: the app starts
+		const notice = await bootApp({ ...asRecipe(serverRecipe(port)), reset: node("console.error('OrbStack is already running. Docker engine is ready to use.'); console.log('Use --all to start all machines.')") }, legacy);
+		expect(notice.ok).toBe(true);
+		if (notice.ok) await notice.stop();
+		const failed = await bootApp({ ...asRecipe(serverRecipe(port)), reset: node("console.error('volume in use'); process.exit(2)") }, legacy);
+		expect(failed).toMatchObject({ ok: false, stage: "setup" });
+		expect(!failed.ok && failed.error).toMatch(/the data reset failed \(.* it exited with status 2\); its output: volume in use/);
+		// a reset that hangs after a notice: stopped, and said so; the notice is only its output
+		const hung = await bootApp({ ...asRecipe(serverRecipe(port)), reset: node("console.error('OrbStack is already running.'); setInterval(() => {}, 1000)") }, legacy, { resetTimeoutMs: 1_000 });
+		expect(!hung.ok && hung.error).toMatch(/did not finish within 1 s and was stopped\); its output: OrbStack is already running/);
+		// the start command failing is the app's own start, not its setup
+		const start = await bootApp({ ...asRecipe(serverRecipe(port)), start: node("process.exit(4)") }, legacy);
+		expect(start).toMatchObject({ ok: false, stage: "start" });
+	});
+
+	it("an app a slice check could not start goes to its setup with what failed, a few times at most until it starts again", async () => {
+		const { root, config } = workspace();
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		const problems: string[] = [];
+		// the fixer changes nothing in the recipe (it started a stopped container): the saved recipe starts, the problem is gone
+		const look: AppFixer = async (o) => (problems.push(o.problem), "the database container was stopped; started it");
+		expect(await setupFixer({ config, root, fixer: look, log: () => {} })(LEGACY, "the data reset failed (reset.py: it exited with status 1)")).toBe(true);
+		expect(problems[0]).toMatch(/did not start for a slice check just now \(the data reset failed \(reset\.py: it exited with status 1\)\)/);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, bootProbes: 1 });
+		expect(loadApps(root)[LEGACY]!.bootProblem).toBeUndefined();
+		// a fixer whose recipe does not start: the problem stays, and after MAX_FIXUPS it is not asked again
+		const broken: AppFixer = async (o) => (problems.push(o.problem), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), resetCmd: process.execPath, resetArgs: ["-e", "process.exit(1)"] }), "tried");
+		for (let i = 0; i < MAX_FIXUPS + 1; i++) expect(await setupFixer({ config, root, fixer: broken, log: () => {} })(LEGACY, "still fails")).toBe(false);
+		expect(problems).toHaveLength(MAX_FIXUPS);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, bootProbes: MAX_FIXUPS, bootProblem: "still fails" });
+		// the working recipe was kept, not the broken one
+		expect(loadApps(root)[LEGACY]!.recipe!.reset).toBeUndefined();
+	});
+
+	it("once its setup ran out of fixes the owner is asked once; checks wait for the answer and \"retry\" gives the setup its tries back", async () => {
+		const { root, config } = workspace();
+		const port = await freePort();
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), serverRecipe(port)), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		const asked: string[] = [];
+		const ask = async (q: { facts: string }) => (asked.push(q.facts), 7);
+		// fixes left: nobody is asked
+		saveApp(root, LEGACY, { bootProblem: "no answer on http://localhost/ after 180s" });
+		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(false);
+		expect(asked).toEqual([]);
+		// used up: asked once, checks wait until the answer is "retry"
+		saveApp(root, LEGACY, { bootProbes: MAX_FIXUPS });
+		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(true);
+		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(true);
+		expect(asked).toHaveLength(1);
+		expect(asked[0]).toMatch(/the old app stopped starting .* no answer after 180s/);
+		let answer: string | undefined;
+		expect(bootWaits(loadApps(root), () => answer)).toBe(LEGACY);
+		answer = "skip";
+		expect(bootWaits(loadApps(root), () => answer)).toBe(LEGACY);
+		answer = "retry";
+		expect(bootWaits(loadApps(root), () => answer)).toBeUndefined();
+		// the next failure after "retry": the setup model is asked again
+		const problems: string[] = [];
+		const look: AppFixer = async (o) => (problems.push(o.problem), "the database was stopped; started it");
+		expect(await setupFixer({ config, root, fixer: look, log: () => {}, answer: () => answer })(LEGACY, "no answer after 180s")).toBe(true);
+		expect(problems).toHaveLength(1);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ bootProbes: 1 });
+		expect(loadApps(root)[LEGACY]!.bootQuestion).toBeUndefined();
 	});
 });
