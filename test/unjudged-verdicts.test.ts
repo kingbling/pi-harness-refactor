@@ -84,7 +84,7 @@ describe("an unjudged verdict is no pass", () => {
 	});
 });
 
-describe("a red main: the builder's repair comes first", () => {
+describe("a red main: the builder repairs it on the side", () => {
 	const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 	async function setup() {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-unjudged-")));
@@ -119,62 +119,27 @@ describe("a red main: the builder's repair comes first", () => {
 		return { root, target, ledger, b, jobs, adapter, setJob: (j: typeof codeJob) => (job = j) };
 	}
 
-	it("a merge on a red main waits for the builder's cycle; green again judges the deferred builds of accepted units", async () => {
+	it("the builder repairs a red main on the side; green again judges the deferred builds of accepted units", async () => {
 		const s = await setup();
 		unitWith(s.ledger, "U1", ["build_ok"]);
 		s.ledger.db.prepare("UPDATE units SET state = 'accepted', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = 'U1'").run();
-		// main not known red: nothing to wait for
-		expect(await s.b.repairFirst("fake")).toBe(false);
-		expect(s.jobs).toEqual([]);
-		// the builder found main red earlier (a check after merges)
 		s.ledger.setMeta(buildRedKey("fake"), "2026-10-15 a.txt fails");
-		expect(await s.b.repairFirst("fake")).toBe(true);
+		s.b.afterMerge("fake");
+		await s.b.finish();
 		expect(s.jobs).toHaveLength(1);
 		expect(s.ledger.getMeta(buildRedKey("fake"))).toBe("");
 		expect(s.ledger.unjudged("U1")).toEqual([]);
 		expect(git(s.target, ["log", "-1", "--format=%s"])).toBe("fixed by the code job");
 	});
 
-	it("a merge waits cycle after cycle while main stays red, not only for one", async () => {
-		const s = await setup();
-		let calls = 0;
-		// the first job merges nothing, the second fixes main
-		s.setJob(async () => {
-			if (++calls === 1) return undefined;
-			writeFileSync(join(s.target, "src", "a.txt"), "ok\n");
-			await commitAll(s.target, "fixed by the second job");
-			return "fixed a.txt";
-		});
-		s.ledger.setMeta(buildRedKey("fake"), "red");
-		expect(await s.b.repairFirst("fake")).toBe(true);
-		expect(calls).toBe(2);
-		expect(s.ledger.getMeta(buildRedKey("fake"))).toBe("");
-	});
-
-	it("a main no code job can fix: the merge waits until the builder parks it, then goes on", async () => {
+	it("a main no code job can fix is parked after MAX_BUILD_CODE_JOBS jobs; it stays red", async () => {
 		const s = await setup();
 		let calls = 0;
 		s.setJob(async () => (calls++, undefined));
-		s.ledger.setMeta(buildRedKey("fake"), "red");
-		expect(await s.b.repairFirst("fake")).toBe(true);
+		for (let i = 0; i < 4; i++) s.b.afterMerge("fake"), await s.b.finish();
 		expect(calls).toBe(3);
 		expect(s.ledger.getMeta(buildParkedKey("fake"))).toMatch(/parked|stops/);
 		expect(s.ledger.getMeta(buildRedKey("fake"))).not.toBe("");
-	});
-
-	it("a stop while a merge waits for the repair hands the lane back", async () => {
-		const s = await setup();
-		let release!: () => void;
-		let started!: () => void;
-		const inJob = new Promise<void>((r) => (started = r));
-		s.setJob(async () => (started(), await new Promise<void>((r) => (release = r)), undefined));
-		s.ledger.setMeta(buildRedKey("fake"), "red");
-		const waiting = s.b.repairFirst("fake");
-		await inJob;
-		const stopping = s.b.stop();
-		release();
-		await stopping;
-		expect(await waiting).toBe(true);
 	});
 
 	it("a hand accept runs the deferred whole-project build first: red refuses before any commit, green judges it", async () => {
@@ -187,13 +152,5 @@ describe("a red main: the builder's repair comes first", () => {
 		expect(s.ledger.unjudged("U1")).toEqual([]);
 		unitWith(s.ledger, "U2", ["wired_ok"]);
 		expect(await judgeBeforeAccept(s.ledger, s.adapter, s.target, "U2")).toMatch(/^not judged: wired_ok/);
-	});
-
-	it("a parked red main does not hold merges (nothing is working on it)", async () => {
-		const s = await setup();
-		s.ledger.setMeta(buildRedKey("fake"), "red");
-		s.ledger.setMeta(buildParkedKey("fake"), "parked");
-		expect(await s.b.repairFirst("fake")).toBe(false);
-		expect(s.jobs).toEqual([]);
 	});
 });

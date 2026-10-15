@@ -784,8 +784,6 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					testsNote = undefined;
 					if (res!.state !== "review") break;
 					try {
-						// main fails its whole-project checks: the builder's repair goes first, this merge after it
-						if (!o.dry && (await builder.repairFirst(placementOf(ledger.getUnit(unitId)!.meta).stackId))) log(pc.dim(`  ${unitId}: main is red: waited for the builder's repair before merging`));
 						await merge.run(async () => {
 							setStep(`merging ${unitId}`);
 							const { stackId } = placementOf(ledger.getUnit(unitId)!.meta);

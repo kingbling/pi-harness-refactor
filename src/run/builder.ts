@@ -28,9 +28,9 @@ import { setStep } from "./watchdog.ts";
  * What it cannot fix goes to a code job (which may fix test code too; it merges when main gets fewer errors and no new
  * ones); after MAX_BUILD_CODE_JOBS of those in a row that merged nothing the stack is parked quietly (br status shows
  * it), never a "fix or ignore" question to the owner. Errors only in files a code job may not change (those that decide
- * how the checks run) go to the setup model instead. While main is red (and not parked) a unit's merge waits for the
- * builder's repair (repairFirst) instead of landing on top as if it were green; a green main gives the accepted units
- * whose build the gate deferred their verdict.
+ * how the checks run) go to the setup model instead. A unit never waits for the repair: on a red main its merge lands
+ * only when it adds no error (the merge check), and a green main gives the accepted units whose build the gate
+ * deferred their verdict. (Waiting held every lane for hours while repairs that each fixed part of main ran.)
  */
 
 /** Returns the model's one-sentence account of what it changed. */
@@ -180,12 +180,6 @@ export interface Builder {
 	afterMerge(stackId: string): void;
 	/** The stack's new app did not start on main (parity found it): a main problem, built once per main tree. */
 	appDown(stackId: string, error: string): Promise<void>;
-	/**
-	 * Before a unit of this stack merges: while main fails its whole-project checks (and the builder has not parked
-	 * it), the builder's repair goes first; resolves once main is green, parked, the run stops, or after
-	 * MAX_BUILD_CODE_JOBS + 2 cycles that left it red. True when it waited.
-	 */
-	repairFirst(stackId: string): Promise<boolean>;
 	/** At the end of the run: one last build of what was merged since the last one. */
 	finish(): Promise<void>;
 	/**
@@ -313,7 +307,7 @@ export function createBuilder(o: {
 				if (judged.length) o.log(pc.dim(`builder ${stackId}: ${judged.length} accepted unit(s) whose whole-project build was not judged yet now have it`));
 			};
 			if (!problem) return green(), o.log(pc.green(`builder ${stackId}: whole project ok`)), false;
-			// red: merges of this stack wait for the repair below (repairFirst)
+			// red: merges of this stack land only when they add no error (the merge check), while the repair below runs
 			if (!o.ledger.getMeta(buildRedKey(stackId))) o.ledger.setMeta(buildRedKey(stackId), `${new Date().toISOString()} ${(problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? "").slice(0, 200)}`);
 			const errors = errorKeys(problem, dir).length;
 			if (again && errors >= (jobFrom.get(stackId) ?? Infinity)) return o.log(pc.yellow(`builder ${stackId}: main has no fewer errors after the last code job (${errors}); the next one after the next merges`)), false;
@@ -411,21 +405,6 @@ export function createBuilder(o: {
 			down.set(stackId, error);
 			merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
 			start(true);
-		},
-		async repairFirst(stackId) {
-			const red = () => !stopped && !!o.ledger.getMeta(buildRedKey(stackId)) && !o.ledger.getMeta(buildParkedKey(stackId));
-			if (!red()) return false;
-			// cycle after cycle until main is green or parked (MAX_BUILD_CODE_JOBS cycles without progress park it); a
-			// cycle that ends in an error changes nothing, so the wait is capped too and the merge goes on under the merge
-			// check's rule (no new errors)
-			for (let i = 0; i <= MAX_BUILD_CODE_JOBS + 1 && red(); i++) {
-				if (!running) {
-					merged.set(stackId, (merged.get(stackId) ?? 0) + 1);
-					start(true);
-				}
-				await running;
-			}
-			return true;
 		},
 		async finish() {
 			await running;
