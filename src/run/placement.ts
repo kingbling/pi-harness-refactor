@@ -602,12 +602,21 @@ function excerpt(config: Config, files: string[]): string {
 }
 
 /**
+ * Not yet placed units still linked to their placement question in one of these statuses. Driven from the questions
+ * side (a placement question is asked for its own unit): finding the link in every unit's meta held the run's thread
+ * for seconds on each scheduling pass.
+ */
+const linkedUnits = (statuses: string) =>
+	`SELECT u.id, u.meta, q.id qid, q.answer, q.context FROM questions q JOIN units u ON u.id = q.unit_id
+	 WHERE q.point = '${POINT}' AND q.status IN (${statuses}) AND json_extract(u.meta, '$.placeQuestion') = q.id AND json_extract(u.meta, '$.place') IS NULL`;
+
+/**
  * Answered placement questions → the unit's placement + a prefix rule in placement.json for similar files.
- * Cheap (one query); the scheduler calls it before every scheduling pass so an answer re-plans its unit.
+ * Cheap (one indexed query); the scheduler calls it before every scheduling pass so an answer re-plans its unit.
  */
 export function applyPlacementAnswers(ledger: Ledger, config: Config, root: string): string[] {
 	const rows = ledger.db
-		.prepare("SELECT u.id, u.meta, q.answer, q.context FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.placeQuestion') WHERE json_extract(u.meta, '$.place') IS NULL AND q.status IN ('answered', 'auto')")
+		.prepare(linkedUnits("'answered', 'auto'"))
 		.all() as Array<{ id: string; meta: string; answer: string | null; context: string | null }>;
 	const done: string[] = [];
 	for (const r of rows) {
@@ -647,7 +656,7 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 /** Units still waiting on a placement question that the new rules now place for sure: placed, their question withdrawn. */
 function placeCoveredWaiting(ledger: Ledger, config: Config, root: string): void {
 	const rows = ledger.db
-		.prepare("SELECT u.id, u.meta, q.id qid FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.placeQuestion') WHERE json_extract(u.meta, '$.place') IS NULL AND q.status = 'open'")
+		.prepare(linkedUnits("'open'"))
 		.all() as Array<{ id: string; meta: string; qid: number }>;
 	for (const r of rows) {
 		const c = codePlace(config, JSON.parse(r.meta) as UnitMeta, root);
