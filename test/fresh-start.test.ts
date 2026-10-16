@@ -50,6 +50,23 @@ describe("init in a workspace with earlier work", () => {
 		expect(existsSync(join(root, ".bigrefactor", "adapters", "symfony.seed"))).toBe(true);
 	});
 
+	it("a migration under way is never moved aside on the preselected answer: keep comes first and is the default", async () => {
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const root = workspace();
+		const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
+		for (const id of ["U1", "U2"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'U1'").run();
+		ledger.close();
+		let seen: { message: string; options: Array<{ value: string; label: string }>; initial?: string } | undefined;
+		const pick = { select: async (message: string, options: never, initial?: string) => ((seen = { message, options, initial }), initial), text: async () => "", log: () => {} } as never;
+		expect(await offerFreshStart(root, pick, { yes: false, fresh: false })).toBe(false);
+		expect(seen!.initial).toBe("keep");
+		expect(seen!.options[0]!.value).toBe("keep");
+		expect(seen!.message).toMatch(/migration under way \(1 accepted units\)/);
+		expect(seen!.options[1]!.label).toMatch(/move the migration aside \(1 accepted units\)/);
+		expect(existsSync(join(root, ".bigrefactor", "ledger.sqlite"))).toBe(true);
+	});
+
 	it("keep leaves it; --yes keeps without asking; --fresh moves without asking; an empty workspace asks nothing", async () => {
 		const a = workspace();
 		expect(await offerFreshStart(a, ui("keep"), { yes: false, fresh: false })).toBe(false);

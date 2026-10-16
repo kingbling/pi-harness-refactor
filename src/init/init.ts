@@ -14,6 +14,7 @@ import { withCommandOverrides } from "../adapters/command-overrides.ts";
 import { libraryPlan, parseChoiceFlag, parseReplaceFlag, renderStackPlan, resolveChoices } from "./stack.ts";
 import { loadDecisions, recordEarlyDecision } from "../inventory/decisions.ts";
 import { cp, rm } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 
 export interface PromptOption {
 	value: string;
@@ -373,13 +374,29 @@ export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: 
 		/* no decisions yet */
 	}
 	const ledger = existsSync(join(dir, "ledger.sqlite")) ? statSync(join(dir, "ledger.sqlite")).size : 0;
+	// a migration under way (units past planned): its work is never moved aside on a preselected answer
+	let started: Record<string, number> = {};
+	if (ledger)
+		try {
+			const db = new DatabaseSync(`file:${join(dir, "ledger.sqlite")}?immutable=1`, { readOnly: true });
+			for (const r of db.prepare("SELECT state, COUNT(*) n FROM units WHERE state != 'planned' GROUP BY state").all() as Array<{ state: string; n: number }>) started[r.state] = r.n;
+			db.close();
+		} catch {
+			started = {}; // no units table yet
+		}
+	const done = Object.entries(started).map(([st, n]) => `${n} ${st}`).join(", ");
 	const what = [answers ? `${answers} earlier answers (target stacks, libraries, rules …)` : "", ledger ? `the unit ledger (${Math.max(1, Math.round(ledger / 1e6))} MB)` : "", ...["rules", "truth", "placement.json", "areas.json"].filter((f) => existsSync(join(dir, f)))].filter(Boolean).join(", ");
 	let fresh = o.fresh;
 	if (!fresh && !o.yes) {
-		const v = await ui.select(`This workspace still holds earlier work: ${what}.\n   Kept answers count as decided: onboarding will not ask them again.`, [
-			{ value: "fresh", label: "start fresh (recommended)", hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted" },
-			{ value: "keep", label: "keep the earlier answers and work" },
-		], "fresh");
+		const v = done
+			? await ui.select(`This workspace holds a migration under way (${done} units): ${what}.`, [
+					{ value: "keep", label: "keep the migration and its work (recommended)" },
+					{ value: "fresh", label: `start over: move the migration aside (${done} units)`, hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted, but the run starts from the beginning" },
+				], "keep")
+			: await ui.select(`This workspace still holds earlier work: ${what}.\n   Kept answers count as decided: onboarding will not ask them again.`, [
+					{ value: "fresh", label: "start fresh (recommended)", hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted" },
+					{ value: "keep", label: "keep the earlier answers and work" },
+				], "fresh");
 		if (v === undefined) throw new Error("init cancelled");
 		fresh = v === "fresh";
 	}
