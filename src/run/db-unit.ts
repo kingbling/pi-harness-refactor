@@ -5,6 +5,10 @@ import { getTargetAdapter } from "../adapters/registry.ts";
 import { projectDir } from "../init/init.ts";
 import { schemaTextFor, type DbUnitMeta } from "../inventory/db.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
+import { disputeEarlierTestTool } from "../sessions/tools.ts";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { runPortedTests } from "./ported.ts";
 import { fixRunSetup, fixSetupWithModel } from "../init/setup-fixer.ts";
 import { errorSignature, run, runGate, renderGate, sha1, type GateReport } from "./gate.ts";
 import { reviewWithModel } from "./review.ts";
@@ -38,6 +42,8 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	const meta = JSON.parse(unit.meta) as DbUnitMeta & { group?: string };
 	const adapter = await getTargetAdapter(place.stackId);
 	const targetProjectDir = o.workDir ? join(o.workDir, relative(o.config.target.path, projectDir(o.config, place.stackId))) : projectDir(o.config, place.stackId);
+	// main's checkout: another unit's test that fails here counts only if it passes there (as for code units)
+	const mainDir = o.workDir ? projectDir(o.config, place.stackId) : undefined;
 	if (!adapter.toolchain.isProjectReady(targetProjectDir)) throw new Error(`target project missing at ${targetProjectDir}; run br setup`);
 	const dataDirs = adapter.layout.dataDirs?.length ? adapter.layout.dataDirs : DEFAULT_DATA_DIRS;
 	const writeGlobs = [...new Set(dataDirs.flatMap((d) => [`${d}**`, ...adapter.layout.testFileGlobs(d.replace(/\/$/, ""))]))];
@@ -53,7 +59,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		`You are the database engineer of a legacy rewrite (${o.config.source.stack} → ${place.stackId}). You work in the target project; write ONLY under ${dataDirs.join(", ")}.`,
 		`Engines: ${meta.from.join(" + ")} → ${meta.to ?? "unchanged"}. Strategy: ${meta.strategy}. Stack choices: ${JSON.stringify(choices)}.`,
 		adapter.layout.dataAccessHint ? `Data access in this stack: ${adapter.layout.dataAccessHint}.` : "",
-		`Tests: ${adapter.layout.testHint} Write at least one test next to your files that proves the schema (the tables' columns as the stack's data-access code declares them, or the migration's DDL) — or for the data lane, the transformation on a small in-memory fixture. Tests must run without a live database.`,
+		`Tests: ${adapter.layout.testHint} Write at least one test next to your files that proves the schema (the tables' columns as the stack's data-access code declares them, or the migration's DDL) — or for the data lane, the transformation on a small in-memory fixture. Tests must run without a live database. A test checks what its own unit's files create, not what other units' migrations hold (no counts or orders across them): other units add migrations after yours. Run check_my_tests after each change and before you finish. Another unit's test is never yours to change unless it is wrong: then dispute_test with evidence from the legacy schema.`,
 		CODE_QUALITY,
 		goalsText(o.config.goals),
 		"Never write credentials. Never edit files outside your directories; other units build features on what you write, so names must match the legacy tables exactly unless your task says otherwise.",
@@ -65,7 +71,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		task,
 		meta.tables?.length ? `\nTables (${meta.tables.length}): ${meta.tables.join(", ")}` : "",
 		`\nFiles already in ${dataDirs.join(", ")} (earlier units' schema and migrations): ${existing.length ? existing.slice(0, 200).join(", ") : "none yet"}`,
-		own.length ? `\nThis unit's own tests from an earlier run (yours to update when your schema change makes them wrong; never change another unit's tests): ${own.join(", ")}` : "",
+		own.length ? `\nThis unit's own tests from an earlier run (yours to update when your schema change makes them wrong): ${own.join(", ")}` : "",
 		snapshot ? `\nData dump: ${snapshot}${existsSync(snapshot) ? "" : " (not found on this machine)"} — read it for realistic fixtures; never commit it.` : "",
 		o.config.db.url ? `\nLegacy connection: ${o.config.db.url} (an env var; introspection allowed, read-only).` : "",
 		`\n## Legacy schema\n\`\`\`sql\n${schema || "(no schema inputs: br onboard --force-db to point at them)"}\n\`\`\``,
@@ -76,6 +82,22 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	const gateFn = o.gate ?? runGate;
 	const gateSlot = o.gateSlot ?? (<T>(fn: () => Promise<T>) => fn());
 	const reviewer = o.reviewer === false ? undefined : (o.reviewer ?? (o.spawn ? undefined : reviewWithModel));
+	// an earlier unit's test the session changed with evidence (dispute_test): kept at the gate, and the reviewer is told
+	const disputed = new Map<string, string>();
+	const tools: ToolDefinition[] = [
+		{
+			name: "check_my_tests",
+			label: "Run my tests",
+			description: "Run the gate's test step now: every test file in the data dirs, yours first, then the other units' (one that fails on main too does not count). Run it after each change and before you finish; the gate runs the same.",
+			promptSnippet: "check_my_tests: run the gate's test step on the data dirs' tests now",
+			parameters: Type.Object({}),
+			execute: async () => {
+				const r = await runPortedTests({ ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, tests: dataTests(targetProjectDir, dataDirs, adapter.layout.isTestFile).map((t) => t.path), mainDir, timeoutMs: 240_000, slot: gateSlot });
+				return { content: [{ type: "text" as const, text: `${r.ok ? "TESTS GREEN" : "TESTS RED"}\n${r.output.slice(-6000)}` }], details: {} };
+			},
+		} as unknown as ToolDefinition,
+		disputeEarlierTestTool({ ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, onDispute: (d) => (disputed.set(d.test, `${d.why} (evidence: ${d.evidence})`), log(pc.yellow(`  db dispute: ${d.test} — ${d.why.slice(0, 160)}`))) }),
+	];
 	const maxImpl = o.config.run.maxImplementAttempts;
 	const maxTotal = maxImpl + o.config.run.maxEscalateAttempts;
 	let cost = 0;
@@ -88,7 +110,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		n++;
 		const role = escalate || n > maxImpl ? "escalate" : "implement";
 		const attempt = o.ledger.startAttempt(o.unitId, role, o.config.models[role].id);
-		const s = await spawn({ role, cwd: targetProjectDir, config: o.config, writeGlobs, protectedGlobs: adapter.protectedGlobs, systemPrompt: system, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `${role}-${attempt}.jsonl`) });
+		const s = await spawn({ role, cwd: targetProjectDir, config: o.config, writeGlobs, protectedGlobs: adapter.protectedGlobs, systemPrompt: system, customTools: tools, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `${role}-${attempt}.jsonl`) });
 		let res;
 		try {
 			res = await s.run(prompt + (last ? `\n\n## Previous attempt failed the gate\n${last}` : ""));
@@ -104,13 +126,13 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		const review = reviewer
 			? async (changedFiles: string[]) => {
 					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir: dataDirs[0]!.replace(/\/$/, ""), legacyFiles: [], changedFiles, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: `This is a database unit. Its task: ${task}${meta.tables?.length ? ` Tables: ${meta.tables.join(", ")}.` : ""} Its tests run without a live database by design (the session is told so)${adapter.migrateFresh ? "; the gate applies all migrations to an empty database in a step of its own" : ""}: do not ask for database-backed tests.`, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `review-${ra}.jsonl`) });
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir: dataDirs[0]!.replace(/\/$/, ""), legacyFiles: [], changedFiles, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: `This is a database unit. Its task: ${task}${meta.tables?.length ? ` Tables: ${meta.tables.join(", ")}.` : ""} Its tests run without a live database by design (the session is told so)${adapter.migrateFresh ? "; the gate applies all migrations to an empty database in a step of its own" : ""}: do not ask for database-backed tests.${disputed.size ? ` It changed earlier units' tests, saying they are wrong: ${[...disputed].map(([f, w]) => `${f}: ${w}`).join("; ")}. Judge each against the legacy schema; a change that only weakens a right test is a finding.` : ""}`, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `review-${ra}.jsonl`) });
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					cost += r.costUsd ?? 0;
 					return r;
 				}
 			: undefined;
-		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot, sanctioned: own });
+		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot, mainDir, sanctioned: [...own, ...disputed.keys()] });
 		gate = await migrateFreshStep(gate, { ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, slot: gateSlot });
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));

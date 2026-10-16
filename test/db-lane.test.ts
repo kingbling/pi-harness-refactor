@@ -279,6 +279,30 @@ describe("DB lane", () => {
 		expect(prompts[0]).not.toContain("ORM schema/entities");
 		expect(prompts[0]).toContain("this stack's data-access approach");
 	});
+
+	it("the session can run the gate's tests and keep a change to an earlier unit's test it disputes with evidence", async () => {
+		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
+		write(join(ws, "migrated", "package.json"), "{}");
+		write(join(ws, "migrated", "src", "db", "other.entity.spec.ts"), "it('y', () => {});\n");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await planDbLane(ledger, config);
+		let names: string[] = [];
+		const spawn = async (opts: { customTools?: Array<{ name: string; execute: (...a: unknown[]) => Promise<unknown> }> }): Promise<LeafSession> =>
+			({
+				run: async () => {
+					names = (opts.customTools ?? []).map((t) => t.name);
+					await opts.customTools!.find((t) => t.name === "dispute_test")!.execute("1", { test: "src/db/other.entity.spec.ts", why: "counts every migration", evidence: "the legacy schema has 9 tables" });
+					return { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const seen: GateInput[] = [];
+		const gate = async (g: GateInput): Promise<GateReport> => (seen.push(g), { ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		await runUnit({ ledger, config, root: ws, unitId: "DB_schema_invoice", spawn: spawn as never, gate, log: () => {} });
+		expect(names).toEqual(expect.arrayContaining(["check_my_tests", "dispute_test"]));
+		expect(seen[0]!.sanctioned).toContain("src/db/other.entity.spec.ts");
+	});
 });
 
 describe("DB lane: migrations are written in order, reviewed, and applied to an empty database", () => {
