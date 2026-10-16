@@ -250,7 +250,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// the waiting unit's kept code (its last try, kept when it parked): the job starts from it and merges both
 		const keptWork = unit ? (JSON.parse(unit.meta) as { keptWork?: string }).keptWork : undefined;
 		const unitWork = unit && keptWork ? { unitId: unit.id, apply: (wt: string) => applyCleanly(wt, keptWork) } : undefined;
-		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, unitWork, onRefused: (p, diff) => (refused = { refused: p, diff }), onLocked: (l) => (locked = l), onNothing: (s) => (miss = { nothing: s || "the code model gave no reason" }), onFailed: (f) => (miss = { failed: f }), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, unitWork, forUnit: q.unit_id ?? undefined, onRefused: (p, diff) => (refused = { refused: p, diff }), onLocked: (l) => (locked = l), onNothing: (s) => (miss = { nothing: s || "the code model gave no reason" }), onFailed: (f) => (miss = { failed: f }), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => {
+				// withdrawn while the job ran (its unit was requeued and works on its own again): the code would land beside that work
+				const now = ledger.getQuestion(q.id);
+				if (now?.status === "withdrawn") throw new Error(`question #${q.id} was withdrawn while the job ran (${now.answer ?? "no reason"}), so its code is not merged`);
+				return await mergeUnit(config, "code", wt, branch, "", msg);
+			}).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 		// main holds the unit's kept code now: its next try starts from main
 		if (said && unitWork && merged) ledger.updateUnit(unitWork.unitId, { meta: { keptWork: undefined } });
 		// a fix on main may unblock quarantined units too, not only the ones waiting on this question
@@ -1324,11 +1329,13 @@ export async function fastForwardMain(config: Config, branch: string): Promise<s
 
 /** A unit's merge refused: with it the stack's whole-project check has errors main does not have. */
 class BreaksMain extends Error {
-	constructor(
-		readonly stackId: string,
-		readonly output: string,
-	) {
-		super(`the whole-project check of ${stackId} fails with this merge: ${output.slice(0, 300)}`);
+	readonly output: string;
+	readonly stackId: string;
+	constructor(stackId: string, output: string) {
+		const plain = output.replace(/\x1b\[[0-9;]*m/g, ""); // colored compiler output: plain file names and a readable reason
+		super(`the whole-project check of ${stackId} fails with this merge: ${plain.slice(0, 300)}`);
+		this.stackId = stackId;
+		this.output = plain;
 	}
 }
 

@@ -447,4 +447,18 @@ describe("a reopened DB unit's own tests", () => {
 		green("DB_b", ["migrations/SharedTest.php", "migrations/BTest.php"]);
 		expect(ownTests(ledger, "DB_a", (f) => f.endsWith("Test.php"))).toEqual(["migrations/ATest.php"]);
 	});
+
+	it("include the tests a code job merged for one of its questions", async () => {
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { ownTests } = await import("../src/run/db-unit.ts");
+		const ledger = new Ledger(":memory:");
+		for (const id of ["DB_a", "DB_b"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const job = (report: object) => ledger.endAttempt(ledger.startAttempt("__code__", "code:php"), { outcome: "fixed", gateReport: report });
+		job({ changedFiles: ["db/JobTest.php", "db/x.sql"], forUnit: "DB_a" });
+		// an older job names its unit only through the question in its task
+		const q = ledger.askQuestion({ unitId: "DB_a", point: "p", question: "how?", askedBy: "x" });
+		job({ changedFiles: ["db/OldJobTest.php"], what: `write it\n\nThis came up as question #${q} (p, unit DB_a)` });
+		job({ changedFiles: ["db/OtherTest.php"], forUnit: "DB_b" });
+		expect(ownTests(ledger, "DB_a", (f) => f.endsWith("Test.php"))).toEqual(["db/JobTest.php", "db/OldJobTest.php"]);
+	});
 });

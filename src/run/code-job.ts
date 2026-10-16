@@ -141,6 +141,8 @@ export async function runCodeJob(o: {
 	 * top, false when it does not apply), and the job merges both. The unit's own stub marks are then its to remove.
 	 */
 	unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> };
+	/** the unit whose question the job serves: the tests it writes count as that unit's own (a reopened unit may change them) */
+	forUnit?: string;
 }): Promise<string | undefined> {
 	const key = o.whole ? `${o.adapter.id}:build` : o.adapter.id;
 	while (busy.has(key)) await busy.get(key)!.catch(() => undefined);
@@ -198,7 +200,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 			return undefined;
 		}
 		const sha = await o.mergeFix(wt, branch, `feat(${o.adapter.id}): ${(said || o.what).split("\n")[0]!.slice(0, 120)}\n\ncode job ${o.label}`);
-		o.ledger.endAttempt(attempt, { outcome: "fixed", gateReport: { said, commit: sha ?? null, changedFiles: changed, what: o.what.slice(0, 2000) } });
+		o.ledger.endAttempt(attempt, { outcome: "fixed", gateReport: { said, commit: sha ?? null, changedFiles: changed, forUnit: o.forUnit ?? o.unitWork?.unitId, what: o.what.slice(0, 2000) } });
 		// what it added is found by later units (reuse hints, the copy check)
 		await indexTarget(o.ledger, o.adapter, projectDir(o.config, o.adapter.id), changed).catch(() => 0);
 		o.log(pc.green(`code job ${o.label}: merged${sha ? ` ${sha.slice(0, 7)}` : ""} — ${said.split("\n")[0]!.slice(0, 160)}`));

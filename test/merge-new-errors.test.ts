@@ -63,6 +63,8 @@ describe("error lines against main's", () => {
 
 	it("name the files of an output relative to where it ran, not the echoed command", () => {
 		expect(filesNamed("$ tsc -p x.ts\nsrc/a.test.ts(3,5): error TS1\n/wt/p/src/b.ts\n  1:1 error", "/wt/p", [".ts"]).sort()).toEqual(["src/a.test.ts", "src/b.ts"]);
+		// tsc colors its file names (pretty output): the tester must still see they are its test files
+		expect(filesNamed("\x1b[96msrc/a.test.tsx\x1b[0m:\x1b[93m41\x1b[0m:\x1b[93m57\x1b[0m - \x1b[91merror\x1b[0m TS2339", "/wt/p", [".tsx"])).toEqual(["src/a.test.tsx"]);
 	});
 });
 

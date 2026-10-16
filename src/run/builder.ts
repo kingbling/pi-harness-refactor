@@ -152,7 +152,7 @@ export function newErrorLines(output: string, dir: string, other: string, otherD
 export function filesNamed(output: string, dir: string, exts: string[]): string[] {
 	const dirs = [dir, ...(existsSync(dir) ? [realpathSync(dir)] : [])].map((d) => `${d.replace(/\/$/, "")}/`);
 	const out = new Set<string>();
-	for (const line of output.split("\n")) {
+	for (const line of output.replace(/\x1b\[[0-9;]*m/g, "").split("\n")) {
 		if (line.startsWith("$ ")) continue;
 		for (const [t] of line.matchAll(/[^\s'"`():,]+/g)) if (exts.some((e) => t.endsWith(e))) out.add(dirs.reduce((f, d) => (f.startsWith(d) ? f.slice(d.length) : f), t).replace(/^\.\//, ""));
 	}
