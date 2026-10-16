@@ -50,23 +50,6 @@ describe("init in a workspace with earlier work", () => {
 		expect(existsSync(join(root, ".bigrefactor", "adapters", "symfony.seed"))).toBe(true);
 	});
 
-	it("a migration under way is never moved aside on the preselected answer: keep comes first and is the default", async () => {
-		const { Ledger } = await import("../src/ledger/db.ts");
-		const root = workspace();
-		const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
-		for (const id of ["U1", "U2"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
-		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'U1'").run();
-		ledger.close();
-		let seen: { message: string; options: Array<{ value: string; label: string }>; initial?: string } | undefined;
-		const pick = { select: async (message: string, options: never, initial?: string) => ((seen = { message, options, initial }), initial), text: async () => "", log: () => {} } as never;
-		expect(await offerFreshStart(root, pick, { yes: false, fresh: false })).toBe(false);
-		expect(seen!.initial).toBe("keep");
-		expect(seen!.options[0]!.value).toBe("keep");
-		expect(seen!.message).toMatch(/migration under way \(1 accepted units\)/);
-		expect(seen!.options[1]!.label).toMatch(/move the migration aside \(1 accepted units\)/);
-		expect(existsSync(join(root, ".bigrefactor", "ledger.sqlite"))).toBe(true);
-	});
-
 	it("keep leaves it; --yes keeps without asking; --fresh moves without asking; an empty workspace asks nothing", async () => {
 		const a = workspace();
 		expect(await offerFreshStart(a, ui("keep"), { yes: false, fresh: false })).toBe(false);
@@ -93,5 +76,45 @@ describe("git: never commits a parent repo", () => {
 		expect(await isRepoRoot(parent)).toBe(true);
 		expect(await isRepoRoot(inner)).toBe(false);
 		await expect(commitAll(inner, "nope")).rejects.toThrow(/not the top of its own git repo/);
+	});
+});
+
+describe("br init over a migration under way", () => {
+	async function migration(open?: string) {
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const root = workspace();
+		const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
+		for (const id of ["U1", "U2", "U3"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id IN ('U1', 'U2')").run();
+		if (open) ledger.setMeta("open_run", open);
+		ledger.close();
+		return root;
+	}
+	const answer = (pick: string | undefined, seen: Array<{ message: string; initial?: string; first: string }> = []) =>
+		({ select: async (message: string, options: Array<{ value: string }>, initial?: string) => (seen.push({ message, initial, first: options[0]!.value }), pick), text: async () => "", log: () => {} }) as never;
+
+	it("knows a migration from its units past planned, and a run going on from its mark and a fresh ledger write", async () => {
+		const { migrationUnderWay } = await import("../src/init/init.ts");
+		expect(migrationUnderWay(workspace())).toBeUndefined(); // answers only: no migration
+		expect(migrationUnderWay(await migration())).toEqual({ done: "2 accepted", live: false });
+		const running = await migration(JSON.stringify({ startedAt: "2026-10-16T09:00:00Z" }));
+		expect(migrationUnderWay(running)).toEqual({ done: "2 accepted", live: true });
+		expect(migrationUnderWay(running, Date.now() + 60 * 60_000)!.live).toBe(false); // a killed run's mark
+	});
+
+	it("asks first, no is the default; no, a cancel or --yes keep everything; beside a running run it never asks", async () => {
+		const { init, confirmStartOver } = await import("../src/init/init.ts");
+		const root = await migration();
+		const seen: Array<{ message: string; initial?: string; first: string }> = [];
+		await expect(init([], { root, prompter: answer("no", seen) })).rejects.toThrow(/migration is kept \(2 accepted units\); continue it with br run/);
+		expect(seen[0]).toMatchObject({ initial: "no", first: "no", message: expect.stringMatching(/Really start from scratch\?/) });
+		await expect(init([], { root, prompter: answer(undefined) })).rejects.toThrow(/migration is kept/);
+		await expect(init(["--yes", "--fresh", "--force"], { root, prompter: answer("yes") })).rejects.toThrow(/does not run with --yes/);
+		expect(existsSync(join(root, ".bigrefactor", "ledger.sqlite"))).toBe(true);
+		expect(readdirSync(root).some((n) => n.startsWith(".bigrefactor.old-"))).toBe(false);
+		const asked: unknown[] = [];
+		await expect(confirmStartOver(answer("yes", asked as never), { done: "2 accepted", live: true }, false)).rejects.toThrow(/never runs beside it/);
+		expect(asked).toEqual([]);
+		await expect(confirmStartOver(answer("yes"), { done: "2 accepted", live: false }, false)).resolves.toBeUndefined();
 	});
 });

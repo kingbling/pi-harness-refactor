@@ -91,11 +91,14 @@ export async function init(args: string[], opts: InitOptions = {}): Promise<stri
 	const ui = opts.prompter ?? terminalPrompter;
 	const terminal = ui === terminalPrompter;
 	const cancelled = () => new Error("init cancelled");
-	if (existsSync(resolve(root, CONFIG_FILE)) && !args.includes("--force")) {
+	// a migration under way: init only starts it from scratch, and only when the owner says so (never beside a run)
+	const under = migrationUnderWay(root);
+	if (under) await confirmStartOver(ui, under, yes);
+	if (existsSync(resolve(root, CONFIG_FILE)) && !args.includes("--force") && !under) {
 		throw new Error(`${CONFIG_FILE} already exists here; use --force to overwrite`);
 	}
 
-	await offerFreshStart(root, ui, { yes, fresh: args.includes("--fresh") });
+	await offerFreshStart(root, ui, { yes, fresh: !!under || args.includes("--fresh") });
 
 	let sourcePath = flag("--source");
 	let stack = flag("--stack");
@@ -359,6 +362,49 @@ function subdirOf(stackId: string): string {
 	return TARGET_SUBDIRS[stackId] ?? stackId;
 }
 
+/** A run counts as going on while its open-run mark is set and the ledger was written this recently (a killed run leaves the mark). */
+const LIVE_RUN_MS = 10 * 60_000;
+
+/**
+ * The migration under way in this workspace: its units past planned (`done`, e.g. "1810 accepted, 74 quarantined")
+ * and whether a run is going on now. Undefined when no unit has left planned (only answers or an inventory: no migration yet).
+ */
+export function migrationUnderWay(root: string, now = Date.now()): { done: string; live: boolean } | undefined {
+	const path = join(root, ".bigrefactor", "ledger.sqlite");
+	if (!existsSync(path)) return undefined;
+	let db: DatabaseSync;
+	try {
+		db = new DatabaseSync(path, { readOnly: true });
+	} catch {
+		db = new DatabaseSync(`file:${path}?immutable=1`, { readOnly: true });
+	}
+	try {
+		const rows = db.prepare("SELECT state, COUNT(*) n FROM units WHERE state != 'planned' GROUP BY state ORDER BY n DESC").all() as Array<{ state: string; n: number }>;
+		if (!rows.length) return undefined;
+		const open = (db.prepare("SELECT value FROM meta WHERE key = 'open_run'").get() as { value: string } | undefined)?.value;
+		const written = Math.max(...[path, `${path}-wal`].map((f) => (existsSync(f) ? statSync(f).mtimeMs : 0)));
+		return { done: rows.map((r) => `${r.n} ${r.state}`).join(", "), live: !!open && now - written < LIVE_RUN_MS };
+	} catch {
+		return undefined; // no units table yet: no migration
+	} finally {
+		db.close();
+	}
+}
+
+/**
+ * br init over a migration under way: never beside a running run, never on --yes, and only after the owner answers
+ * yes to starting from scratch (no is the default). Throws unless that yes came.
+ */
+export async function confirmStartOver(ui: InitPrompter, m: { done: string; live: boolean }, yes: boolean): Promise<void> {
+	if (m.live) throw new Error(`a migration run is going on in this workspace (${m.done} units). br init never runs beside it: stop the run first (br stop), or continue it with br run`);
+	if (yes) throw new Error(`a migration is under way in this workspace (${m.done} units): continue it with br run. Starting it from scratch needs your answer, so br init does not run with --yes`);
+	const v = await ui.select(`A migration is under way in this workspace (${m.done} units).\n   br init starts it from scratch: its work moves to .bigrefactor.old-<time> (nothing is deleted) and every unit is migrated again. Really start from scratch?`, [
+		{ value: "no", label: "No, keep the migration (continue it with br run)" },
+		{ value: "yes", label: `Yes, start from scratch (${m.done} units set aside)` },
+	], "no");
+	if (v !== "yes") throw new Error(`init stopped: the migration is kept (${m.done} units); continue it with br run`);
+}
+
 /**
  * A new init in a workspace that still holds earlier work (answers, ledger, rules): those answers would be taken
  * as decided and their questions never asked again. The owner chooses; "start fresh" moves the old state aside
@@ -374,29 +420,13 @@ export async function offerFreshStart(root: string, ui: InitPrompter, o: { yes: 
 		/* no decisions yet */
 	}
 	const ledger = existsSync(join(dir, "ledger.sqlite")) ? statSync(join(dir, "ledger.sqlite")).size : 0;
-	// a migration under way (units past planned): its work is never moved aside on a preselected answer
-	let started: Record<string, number> = {};
-	if (ledger)
-		try {
-			const db = new DatabaseSync(`file:${join(dir, "ledger.sqlite")}?immutable=1`, { readOnly: true });
-			for (const r of db.prepare("SELECT state, COUNT(*) n FROM units WHERE state != 'planned' GROUP BY state").all() as Array<{ state: string; n: number }>) started[r.state] = r.n;
-			db.close();
-		} catch {
-			started = {}; // no units table yet
-		}
-	const done = Object.entries(started).map(([st, n]) => `${n} ${st}`).join(", ");
 	const what = [answers ? `${answers} earlier answers (target stacks, libraries, rules …)` : "", ledger ? `the unit ledger (${Math.max(1, Math.round(ledger / 1e6))} MB)` : "", ...["rules", "truth", "placement.json", "areas.json"].filter((f) => existsSync(join(dir, f)))].filter(Boolean).join(", ");
 	let fresh = o.fresh;
 	if (!fresh && !o.yes) {
-		const v = done
-			? await ui.select(`This workspace holds a migration under way (${done} units): ${what}.`, [
-					{ value: "keep", label: "keep the migration and its work (recommended)" },
-					{ value: "fresh", label: `start over: move the migration aside (${done} units)`, hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted, but the run starts from the beginning" },
-				], "keep")
-			: await ui.select(`This workspace still holds earlier work: ${what}.\n   Kept answers count as decided: onboarding will not ask them again.`, [
-					{ value: "fresh", label: "start fresh (recommended)", hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted" },
-					{ value: "keep", label: "keep the earlier answers and work" },
-				], "fresh");
+		const v = await ui.select(`This workspace still holds earlier work: ${what}.\n   Kept answers count as decided: onboarding will not ask them again.`, [
+			{ value: "fresh", label: "start fresh (recommended)", hint: "the old work is moved to .bigrefactor.old-<time>; nothing is deleted" },
+			{ value: "keep", label: "keep the earlier answers and work" },
+		], "fresh");
 		if (v === undefined) throw new Error("init cancelled");
 		fresh = v === "fresh";
 	}

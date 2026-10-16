@@ -826,6 +826,12 @@ export default function (pi: ExtensionAPI) {
 					refreshStatus(ctx);
 					return;
 				}
+				// /br init over a migration under way is a start from scratch or nothing: init's guard asks (no is the
+				// default) or refuses beside a running run; without --force an existing config would skip it and resume
+				if (sub === "init") {
+					const { migrationUnderWay } = await import("../init/init.ts");
+					if (migrationUnderWay(ctx.cwd) && !rest.includes("--force")) rest.push("--force");
+				}
 				if (ctx.hasUI) return startOnboarding(pi, ctx, sub, rest);
 				// Print/json mode: no widget, nothing to chat with meanwhile; run to completion and print.
 				const { onboard } = await import("../init/onboard.ts");
