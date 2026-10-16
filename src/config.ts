@@ -124,6 +124,8 @@ export const ConfigSchema = z.object({
 			restartOnNewCode: z.boolean().default(false),
 			/** No new unit starts while the disk holding the workspace has less free space than this (GB); running ones finish. 0 = off. */
 			minFreeDiskGb: z.number().min(0).default(10),
+			/** The run removes what this workspace made and no longer needs (left-over worktrees and branches, old backups and transcripts, its stopped containers and unused volumes) on the side: soon after the start, then every this many minutes (0 = off). Only what code can prove is this workspace's. */
+			cleanEveryMinutes: z.number().min(0).default(30),
 			/** `br run` pauses after this many accepted units for a layout review question (0 = off). */
 			sampleSize: z.number().int().min(0).default(10),
 			/** Accepted units with truth only read from the old code get a script that runs it, this many per run (0 = off); one at a time, more while lanes are free. */

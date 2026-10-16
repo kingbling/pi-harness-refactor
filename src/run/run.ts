@@ -41,6 +41,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
 import { createStubSweep } from "./stub-sweep.ts";
+import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
@@ -549,6 +550,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	setStep("removing leftover worktrees");
 	emptyWorktreeTrash(join(o.root, ".bigrefactor", "worktrees"));
 	if (!o.dry) for (const n of await sweepWorktrees(config.target.path, join(o.root, ".bigrefactor", "worktrees"))) log(pc.dim(`removed leftover worktree ${n}`));
+	// what this workspace made and no longer needs goes on the side: soon after the start, then every run.cleanEveryMinutes;
+	// a lane's worktree (a unit id, or <id>-ahead) is in use while the lane runs
+	const cleaner = o.dry || o.spawn ? undefined : createCleaner({ config, root: o.root, ledger, everyMinutes: config.run.cleanEveryMinutes, log, inUse: () => new Set([...running.keys()].flatMap((id) => [id, `${id}-ahead`])) });
 	const branchNow = await mainBranch(config.target.path, config.target.git.branch);
 	if (branchNow !== config.target.git.branch) log(pc.yellow(`target branch ${config.target.git.branch} is gone from ${config.target.path}; units merge into ${branchNow} (the checked-out branch). Set target.git.branch to "${branchNow}" to make it permanent.`));
 	if (!o.dry) {
@@ -566,6 +570,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// the builder starts nothing new from now on (no check, repair or code job while the lanes finish); its running
 		// check is killed, a running repair or code job finishes; the run's end waits for it
 		void builder.stop().catch(() => undefined);
+		void cleaner?.stop();
 		log(pc.yellow(`■ stop requested (${reason}): ${stopRecord.finishing.length} running lane(s) stop at their next step, code kept${stopRecord.finishing.length ? ` (${stopRecord.finishing.join(", ")})` : ""}; no new units start`));
 	};
 	const onSigint = () => {
@@ -1121,6 +1126,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			// A pilot of N migrates N units: in-flight units count toward the limit (otherwise up to N+lanes-1 land).
 			const underLimit = () => o.limit === undefined || acceptedNow + running.size < o.limit;
 			if (!stop && !dayCapHit) tidyJobs.next();
+			// the cleaner removes what this workspace made and no longer needs, on the side (never during a stop)
+			if (!stop) cleaner?.tick();
 			const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : (diskReason() ?? (await samplePause()));
 			let readyNow = 0;
 			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
@@ -1244,6 +1251,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		else await waitOn("a code job is fixing a difference many slices share", () => sharedRunning!);
 	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
+	// a stop ends the cleaner between items; it does not outlive the run
+	if (cleaner) await waitOn("finishing the cleanup pass", () => cleaner.stop());
 	// a stub sweep's code job finishes (it merges on main) before the run ends
 	if (stubSweep) await waitOn("a code job is replacing stubs no unit will replace", () => stubSweep.idle());
 	// the builder checks what was merged since its last pass (a stop skips it: the next run's builder does it)

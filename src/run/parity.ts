@@ -15,6 +15,7 @@ import { legacyCopyTool, loadLegacyEnv, ownerPreference, type ProbeAnswer, type 
 import { exec } from "../proc.ts";
 import { readFile, rm } from "node:fs/promises";
 import { setStep } from "./watchdog.ts";
+import { recordOwnedTool } from "./cleanup.ts";
 
 /**
  * Differential parity, step one: can the OLD app and the NEW app each be started here as a local server that
@@ -439,9 +440,9 @@ export const findAppBootWithModel: AppFixer = async (o) => {
 		config: o.config,
 		writeGlobs: ["**"],
 		protectedGlobs: [],
-		customTools: [...(legacy ? [legacyCopyTool(o.root, o.config)] : []), ...appBootTools(o.config, o.root, o.side)],
+		customTools: [...(legacy ? [legacyCopyTool(o.root, o.config)] : []), ...appBootTools(o.config, o.root, o.side), recordOwnedTool(o.root)],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__parity__.${o.side}.${Date.now()}.jsonl`),
-		systemPrompt: `You find out how to start ${legacy ? `the OLD app (${o.config.source.stack})` : `the NEW ${o.side} project of a migration`} as a local server, so a migration tool can send the same HTTP requests to the old and the new app and compare the answers. Read what the project itself says (README and docs, compose and container files, package or build manifests, scripts, the framework's own dev server) and check which tools this machine really has (versions, docker) before choosing a way. ${legacy ? `The legacy repo (${o.config.source.path}) is read-only: call make_legacy_copy first, then install and start everything in the copy. ` : ""}Try recipes with check_app_boot (it starts the app, waits for the ready URL and stops it), save the one that works with set_app_boot. Never start the app server yourself in bash and never leave it running; a database the app needs may be started and may stay up. Never interactive prompts. End with one sentence saying how the app starts, or exactly what is missing.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You find out how to start ${legacy ? `the OLD app (${o.config.source.stack})` : `the NEW ${o.side} project of a migration`} as a local server, so a migration tool can send the same HTTP requests to the old and the new app and compare the answers. Read what the project itself says (README and docs, compose and container files, package or build manifests, scripts, the framework's own dev server) and check which tools this machine really has (versions, docker) before choosing a way. ${legacy ? `The legacy repo (${o.config.source.path}) is read-only: call make_legacy_copy first, then install and start everything in the copy. ` : ""}Try recipes with check_app_boot (it starts the app, waits for the ready URL and stops it), save the one that works with set_app_boot. Never start the app server yourself in bash and never leave it running; a database the app needs may be started and may stay up. Docker on this machine is shared with other projects: start your own containers and volumes and put the label bigrefactor.root=${resolve(o.root)} on each (docker run --label, docker volume create --label, labels: in a compose file); never create databases or anything else inside another project's container when you can start your own; whatever you still make without that label (a database inside a server you did not start), write down with record_owned. The workspace removes only what is labelled or recorded, once no recipe names it. Never interactive prompts. End with one sentence saying how the app starts, or exactly what is missing.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		const r = await session.run(`${o.problem}${truth ? ownerPreference(truth) : ""}`);

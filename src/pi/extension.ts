@@ -52,6 +52,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	forecast: "how far the migration is: done, open, spend and time left",
 	lanes: "lanes [n] [gates m]: show/change parallel units live (running units finish)",
 	push: "push [on|off] [remote] | replace: push the migration branch to the target repo's remote after merges; replace overwrites a remote branch with another history",
+	clean: "clean [--yes]: what this workspace made and no longer needs (left-over worktrees, branches, old backups, its stopped containers, unused volumes); --yes removes it; only what is provably this workspace's",
 	why: "why <id|path>: full history of a symbol or file",
 	unaccounted: "symbols not yet in a terminal state",
 	questions: "open questions waiting for you (list)",
@@ -732,6 +733,21 @@ export default function (pi: ExtensionAPI) {
 					show(ctx, "push", await pushSetting(p, rest));
 				} catch (e: any) {
 					warn(ctx, `push: ${e?.message ?? e}`);
+				}
+				return;
+			}
+			if (sub === "clean") {
+				const cp = findConfigPath(ctx.cwd);
+				if (!cp) return warn(ctx, "no bigrefactor.config.json here");
+				const { config, root } = loadConfig(cp);
+				const { cleanCommand } = await import("../run/cleanup.ts");
+				const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+				try {
+					show(ctx, "clean", (await cleanCommand({ config, root, ledger, apply: rest.includes("--yes") })).join("\n"));
+				} catch (e: any) {
+					warn(ctx, `clean: ${e?.message ?? e}`);
+				} finally {
+					ledger.close();
 				}
 				return;
 			}

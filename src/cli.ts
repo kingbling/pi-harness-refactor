@@ -51,6 +51,9 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
   br push [on|off] [remote]    push the migration branch to the target repo's remote after merges
   br push replace              overwrite the remote's migration branch with this repo's (when push says it has another history)
+  br clean [--yes]             what this workspace made and no longer needs (left-over worktrees and branches, old backups and
+                               transcripts, its stopped containers and unused volumes); --yes removes it. Only what is provably
+                               this workspace's; a running br run does this by itself every run.cleanEveryMinutes
   br forecast                  how far the migration is: done, open, spend and time left (with range)
   br questions | answer <id> <text>   open human questions (nothing unrelated waits on them)
   br why <symbol|path>         full history of one symbol or file
@@ -76,6 +79,15 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const p = findConfigPath();
 		if (!p) throw new Error("no bigrefactor.config.json here");
 		console.log(await pushSetting(p, args));
+	},
+	clean: async (args) => {
+		const { config, root, ledger } = open();
+		const { cleanCommand } = await import("./run/cleanup.ts");
+		try {
+			console.log((await cleanCommand({ config, root, ledger, apply: args.includes("--yes"), log: (l) => console.log(l) })).join("\n"));
+		} finally {
+			ledger.close();
+		}
 	},
 	forecast: async () => {
 		const { forecast, renderForecast } = await import("./run/forecast.ts");
