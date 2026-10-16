@@ -6,7 +6,7 @@ import pc from "picocolors";
 import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, mainBranch, removeWorktree, whitespaceOnly, deleteBranch } from "../git.ts";
+import { addWorktree, mainBranch, removeWorktree, whitespaceOnly, deleteBranch, wsBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { placeUnit } from "./placement.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -261,7 +261,7 @@ export function createBuilder(o: {
 		const adapter = o.adapters.get(stackId);
 		if (!adapter) return false;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__builder__${stackId}`);
-		const branch = `builder/${stackId}`;
+		const branch = wsBranch(o.root, `builder/${stackId}`);
 		const reset = async () => {
 			await removeWorktree(o.config.target.path, wt);
 			try {

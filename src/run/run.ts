@@ -17,7 +17,7 @@ import { loadSpend, paidSince } from "../spend.ts";
 import { setStep, startWatchdog } from "./watchdog.ts";
 import { gateSlots, loadConfig, type Config } from "../config.ts";
 import { ensureLedgerIndexes } from "../ledger/indexes.ts";
-import { addWorktree, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree, deleteBranch } from "../git.ts";
+import { addWorktree, claimMainBranch, emptyWorktreeTrash, headOf, isRepo, mainBranch, removeWorktree, deleteBranch, wsBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import { probeLegacyEnv, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
@@ -544,6 +544,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	let cost = 0;
 	let stop = false;
 	const startedAt = new Date().toISOString();
+	// two workspaces on one repo and main branch would both merge into it
+	const other = o.dry ? undefined : await claimMainBranch(config.target.path, config.target.git.branch, o.root);
+	if (other) throw new Error(`another workspace (${other}) already migrates into ${config.target.git.branch} of ${config.target.path}: give this workspace its own target.git.branch, or remove that workspace's .bigrefactor folder`);
 	if (!o.dry) ledger.setMeta(OPEN_RUN, JSON.stringify({ startedAt }));
 	// every model call of this run (units, setup and builder sessions, doctor, triage, questions) for the total
 	const usageAtStart = progress.tally();
@@ -671,7 +674,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const w = joinWave();
 		const p = agents.run(async () => {
 			const wt = worktreeDir(o.root, unitId) + "-ahead";
-			const branch = `ahead/${unitId}`;
+			const branch = wsBranch(o.root, `ahead/${unitId}`);
 			const drop = async () => {
 				await removeWorktree(config.target.path, wt);
 				try {
@@ -724,7 +727,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const w = joinWave();
 		const p = agents.run(async () => {
 			const wt = worktreeDir(o.root, unitId);
-			const branch = `unit/${unitId}`;
+			const branch = wsBranch(o.root, `unit/${unitId}`);
 			const fresh = async () => {
 				await removeWorktree(config.target.path, wt);
 				try {
@@ -2047,7 +2050,7 @@ export async function requeueUnits(ledger: Ledger, config: Config, root: string,
 		await removeWorktree(config.target.path, worktreeDir(root, id));
 		if (!o.keepCode || o.fresh || o.human) {
 			try {
-				await deleteBranch(config.target.path, `unit/${id}`);
+				await deleteBranch(config.target.path, wsBranch(root, `unit/${id}`));
 			} catch {
 				/* no branch */
 			}

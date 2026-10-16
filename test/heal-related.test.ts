@@ -127,7 +127,7 @@ describe("self-heal asks about every change and keeps the unit's code", () => {
 	it("a self-heal requeue keeps the unit's code and the next start puts it on current main; an owner's requeue drops it", async () => {
 		const { root, config, ledger } = workspace();
 		const { keepUnitWork, requeueUnits, restoreKeptWork } = await import("../src/run/run.ts");
-		const { addWorktree } = await import("../src/git.ts");
+		const { addWorktree, wsBranch } = await import("../src/git.ts");
 		const { execFileSync } = await import("node:child_process");
 		const repo = config.target.path;
 		const git = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
@@ -141,7 +141,7 @@ describe("self-heal asks about every change and keeps the unit's code", () => {
 			ledger.transitionUnit(id, "truth", "t");
 			ledger.transitionUnit(id, "quarantined", "gate still red after 5 attempts (wired_ok)");
 			const wt = join(root, "wt", id);
-			await addWorktree(repo, wt, `unit/${id}`);
+			await addWorktree(repo, wt, wsBranch(root, `unit/${id}`));
 			writeFileSync(join(wt, `${id}.txt`), "code\n");
 			ledger.updateUnit(id, { meta: { keptWork: await keepUnitWork(wt, id), reviewFindings: [`- ${id}.txt:1: stub → port it`] } });
 			git(repo, "worktree", "remove", "--force", wt);
@@ -150,7 +150,7 @@ describe("self-heal asks about every change and keeps the unit's code", () => {
 		await requeueUnits(ledger, config, root, ["U2"], "owner", { human: true });
 		const kept = JSON.parse(ledger.getUnit("U1")!.meta).keptWork as string;
 		expect(kept).toBeTruthy();
-		expect(git(repo, "branch", "--list", "unit/*")).toBe("unit/U1");
+		expect(git(repo, "branch", "--list", "--format=%(refname:short)").split("\n").sort()).toEqual([wsBranch(root, "unit/U1"), "main"].sort());
 		// the owner's requeue drops the code, and with it the reviewer's findings about that code
 		expect(JSON.parse(ledger.getUnit("U2")!.meta)).not.toHaveProperty("keptWork");
 		expect(JSON.parse(ledger.getUnit("U2")!.meta)).not.toHaveProperty("reviewFindings");

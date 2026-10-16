@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { exec } from "./proc.ts";
 
 /**
@@ -134,6 +135,31 @@ export async function renameDir(repo: string, from: string, to: string, message:
 }
 
 /** Worktree per unit so parallel implementers never share a working copy. */
+/**
+ * A branch this workspace makes in the target repo: its name carries the workspace (folder name and a hash of its
+ * path). Another workspace on the same repo makes branches for the same unit ids, and adding a worktree with -B, or
+ * deleting a leftover branch, would otherwise reset or delete that workspace's work.
+ */
+export function wsBranch(root: string, name: string): string {
+	const abs = resolve(root);
+	const slug = basename(abs).replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "ws";
+	return `br-${slug}-${createHash("sha1").update(abs).digest("hex").slice(0, 6)}/${name}`;
+}
+
+/**
+ * One workspace per main branch: the first run of a workspace writes it into the target repo's git config; a run of
+ * another workspace on the same repo and main branch is refused while that workspace still exists (both would merge
+ * into one main). Returns the other workspace's path when refused.
+ */
+export async function claimMainBranch(repo: string, branch: string, root: string): Promise<string | undefined> {
+	const key = `bigrefactor.${branch}.workspace`;
+	const me = resolve(root);
+	const cur = (await git(repo, ["config", "--get", key]).catch(() => "")).trim();
+	if (cur && cur !== me && existsSync(join(cur, ".bigrefactor"))) return cur;
+	if (cur !== me) await git(repo, ["config", key, me]);
+	return undefined;
+}
+
 export async function addWorktree(repo: string, worktreePath: string, branch: string): Promise<void> {
 	if (existsSync(worktreePath)) return; // same unit resuming in place: keep its work
 	// A new worktree always starts from the current main: -B resets a leftover unit branch (from a parked or

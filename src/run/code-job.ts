@@ -3,7 +3,7 @@ import { join, relative } from "node:path";
 import pc from "picocolors";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, deleteBranch, removeWorktree } from "../git.ts";
+import { addWorktree, deleteBranch, removeWorktree, wsBranch } from "../git.ts";
 import { probeStillFails, projectDir } from "../init/init.ts";
 import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -152,7 +152,7 @@ export async function runCodeJob(o: {
 async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefined> {
 	const repo = o.config.target.path;
 	const wt = join(o.root, ".bigrefactor", "worktrees", `__code__${o.label}`);
-	const branch = `code/${o.label}`;
+	const branch = wsBranch(o.root, `code/${o.label}`);
 	const reset = async () => {
 		await removeWorktree(repo, wt);
 		try {

@@ -6,7 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
 import type { Config } from "../config.ts";
-import { addWorktree, headOf, removeWorktree, deleteBranch } from "../git.ts";
+import { addWorktree, headOf, removeWorktree, deleteBranch, wsBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
@@ -154,18 +154,17 @@ export function appRoot(config: Config, root: string, side: string): string {
 }
 
 export const targetWorktree = (root: string) => join(root, ".bigrefactor", "worktrees", "__parity__");
-const TARGET_BRANCH = "parity/main";
 
 /** A fresh worktree of main for the new app (dependencies linked like a unit's). */
 export async function prepareTargetCopy(config: Config, root: string, linkAll: (wt: string) => void | Promise<void>): Promise<string> {
 	const wt = targetWorktree(root);
 	await removeWorktree(config.target.path, wt);
 	try {
-		await deleteBranch(config.target.path, TARGET_BRANCH);
+		await deleteBranch(config.target.path, wsBranch(root, "parity/main"));
 	} catch {
 		/* no branch */
 	}
-	await addWorktree(config.target.path, wt, TARGET_BRANCH);
+	await addWorktree(config.target.path, wt, wsBranch(root, "parity/main"));
 	await linkAll(wt);
 	return wt;
 }

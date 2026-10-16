@@ -4,7 +4,7 @@ import pc from "picocolors";
 import { keepOverrides } from "../adapters/command-overrides.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
-import { addWorktree, commitAll, headOf, mainBranch, removeWorktree, deleteBranch } from "../git.ts";
+import { addWorktree, commitAll, headOf, mainBranch, removeWorktree, deleteBranch, wsBranch } from "../git.ts";
 import { projectDir } from "../init/init.ts";
 import { indexTarget } from "../inventory/target.ts";
 import type { Ledger } from "../ledger/db.ts";
@@ -87,7 +87,7 @@ export function createTidyJobs(o: {
 	const run = async (t: TidyTask, work: TidyWorker) => {
 		const adapter = o.adapters.get(t.stack)!;
 		const wt = join(o.root, ".bigrefactor", "worktrees", `__tidy__${t.id}`);
-		const branch = `tidy/${t.id}`;
+		const branch = wsBranch(o.root, `tidy/${t.id}`);
 		const reset = async () => {
 			await removeWorktree(o.config.target.path, wt);
 			try {
