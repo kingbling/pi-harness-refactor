@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
 import { Type } from "typebox";
@@ -128,6 +128,10 @@ export const createProjectWithModel: ProjectCreator = async (o) => {
 
 const fixing = new Map<string, Promise<string | undefined>>();
 const fixes = new Map<string, number>();
+/** Per stack: what the setup guard put back from its last fix. */
+const putBack = new Map<string, string[]>();
+/** Why a setup fix changed nothing: it never ran (a limit, `ran` false) or it ran and nothing stayed, with what the model said. */
+export type NoFix = { ran: boolean; why: string; said?: string };
 /** Fix sessions per problem: a problem the model does not fix in this many tries goes to the owner. */
 export const MAX_FIXES_PER_PROBLEM = 2;
 /** Fix sessions per stack in one process that changed nothing (a cost guard, not a stop: the run goes on); fixes that worked do not count. */
@@ -160,8 +164,9 @@ function migratedCodeDirs(adapter: TargetAdapter): string[] {
  * builder does for tests. Tests are the truth and accepted code is proven by them; a setup fix runs neither.
  * `migrated` (project-relative files the ledger's moves point to) says which existing files hold migrated code: a
  * folder that also holds the stack's own wiring (a config folder) is no reason to put back a feature registration.
- * New source files in the code folders are new app code: put back too, unless a file the fix keeps names them by
- * their path (a tool config loading a bootstrap file): then they are part of the fix, and putting them back would
+ * New source files in the code folders are new app code: put back too, unless a file the fix keeps, a file on main or
+ * another such new file names them by their path, full or from its own folder (a tool config loading a bootstrap
+ * file, a committed loader reading `__DIR__/assets/x`): then they are part of the fix, and putting them back would
  * leave main pointing at a missing file. New source files in a folder outside the layout (`src/api/` next to the feature
  * root, see strayDirs) or in a folder the fix made (`config/reports/`) are new app code too: a setup fix makes no
  * source folders. Without the ledger, the folders decide.
@@ -203,18 +208,39 @@ export async function undoMigratedCode(repo: string, projectDir: string, adapter
 		if (undo === "always" && !isNew && await whitespaceOnly(repo, path)) undo = "keep"; // a formatter's fix changes no behaviour
 		changes.push({ path, rel, isNew, from, undo });
 	}
-	// what the fix keeps: a new code file one of them names by path belongs to the fix
-	const kept = changes.filter((c) => c.undo === "keep").map((c) => {
+	// what names a new code file by path belongs with it: a file the fix keeps, a file already on main (a committed
+	// loader whose asset went missing), or another new file kept that way. By its full path or by its path from the
+	// naming file's own folder (`__DIR__/assets/x`), the way a loader names the file next to it
+	const read = (p: string) => {
 		try {
-			return readFileSync(join(repo, c.path), "utf8");
+			return readFileSync(join(repo, p), "utf8");
 		} catch {
 			return "";
 		}
-	});
+	};
+	const namers = changes.filter((c) => c.undo === "keep").map((c) => ({ path: c.path, text: read(c.path) }));
+	const onMain = async (c: { path: string }) => {
+		try {
+			const hits = (await exec("git", ["-C", repo, "grep", "-l", "-F", "-e", basename(c.path), "HEAD", "--", proj || "."])).split("\n").filter(Boolean);
+			return hits.map((h) => h.replace(/^HEAD:/, "")).filter((p) => p !== c.path).map((p) => ({ path: p, text: read(p) }));
+		} catch {
+			return []; // no file on main names it
+		}
+	};
+	const named = (c: { path: string; rel?: string }, n: { path: string; text: string }) => n.text.includes(c.rel!) || n.text.includes(c.path) || n.text.includes(relative(dirname(n.path), c.path));
+	const wanted = new Set<string>();
+	const candidates = changes.filter((c) => c.undo === "newCode");
+	for (const c of candidates) if ((await onMain(c)).some((n) => named(c, n))) wanted.add(c.path);
+	// until nothing more is found: a kept config names a new loader, the loader names its asset
+	for (let more = true; more; ) {
+		more = false;
+		const all = [...namers, ...candidates.filter((c) => wanted.has(c.path)).map((c) => ({ path: c.path, text: read(c.path) }))];
+		for (const c of candidates) if (!wanted.has(c.path) && all.some((n) => n.path !== c.path && named(c, n))) wanted.add(c.path), (more = true);
+	}
 	const undone: string[] = [];
 	for (const c of changes) {
 		if (c.undo === "keep") continue;
-		if (c.undo === "newCode" && kept.some((t) => t.includes(c.rel!) || t.includes(c.path))) continue;
+		if (c.undo === "newCode" && wanted.has(c.path)) continue;
 		if (c.isNew) {
 			await exec("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", c.path]);
 			rmSync(join(repo, c.path), { force: true });
@@ -265,14 +291,16 @@ async function bootCheck(adapter: TargetAdapter, root: string, projectDir: strin
  * stack's fixes log, which wakes the units parked on a setup problem, and kept in the ledger as a `__setup__`
  * attempt (what changed, what was put back, what the model said). Returns what changed, or undefined when nothing did.
  */
-export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer; ledger?: Ledger; lock?: <T>(fn: () => Promise<T>) => Promise<T>; unitId?: string }): Promise<string | undefined> {
+export async function fixRunSetup(o: { config: Config; root: string; adapter: TargetAdapter; projectDir: string; problem: string; signature?: string; fixer?: SetupFixer; ledger?: Ledger; lock?: <T>(fn: () => Promise<T>) => Promise<T>; unitId?: string; onNoFix?: (why: NoFix) => void }): Promise<string | undefined> {
 	const key = o.adapter.id;
 	const parks = () => (o.unitId && o.ledger ? ((JSON.parse(o.ledger.getUnit(o.unitId)?.meta ?? "{}") as { setupParks?: number }).setupParks ?? 0) : 0);
-	if (parks() >= MAX_SETUP_PARKS) return undefined;
+	const notRun = (why: string) => (o.onNoFix?.({ ran: false, why }), undefined);
+	if (parks() >= MAX_SETUP_PARKS) return notRun(`this unit already waited on ${MAX_SETUP_PARKS} setup fixes`);
 	const running = fixing.get(key);
-	if (running) return running;
+	if (running) return running.then((r) => r ?? notRun("another setup fix for this stack was running and changed nothing"));
 	const problemKey = `${key}|${o.signature ?? o.problem.slice(0, 200)}`;
-	if ((fixes.get(problemKey) ?? 0) >= MAX_FIXES_PER_PROBLEM || (fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return undefined;
+	if ((fixes.get(problemKey) ?? 0) >= MAX_FIXES_PER_PROBLEM) return notRun(`the setup model already tried this problem ${MAX_FIXES_PER_PROBLEM} times in this run`);
+	if ((fixes.get(key) ?? 0) >= MAX_RUN_FIXES) return notRun(`${MAX_RUN_FIXES} setup fixes of this stack changed nothing in this run`);
 	fixes.set(problemKey, (fixes.get(problemKey) ?? 0) + 1);
 	const wasted = () => fixes.set(key, (fixes.get(key) ?? 0) + 1);
 	const lock = o.lock ?? (<T>(fn: () => Promise<T>) => fn());
@@ -286,7 +314,10 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 		const attempt = o.ledger?.startAttempt("__setup__", `fix:${key}`, o.config.models.escalate.id);
 		// main's start-up check before the fix: a fix must not leave an app that started unable to start
 		const bootBefore = await bootCheck(o.adapter, o.root, o.projectDir);
-		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem: o.problem, attempt: fixes.get(problemKey)! }).catch((e) => {
+		// files the last fix wrote and the setup guard put back: this fix knows, instead of writing them again into the same loss
+		const lost = putBack.get(key);
+		const problem = lost?.length ? `${o.problem}\n\nThe last setup fix of this stack wrote these files and they were put back before its commit (new source files that no kept file and no file on main names by path count as app code): ${lost.slice(0, 10).join(", ")}. If the fix needs one, have the file that uses it name it by its path.` : o.problem;
+		const said = await (o.fixer ?? fixSetupWithModel)({ config: o.config, root: o.root, adapter: o.adapter, projectDir: o.projectDir, problem, attempt: fixes.get(problemKey)! }).catch((e) => {
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000) } });
 			wasted();
 			throw e;
@@ -362,12 +393,14 @@ export async function fixRunSetup(o: { config: Config; root: string; adapter: Ta
 			console.log(pc.red(`  setup fix put back: ${cannotFail.slice(0, 500)}`));
 			if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: bootBroken ? "boot_broken" : "probe_failed", gateReport: { said, error: cannotFail, problem: o.problem.slice(0, 2000) } });
 			wasted();
+			o.onNoFix?.({ ran: true, why: `the fix was put back whole: ${cannotFail.slice(0, 300)}`, said: said || undefined });
 			return undefined;
 		}
+		putBack.set(key, undone);
 		if (undone.length) console.log(pc.yellow(`  setup fix: put back ${undone.length} file(s) it changed (tests, migrated code, another stack's project): ${undone.slice(0, 5).join(", ")}${undone.length > 5 ? " …" : ""}`));
 		const override = settings() !== before;
 		if (attempt !== undefined) o.ledger!.endAttempt(attempt, { outcome: sha || override ? "fixed" : "no_change", gateReport: { said, commit: sha ?? null, changedFiles: changed, undone, override, problem: o.problem.slice(0, 2000) } });
-		if (!sha && !override) return (wasted(), undefined);
+		if (!sha && !override) return (wasted(), o.onNoFix?.({ ran: true, why: undone.length ? `the setup guard put back all it wrote: ${undone.slice(0, 5).join(", ")}` : "the setup model changed nothing", said: said || undefined }), undefined);
 		const what = said || "the setup was changed";
 		noteFix(o.root, key, sha, what);
 		if (o.unitId && o.ledger) o.ledger.updateUnit(o.unitId, { meta: { setupParks: parks() + 1 } });

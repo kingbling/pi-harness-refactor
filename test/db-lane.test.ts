@@ -434,3 +434,17 @@ describe("DB lane: tables no parser reads are found by a model with tools", () =
 		expect(existsSync(foundTablesPath(ws))).toBe(false);
 	});
 });
+
+describe("a reopened DB unit's own tests", () => {
+	it("are the tests its green attempts wrote, less any another unit's green attempt wrote too", async () => {
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { ownTests } = await import("../src/run/db-unit.ts");
+		const ledger = new Ledger(":memory:");
+		for (const id of ["DB_a", "DB_b"]) ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const green = (u: string, files: string[], outcome = "gate_green") => ledger.endAttempt(ledger.startAttempt(u, "implement"), { outcome, gateReport: { changedFiles: files } });
+		green("DB_a", ["migrations/ATest.php", "migrations/V1.php", "migrations/SharedTest.php"]);
+		green("DB_a", ["migrations/RedTest.php"], "gate_red:tests");
+		green("DB_b", ["migrations/SharedTest.php", "migrations/BTest.php"]);
+		expect(ownTests(ledger, "DB_a", (f) => f.endsWith("Test.php"))).toEqual(["migrations/ATest.php"]);
+	});
+});

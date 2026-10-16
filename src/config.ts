@@ -103,6 +103,8 @@ export const ConfigSchema = z.object({
 	run: z
 		.object({
 			agentConcurrency: z.number().int().min(1).default(8),
+			/** Units of one target module running at once (their merges may clash; the merge rounds settle that). The DB lane and shared modules run one at a time. */
+			unitsPerModule: z.number().int().min(1).default(3),
 			/** Gate slots; unset = follow the lanes (see gateSlots). Set only when the owner picks a number with `br lanes --gates`. */
 			gateConcurrency: z.number().int().min(1).optional(),
 			maxImplementAttempts: z.number().int().min(1).default(3),

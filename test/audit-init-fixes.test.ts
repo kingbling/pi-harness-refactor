@@ -39,6 +39,38 @@ describe("setup fix during the run: renames and failed commits", () => {
 		expect(git(target, "status", "--porcelain")).toBe("");
 	});
 
+	it("a new asset a committed loader names from its own folder stays: a fix that only restores it is not put back", async () => {
+		const { undoMigratedCode } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { target, adapter } = targetRepo("asset");
+		mkdirSync(join(target, "tools", "setup"), { recursive: true });
+		writeFileSync(join(target, "tools", "setup", "provision.ts"), "readFileSync(__dirname + '/assets/contract.ts')\n");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
+		// the restore: only the asset, in a folder main does not have, with a source extension
+		mkdirSync(join(target, "tools", "setup", "assets"), { recursive: true });
+		writeFileSync(join(target, "tools", "setup", "assets", "contract.ts"), "export {}\n");
+		// a stray new source file nothing names is still app code
+		mkdirSync(join(target, "tools", "other"), { recursive: true });
+		writeFileSync(join(target, "tools", "other", "stray.ts"), "export {}\n");
+		expect(await undoMigratedCode(target, target, adapter)).toEqual(["tools/other/stray.ts"]);
+		expect(existsSync(join(target, "tools", "setup", "assets", "contract.ts"))).toBe(true);
+	});
+
+	it("a kept config names a new loader, the loader names its new asset from its folder: both stay", async () => {
+		const { undoMigratedCode } = await import("../src/init/setup-fixer.ts");
+		const { ensureRepo, commitAll } = await import("../src/git.ts");
+		const { target, adapter } = targetRepo("chain");
+		writeFileSync(join(target, "tool.config"), "x\n");
+		await ensureRepo(target, "migration/main", []);
+		await commitAll(target, "init");
+		writeFileSync(join(target, "tool.config"), "run tools/setup/load.ts\n");
+		mkdirSync(join(target, "tools", "setup", "assets"), { recursive: true });
+		writeFileSync(join(target, "tools", "setup", "load.ts"), "read('assets/data.ts')\n");
+		writeFileSync(join(target, "tools", "setup", "assets", "data.ts"), "export {}\n");
+		expect(await undoMigratedCode(target, target, adapter)).toEqual([]);
+	});
+
 	it("a commit a hook refuses leaves main clean, not with the fixer's edits", async () => {
 		const { fixRunSetup } = await import("../src/init/setup-fixer.ts");
 		const { ensureRepo, commitAll } = await import("../src/git.ts");

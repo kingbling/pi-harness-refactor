@@ -15,8 +15,8 @@ import { runScheduler } from "../src/run/run.ts";
 const here = resolve(import.meta.dirname, "..");
 
 describe("one unit per area at a time", () => {
-	it("a scheduling pass with free lanes starts one unit of an area, not all of them", async () => {
-		const ws = join(here, ".sim", "one-unit-per-area");
+	it.each([1, 2])("a scheduling pass with free lanes starts run.unitsPerModule (%i) units of an area, not all of them", async (limit) => {
+		const ws = join(here, ".sim", `one-unit-per-area-${limit}`);
 		rmSync(ws, { recursive: true, force: true });
 		cpSync(join(here, "fixtures", "mini-app"), join(ws, "legacy"), { recursive: true });
 		const target = join(ws, "migrated");
@@ -25,7 +25,7 @@ describe("one unit per area at a time", () => {
 		await ensureRepo(target, "migration/main");
 		await commitAll(target, "chore: bootstrap");
 		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
-		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {}, run: { agentConcurrency: 4, gateConcurrency: 1, minFreeDiskGb: 0 } });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {}, run: { agentConcurrency: 4, gateConcurrency: 1, minFreeDiskGb: 0, unitsPerModule: limit } });
 		writeFileSync(join(ws, "bigrefactor.config.json"), JSON.stringify(config, null, 2));
 		process.env["BR_WORKSPACE"] = ws;
 		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
@@ -55,7 +55,7 @@ describe("one unit per area at a time", () => {
 			},
 		});
 		const left = ledger.db.prepare("SELECT DISTINCT entity_id FROM transitions WHERE entity = 'unit' AND from_state = 'planned'").all() as Array<{ entity_id: string }>;
-		expect(left.map((r) => r.entity_id)).toHaveLength(1);
+		expect(left.map((r) => r.entity_id)).toHaveLength(limit);
 		ledger.close();
 	}, 60_000);
 });

@@ -132,6 +132,10 @@ export async function runCodeJob(o: {
 	onRefused?: (problem: string, diff: string) => void;
 	/** told what the job wanted to change in the files that decide how the checks run (put back): the setup model's to judge */
 	onLocked?: (l: { files: string[]; diff: string }) => void;
+	/** told what the job said when it changed nothing (it returns undefined then): why it could not, in its words */
+	onNothing?: (said: string) => void;
+	/** told why the job broke on the way (a merge conflict, a crash): nothing about the task, it may run again later */
+	onFailed?: (why: string) => void;
 	/**
 	 * The job serves a waiting unit: its worktree starts from main plus that unit's current work (`apply` puts it on
 	 * top, false when it does not apply), and the job merges both. The unit's own stub marks are then its to remove.
@@ -190,6 +194,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, lockedFiles: [...locked.files], problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
 			o.log(pc.yellow(`code job ${o.label}: not merged — ${problem.split("\n")[0]}`));
 			if (changed.length || locked.files.size) o.onRefused?.(problem, [await jobDiff(dir, changed), ...locked.diffs].filter(Boolean).join("\n").slice(0, 8000));
+			else o.onNothing?.(said);
 			return undefined;
 		}
 		const sha = await o.mergeFix(wt, branch, `feat(${o.adapter.id}): ${(said || o.what).split("\n")[0]!.slice(0, 120)}\n\ncode job ${o.label}`);
@@ -201,6 +206,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	} catch (e: any) {
 		o.ledger.endAttempt(attempt, { outcome: "exception", gateReport: { error: String(e?.message ?? e).slice(0, 2000), what: o.what.slice(0, 2000) } });
 		o.log(pc.yellow(`code job ${o.label}: failed (${String(e?.message ?? e).split("\n")[0]})`));
+		o.onFailed?.(String(e?.message ?? e).slice(0, 1000));
 		return undefined;
 	} finally {
 		await reset();

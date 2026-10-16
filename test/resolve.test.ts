@@ -79,9 +79,14 @@ describe("resolver model before the owner", () => {
 		expect(jobs).toEqual(["create the bootstrap file the lint config loads"]);
 		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — retry after fixing the setup\nhint: what the fix job changed on main: created the bootstrap file", answered_by: FIX_JOB });
 		const b = ask();
+		// nothing stayed: the resolver looks once more, with the job's outcome and words in its facts, then the unit is parked
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => ({ nothing: "the setup guard put back all it wrote: tools/assets/a.yaml" }) });
+		expect(ledger.getQuestion(b)!.status).toBe("open");
+		expect(JSON.parse(ledger.getQuestion(b)!.context!).lastJob).toMatch(/changed nothing: create the bootstrap file .*\nWhy, and what it said: the setup guard put back all it wrote/s);
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => undefined });
 		expect(ledger.getQuestion(b)).toMatchObject({ status: "answered", answer: expect.stringMatching(/^leave — leave it parked\nhint: a fix job was tried and changed nothing/), answered_by: RESOLVER });
 		const c = ledger.askQuestion({ point: "budget", question: "the setup needs a paid service", options: ["retry — retry", "stop — stop"], askedBy: "orchestrator" });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => undefined });
 		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, fixJob: async () => undefined });
 		expect(JSON.parse(ledger.getQuestion(c)!.context!).forOwner).toMatch(/fix job was tried and changed nothing/);
 	});
@@ -100,13 +105,24 @@ describe("resolver model before the owner", () => {
 		expect(ledger.getQuestion(a)).toMatchObject({ status: "answered", answer: "retry — try again\nhint: what the code job changed on main: added the endpoint with tests", answered_by: CODE_JOB });
 	});
 
+	it("a job that never ran or broke (a limit, a merge conflict) keeps the question open for later, it parks nothing", async () => {
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["symfony"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const a = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "the page needs a shared view", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
+		const resolver: Resolver = async () => ({ code: "add the shared view", then: "retry" });
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: async () => ({ failed: "merge conflict rebasing code/q1 onto migration/main" }) });
+		expect(ledger.getQuestion(a)!.status).toBe("open");
+		expect(JSON.parse(ledger.getQuestion(a)!.context!)).toMatchObject({ resolverFailed: 1 });
+	});
+
 	it("a code job the check refused: the resolver hears why it was not merged, not that it changed nothing", async () => {
 		const ledger = new Ledger(":memory:");
 		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["symfony"] }, models: {} });
 		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
 		const a = ledger.askQuestion({ unitId: "u1", point: "quarantine", question: "the bundle is not registered", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
 		const resolver: Resolver = async () => ({ code: "register the Inventory bundle", then: "retry" });
-		await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: async () => ({ refused: "protected config was changed: config/bundles/registry.php" }) });
+		for (let i = 0; i < 2; i++) await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: async () => ({ refused: "protected config was changed: config/bundles/registry.php" }) });
 		const answer = ledger.getQuestion(a)!.answer!;
 		expect(answer).toMatch(/a code job wrote it but was not merged: protected config was changed: config\/bundles\/registry\.php/);
 		expect(answer).not.toMatch(/changed nothing/);
@@ -124,7 +140,9 @@ describe("resolver model before the owner", () => {
 			ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'done'").run();
 			const a = ledger.askQuestion({ unitId: "u1708", point: "gate_env", question: "the login wiring is missing", options: ["retry — try again", "leave — leave parked"], askedBy: "orchestrator" });
 			const resolver: Resolver = async () => ({ code: "wire the login", then: "retry" });
-			const r = await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: async () => ({ refused: "the build fails", diff: "+++ b/config/packages/security.yaml\n+  firewalls: main" }) });
+			const job = async () => ({ refused: "the build fails", diff: "+++ b/config/packages/security.yaml\n+  firewalls: main" });
+			await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: job }); // the resolver's one more look
+			const r = await resolveOpenQuestions({ ledger, config, root: "/r", resolver, codeJob: job });
 			return { r, q: ledger.getQuestion(a)! };
 		};
 		const few = await run(ASK_OWNER_BLOCKS - 1);

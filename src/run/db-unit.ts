@@ -9,6 +9,7 @@ import { fixRunSetup, fixSetupWithModel } from "../init/setup-fixer.ts";
 import { errorSignature, run, runGate, renderGate, sha1, type GateReport } from "./gate.ts";
 import { reviewWithModel } from "./review.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
+import type { Ledger } from "../ledger/db.ts";
 import { triageGate } from "./triage.ts";
 import { rulesText } from "./prompts.ts";
 import type { UnitRunOptions, UnitRunResult } from "./unit.ts";
@@ -46,6 +47,8 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	const task = (TASK[unit.kind ?? ""] ?? TASK["db_schema"]!)(meta, dataDirs[0]!);
 	// what earlier DB units wrote: the model reads them and orders its migration after every table it references
 	const existing = dataFiles(targetProjectDir, dataDirs, (p) => !adapter.layout.isTestFile(p));
+	// a reopened unit's own earlier tests are its to change: DB units have no truth cases to mark them as theirs
+	const own = ownTests(o.ledger, o.unitId, adapter.layout.isTestFile);
 	const system = [
 		`You are the database engineer of a legacy rewrite (${o.config.source.stack} → ${place.stackId}). You work in the target project; write ONLY under ${dataDirs.join(", ")}.`,
 		`Engines: ${meta.from.join(" + ")} → ${meta.to ?? "unchanged"}. Strategy: ${meta.strategy}. Stack choices: ${JSON.stringify(choices)}.`,
@@ -62,6 +65,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		task,
 		meta.tables?.length ? `\nTables (${meta.tables.length}): ${meta.tables.join(", ")}` : "",
 		`\nFiles already in ${dataDirs.join(", ")} (earlier units' schema and migrations): ${existing.length ? existing.slice(0, 200).join(", ") : "none yet"}`,
+		own.length ? `\nThis unit's own tests from an earlier run (yours to update when your schema change makes them wrong; never change another unit's tests): ${own.join(", ")}` : "",
 		snapshot ? `\nData dump: ${snapshot}${existsSync(snapshot) ? "" : " (not found on this machine)"} — read it for realistic fixtures; never commit it.` : "",
 		o.config.db.url ? `\nLegacy connection: ${o.config.db.url} (an env var; introspection allowed, read-only).` : "",
 		`\n## Legacy schema\n\`\`\`sql\n${schema || "(no schema inputs: br onboard --force-db to point at them)"}\n\`\`\``,
@@ -100,13 +104,13 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		const review = reviewer
 			? async (changedFiles: string[]) => {
 					const ra = o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
-					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir: dataDirs[0]!.replace(/\/$/, ""), legacyFiles: [], changedFiles, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: `This is a database unit. Its task: ${task}${meta.tables?.length ? ` Tables: ${meta.tables.join(", ")}.` : ""}`, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `review-${ra}.jsonl`) });
+					const r = await reviewer({ ledger: o.ledger, config: o.config, root: o.root, unitId: o.unitId, adapter, targetProjectDir, moduleDir: dataDirs[0]!.replace(/\/$/, ""), legacyFiles: [], changedFiles, testFiles: testFiles.map((t) => t.path), writeGlobs, ownerNote: `This is a database unit. Its task: ${task}${meta.tables?.length ? ` Tables: ${meta.tables.join(", ")}.` : ""} Its tests run without a live database by design (the session is told so)${adapter.migrateFresh ? "; the gate applies all migrations to an empty database in a step of its own" : ""}: do not ask for database-backed tests.`, transcriptPath: join(o.root, ".bigrefactor", "sessions", o.unitId, `review-${ra}.jsonl`) });
 					o.ledger.endAttempt(ra, { outcome: !r.judged ? "not_judged" : r.ok ? "review_ok" : "review_red", costUsd: r.costUsd ?? 0, gateReport: { output: r.output } });
 					cost += r.costUsd ?? 0;
 					return r;
 				}
 			: undefined;
-		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot });
+		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot, sanctioned: own });
 		gate = await migrateFreshStep(gate, { ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, slot: gateSlot });
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });
 		log(renderGate(gate));
@@ -175,4 +179,16 @@ function dataFiles(projectDir: string, dataDirs: string[], keep: (p: string) => 
 	};
 	for (const d of dataDirs) walk(d.replace(/\/$/, ""));
 	return out;
+}
+
+/**
+ * The tests this DB unit wrote in its green attempts (a reopened unit's own), less any another unit's green attempt
+ * also wrote: those prove that unit's schema.
+ */
+export function ownTests(ledger: Ledger, unitId: string, isTestFile: (f: string) => boolean): string[] {
+	const rows = ledger.db.prepare("SELECT unit_id, json_extract(gate_report, '$.changedFiles') files FROM attempts WHERE outcome = 'gate_green' AND json_extract(gate_report, '$.changedFiles') IS NOT NULL").all() as Array<{ unit_id: string; files: string }>;
+	const mine = new Set<string>();
+	const others = new Set<string>();
+	for (const r of rows) for (const f of JSON.parse(r.files) as string[]) if (isTestFile(f)) (r.unit_id === unitId ? mine : others).add(f);
+	return [...mine].filter((f) => !others.has(f)).sort();
 }

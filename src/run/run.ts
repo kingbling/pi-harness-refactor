@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { linkedDirs, loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
-import { fixRunSetup, fixSetupWithModel, type SetupFixer } from "../init/setup-fixer.ts";
+import { fixRunSetup, fixSetupWithModel, type NoFix, type SetupFixer } from "../init/setup-fixer.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { buildRedKey, createBuilder, createMergeCheck, filesNamed, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
@@ -246,17 +246,18 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		let merged: string | undefined;
 		let refused: { refused: string; diff: string } | undefined;
 		let locked: { files: string[]; diff: string } | undefined;
+		let miss: { failed: string } | { nothing: string } | undefined;
 		// the waiting unit's kept code (its last try, kept when it parked): the job starts from it and merges both
 		const keptWork = unit ? (JSON.parse(unit.meta) as { keptWork?: string }).keptWork : undefined;
 		const unitWork = unit && keptWork ? { unitId: unit.id, apply: (wt: string) => applyCleanly(wt, keptWork) } : undefined;
-		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, unitWork, onRefused: (p, diff) => (refused = { refused: p, diff }), onLocked: (l) => (locked = l), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+		const said = await runCodeJob({ config, root: o.root, ledger, adapter, label: `q${q.id}`, linkAll, log, unitWork, onRefused: (p, diff) => (refused = { refused: p, diff }), onLocked: (l) => (locked = l), onNothing: (s) => (miss = { nothing: s || "the code model gave no reason" }), onFailed: (f) => (miss = { failed: f }), what: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once your code is merged.\n${q.question}`, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 		// main holds the unit's kept code now: its next try starts from main
 		if (said && unitWork && merged) ledger.updateUnit(unitWork.unitId, { meta: { keptWork: undefined } });
 		// a fix on main may unblock quarantined units too, not only the ones waiting on this question
 		if (said && stackId) noteFix(o.root, stackId, merged, `code job q${q.id}: ${said}`);
 		// what the job wanted in the files that decide how the checks run: the setup model's to judge, with the same diff
 		const setup = locked ? await lockedToSetup(adapter, stackId!, `question #${q.id}`, locked) : undefined;
-		return said ?? setup ?? refused;
+		return said ?? setup ?? refused ?? miss;
 	};
 	/** A code job changed files that decide how the checks run (put back): the setup model gets the same change to judge. */
 	const lockedToSetup = (adapter: TargetAdapter, stackId: string, why: string, l: { files: string[]; diff: string }) =>
@@ -271,7 +272,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const adapter = stackId ? adapters.get(stackId) : undefined;
 		if (!stackId || !adapter) return undefined;
 		const sameAs = q.context ? (JSON.parse(q.context) as { sameAs?: string }).sameAs : undefined;
-		return fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, stackId), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), signature: sameAs ?? `question ${q.id}`, problem: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once the setup is fixed. Fix the project setup, not a unit's own code.\n${q.question}${q.context ? `\nFacts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 3000)}` : ""}` });
+		let miss: NoFix | undefined;
+		const fixed = await fixRunSetup({ config, root: o.root, adapter, projectDir: projectDir(config, stackId), fixer: o.setupFixer || fixSetupWithModel, ledger, lock: (fn) => merge.run(fn), onNoFix: (n) => (miss = n), signature: sameAs ?? `question ${q.id}`, problem: `${what}\n\nThis came up as question #${q.id} (${q.point}${q.unit_id ? `, unit ${q.unit_id}` : ""}); the units waiting on it run again once the setup is fixed. Fix the project setup, not a unit's own code.\n${q.question}${q.context ? `\nFacts:\n${JSON.stringify(JSON.parse(q.context), null, 1).slice(0, 3000)}` : ""}` });
+		const m = miss as NoFix | undefined;
+		return fixed ?? (m && (m.ran ? { nothing: `${m.why}${m.said ? `; the setup model said: ${m.said.slice(-800)}` : ""}` } : { failed: m.why }));
 	};
 	// a path the folder check keeps refusing because the layout has no slot for it: widen the layout (only more allowed)
 	const layoutJob = !o.client || o.spawn ? undefined : async (q: QuestionRow, what: string, stack?: string) => {
@@ -320,6 +324,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		for (const [id, a] of adapters) await linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(o.root, id).worktreeCopy ?? []);
 	};
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
+	// the DB lane (one migrations folder, ordered versions) and a shared module run one unit at a time
+	const moduleLimit = (p: { moduleKey: string; shared: boolean }) => (p.shared || p.moduleKey.endsWith(":db") ? 1 : config.run.unitsPerModule);
 	await excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
 	const agents = new Semaphore(config.run.agentConcurrency);
 	const gates = new Semaphore(gateSlots(config.run));
@@ -616,8 +622,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		const blocked = ledger.blockedUnits();
 		decisionBlocked = (await o.blocked?.()) ?? new Map();
 		for (const u of decisionBlocked.keys()) if (!blocked.has(u)) blocked.set(u, []);
-		// one unit per target module at a time: units sharing a write scope would conflict on merge
-		const busyModules = new Set([...running.keys()].map((id) => placementOf(ledger.getUnit(id)!.meta).moduleKey));
+		// a few units per target module at a time (run.unitsPerModule): units sharing a write scope may conflict on merge
+		const busyModules = new Map<string, number>();
+		for (const id of running.keys()) {
+			const k = placementOf(ledger.getUnit(id)!.meta).moduleKey;
+			busyModules.set(k, (busyModules.get(k) ?? 0) + 1);
+		}
 		// One query: planned units whose every dep is accepted (json_each over the deps array), not stale.
 		const rows = ledger.db
 			.prepare(
@@ -632,7 +642,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			if (running.has(u.id) || blocked.has(u.id)) return false;
 			// waits for Jev or its placement question, never runs on a guess (a dry run previews before placement ran)
 			if (!o.dry && unplacedReason(config, u.meta, o.root)) return false;
-			if (busyModules.has(placementOf(u.meta).moduleKey)) return false;
+			if ((busyModules.get(placementOf(u.meta).moduleKey) ?? 0) >= moduleLimit(placementOf(u.meta))) return false;
 			if (held.has(`${placementOf(u.meta).stackId}\0${placementOf(u.meta).area}`)) return false;
 			if (o.units && !o.units.includes(u.id)) return false;
 			if (o.slice && JSON.parse(u.meta).slice !== o.slice) return false;
@@ -1136,13 +1146,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
 				const candidates = await ready();
 				readyNow = candidates.length;
-				// one unit per target module also within this pass: ready() only knows the modules busy before it
-				const startedModules = new Set<string>();
+				// the module limit also within this pass: ready() only knows the units running before it (startUnit adds to running)
 				for (const id of candidates) {
 					if (running.size >= laneLimit || !underLimit()) break;
-					const moduleKey = placementOf(ledger.getUnit(id)!.meta).moduleKey;
-					if (startedModules.has(moduleKey)) continue;
-					startedModules.add(moduleKey);
+					const place = placementOf(ledger.getUnit(id)!.meta);
+					const busy = [...running.keys()].filter((r) => placementOf(ledger.getUnit(r)!.meta).moduleKey === place.moduleKey).length;
+					if (busy >= moduleLimit(place)) continue;
 					startUnit(id);
 					readyNow--;
 				}
@@ -1754,6 +1763,11 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
 		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginChecked?: number };
+		// a question withdrawn after it was asked (the unit was requeued meanwhile) answers nothing: as if none was asked
+		if (meta.healQuestion && ledger.getQuestion(meta.healQuestion)?.status === "withdrawn") {
+			ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.healQuestion') WHERE id = ?").run(r.id);
+			delete meta.healQuestion;
+		}
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
 		const failure = errorSignature("quarantine", r.reason ?? "");
@@ -1775,7 +1789,8 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// more try when the plugin's own changes since the park touch what parked it (the decide model reads them, as for
 		// a change on main), counted against the automatic tries; asked once per plugin version
 		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0) && (meta.pluginChecked ?? 0) < pluginAt && heals < config.run.maxAutoHeals) {
-			const changes = await (o.pluginChanges ?? pluginChangesSince)(meta.parkedAt ?? 0);
+			// only what is new since the last look: each change is judged once, while it is new, and the list stays short
+			const changes = await (o.pluginChanges ?? pluginChangesSince)(Math.max(meta.parkedAt ?? 0, meta.pluginChecked ?? 0));
 			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
 			// the decide model is unavailable: asked next pass
 			if (touches === undefined) continue;
@@ -1787,8 +1802,9 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 			ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.pluginChecked', ?) WHERE id = ?").run(pluginAt, r.id);
 		}
 		if (changed && mayRun) {
-			// a change the decide model already said does not touch this failure is not asked about again
-			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, await changesSince(config, root, manifests, stackId, ledgerTime(r.at)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			// a change the decide model already said does not touch this failure is not asked about again: it sees only
+			// the changes since its last no (healChecked), so a long park never pushes the newest fix out of what it reads
+			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, await changesSince(config, root, manifests, stackId, Math.max(ledgerTime(r.at), meta.healChecked ?? 0)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
 			if (touches) {
 				// something changed since the unit failed that may fix it: worth a try, an open question about it or not
 				await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${parked ? ` It was parked: ${meta.parkedWhy}` : ""}${lastFailure}`, failure, retriedOn);
@@ -1871,7 +1887,8 @@ export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: s
 			// units with a different retry left never share a question: one's "retry is no answer" is not the other's
 			sameAs: [errorSignature("quarantine", r.reason ?? ""), last && kind, retry && `retry ${retry}`].filter(Boolean).join(" | "),
 		});
-		d.ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', ?) WHERE id = ?").run(q.id, r.id);
+		// only while it is still quarantined: a self-heal may have requeued it while the question was being asked
+		d.ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', ?) WHERE id = ? AND state = 'quarantined'").run(q.id, r.id);
 		if (!q.shared) asked++;
 	}
 	return asked;

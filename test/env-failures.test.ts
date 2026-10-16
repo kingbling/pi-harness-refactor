@@ -57,6 +57,17 @@ describe("environment failures (the @jest/globals incident)", () => {
 		expect(a).toMatch(/@jest\/globals/);
 	});
 
+	it("a clipped output's key is its most frequent message, never the clip's own header", async () => {
+		const { clipOutput, CLIP_HEADER } = await import("../src/run/gate.ts");
+		const long = (msg: string) => clipOutput(Array.from({ length: 300 }, (_, i) => `FAIL tests/T${i}Test.php::testIt\n${msg}\n${"padding line ".repeat(8)}`).join("\n"), 3000);
+		const a = errorSignature("ported_tests_green", long("Error: HTTP/1.1 503 Service Unavailable"));
+		const b = errorSignature("ported_tests_green", long("Error: relation \"sessions\" does not exist"));
+		expect(long("x")).toContain(CLIP_HEADER);
+		expect(a).not.toBe(b);
+		expect(a).not.toContain("each distinct one");
+		expect(b).toContain("sessions");
+	});
+
 	it("the key never carries the unit (worktree paths with '+', file names) but keeps the cause", () => {
 		const wt = (u: string) => `/w/.bigrefactor/worktrees/${u}/symfony`;
 		const oom = (u: string) => `$ vendor/bin/phpstan analyse src\nPHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes) in phar://${wt(u)}/vendor/phpstan/phpstan/phpstan.phar/src/X.php on line 98\n#13 phar://${wt(u)}/vendor/bin/phpstan(116): run()`;

@@ -67,14 +67,19 @@ export function blockedBehind(ledger: Ledger, unitId: string): number {
 const parks = (q: QuestionRow) => q.point === "quarantine" || q.point === "gate_env";
 
 export type Resolution = { answer: string; why: string; hint?: string } | { owner: string } | { park: string } | { fix: string; then: string; stack?: string } | { code: string; then: string; stack?: string } | { layout: string; then: string; stack?: string };
-/** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or undefined. */
-export type FixJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | undefined>;
+/**
+ * Why a job left main as it was: { failed } it never ran or broke on the way (a limit, a merge conflict): the question
+ * is tried again later, like a failed resolver call. { nothing } it ran and nothing stayed, with what it said.
+ */
+export type JobMiss = { failed: string } | { nothing: string };
+/** A fix job: the big setup model changes the project setup on main for this question; returns what changed, or why not. */
+export type FixJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | JobMiss | undefined>;
 export const FIX_JOB = "setup model (fix job)";
 /**
  * A code job: a model writes app code a unit needs but may not write (an endpoint, wiring, a shared fixture) on main, with tests.
  * { refused }: it wrote code that the check would not merge, and why.
  */
-export type CodeJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | { refused: string; diff?: string } | undefined>;
+export type CodeJob = (q: QuestionRow, what: string, stack?: string) => Promise<string | { refused: string; diff?: string } | JobMiss | undefined>;
 export const CODE_JOB = "code model (code job)";
 /** A layout job: the stack's folder layout gets the slot the gate keeps refusing; applied when it only allows more, else the owner decides. */
 export type LayoutJob = (q: QuestionRow, what: string, stack?: string) => Promise<{ applied: string } | { owner: string } | undefined>;
@@ -108,7 +113,7 @@ export async function resolveOpenQuestions(d: {
   let forOwner = 0;
   for (const q of d.ledger.openQuestions()) {
     const ctx = q.context
-      ? (JSON.parse(q.context) as { forOwner?: string; forOwnerAt?: number; resolverFailed?: number; resolverFailedAt?: number })
+      ? (JSON.parse(q.context) as { forOwner?: string; forOwnerAt?: number; resolverFailed?: number; resolverFailedAt?: number; jobTried?: number })
       : {};
     const again = ctx.forOwner !== undefined && !!d.pluginChangedAt && (ctx.forOwnerAt ?? 0) < d.pluginChangedAt;
     if (ctx.forOwner !== undefined && !again) continue;
@@ -202,10 +207,33 @@ export async function resolveOpenQuestions(d: {
         : undefined;
       if (d.ledger.getQuestion(q.id)?.status !== "open") continue;
       const fixed = typeof done === "string" ? done : undefined;
+      // a job that never ran (a limit) or broke (a merge conflict) says nothing about the question: tried again later
+      if (typeof done === "object" && "failed" in done) {
+        if (failed + 1 < MAX_RESOLVER_FAILURES) {
+          d.ledger.db
+            .prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.resolverFailed', ?, '$.resolverFailedAt', ?) WHERE id = ?")
+            .run(failed + 1, Date.now(), q.id);
+          d.log?.(`question #${q.id}: the ${kind} did not run through (${done.failed.slice(0, 160)}); tried again later`);
+          continue;
+        }
+        d.ledger.db.prepare("UPDATE questions SET context = json_remove(context, '$.resolverFailed', '$.resolverFailedAt') WHERE id = ?").run(q.id);
+      }
       // what a refused job wrote stays with the question: an owner asked about this unit later sees it
-      if (typeof done === "object" && done.diff) d.ledger.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.jobDiff', ?) WHERE id = ?").run(done.diff.slice(0, 8000), q.id);
+      if (typeof done === "object" && "diff" in done && done.diff) d.ledger.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.jobDiff', ?) WHERE id = ?").run(done.diff.slice(0, 8000), q.id);
       // a refused job did write something: the resolver sees why it stayed off main, not "changed nothing"
-      const why = typeof done === "object" ? `a ${kind} wrote it but was not merged: ${done.refused.slice(0, 1500)} (asked for: ${what})` : `a ${kind} was tried and changed nothing: ${what}`;
+      const why =
+        typeof done === "object" && "refused" in done
+          ? `a ${kind} wrote it but was not merged: ${done.refused.slice(0, 1500)} (asked for: ${what})`
+          : typeof done === "object" && "failed" in done
+            ? `a ${kind} did not run through ${failed + 1} times: ${done.failed.slice(0, 600)} (asked for: ${what})`
+            : `a ${kind} was tried and changed nothing: ${what}${typeof done === "object" && "nothing" in done ? `\nWhy, and what it said: ${done.nothing.slice(0, 1500)}` : ""}`;
+      // the resolver gets one more look with the job's outcome in its facts (a job in the other stack, a hint for the
+      // unit's own scope) before the unit is parked on it
+      if (!fixed && !ctx.jobTried && !(typeof done === "object" && "failed" in done)) {
+        d.ledger.db.prepare("UPDATE questions SET context = json_set(COALESCE(context, '{}'), '$.jobTried', 1, '$.lastJob', ?) WHERE id = ?").run(why.slice(0, 3000), q.id);
+        d.log?.(`question #${q.id}: ${why.slice(0, 160)}; the resolver looks once more`);
+        continue;
+      }
       if (!fixed && parks(q)) {
         park(why);
         continue;

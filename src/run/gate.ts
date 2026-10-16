@@ -375,6 +375,9 @@ function messageLines(lines: string[]): Set<number> {
  * what still does not fit is cut from the middle.
  * `saveTo`: when anything was cut, the full output is written there and the clip names the file.
  */
+/** The line a long clip starts its list of distinct error messages with (clipOutput); each `N × message` follows. */
+export const CLIP_HEADER = "error messages (each distinct one, × the failed tests with it):";
+
 export function clipOutput(out: string, max = 6000, saveTo?: string): string {
 	const plain = out.replace(ANSI, "");
 	if (plain.length <= max) return plain;
@@ -387,7 +390,7 @@ export function clipOutput(out: string, max = 6000, saveTo?: string): string {
 		counts.set(m, (counts.get(m) ?? 0) + 1);
 	}
 	const top = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 8);
-	const summary = top.length ? `error messages (each distinct one, × the failed tests with it):\n${top.map(([m, n]) => `${n} × ${m}`).join("\n").slice(0, Math.floor(max / 4))}${counts.size > top.length ? `\n… ${counts.size - top.length} more` : ""}\n` : "";
+	const summary = top.length ? `${CLIP_HEADER}\n${top.map(([m, n]) => `${n} × ${m}`).join("\n").slice(0, Math.floor(max / 4))}${counts.size > top.length ? `\n… ${counts.size - top.length} more` : ""}\n` : "";
 	const seen = new Map<string, number>();
 	let dropped = 0;
 	let notices = listed.dropped;
@@ -700,7 +703,12 @@ const ASSERTION = /failed asserting|assertionerror|expected .+ to /i;
  * different keys are one cause (sameQuestion in src/jev/same.ts).
  */
 export function errorSignature(step: string, output: string): string {
-	const lines = output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+	const all = output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+	// a clip (clipOutput) starts with its own lines: its list's most frequent message is the cause, never its header
+	const head = all.indexOf(CLIP_HEADER);
+	const top = head >= 0 ? all[head + 1]?.match(/^\d+ × (.+)$/)?.[1] : undefined;
+	if (top && !ASSERTION.test(top)) return `${step}: ${normalizeErrorLine(top)}`.slice(0, 200); // an assertion names no cause: the file below decides
+	const lines = all.filter((l) => l !== CLIP_HEADER && !/^\(full output: |^\(\d+ .* left out\)$/.test(l));
 	// what follows a tool's closing summary is its footer (PHPStan's "how to read errors"), never the cause
 	const end = lines.reduce((e, l, i) => (SUMMARY_LINE.test(l) ? i : e), lines.length); // the last summary line
 	const cause = lines.findIndex((l, i) => i < end && /error|failed|fatal|cannot|could not|not found|no such/i.test(l) && !FRAME_LINE.test(l) && !SUMMARY_LINE.test(l));
