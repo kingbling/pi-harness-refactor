@@ -13,16 +13,18 @@ import { exec } from "../proc.ts";
  * The cleaner: removes what this workspace made and no longer needs (left-over worktrees and branches, old ledger
  * backups, old transcripts, stopped Docker containers and unused volumes and databases it made).
  *
- * Ownership is the hard rule. Docker on this machine is shared with other projects, so nothing is removed on looks:
- * only what code can prove is this workspace's —
+ * Ownership is the hard rule. Docker and the target repo on this machine are shared with other projects and other
+ * workspaces, so nothing is removed on looks: only what code can prove is this workspace's —
  *  - a path inside <root>/.bigrefactor (or the old copy `br init` fresh start left as <root>/.bigrefactor.old-*);
- *  - a worktree of the target repo inside <root>/.bigrefactor/worktrees, a branch with the plugin's own naming;
+ *  - a worktree folder inside <root>/.bigrefactor/worktrees; a branch whose git config record
+ *    (branch.<name>.bigrefactorWorktree, written by addWorktree) points inside it, and only once merged into main;
  *  - a Docker container whose compose working_dir is inside <root>/.bigrefactor, or with the label
- *    bigrefactor.root=<root>, or recorded in owned.jsonl (written by code: the record_owned tool, or the cleaner
- *    itself before it removes a container whose volumes then lose their only proof);
- *  - a volume with that label, of a compose project all of whose containers are ours, or recorded;
- *  - a database recorded with record_owned.
- * Anything else, however unused it looks, is never touched.
+ *    bigrefactor.root=<root>, or recorded in owned.jsonl (by record_owned, matched by its Id);
+ *  - a volume with that label, or recorded: by record_owned, or by the cleaner before it removes our container,
+ *    and then only a volume of that container's own compose project made with it (never one that existed before);
+ *  - a database that record_owned itself created (it refuses one that already existed).
+ * Anything else, however unused it looks, is never touched. Docker things younger than a day are left alone (a
+ * setup model may still be building them), and Docker is not looked at while a setup model runs in this process.
  */
 
 /** Runs a command and resolves with its stdout (tests pass a fake). */
@@ -57,13 +59,29 @@ export interface CleanOptions {
 	inUse?: () => Set<string>;
 	/** Another process's run is live (`br clean` while `br run` goes): worktrees and branches are not looked at. */
 	otherRunLive?: boolean;
+	/** Asked again right before each worktree or branch removal: another process's run started meanwhile. */
+	otherRunNow?: () => boolean;
 	now?: number;
 	stopped?: () => boolean;
 }
 
-/** Branch names the plugin gives (git.ts addWorktree callers: run.ts, builder.ts, code-job.ts, tidy-job.ts, parity.ts). */
-const PLUGIN_BRANCH = /^(unit|ahead|builder|code|tidy|parity)\//;
 const DAY = 86_400_000;
+/** A Docker thing (or a database record) younger than this is left alone: a setup model may still be building it. */
+const MIN_DOCKER_AGE = DAY;
+/** A compose volume counts as made with our container when it is at most this much older (compose makes volumes first). */
+const VOLUME_BEFORE_CONTAINER = 10 * 60_000;
+const DB_NAME = /^[A-Za-z0-9_]{1,63}$/;
+
+/** Setup models (the parity setup model) running in this process now: Docker is not looked at meanwhile. */
+let settingUp = 0;
+export async function whileSettingUp<T>(fn: () => Promise<T>): Promise<T> {
+	settingUp++;
+	try {
+		return await fn();
+	} finally {
+		settingUp--;
+	}
+}
 /** Ledger backups are kept this long (the newest always). */
 const BACKUP_DAYS = 3;
 /** Transcripts of accepted units are kept this long. No code reads them back; people do, to debug a fresh unit. */
@@ -77,12 +95,16 @@ const inside = (child: string, parent: string) => {
 export const ownedFile = (root: string) => join(root, ".bigrefactor", "owned.jsonl");
 
 export interface OwnedRecord {
-	kind: "container" | "volume" | "database" | "compose-project";
+	kind: "container" | "volume" | "database";
 	name: string;
+	/** container: its Id (a later container with the same name is not ours) */
+	id?: string;
+	/** volume: its CreatedAt (a later volume with the same name is not ours) */
+	created?: string;
 	/** database: the container of the server holding it */
 	server?: string;
-	/** database: the command that drops it (docker exec <server> …) */
-	drop?: string[];
+	/** database: the server's kind; code builds the drop command from it (records without it are never dropped) */
+	engine?: "postgres" | "mysql";
 	why?: string;
 	at: string;
 	removed?: boolean;
@@ -100,6 +122,7 @@ export async function readOwned(root: string): Promise<OwnedRecord[]> {
 	for (const l of text.split("\n")) {
 		try {
 			const r = JSON.parse(l) as OwnedRecord;
+			if (!["container", "volume", "database"].includes(r.kind)) continue; // an older kind no code proves by now
 			const key = `${r.kind}:${r.name}`;
 			if (r.removed) live.delete(key);
 			else live.set(key, r);
@@ -138,7 +161,8 @@ async function recipeText(root: string): Promise<string> {
 /** Whole-name match: `ssp1copy` does not name `ssp1copy2`. */
 const names = (text: string, name: string) => !!name && new RegExp(`(^|[^A-Za-z0-9_.-])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^A-Za-z0-9_-])`).test(text);
 
-async function sizeOf(run: Runner, path: string): Promise<number | undefined> {
+async function sizeOf(o: CleanOptions, run: Runner, path: string): Promise<number | undefined> {
+	if (o.stopped?.()) return undefined; // a stop does not wait for du
 	try {
 		return Number((await run("du", ["-sk", path])).split(/\s/)[0]) * 1024;
 	} catch {
@@ -162,9 +186,12 @@ export async function planCleanup(o: CleanOptions): Promise<CleanPlan> {
 	const plan: CleanPlan = { remove: [], kept: [] };
 	const state = join(o.root, ".bigrefactor");
 	await planFiles(o, run, now, state, plan);
+	if (o.stopped?.()) return plan;
 	if (!o.otherRunLive) await planGit(o, run, state, plan);
 	else plan.kept.push("worktrees and branches: another process's run is live (it cleans its own)");
-	await planDocker(o, run, plan);
+	if (o.stopped?.()) return plan;
+	if (settingUp) plan.kept.push("Docker and databases: a setup model is running now (it may be building them); looked at on a later pass");
+	else await planDocker(o, run, now, plan);
 	return plan;
 }
 
@@ -175,7 +202,7 @@ async function planFiles(o: CleanOptions, run: Runner, now: number, state: strin
 		const pid = Number(/-(\d+)-\d+$/.exec(n)?.[1]);
 		if (pid && pidAlive(pid)) continue; // that process is deleting it now
 		const p = join(trash, n);
-		plan.remove.push({ kind: "trash", name: p, ours: "inside .bigrefactor/worktrees/.trash", unneeded: "a removed worktree whose process ended before deleting it", bytes: await sizeOf(run, p), remove: () => rm(p, { recursive: true, force: true }) });
+		plan.remove.push({ kind: "trash", name: p, ours: "inside .bigrefactor/worktrees/.trash", unneeded: "a removed worktree whose process ended before deleting it", bytes: await sizeOf(o, run, p), remove: () => rm(p, { recursive: true, force: true }) });
 	}
 	// ledger backups (ledger.<anything>.sqlite): the newest stays, the others go after a few days
 	const all = existsSync(state) ? await readdir(state) : [];
@@ -207,7 +234,7 @@ async function planFiles(o: CleanOptions, run: Runner, now: number, state: strin
 				plan.kept.push(`${p}: git still lists a worktree in it`);
 				continue;
 			}
-			plan.remove.push({ kind: "old copy", name: p, ours: "the former .bigrefactor of this workspace, moved aside by br init (fresh start)", unneeded: sub === "worktrees" ? "git lists none of these worktrees any more" : "a dead copy of the old app; the live one is .bigrefactor/legacy-env/app", bytes: await sizeOf(run, p), remove: () => rm(p, { recursive: true, force: true }) });
+			plan.remove.push({ kind: "old copy", name: p, ours: "the former .bigrefactor of this workspace, moved aside by br init (fresh start)", unneeded: sub === "worktrees" ? "git lists none of these worktrees any more" : "a dead copy of the old app; the live one is .bigrefactor/legacy-env/app", bytes: await sizeOf(o, run, p), remove: () => rm(p, { recursive: true, force: true }) });
 		}
 	}
 	// transcripts and check logs of units accepted a while ago: no code reads them back (br why reads the ledger)
@@ -226,7 +253,7 @@ async function planFiles(o: CleanOptions, run: Runner, now: number, state: strin
 					try {
 						const s = await stat(p);
 						if (now - s.mtimeMs < TRANSCRIPT_DAYS * DAY) return;
-						old.push({ p, size: s.isDirectory() ? ((await sizeOf(run, p)) ?? 0) : s.size });
+						old.push({ p, size: s.isDirectory() ? ((await sizeOf(o, run, p)) ?? 0) : s.size });
 					} catch {
 						/* gone */
 					}
@@ -256,15 +283,16 @@ async function planGit(o: CleanOptions, run: Runner, state: string, plan: CleanP
 	} catch {
 		return; // no target repo yet
 	}
-	const checkedOut = new Set([...listed.matchAll(/^branch refs\/heads\/(.+)$/gm)].map((m) => m[1]!));
+	const checkedOutIn = (text: string) => new Set([...text.matchAll(/^branch refs\/heads\/(.+)$/gm)].map((m) => m[1]!));
+	const checkedOut = checkedOutIn(listed);
 	const wtDir = join(state, "worktrees");
 	// a job's worktree (__builder__, __code__, __tidy__, __parity__) is reset by that job on its next use and swept at a
 	// run's start; jobs also run outside a run (br parity, br recheck), so the cleaner leaves them alone
-	const busy = (n: string) => n.startsWith("__") || !!o.inUse?.().has(n);
+	const busy = (n: string) => n.startsWith("__") || !!o.inUse?.().has(n) || !!o.otherRunNow?.();
 	// unit worktree folders: in a live run, the ones no lane uses (left by a crash); with no run live, all (as the run's start sweep)
 	for (const n of existsSync(wtDir) ? (await readdir(wtDir)).filter((x) => !x.startsWith(".")) : []) {
 		if (busy(n)) {
-			plan.kept.push(`worktree ${n}: ${n.startsWith("__") ? "a job's worktree (the job resets it itself)" : "in use by the run"}`);
+			plan.kept.push(`worktree ${n}: ${n.startsWith("__") ? "a job's worktree (the job resets it itself)" : o.otherRunNow?.() ? "another process's run is live" : "in use by the run"}`);
 			continue;
 		}
 		const p = join(wtDir, n);
@@ -273,72 +301,120 @@ async function planGit(o: CleanOptions, run: Runner, state: string, plan: CleanP
 			name: p,
 			ours: "a worktree folder inside .bigrefactor/worktrees",
 			unneeded: o.inUse ? "no lane or job of the live run uses it" : "no run is live; a unit's next lane starts from a fresh worktree (its kept code is on its branch)",
-			bytes: await sizeOf(run, p),
-			remove: () =>
-				withRepoLock(repo, async () => {
-					// checked again right before the move, in the same tick: a lane starting now finds no folder and makes its own
-					if (busy(n) || !existsSync(p)) return;
+			bytes: await sizeOf(o, run, p),
+			remove: async () => {
+				// moved aside and forgotten by git under the lock (checked again right before, in the same tick: a lane starting
+				// now finds no folder and makes its own); the files are deleted after the lock is released, so lanes never wait on it
+				const t = await withRepoLock(repo, async () => {
+					if (busy(n) || !existsSync(p)) return undefined;
 					const t = join(wtDir, ".trash", `${n}-${process.pid}-${Date.now()}`);
 					mkdirSync(join(wtDir, ".trash"), { recursive: true });
 					renameSync(p, t);
 					await git(["worktree", "prune"]).catch(() => undefined);
-					await rm(t, { recursive: true, force: true });
-				}),
+					return t;
+				});
+				if (t) await rm(t, { recursive: true, force: true });
+			},
 		});
 	}
-	// branches the plugin made: gone once all their commits are on main (or their unit is accepted), unless kept code is on them
+	// branches: only the ones this workspace's addWorktree made (git config branch.<name>.bigrefactorWorktree points into
+	// its worktrees folder; another workspace on the same repo writes its own folder there), once all their commits are on
+	// main, and never while they hold a unit's kept code. The same unit ids exist in every workspace of a repo: a name is no proof.
 	const main = await mainBranch(repo, o.config.target.git.branch);
+	const made = new Map<string, string>();
+	for (const l of (await git(["config", "--get-regexp", "^branch\\..*\\.bigrefactorworktree$"]).catch(() => "")).split("\n").filter(Boolean)) {
+		const m = /^branch\.(.+)\.bigrefactorworktree (.+)$/i.exec(l);
+		if (m) made.set(m[1]!, m[2]!);
+	}
 	const heads = new Map<string, string>();
 	for (const l of (await git(["for-each-ref", "--format=%(refname:short)%09%(objectname)", "refs/heads/"])).split("\n").filter(Boolean)) {
 		const [b, sha] = l.split("\t");
 		heads.set(b!, sha!);
 	}
 	const merged = new Set((await git(["branch", "--format=%(refname:short)", "--merged", main]).catch(() => "")).split("\n").map((x) => x.trim()).filter(Boolean));
-	const units = new Map((o.ledger.db.prepare("SELECT id, state, json_extract(meta, '$.keptWork') AS kept FROM units").all() as Array<{ id: string; state: string; kept: string | null }>).map((u) => [u.id, u]));
-	const keptShas = new Set([...units.values()].map((u) => u.kept).filter((x): x is string => !!x));
-	for (const [b, sha] of heads) {
-		if (!PLUGIN_BRANCH.test(b) || b === main) continue;
-		const id = b.split("/").slice(1).join("/");
-		const unit = /^(unit|ahead)\//.test(b) ? units.get(id) : undefined;
-		const why =
-			checkedOut.has(b) ? "checked out in a worktree"
-			: keptShas.has(sha) || unit?.kept ? "holds a unit's kept code (a self-heal or answer goes on from it)"
-			: /^(unit|ahead)\//.test(b) && o.inUse?.().has(id) ? "its unit's lane runs"
+	const keptOf = (id: string) => (o.ledger.db.prepare("SELECT json_extract(meta, '$.keptWork') AS kept FROM units WHERE id = ?").get(id) as { kept: string | null } | undefined)?.kept ?? undefined;
+	const allKept = () => new Set((o.ledger.db.prepare("SELECT json_extract(meta, '$.keptWork') AS kept FROM units").all() as Array<{ kept: string | null }>).map((u) => u.kept).filter((x): x is string => !!x));
+	const keptShas = allKept();
+	/** Why a branch must stay now (asked at planning and again under the lock right before its removal). */
+	const holds = (b: string, sha: string, checked: Set<string>, kept: Set<string>) => {
+		const id = /^(unit|ahead)\//.test(b) ? b.split("/").slice(1).join("/") : undefined;
+		return checked.has(b) ? "checked out in a worktree"
+			: kept.has(sha) || (id && keptOf(id)) ? "holds a unit's kept code (a self-heal or answer goes on from it)"
+			: id && o.inUse?.().has(id) ? "its unit's lane runs"
+			: o.otherRunNow?.() ? "another process's run is live"
 			: undefined;
+	};
+	let others = 0;
+	for (const [b, sha] of heads) {
+		if (b === main) continue;
+		const wt = made.get(b);
+		if (!wt || !inside(wt, wtDir)) {
+			if (wt) others++;
+			continue; // not made by this workspace: never looked at
+		}
+		const why = holds(b, sha, checkedOut, keptShas);
 		if (why) {
 			plan.kept.push(`branch ${b}: ${why}`);
 			continue;
 		}
-		const done = merged.has(b) ? `all its commits are on ${main}` : b.startsWith("unit/") && unit?.state === "accepted" ? "its unit is accepted (merged)" : undefined;
-		if (!done) {
+		if (!merged.has(b)) {
 			plan.kept.push(`branch ${b}: not merged into ${main}`);
 			continue;
 		}
 		plan.remove.push({
 			kind: "branch",
 			name: b,
-			ours: `in the target repo with the plugin's branch naming (${b.split("/")[0]}/)`,
-			unneeded: `${done}; no worktree uses it`,
+			ours: `made by this workspace's worktree ${wt} (git config branch.${b}.bigrefactorWorktree)`,
+			unneeded: `all its commits are on ${main}; no worktree uses it`,
 			bytes: 0,
-			// git itself refuses to delete a branch checked out anywhere, so a lane that took it meanwhile keeps it
-			remove: () => withRepoLock(repo, () => git(["branch", "-q", "-D", b]).then(() => undefined)),
+			remove: () =>
+				withRepoLock(repo, async () => {
+					// asked again now: a lane may have taken it, kept code on it or moved it since the plan was made
+					const why = holds(b, sha, checkedOutIn(await git(["worktree", "list", "--porcelain"])), allKept());
+					if (why) throw new Error(`left: ${why}`);
+					// deleted only while it still points where it pointed when it was found merged (git checks that itself)
+					await git(["update-ref", "-d", `refs/heads/${b}`, sha]);
+					await git(["config", "--remove-section", `branch.${b}`]).catch(() => undefined);
+				}),
 		});
 	}
+	if (others) plan.kept.push(`${others} branch(es) made by another workspace on this repo: never touched`);
 }
 
 interface DockerContainer {
 	Id: string;
 	Name: string;
+	Created?: string;
 	State: { Status: string; Running: boolean };
 	Config: { Labels: Record<string, string> | null; Env?: string[] | null };
 	Mounts: Array<{ Type: string; Name?: string }>;
 }
 interface DockerVolume {
 	Name: string;
+	CreatedAt?: string;
 	Labels: Record<string, string> | null;
 }
 
-async function planDocker(o: CleanOptions, run: Runner, plan: CleanPlan): Promise<void> {
+/** The kind of database server a container runs, from the variables its official image sets, and how code talks to it. */
+function dbServer(env: string[]): { engine: "postgres" | "mysql"; sql: (server: string, statement: string) => string[]; own: string[] } | undefined {
+	const v = (k: string) => env.find((e) => e.startsWith(`${k}=`))?.slice(k.length + 1);
+	const own = env.filter((e) => /^(POSTGRES_DB|POSTGRES_USER|MYSQL_DATABASE|MARIADB_DATABASE)=/.test(e)).map((e) => e.split("=")[1]!);
+	if (env.some((e) => /^(PG_VERSION|POSTGRES_[A-Z_]+)=/.test(e))) {
+		const user = v("POSTGRES_USER") || "postgres";
+		const maint = v("POSTGRES_DB") || user;
+		return { engine: "postgres", own: [...own, "postgres", "template0", "template1"], sql: (server, st) => ["docker", "exec", server, "psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", maint, "-c", st] };
+	}
+	if (env.some((e) => /^(MYSQL|MARIADB)_[A-Z_]+=/.test(e)))
+		return {
+			engine: "mysql",
+			own: [...own, "mysql", "information_schema", "performance_schema", "sys"],
+			sql: (server, st) => ["docker", "exec", server, "sh", "-c", `exec "$(command -v mariadb || command -v mysql)" -uroot -p"\${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" -e '${st}'`],
+		};
+	return undefined;
+}
+const quoteDb = (engine: "postgres" | "mysql", name: string) => (engine === "postgres" ? `"${name}"` : `\`${name}\``);
+
+async function planDocker(o: CleanOptions, run: Runner, now: number, plan: CleanPlan): Promise<void> {
 	let containers: DockerContainer[] = [];
 	let volumes: DockerVolume[] = [];
 	try {
@@ -352,28 +428,29 @@ async function planDocker(o: CleanOptions, run: Runner, plan: CleanPlan): Promis
 	const root = resolve(o.root);
 	const state = join(root, ".bigrefactor");
 	const records = await readOwned(o.root);
-	const recorded = (kind: OwnedRecord["kind"], name: string) => records.some((r) => r.kind === kind && r.name === name);
+	const containerRecord = (c: DockerContainer) => records.find((r) => r.kind === "container" && r.name === cname(c) && (!r.id || r.id === c.Id));
+	const volumeRecord = (v: DockerVolume) => records.find((r) => r.kind === "volume" && r.name === v.Name && (!r.created || r.created === v.CreatedAt));
 	const labels = (x: { Config?: { Labels: Record<string, string> | null }; Labels?: Record<string, string> | null }) => (x.Config ? x.Config.Labels : x.Labels) ?? {};
 	const cname = (c: DockerContainer) => c.Name.replace(/^\//, "");
 	const project = (l: Record<string, string>) => l["com.docker.compose.project"];
+	const time = (t?: string) => (t ? Date.parse(t) : NaN);
+	// unknown age counts as young: left alone
+	const young = (t?: string) => !(now - time(t) >= MIN_DOCKER_AGE);
 	const ownProof = (c: DockerContainer): string | undefined => {
 		const l = labels(c);
 		if (l["bigrefactor.root"] === root) return `label bigrefactor.root=${root}`;
 		const wd = l["com.docker.compose.project.working_dir"];
 		if (wd && inside(wd, state)) return `its compose working_dir ${wd} is inside .bigrefactor`;
-		if (recorded("container", cname(c))) return "recorded in .bigrefactor/owned.jsonl when it was made";
+		if (containerRecord(c)) return "recorded in .bigrefactor/owned.jsonl when it was made";
 		return undefined;
 	};
-	// a compose project is ours when every container of it is ours (one other container: another project uses the name)
-	const projects = new Map<string, boolean>();
-	for (const c of containers) {
-		const p = project(labels(c));
-		if (p) projects.set(p, (projects.get(p) ?? true) && !!ownProof(c));
-	}
-	for (const r of records) if (r.kind === "compose-project" && !projects.has(r.name)) projects.set(r.name, true);
-	const ownProject = (p?: string) => !!p && projects.get(p) === true;
+	// the live legacy copy and the parity worktree are started by path from their recipes (compose files there, a
+	// network, a hostname): a container whose compose files are there is in use while that folder exists
+	const startedByPath = (wd?: string) => !!wd && [join(state, "legacy-env", "app"), join(state, "worktrees", "__parity__")].some((d) => (wd === d || inside(wd, d)) && existsSync(wd));
 	const text = await recipeText(o.root);
 	const named = (...xs: Array<string | undefined>) => xs.find((x) => x && names(text, x));
+	const volumeByName = new Map(volumes.map((v) => [v.Name, v]));
+	const retire = (r: OwnedRecord) => appendFile(ownedFile(o.root), JSON.stringify({ kind: r.kind, name: r.name, removed: true, at: new Date().toISOString() }) + "\n");
 	let notOurs = 0;
 
 	for (const c of containers) {
@@ -384,23 +461,38 @@ async function planDocker(o: CleanOptions, run: Runner, plan: CleanPlan): Promis
 		}
 		const n = cname(c);
 		const l = labels(c);
-		const use = c.State.Running || !["exited", "created", "dead"].includes(c.State.Status) ? `it is ${c.State.Status}` : named(n, project(l)) ? `the workspace's setup names ${named(n, project(l))}` : undefined;
+		const wd = l["com.docker.compose.project.working_dir"];
+		const use =
+			c.State.Running || !["exited", "created", "dead"].includes(c.State.Status) ? `it is ${c.State.Status}`
+			: young(c.Created) ? "made less than a day ago (a setup model may still be building it)"
+			: startedByPath(wd) ? `its compose files (${wd}) are in the live legacy copy or parity worktree, which its recipes start by path`
+			: named(n, project(l)) ? `the workspace's setup names ${named(n, project(l))}`
+			: undefined;
 		if (use) {
 			plan.kept.push(`container ${n}: ${use}`);
 			continue;
 		}
-		const vols = c.Mounts.filter((m) => m.Type === "volume" && m.Name).map((m) => m.Name!);
+		// its named volumes are proven ours only through it, so they are written down before it goes — but only a volume
+		// of its own compose project made with it: a volume it borrowed (external, another project's, older than it) is not
+		const record: DockerVolume[] = [];
+		for (const name of c.Mounts.filter((m) => m.Type === "volume" && m.Name).map((m) => m.Name!)) {
+			const v = volumeByName.get(name);
+			if (!v || labels(v)["bigrefactor.root"] === root || volumeRecord(v)) continue;
+			const vp = project(labels(v));
+			if (vp && vp === project(l) && time(v.CreatedAt) >= time(c.Created) - VOLUME_BEFORE_CONTAINER) record.push(v);
+			else plan.kept.push(`volume ${name}: mounted by our container ${n} but not made with it (${vp ? (vp === project(l) ? "it existed before the container" : `of compose project ${vp}`) : "no compose project label"}): not recorded as ours`);
+		}
 		plan.remove.push({
 			kind: "container",
 			name: n,
 			ours: proof,
-			unneeded: "stopped, and no app recipe or setup script of this workspace names it",
+			unneeded: "stopped for more than a day, and no app recipe or setup script of this workspace names it",
 			remove: async () => {
-				// its volumes are proven ours only through it: written down before it goes, so they stay provable
-				for (const v of vols) if (!recorded("volume", v)) await recordOwned(o.root, { kind: "volume", name: v, why: `mounted by our container ${n}` });
-				const p = project(l);
-				if (p && !recorded("compose-project", p)) await recordOwned(o.root, { kind: "compose-project", name: p, why: `project of our container ${n}` });
+				for (const v of record) await recordOwned(o.root, { kind: "volume", name: v.Name, created: v.CreatedAt, why: `made with our container ${n} (compose project ${project(l)})` });
 				await run("docker", ["rm", "-v", c.Id]);
+				// the record ends with it: a later container with this name is not ours
+				const r = containerRecord(c);
+				if (r) await retire(r);
 			},
 		});
 	}
@@ -422,43 +514,64 @@ async function planDocker(o: CleanOptions, run: Runner, plan: CleanPlan): Promis
 		}
 		return sizes.get(n);
 	};
+	// volumes only by our label or by a record of that very volume (a compose project name is no proof: names repeat)
 	for (const v of volumes) {
 		const l = labels(v);
-		const proof =
-			l["bigrefactor.root"] === root ? `label bigrefactor.root=${root}`
-			: recorded("volume", v.Name) ? "recorded in .bigrefactor/owned.jsonl"
-			: ownProject(project(l)) ? `of compose project ${project(l)}, whose containers are all this workspace's`
-			: undefined;
+		const r = volumeRecord(v);
+		const proof = l["bigrefactor.root"] === root ? `label bigrefactor.root=${root}` : r ? "recorded in .bigrefactor/owned.jsonl" : undefined;
 		if (!proof) {
 			notOurs++;
 			continue;
 		}
-		const use = mounted.has(v.Name) ? "a container uses it" : named(v.Name, project(l)) ? `the workspace's setup names ${named(v.Name, project(l))}` : undefined;
+		const use =
+			mounted.has(v.Name) ? "a container uses it"
+			: young(v.CreatedAt) ? "made less than a day ago (a setup model may still be building it)"
+			: named(v.Name, project(l)) ? `the workspace's setup names ${named(v.Name, project(l))}`
+			: undefined;
 		if (use) {
 			plan.kept.push(`volume ${v.Name}: ${use}`);
 			continue;
 		}
-		plan.remove.push({ kind: "volume", name: v.Name, ours: proof, unneeded: "no container uses it and no app recipe or setup script names it", bytes: await volSize(v.Name), remove: () => run("docker", ["volume", "rm", v.Name]).then(() => undefined) });
+		plan.remove.push({
+			kind: "volume",
+			name: v.Name,
+			ours: proof,
+			unneeded: "no container uses it and no app recipe or setup script names it",
+			bytes: await volSize(v.Name),
+			remove: async () => {
+				await run("docker", ["volume", "rm", v.Name]);
+				if (r) await retire(r);
+			},
+		});
 	}
 
-	// databases only by record (a database inside a shared server has no other proof)
+	// databases only by a record of one record_owned created itself; the drop command is built by code here
 	const running = new Set(containers.filter((c) => c.State.Running).map(cname));
 	for (const r of records.filter((x) => x.kind === "database")) {
 		const server = containers.find((c) => cname(c) === r.server);
-		const serverOwn = (server?.Config.Env ?? []).some((e) => /^(POSTGRES_DB|POSTGRES_USER|MYSQL_DATABASE|MARIADB_DATABASE)=/.test(e) && e.split("=")[1] === r.name);
-		const use = serverOwn ? "it is its server's own database (never ours)" : named(r.name) ? "the workspace's setup names it" : !r.server || !running.has(r.server) ? `its server ${r.server ?? "?"} is not running (never started by the cleaner)` : !r.drop?.length ? "no drop command was recorded" : undefined;
+		const db = dbServer(server?.Config.Env ?? []);
+		const use =
+			!r.engine ? "recorded before code created databases itself (no proof it made it)"
+			: !DB_NAME.test(r.name) ? "its name is not a plain database name"
+			: !r.server || !running.has(r.server) || !db ? `its server ${r.server ?? "?"} is not running (never started by the cleaner)`
+			: db.engine !== r.engine ? `its server ${r.server} is no ${r.engine} server now`
+			: db.own.includes(r.name) ? "it is its server's own database (never ours)"
+			: young(r.at) ? "made less than a day ago (a setup model may still be using it)"
+			: named(r.name) ? "the workspace's setup names it"
+			: undefined;
 		if (use) {
 			plan.kept.push(`database ${r.name}: ${use}`);
 			continue;
 		}
+		const drop = db!.sql(r.server!, `DROP DATABASE ${quoteDb(r.engine!, r.name)}`);
 		plan.remove.push({
 			kind: "database",
 			name: `${r.name} (in ${r.server})`,
-			ours: "recorded in .bigrefactor/owned.jsonl by record_owned when it was made",
+			ours: "created by record_owned (it refuses a database that already existed)",
 			unneeded: "no app recipe or setup script names it any more",
 			remove: async () => {
-				await run(r.drop![0]!, r.drop!.slice(1));
-				await appendFile(ownedFile(o.root), JSON.stringify({ kind: "database", name: r.name, removed: true, at: new Date().toISOString() }) + "\n");
+				await run(drop[0]!, drop.slice(1));
+				await retire(r);
 			},
 		});
 	}
@@ -533,10 +646,11 @@ export function createCleaner(o: CleanOptions & { everyMinutes: number; log: (l:
 }
 
 /**
- * Checks a setup model's record before it is written: the thing exists, and nothing marks it as another project's.
- * Returns why it is refused, or undefined.
+ * record_owned's work: checks a setup model's record (the thing exists, nothing marks it as another project's) and
+ * writes it. A database is created here by code (CREATE DATABASE fails when it already exists), so a database that
+ * was there before is never recorded. Returns what happened, starting with "refused:" when nothing was written.
  */
-export async function recordProblem(root: string, r: { kind: string; name: string; server?: string; drop?: string[] }, run: Runner = realRunner): Promise<string | undefined> {
+export async function recordOwnedChecked(root: string, r: { kind: string; name: string; server?: string; why?: string }, run: Runner = realRunner): Promise<string> {
 	const inspect = async (args: string[]) => {
 		try {
 			return (JSON.parse(await run("docker", args)) as any[])[0];
@@ -551,50 +665,60 @@ export async function recordProblem(root: string, r: { kind: string; name: strin
 		if (wd && !inside(wd, join(root, ".bigrefactor"))) return `it belongs to the compose project in ${wd}, not to this workspace`;
 		return undefined;
 	};
+	const refused = (why: string) => `refused: ${why}`;
 	if (r.kind === "container") {
 		const c = await inspect(["inspect", r.name]);
-		return !c ? `no container ${r.name}` : foreign(c.Config?.Labels);
+		if (!c) return refused(`no container ${r.name}`);
+		const bad = foreign(c.Config?.Labels);
+		if (bad) return refused(bad);
+		await recordOwned(root, { kind: "container", name: r.name, id: c.Id, why: r.why });
+		return `recorded container ${r.name}`;
 	}
 	if (r.kind === "volume") {
 		const v = await inspect(["volume", "inspect", r.name]);
-		if (!v) return `no volume ${r.name}`;
-		// a compose volume is proven through its project's containers; a record would skip that check
-		if (v.Labels?.["com.docker.compose.project"]) return `it is a compose volume of project ${v.Labels["com.docker.compose.project"]}: label it in the compose file instead (labels: bigrefactor.root)`;
-		return foreign(v.Labels);
+		if (!v) return refused(`no volume ${r.name}`);
+		// a compose volume may be another project's with the same project name: it is labelled in the compose file instead
+		if (v.Labels?.["com.docker.compose.project"]) return refused(`it is a compose volume of project ${v.Labels["com.docker.compose.project"]}: label it in the compose file instead (labels: bigrefactor.root)`);
+		const bad = foreign(v.Labels);
+		if (bad) return refused(bad);
+		await recordOwned(root, { kind: "volume", name: r.name, created: v.CreatedAt, why: r.why });
+		return `recorded volume ${r.name}`;
 	}
 	if (r.kind === "database") {
-		if (!r.server) return "say which container holds the database (server)";
+		if (!r.server) return refused("say which container holds the database (server)");
+		if (!DB_NAME.test(r.name)) return refused("use a plain database name (letters, digits, _)");
 		const c = await inspect(["inspect", r.server]);
-		if (!c?.State?.Running) return `no running container ${r.server}`;
-		const d = r.drop ?? [];
-		if (d[0] !== "docker" || d[1] !== "exec" || !d.includes(r.server) || !d.includes(r.name)) return `drop must be a docker exec command into ${r.server} that names ${r.name}, e.g. ["docker","exec","${r.server}","dropdb","-U","<user>","${r.name}"]`;
-		// the server's own database (named in its environment) is the server owner's, never ours
-		const env = (c.Config?.Env ?? []) as string[];
-		const own = env.filter((e) => /^(POSTGRES_DB|POSTGRES_USER|MYSQL_DATABASE|MARIADB_DATABASE)=/.test(e)).map((e) => e.split("=")[1]);
-		if (own.includes(r.name)) return `${r.name} is the server's own database (from its environment), not one you made`;
-		return undefined;
+		if (!c?.State?.Running) return refused(`no running container ${r.server}`);
+		const db = dbServer((c.Config?.Env ?? []) as string[]);
+		if (!db) return refused(`${r.server} is no Postgres or MySQL/MariaDB server this tool knows: start your own labelled container instead`);
+		if (db.own.includes(r.name)) return refused(`${r.name} is the server's own database, not one you made`);
+		const create = db.sql(r.server, `CREATE DATABASE ${quoteDb(db.engine, r.name)}`);
+		try {
+			await run(create[0]!, create.slice(1));
+		} catch (e: any) {
+			return refused(`could not create ${r.name} (a database that already exists is never recorded): ${String(e?.message ?? e).split("\n")[0]}`);
+		}
+		await recordOwned(root, { kind: "database", name: r.name, server: r.server, engine: db.engine, why: r.why });
+		return `created database ${r.name} in ${r.server} and recorded it`;
 	}
-	return `unknown kind ${r.kind}`;
+	return refused(`unknown kind ${r.kind}`);
 }
 
-/** Tool for setup models: write down a Docker thing or a database they made, so the cleaner may later remove it. */
+/** Tool for setup models: write down a Docker thing they made, or create a database and write it down, so the cleaner may later remove it. */
 export function recordOwnedTool(root: string): ToolDefinition {
 	return {
 		name: "record_owned",
 		label: "Record what you made",
-		description: `Write down a Docker container, a Docker volume or a database YOU made in this session (never one that was there before), so the workspace can remove it once no recipe names it any more. Better than a record: put the label bigrefactor.root=${resolve(root)} on every container and volume you create (docker run --label, docker volume create --label, labels: in a compose file). A database inside a server you did not start has no label: record it here with its server container and the command that drops it.`,
-		promptSnippet: "record_owned: write down a container, volume or database you made",
+		description: `Write down a Docker container or volume YOU made in this session (never one that was there before), so the workspace can remove it once no recipe names it any more. Better than a record: put the label bigrefactor.root=${resolve(root)} on every container and volume you create (docker run --label, docker volume create --label, labels: in a compose file). A database inside a server you did not start has no label: do not create it yourself; call this with kind database, its name and the server container, and the tool creates it (it refuses a name that already exists).`,
+		promptSnippet: "record_owned: write down a container or volume you made, or create a database in a running server",
 		parameters: Type.Object({
 			kind: Type.Union([Type.Literal("container"), Type.Literal("volume"), Type.Literal("database")]),
 			name: Type.String(),
-			server: Type.Optional(Type.String({ description: "database only: the container of the database server" })),
-			drop: Type.Optional(Type.Array(Type.String(), { description: 'database only: the command that drops it, e.g. ["docker","exec","<server>","dropdb","-U","<user>","<name>"]' })),
+			server: Type.Optional(Type.String({ description: "database only: the container of the running Postgres or MySQL/MariaDB server" })),
 			why: Type.Optional(Type.String()),
 		}),
-		execute: async (_id: string, p: { kind: "container" | "volume" | "database"; name: string; server?: string; drop?: string[]; why?: string }) => {
-			const bad = await recordProblem(root, p);
-			if (!bad) await recordOwned(root, p);
-			return { content: [{ type: "text" as const, text: bad ? `refused: ${bad}` : `recorded ${p.kind} ${p.name}` }], details: {} };
+		execute: async (_id: string, p: { kind: "container" | "volume" | "database"; name: string; server?: string; why?: string }) => {
+			return { content: [{ type: "text" as const, text: await recordOwnedChecked(root, p) }], details: {} };
 		},
 	} as unknown as ToolDefinition;
 }
@@ -608,6 +732,11 @@ export async function cleanCommand(o: { config: Config; root: string; ledger: Le
 	const pid = liveRun(o.root);
 	const live = pid !== undefined && pid !== process.pid;
 	const note = live ? [`a run is going in this workspace (pid ${pid}): it removes these by itself every ${o.config.run.cleanEveryMinutes || "(off)"} minutes; nothing removed now`, ""] : [];
-	const r = await cleanOnce({ ...o, otherRunLive: live, apply: o.apply && !live });
+	// asked again before each worktree and branch removal: a run started while this one plans is seen
+	const otherRunNow = () => {
+		const p = liveRun(o.root);
+		return p !== undefined && p !== process.pid;
+	};
+	const r = await cleanOnce({ ...o, otherRunLive: live, otherRunNow, apply: o.apply && !live });
 	return [...note, ...renderPlan(r.plan, o.apply && !live ? r : undefined)];
 }

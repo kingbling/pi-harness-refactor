@@ -142,6 +142,9 @@ export async function addWorktree(repo: string, worktreePath: string, branch: st
 	await withRepoLock(repo, async () => {
 		await git(repo, ["worktree", "prune"]);
 		await git(repo, ["worktree", "add", "-q", "-B", branch, worktreePath]);
+		// which workspace made the branch: the cleaner removes only branches whose record points into its own worktrees
+		// folder (other workspaces on the same repo make branches with the same names); git drops it with the branch
+		await git(repo, ["config", `branch.${branch}.bigrefactorWorktree`, resolve(worktreePath)]);
 	});
 }
 
