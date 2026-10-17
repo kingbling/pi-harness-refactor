@@ -330,12 +330,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	};
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
 	// the DB lane (one migrations folder, ordered versions) and a shared module run one unit at a time
-	const moduleLimit = (p: { moduleKey: string; shared: boolean }) => (p.shared || p.moduleKey.endsWith(":db") ? 1 : config.run.unitsPerModule);
+	let perModule = config.run.unitsPerModule;
+	const moduleLimit = (p: { moduleKey: string; shared: boolean }) => (p.shared || p.moduleKey.endsWith(":db") ? 1 : perModule);
 	await excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
 	const agents = new Semaphore(config.run.agentConcurrency);
 	const gates = new Semaphore(gateSlots(config.run));
 	// Lanes are live: `br lanes <n>` / `/br lanes <n>` edits run.agentConcurrency (and gateConcurrency; unset, the gates follow the lanes) in the
-	// config; the loop picks it up within seconds. Shrinking never kills a lane — running units finish first.
+	// config; the loop picks it up within seconds (run.unitsPerModule too). Shrinking never kills a lane — running units finish first.
 	let laneLimit = config.run.agentConcurrency;
 	let configMtime = 0;
 	const reloadLanes = () => {
@@ -352,6 +353,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				laneLimit = run.agentConcurrency;
 				agents.setLimit(laneLimit);
 				gates.setLimit(gateSlots(run));
+			}
+			if (run.unitsPerModule !== perModule) {
+				log(pc.cyan(`units per module ${perModule} → ${run.unitsPerModule}`));
+				perModule = run.unitsPerModule;
 			}
 		} catch {
 			/* unreadable mid-write: next tick */
