@@ -208,7 +208,7 @@ describe("answers are applied per option", () => {
 		expect(JSON.parse(ledger.getUnit("U1")!.meta).parkedWhy).toBeUndefined();
 	});
 
-	it("a unit a model parked gets one more try when the plugin changed after the park in a way that touches it", async () => {
+	it("a unit a model parked gets one more try when the plugin changed after the park in a way that touches it, past its automatic tries too", async () => {
 		const { root, config, ledger, mk } = await workspace();
 		const { healQuarantined } = await import("../src/run/run.ts");
 		mk("U1", "billing", "implementing");
@@ -238,9 +238,14 @@ describe("answers are applied per option", () => {
 		ledger.transitionUnit("U1", "quarantined", "still red");
 		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "still red", parkedAt: Date.now() } });
 		expect(await heal(parkedAt + 3000, "abc3 code jobs may change app config")).toEqual([]);
-		// its automatic tries used up: a plugin change does not bring it back either
+		// its automatic tries used up: a later plugin change that touches it still brings it back once (a fix, no plain retry)
 		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals } });
-		expect(await heal(Date.now() + 1000, "abc4 code jobs may change app config")).toEqual([]);
+		const later = Date.now() + 1000;
+		expect(await heal(later, "abc4 code jobs may change app config", true)).toEqual(["U1"]);
+		ledger.transitionUnit("U1", "implementing", "x");
+		ledger.transitionUnit("U1", "quarantined", "still red");
+		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "still red", parkedAt: later + 1000 } });
+		expect(await heal(later, "abc4 code jobs may change app config", true)).toEqual([]);
 	});
 
 	it("the plugin's changes come from its own git history: each commit's subject and files", async () => {

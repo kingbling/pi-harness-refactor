@@ -1799,8 +1799,9 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		const mayRun = (meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && (meta.stuck || !meta.healQuestion)) || parked;
 		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change). One
 		// more try when the plugin's own changes since the park touch what parked it (the decide model reads them, as for
-		// a change on main), counted against the automatic tries; asked once per plugin version
-		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0) && (meta.pluginChecked ?? 0) < pluginAt && heals < config.run.maxAutoHeals) {
+		// a change on main), counted, past the automatic tries too (like a change on main after the park: a fix in the
+		// plugin is no plain retry); asked once per plugin version, and a new park after that try is newer than the plugin
+		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0) && (meta.pluginChecked ?? 0) < pluginAt) {
 			// only what is new since the last look: each change is judged once, while it is new, and the list stays short
 			const changes = await (o.pluginChanges ?? pluginChangesSince)(Math.max(meta.parkedAt ?? 0, meta.pluginChecked ?? 0));
 			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
