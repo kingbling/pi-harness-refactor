@@ -8,7 +8,7 @@ import type { TargetAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo } from "../src/git.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { buildParkedKey, createBuilder, type Repairer } from "../src/run/builder.ts";
+import { buildParkedKey, builderLogPath, createBuilder, keepBuilderLine, type Repairer } from "../src/run/builder.ts";
 import { wholeProjectSteps } from "../src/run/gate.ts";
 
 /**
@@ -110,6 +110,22 @@ describe("the builder", () => {
 		expect(calls).toBe(0); // the repair may not touch tests; the code job may
 		expect(jobs).toHaveLength(2); // one per cycle: a job that merged nothing ends the cycle
 		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt[\s\S]*run these commands yourself/i);
+		// what the builder did stays readable after the live log scrolled away
+		const kept = readFileSync(builderLogPath(root), "utf8");
+		expect(kept).toMatch(/^\d{4}-\d\d-\d\dT\S+ builder fake: whole-project check fails: \d+ error line\(s\)/m);
+		expect(kept).toMatch(/builder fake: code job 1\/3 merged nothing/);
+		expect(kept).not.toMatch(/\x1b\[/);
+	});
+
+	it("the builder's record stays small: past its cap only the newer half is kept, whole lines", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-builderlog-")));
+		mkdirSync(join(root, ".bigrefactor"));
+		for (let i = 0; i < 6000; i++) keepBuilderLine(root, `builder fake: line ${i} ${"x".repeat(100)}`);
+		const kept = readFileSync(builderLogPath(root), "utf8");
+		expect(kept.length).toBeLessThanOrEqual(512 * 1024);
+		expect(kept).toMatch(/^\d{4}-/);
+		expect(kept).toMatch(/line 5999 x+\n$/);
+		expect(kept).not.toMatch(/line 0 /);
 	});
 
 	it("a code job that made progress is followed by the next one in the same cycle, until main is green or one makes none", async () => {

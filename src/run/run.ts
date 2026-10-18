@@ -8,7 +8,7 @@ import { dirname, join, relative } from "node:path";
 import { linkedDirs, loadCommandOverrides, noteFix, setupLogPath } from "../adapters/command-overrides.ts";
 import { fixRunSetup, fixSetupWithModel, type NoFix, type SetupFixer } from "../init/setup-fixer.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
-import { buildRedKey, createBuilder, createMergeCheck, filesNamed, type Repairer } from "./builder.ts";
+import { buildRedKey, createBuilder, createMergeCheck, filesNamed, keepBuilderLine, type Repairer } from "./builder.ts";
 import { createPusher } from "./push.ts";
 import { diagnoseFailure } from "./doctor.ts";
 import pc from "picocolors";
@@ -331,7 +331,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const placementOf = (meta: string) => placeUnit(config, meta, o.root);
 	// the DB lane (one migrations folder, ordered versions) and a shared module run one unit at a time
 	let perModule = config.run.unitsPerModule;
-	const moduleLimit = (p: { moduleKey: string; shared: boolean }) => (p.shared || p.moduleKey.endsWith(":db") ? 1 : perModule);
+	// lanes free and the module limit the only thing holding ready units back (the end of a migration: what is ready sits
+	// in one or two modules): a pass may start up to MODULE_BOOST times as many per module. The merge rounds put a clashing
+	// unit's code back on the new main for another pass; the cap keeps clashes from piling up past those rounds.
+	let boost = false;
+	const moduleLimit = (p: { moduleKey: string; shared: boolean }) => (p.shared || p.moduleKey.endsWith(":db") ? 1 : boost ? perModule * MODULE_BOOST : perModule);
+	/** Ready units held back only by the module limit, per module (from the last ready() and the pass's own starts). */
+	let moduleWait = new Map<string, number>();
 	await excludeFromGit(config.target.path, [...new Set([...adapters.values()].flatMap((a) => a.toolchain.ignoredPaths))]);
 	const agents = new Semaphore(config.run.agentConcurrency);
 	const gates = new Semaphore(gateSlots(config.run));
@@ -392,7 +398,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		codeJob: o.setupFixer === false || (!o.setupFixer && o.spawn) ? undefined : async (stackId, what) => {
 			let merged: string | undefined;
 			let locked: { files: string[]; diff: string } | undefined;
-			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log, what, whole: true, onLocked: (l) => (locked = l), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+			const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `build-${stackId}-${Date.now()}`, linkAll, log: (l) => (log(l), keepBuilderLine(o.root, l)), what, whole: true, onLocked: (l) => (locked = l), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
 			if (said) noteFix(o.root, stackId, merged, `builder code job: ${said}`);
 			const setup = locked ? await lockedToSetup(adapters.get(stackId)!, stackId, `the red ${stackId} main`, locked) : undefined;
 			return said ?? setup;
@@ -648,14 +654,20 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			)
 			.all() as Array<{ id: string; meta: string }>;
 		const held = tidyJobs.heldAreas();
+		moduleWait = new Map();
 		const units = rows.filter((u) => {
 			if (running.has(u.id) || blocked.has(u.id)) return false;
 			// waits for Jev or its placement question, never runs on a guess (a dry run previews before placement ran)
 			if (!o.dry && unplacedReason(config, u.meta, o.root)) return false;
-			if ((busyModules.get(placementOf(u.meta).moduleKey) ?? 0) >= moduleLimit(placementOf(u.meta))) return false;
-			if (held.has(`${placementOf(u.meta).stackId}\0${placementOf(u.meta).area}`)) return false;
+			const place = placementOf(u.meta);
+			if (held.has(`${place.stackId}\0${place.area}`)) return false;
 			if (o.units && !o.units.includes(u.id)) return false;
 			if (o.slice && JSON.parse(u.meta).slice !== o.slice) return false;
+			// last: a unit counted here waits for nothing but the module limit
+			if ((busyModules.get(place.moduleKey) ?? 0) >= moduleLimit(place)) {
+				moduleWait.set(place.moduleKey, (moduleWait.get(place.moduleKey) ?? 0) + 1);
+				return false;
+			}
 			return true;
 		});
 		// what many units (or an early slice) wait on goes first, not the alphabet
@@ -1154,18 +1166,33 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			const sampleReason = stop ? undefined : healing ? "fixing a shared failure (setup model); new units wait" : (diskReason() ?? (await samplePause()));
 			let readyNow = 0;
 			if (!stop && !dayCapHit && !sampleReason && underLimit()) {
-				const candidates = await ready();
-				readyNow = candidates.length;
-				// the module limit also within this pass: ready() only knows the units running before it (startUnit adds to running)
-				for (const id of candidates) {
-					if (running.size >= laneLimit || !underLimit()) break;
-					const place = placementOf(ledger.getUnit(id)!.meta);
-					const busy = [...running.keys()].filter((r) => placementOf(ledger.getUnit(r)!.meta).moduleKey === place.moduleKey).length;
-					if (busy >= moduleLimit(place)) continue;
-					startUnit(id);
-					readyNow--;
+				const startReady = async () => {
+					const candidates = await ready();
+					readyNow = candidates.length;
+					// the module limit also within this pass: ready() only knows the units running before it (startUnit adds to running)
+					for (const id of candidates) {
+						if (running.size >= laneLimit || !underLimit()) break;
+						const place = placementOf(ledger.getUnit(id)!.meta);
+						const busy = [...running.keys()].filter((r) => placementOf(ledger.getUnit(r)!.meta).moduleKey === place.moduleKey).length;
+						if (busy >= moduleLimit(place)) {
+							moduleWait.set(place.moduleKey, (moduleWait.get(place.moduleKey) ?? 0) + 1);
+							readyNow--;
+							continue;
+						}
+						startUnit(id);
+						readyNow--;
+					}
+				};
+				await startReady();
+				if (running.size < laneLimit && readyNow === 0 && moduleWait.size && underLimit()) {
+					boost = true;
+					try {
+						await startReady();
+					} finally {
+						boost = false;
+					}
 				}
-			}
+			} else moduleWait = new Map();
 			// Lanes stay full while anything is todo: idle lanes capture truth for units still waiting on deps.
 			// Not in a pilot (a limit means "spend on N units"), not while stopping or over budget.
 			if ((o.truthAhead ?? o.limit === undefined) && !stop && !dayCapHit && !sampleReason && running.size < laneLimit) {
@@ -1186,7 +1213,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 							? `pilot limit ${o.limit}: ${acceptedNow} accepted + ${running.size} finishing, nothing new starts`
 							: running.size >= max
 								? undefined
-								: readyNow === 0
+								: readyNow === 0 && moduleWait.size
+									? moduleWaitNote(moduleWait, perModule)
+									: readyNow === 0
 									? aheadRunning.size
 										? undefined
 										: "no unit ready: the rest wait for dependencies on running units, or for answers"
@@ -1688,6 +1717,16 @@ export function applyParityAnswers(ledger: Ledger): string[] {
 	return slices;
 }
 
+/** How many times run.unitsPerModule a module may run while lanes are free and only the module limit holds ready units. */
+export const MODULE_BOOST = 3;
+
+/** The lanes line when ready units wait only for the module limit (run.unitsPerModule, raised while lanes are free). */
+export function moduleWaitNote(wait: Map<string, number>, perModule: number): string {
+	const n = [...wait.values()].reduce((a, b) => a + b, 0);
+	const where = [...wait].sort((a, b) => b[1] - a[1]).map(([k, c]) => `${k} (${c})`);
+	return `${n} ready unit${n === 1 ? "" : "s"} wait for a free place in ${where.slice(0, 3).join(", ")}${where.length > 3 ? ", …" : ""}: at most ${perModule * MODULE_BOOST} per module while lanes are free (run.unitsPerModule ${perModule}; a DB or shared module runs 1)`;
+}
+
 /** Parity comparisons that failed with an error in a row before a slice is left alone (until a unit of it lands again). */
 export const MAX_PARITY_ERRORS = 3;
 
@@ -1700,12 +1739,14 @@ export const MAX_PARITY_ERRORS = 3;
  * that also gives a slice that errored too often its tries back.
  */
 export function parityAgain(ledger: Ledger, head?: string): { checked: Set<string>; again: Set<string>; fixed: Set<string> } {
+	// CROSS JOIN keeps SQLite on the blamed diffs first, then each unit's own transitions: left to choose, it walked every
+	// unit transition (200k+ in a long run) for each slice and held the run's thread a second at every accept
 	const rows = ledger.db
 		.prepare(
 			`SELECT x.*, (SELECT COUNT(*) FROM parity_runs e WHERE e.slice = x.slice AND e.outcome = 'error' AND e.id > x.compared_id
 			   AND (x.fixed_at IS NULL OR julianday(e.started_at) > x.fixed_at)) AS errors
 			 FROM (SELECT r.slice, r.outcome, r.commit_sha, COALESCE(c.id, 0) AS compared_id,
-			   (SELECT MAX(julianday(t.created_at)) FROM parity_diffs d JOIN transitions t ON t.entity = 'unit' AND t.entity_id = d.unit_id AND t.to_state = 'accepted'
+			   (SELECT MAX(julianday(t.created_at)) FROM parity_diffs d CROSS JOIN transitions t ON t.entity = 'unit' AND t.entity_id = d.unit_id AND t.to_state = 'accepted'
 			      WHERE d.run_id = c.id AND d.status = 'bug' AND julianday(t.created_at) > julianday(COALESCE(c.ended_at, c.started_at))) AS fixed_at,
 			   EXISTS (SELECT 1 FROM parity_diffs d WHERE d.run_id = r.id AND d.status = 'open') AS unjudged,
 			   EXISTS (SELECT 1 FROM parity_diffs d JOIN quirks q ON q.id = d.quirk_id WHERE d.run_id = r.id AND d.status = 'quirk' AND q.status IN ('kept', 'dropped')) AS decided

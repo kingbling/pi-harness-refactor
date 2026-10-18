@@ -220,6 +220,26 @@ describe("judging parity differences", () => {
 		expect(parityAgain(ledger).fixed.has("invoices")).toBe(true);
 	});
 
+	it("parityAgain reads each blamed unit's own transitions, not every unit transition per slice (it ran at every accept and held the run a second)", () => {
+		const { ledger } = workspace();
+		const tr = ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, created_at) VALUES ('unit', ?, 'planned', ?, '2026-10-15T01:00:00.000Z')");
+		ledger.db.exec("BEGIN");
+		for (let i = 0; i < 20_000; i++) tr.run(`X${i % 2000}`, i % 3 ? "implementing" : "accepted");
+		for (let s = 0; s < 10; s++) {
+			const id = Number(ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at, ended_at) VALUES (?, 'differs', '2026-10-14T23:36:00.000Z', '2026-10-14T23:47:00.000Z')").run(`s${s}`).lastInsertRowid);
+			ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target, status, unit_id) VALUES (?, ?, 's1', 'GET /x', 'status', 'status', '302', '503', 'bug', 'U1')").run(id, `s${s}`);
+		}
+		ledger.db.exec("COMMIT");
+		const sqls: string[] = [];
+		const prepare = ledger.db.prepare.bind(ledger.db);
+		ledger.db.prepare = ((sql: string) => (sqls.push(sql), prepare(sql))) as typeof ledger.db.prepare;
+		expect(parityAgain(ledger).fixed.size).toBe(0);
+		ledger.db.prepare = prepare;
+		const plan = (ledger.db.prepare(`EXPLAIN QUERY PLAN ${sqls[0]}`).all() as Array<{ detail: string }>).map((r) => r.detail).filter((l) => /\bt\b/.test(l));
+		expect(plan.length).toBeGreaterThan(0);
+		for (const l of plan) expect(l).toMatch(/entity=\? AND entity_id=\?/);
+	});
+
 	it("an accept queues its slice's comparison: a route owner's, a slice never compared, or a unit the last comparison blamed", () => {
 		const { ledger } = workspace();
 		// U1 answers the slice's route, U2 is a helper of it

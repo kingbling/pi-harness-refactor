@@ -74,7 +74,7 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 	if (parked.length) lines.push(c.dim(`  parked, no question (nothing a model can do is left): ${parked.slice(0, 8).join(", ")}${parked.length > 8 ? " …" : ""} → br requeue <unit> after a change`));
 	// main red, the builder's code jobs could not fix it: no question, the builder stopped paying for it
 	const redMain = ledger.db.prepare("SELECT key, value FROM meta WHERE key LIKE ? AND value != '' ORDER BY key").all(buildParkedKey("%")) as Array<{ key: string; value: string }>;
-	for (const r of redMain) lines.push(c.yellow(`main of ${r.key.slice(buildParkedKey("").length)} parked red, no question: ${r.value}`));
+	for (const r of redMain) lines.push(c.yellow(`main of ${r.key.slice(buildParkedKey("").length)} parked red, no question: ${r.value} (what the builder tried: .bigrefactor/builder.log)`));
 	// accepted although the reviewer still found the tests weak after the tester's rounds (meta.weakTestsNote)
 	const weak = ledger.listUnits({ state: "accepted" }).flatMap((u) => {
 		const note = (JSON.parse(u.meta) as { weakTestsNote?: string }).weakTestsNote;
