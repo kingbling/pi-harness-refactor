@@ -1,6 +1,7 @@
 import { findSourceAdapter } from "../adapters/registry.ts";
 import { CODEX_PROVIDER, modelRuntime, openRouterCost, priceAt, resolveCodexModel } from "../models/codex.ts";
 import { recordSpend } from "../spend.ts";
+import { exec } from "../proc.ts";
 import { describeArgs, progress } from "../progress.ts";
 import { mkdirSync, lstatSync, realpathSync, renameSync, unlinkSync } from "node:fs";
 import { Type, type TSchema } from "typebox";
@@ -235,6 +236,21 @@ export function globToRegExp(glob: string): RegExp {
 	return new RegExp(`^${out}$`);
 }
 
+/**
+ * A file outside the unit's scope that git does not track yet is new in this worktree (never on main): a session's own
+ * stray write, e.g. a test run's output in the wrong folder. Removing it only undoes that write, so remove_file may,
+ * else the gate's "write outside unit scope" red is one the session can never clear. `scope` is the write gate without
+ * its protected paths (a stray test file is protected too); the unit's own ported tests the gate still checks for.
+ */
+export async function strayNewFile(cwd: string, abs: string, scope: (abs: string) => string | undefined): Promise<boolean> {
+	if (!scope(abs)?.startsWith("outside this unit's scope")) return false;
+	try {
+		return (await exec("git", ["status", "--porcelain", "--untracked-files=all", "--", abs], { cwd })).startsWith("?? ");
+	} catch {
+		return false; // not a git worktree: nothing proves the file is new
+	}
+}
+
 export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot: string; writeGlobs: string[]; protectedGlobs: string[]; isProtected?: (rel: string) => boolean; appendOnlyGlobs?: string[] }) {
 	const allow = opts.writeGlobs.map(globToRegExp);
 	const deny = opts.protectedGlobs.map(globToRegExp);
@@ -257,19 +273,20 @@ export function makeWriteGate(opts: { cwd: string; globRoot?: string; sourceRoot
 /** File-only mutations use the same scope as writes, and reject symlink traversal and directory removal. */
 export function scopedFileTools(opts: Pick<SpawnOptions, "cwd" | "globRoot" | "writeGlobs" | "protectedGlobs" | "isProtected" | "appendOnlyGlobs"> & { sourceRoot: string }): ToolDefinition[] {
 	const gate = makeWriteGate({ ...opts, protectedGlobs: opts.protectedGlobs ?? [] });
+	const scope = makeWriteGate({ ...opts, protectedGlobs: [], isProtected: undefined });
 	// Built on first use: the session's folder may not exist yet when its tools are made.
 	let physicalGate: ReturnType<typeof makeWriteGate> | undefined;
 	const physical = () => (physicalGate ??= makeWriteGate({ ...opts, cwd: realpathSync(opts.cwd), globRoot: opts.globRoot ? realpathSync(opts.globRoot) : undefined, sourceRoot: existsSync(opts.sourceRoot) ? realpathSync(opts.sourceRoot) : opts.sourceRoot, protectedGlobs: opts.protectedGlobs ?? [] }));
-	const checked = (path: string, existing: boolean): string => {
+	const checked = (path: string, existing: boolean, stray = false): string => {
 		if (!path.trim()) throw new Error("a file path is required");
 		const abs = resolve(opts.cwd, path);
 		const reason = gate(abs);
-		if (reason) throw new Error(reason);
+		if (reason && !stray) throw new Error(reason);
 		// Check the real parent too: a writable-looking path must not escape through a symlink.
 		const parent = realpathSync(dirname(abs));
 		const realPath = resolve(parent, basename(abs));
 		const physicalReason = physical()(realPath);
-		if (physicalReason) throw new Error(physicalReason);
+		if (physicalReason && !(stray && /^(outside this unit's scope|protected path)/.test(physicalReason))) throw new Error(physicalReason);
 		if (existing) {
 			if (!lstatSync(abs).isFile()) throw new Error("only regular files may be removed or renamed");
 		} else {
@@ -288,10 +305,11 @@ export function scopedFileTools(opts: Pick<SpawnOptions, "cwd" | "globRoot" | "w
 	return [
 		define({
 			name: "remove_file", label: "Remove file",
-			description: "Delete an obsolete regular file inside your write scope. No directories, protected tests, existing shared files or legacy files. Deletions are kept in the change and checked for scope; do not leave compatibility shims with rejected filenames.",
+			description: "Delete an obsolete regular file inside your write scope, or a new file (not tracked by git) you wrote outside it by mistake. No directories, protected tests, existing shared files or legacy files. Deletions are kept in the change and checked for scope; do not leave compatibility shims with rejected filenames.",
 			parameters: Type.Object({ path: Type.String() }),
 			execute: async (_id, p) => {
-				unlinkSync(checked(p.path, true));
+				const abs = resolve(opts.cwd, p.path || ".");
+				unlinkSync(checked(p.path, true, !!gate(abs) && (await strayNewFile(opts.cwd, abs, scope))));
 				return result(`Removed ${p.path}`);
 			},
 		}),
@@ -371,6 +389,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 	const model = await resolveSessionModel(role);
 	const orCost = await openRouterCost(role.id);
 	const gate = makeWriteGate({ cwd: opts.cwd, globRoot: opts.globRoot, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: opts.protectedGlobs ?? [], isProtected: opts.isProtected, appendOnlyGlobs: opts.appendOnlyGlobs });
+	const scope = makeWriteGate({ cwd: opts.cwd, globRoot: opts.globRoot, sourceRoot: opts.config.source.path, writeGlobs: opts.writeGlobs, protectedGlobs: [], appendOnlyGlobs: opts.appendOnlyGlobs });
 	let toolCalls = 0;
 	let blocked = 0;
 	// the file as it was before each edit, so the syntax check after it reports only errors the edit added
@@ -388,6 +407,7 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 			if (["write", "edit", "remove_file", "rename_file"].includes(event.toolName)) {
 				const path = String(input["path"] ?? "");
 				reason = gate(path);
+				if (reason && event.toolName === "remove_file" && (await strayNewFile(opts.cwd, resolve(opts.cwd, path), scope))) reason = undefined;
 				if (!reason && event.toolName === "rename_file") reason = gate(String(input["destination"] ?? ""));
 				if (!reason && event.toolName === "write" && opts.validateWrite) reason = await opts.validateWrite(path, String(input["content"] ?? ""), fileText(resolve(opts.cwd, path)));
 				if (!reason && event.toolName === "edit" && opts.validateWrite) beforeEdit.set(event.toolCallId, fileText(resolve(opts.cwd, path)));

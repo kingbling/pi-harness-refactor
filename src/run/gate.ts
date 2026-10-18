@@ -214,7 +214,7 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 			if (tracked.has(f)) problems.push(`edited an existing shared file (add-only zone): ${f}`);
 			continue;
 		}
-		problems.push(`write outside unit scope: ${f}`);
+		problems.push(`write outside unit scope: ${f}${tracked.has(f) ? "" : " (a new file, not on main: remove it with remove_file, or put what it holds into your own files)"}`);
 	}
 	for (const t of g.testFiles) {
 		const p = join(g.targetProjectDir, t.path);

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { scopedFileTools } from "../src/sessions/spawn.ts";
 let cwd: string;
@@ -43,5 +44,19 @@ describe("scoped file tools", () => {
   writeFileSync(join(cwd, "pages/own.tsx"), "preserve");
   await expect(call("rename_file", { path: "pages/own.tsx", destination: "outside/new.tsx" })).rejects.toThrow();
   expect(existsSync(join(cwd, "pages/own.tsx"))).toBe(true);
+ });
+ it("removes a new stray file outside the scope, never a tracked one", async () => {
+  const git = (...a: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd, stdio: "ignore" });
+  git("init", "-q");
+  writeFileSync(join(cwd, "outside/kept.ts"), "on main");
+  git("add", "-A");
+  git("commit", "-qm", "main");
+  writeFileSync(join(cwd, "Stray.test.tsx"), "a test run's output in the wrong folder");
+  await call("remove_file", { path: "Stray.test.tsx" });
+  expect(existsSync(join(cwd, "Stray.test.tsx"))).toBe(false);
+  await expect(call("remove_file", { path: "outside/kept.ts" })).rejects.toThrow("scope");
+  expect(existsSync(join(cwd, "outside/kept.ts"))).toBe(true);
+  writeFileSync(join(cwd, "legacy/new.php"), "legacy stays");
+  await expect(call("remove_file", { path: "legacy/new.php" })).rejects.toThrow("read-only");
  });
 });
