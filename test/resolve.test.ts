@@ -297,10 +297,15 @@ describe("a parked unit's question", () => {
 		const b = ask(sameKind);
 		await run({ answer: "retry", why: "the reviewer wants the lazy load", hint: "load the TTD lazily in services.php" });
 		expect(ledger.getQuestion(b)!.answer).toMatch(/^retry — try again\nhint: load the TTD lazily/);
-		// automatic tries used up: even a hint does not bring it back, only a job
+		// automatic tries used up: a plain retry stays parked; one with a hint goes to the owner, who may give more tries
 		const c = ask({ retry: "none" });
-		await run({ answer: "retry", why: "x", hint: "y" });
+		await run({ answer: "retry", why: "x" });
 		parked(c);
+		const c2 = ask({ retry: "none" }, "u2");
+		expect(await run({ answer: "retry", why: "main has no stubs in documents.md any more", hint: "the stubs it was parked on are gone: rerun the tests" })).toEqual({ answered: 0, forOwner: 1 });
+		expect(ledger.getQuestion(c2)).toMatchObject({ status: "open", question: expect.stringMatching(/^u2 used up its automatic tries\. The resolver model found what the next attempt should do differently: the stubs it was parked on are gone/), options: JSON.stringify(["retry — give it another set of tries with this hint", "leave — leave it parked"]) });
+		expect(JSON.parse(ledger.getQuestion(c2)!.context!)).toMatchObject({ resolverHint: "the stubs it was parked on are gone: rerun the tests" });
+		ledger.answerQuestion(c2, "leave");
 		// nothing a model can do is left: parked, the owner is not asked
 		const d = ask();
 		await run({ park: "the legacy screen is dead code" });

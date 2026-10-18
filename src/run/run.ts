@@ -1869,7 +1869,9 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				log(pc.yellow(`⏸ ${r.id}: stays parked, no automatic try left (br requeue ${r.id} after a change)`));
 				continue;
 			}
-			await backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? `the ${q.answered_by}` : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "model's" : "owner's"} hint: ${a.hint}` : ""}${lastFailure}`, failure, retriedOn);
+			// the owner gave more tries for the resolver's hint (ownerMayGrant): it goes with them
+			const resolverHint = !byModel && q.context ? (JSON.parse(q.context) as { resolverHint?: string }).resolverHint : undefined;
+			await backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? `the ${q.answered_by}` : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "model's" : "owner's"} hint: ${a.hint}` : ""}${resolverHint ? ` The resolver model's hint: ${resolverHint}` : ""}${lastFailure}`, failure, retriedOn);
 			back.push(r.id);
 			continue;
 		}

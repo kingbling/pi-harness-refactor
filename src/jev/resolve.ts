@@ -33,12 +33,23 @@ export function retryRefused(q: QuestionRow, answer: string, hint?: string, retr
   // "retry: <text>" carries its hint inline (optionFor, applyParkedAnswer read it the same way)
   const inline = /^retry: /i.test(answer) ? answer.slice(7).trim() : "";
   const ctx = q.context ? (JSON.parse(q.context) as { retry?: string; failureKind?: string; outOfScope?: string }) : {};
-  if (ctx.retry === "none") return "the unit's automatic tries are used up: a retry is no answer; a job (code_job, fix_job, layout_job) that changes main is";
+  if (ctx.retry === "none") return "the unit's automatic tries are used up: a plain retry is no answer. Give a hint that changes the attempt (the owner is then asked to give it more tries), or call a job (code_job, fix_job, layout_job) that changes main";
   // the reviewer wants a file changed that the unit may not write: no hint widens the files a unit may write, so a
   // retry that came back once comes back again
   if (ctx.outOfScope && retried > 0) return "the unit was already retried on the reviewer's finding outside its files and it came back: a retry or a hint never lets the unit write a file outside its list. If the change is needed, call code_job (app code) or fix_job (setup) to make it on main";
   if (ctx.retry && !hint?.trim() && !inline) return `the unit was already retried on this kind of failure (${ctx.failureKind}) and it came back: a plain retry runs it again blind. Give a hint that changes the attempt (what to do differently, or what changed on main and how to use it), or call a job`;
   return undefined;
+}
+
+/**
+ * The resolver found what the next attempt must do differently (a hint), but the unit's automatic tries are used up:
+ * more tries are the owner's to give, so the owner is asked with that hint instead of the unit being parked quietly.
+ */
+export function ownerMayGrant(q: QuestionRow, answer: string, hint?: string): boolean {
+  if (answerValue(answer).toLowerCase() !== "retry") return false;
+  const ctx = q.context ? (JSON.parse(q.context) as { retry?: string }) : {};
+  const inline = /^retry: /i.test(answer) ? answer.slice(7).trim() : "";
+  return ctx.retry === "none" && !!(hint?.trim() || inline);
 }
 
 /**
@@ -253,6 +264,16 @@ export async function resolveOpenQuestions(d: {
       park(r.park);
       continue;
     }
+    if ("answer" in r && parks(q) && ownerMayGrant(q, r.answer, r.hint)) {
+      const hint = [/^retry: /i.test(r.answer) ? r.answer.slice(7).trim() : "", r.hint?.trim()].filter(Boolean).join("\n");
+      d.ledger.db
+        .prepare("UPDATE questions SET question = ?, options = ?, context = json_set(COALESCE(context, '{}'), '$.resolverHint', ?) WHERE id = ?")
+        .run(`${q.unit_id} used up its automatic tries. The resolver model found what the next attempt should do differently: ${hint}${r.why ? `\n(What it read: ${r.why.slice(0, 600)})` : ""}`, JSON.stringify(["retry — give it another set of tries with this hint", "leave — leave it parked"]), hint.slice(0, 3000), q.id);
+      d.ledger.markForOwner(q.id, `${q.unit_id}: its tries are used up; the resolver has a fix for the next attempt`);
+      d.log?.(`question #${q.id} (${q.point} ${q.unit_id}): tries used up, the resolver has a hint, so the owner is asked — ${hint.slice(0, 160)}`);
+      forOwner++;
+      continue;
+    }
     if ("answer" in r && parks(q)) {
       // the code holds the line the prompt draws: a retry that changes nothing is not an answer
       const refused = retryRefused(q, r.answer, r.hint, retried);
@@ -337,7 +358,8 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier, ret
         Type.Object({ answer: Type.String(), why: Type.String(), hint: Type.Optional(Type.String()) }),
         (p) => ({ answer: p.answer, why: p.why, hint: p.hint }),
         // a retry that changes nothing goes back to the model: it picks a job, a real hint, or says what is left
-        (p) => (parks(q) ? retryRefused(q, p.answer, p.hint, retried) : undefined),
+        // a retry with a hint past the unit's tries is recorded: the owner is asked to give the tries (ownerMayGrant)
+        (p) => (parks(q) && !ownerMayGrant(q, p.answer, p.hint) ? retryRefused(q, p.answer, p.hint, retried) : undefined),
       ),
       tool(
         "fix_job",

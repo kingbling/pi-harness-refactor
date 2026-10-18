@@ -270,6 +270,18 @@ describe("answers are applied per option", () => {
 		expect(since).toEqual([runStart]);
 	});
 
+	it("the owner's retry on a question the resolver gave a hint for (tries used up) brings the unit back with a fresh set and that hint", async () => {
+		const { root, config, ledger, mk } = await workspace();
+		const { healQuarantined } = await import("../src/run/run.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "db lane: gate still red after 5 attempts (ported_tests_green)");
+		const q = ledger.askQuestion({ unitId: "U1", point: "quarantine", question: "U1 used up its automatic tries", options: ["retry — give it another set of tries with this hint", "leave — leave it parked"], askedBy: "orchestrator", context: { retry: "none", resolverHint: "rewrite CampaignAccountsSchemaTest to assert the emitted trigger order" } });
+		ledger.updateUnit("U1", { meta: { autoHeals: config.run.maxAutoHeals, healQuestion: q } });
+		ledger.answerQuestion(q, "retry — give it another set of tries with this hint");
+		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: 0 })).toEqual(["U1"]);
+		expect(JSON.parse(ledger.getUnit("U1")!.meta)).toMatchObject({ autoHeals: 0, retryNote: expect.stringMatching(/The resolver model's hint: rewrite CampaignAccountsSchemaTest/) });
+	});
+
 	it("the plugin's changes come from its own git history: each commit's subject and files", async () => {
 		const { pluginChangesSince } = await import("../src/run/run.ts");
 		expect(await pluginChangesSince(0)).toMatch(/^[0-9a-f]{7,} \S[\s\S]*\| +\d+/);
