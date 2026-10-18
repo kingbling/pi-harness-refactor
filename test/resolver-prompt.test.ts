@@ -20,7 +20,7 @@ describe("a hint for the tester", () => {
 		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
 		const ledger = new Ledger(":memory:");
 		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
-		const id = ledger.askQuestion({ unitId: "u1", point: "gate_env", question: "skipped/only test in src/a.spec.ts", options: ["retry — run it again"], askedBy: "orchestrator" });
+		const id = ledger.askQuestion({ unitId: "u1", point: "gate_env", question: "skipped, focused or incomplete test in src/a.spec.ts", options: ["retry — run it again"], askedBy: "orchestrator" });
 		const said: string[] = [];
 		act = async (o) => {
 			said.push((await call("answer_question", { answer: "retry", why: "w", for_tester: true })(o)).content[0]!.text);

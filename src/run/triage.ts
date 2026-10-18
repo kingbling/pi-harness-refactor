@@ -3,7 +3,7 @@ import { decide, setDecisionAction } from "../jev/decide.ts";
 import { choiceOf, JEV_ACT, noulOf, TRIAGE_GATE } from "../jev/questions.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { DecisionAnswer, ModelClient } from "../models/types.ts";
-import { errorSignature, findingKey, NOTHING_WRITTEN, ONLY_COMMENTS, STUB_LEFT, TEST_ON_MARK, type GateReport } from "./gate.ts";
+import { errorSignature, findingKey, NOTHING_WRITTEN, ONLY_COMMENTS, SKIPPED_TEST, STUB_LEFT, TEST_ON_MARK, type GateReport } from "./gate.ts";
 import { failureLines } from "./ported.ts";
 
 /**
@@ -51,7 +51,7 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		const prevFailed = previous?.steps.find((s) => !s.ok);
 		// only skipped or .only tests in the ported tests: the implementer may not edit tests, so another attempt cannot
 		// pass. The tester fixes them (once; a retest that did not help goes on below)
-		const skipped = failed.output.split("\n").every((l) => l.startsWith("skipped/only test in "));
+		const skipped = failed.output.split("\n").every((l) => l.startsWith(`${SKIPPED_TEST} in `));
 		if (skipped && attemptNo < maxTotal && !(lastRetest && (sameFinding(gate, previous) || !lastRetest.progress)))
 			return deterministic(d, unitId, "test_bug", "retest", "skipped or .only tests in the ported tests: the implementer may not edit them, the tester fixes them");
 		const own = failed.output.split("\n").every((l) => l.trim() === NOTHING_WRITTEN || [STUB_LEFT, ONLY_COMMENTS, TEST_ON_MARK].some((p) => l.endsWith(p)));

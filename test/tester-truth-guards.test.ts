@@ -20,13 +20,13 @@ describe("a skipped or .only ported test", () => {
 		const ledger = new Ledger(join(root, ".bigrefactor", "ledger.sqlite"));
 		ledger.createUnit({ id: "U1", tier: "T0", symbolIds: [], meta: {} });
 		const client = new FakeModelClient({ decide: () => ({ cause: "impl_bug" }) });
-		const gate = { ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output: "skipped/only test in src/features/view/View.test.tsx" }], changedFiles: [] } as never;
+		const gate = { ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output: "skipped, focused or incomplete test in src/features/view/View.test.tsx" }], changedFiles: [] } as never;
 		const t = await triageGate({ ledger, config, client }, "U1", gate, undefined, 1);
 		expect(t).toMatchObject({ action: "retest", cause: "test_bug" });
 		expect(client.calls).toEqual([]);
 		expect((await triageGate({ ledger, config, client }, "U1", gate, gate, 2, { progress: false })).action).not.toBe("retest");
 		// mixed with a scope problem of the implementer: not the tester's alone
-		const mixed = { ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output: "skipped/only test in src/features/view/View.test.tsx\nwrite outside unit scope: src/main.tsx" }], changedFiles: [] } as never;
+		const mixed = { ok: false, failedStep: "antigaming_ok", steps: [{ name: "antigaming_ok", ok: false, output: "skipped, focused or incomplete test in src/features/view/View.test.tsx\nwrite outside unit scope: src/main.tsx" }], changedFiles: [] } as never;
 		expect((await triageGate({ ledger, config, client }, "U1", mixed, undefined, 1)).action).toBe("retry");
 		ledger.close();
 	});
