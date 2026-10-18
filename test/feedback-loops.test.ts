@@ -450,8 +450,8 @@ describe("models fix each other's work", () => {
 		expect(ledger.getSymbol("app/money.php::net")!.state).toBe("mapped");
 		expect(JSON.parse(ledger.getUnit("u1")!.deps)).toContain("d1");
 		expect(ledger.hasEvidence("d1", "bug_reported")).toBe(true);
-		// the wait is no fresh set of tries: the reporter's next run goes on counting
-		expect(JSON.parse(ledger.getUnit("u1")!.meta).triesUsed).toBe(1);
+		// the wait is no fresh set of tries, but the session that only reported the bug is no try either (nothing was gated)
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).triesUsed).toBe(0);
 	});
 
 	it("a report on a file the reporter changed itself is refused; so is a third report round in one run", async () => {

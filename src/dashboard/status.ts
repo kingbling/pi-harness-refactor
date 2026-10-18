@@ -80,7 +80,11 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 	for (const r of s.costByModel) lines.push(`  ${r.role.padEnd(11)} ${r.model.padEnd(28)} ${String(r.n).padStart(4)} calls  $${r.c.toFixed(3)}`);
 	if (s.quarantine.length) lines.push(c.red(`quarantine: ${s.quarantine.join(", ")}`));
 	// parked by the resolver model: nothing a model can do is left, and nobody is asked about them
-	const parked = ledger.listUnits({ state: "quarantined" }).filter((u) => JSON.parse(u.meta).parkedWhy).map((u) => u.id);
+	// (one the owner is asked about now shows with the open questions)
+	const parked = ledger.listUnits({ state: "quarantined" }).filter((u) => {
+		const m = JSON.parse(u.meta) as { parkedWhy?: string; parkAsked?: number; healQuestion?: number };
+		return m.parkedWhy && !(m.parkAsked && m.healQuestion === m.parkAsked);
+	}).map((u) => u.id);
 	if (parked.length) lines.push(c.dim(`  parked, no question (nothing a model can do is left): ${parked.slice(0, 8).join(", ")}${parked.length > 8 ? " …" : ""} → br requeue <unit> after a change`));
 	// main red, the builder's code jobs could not fix it: no question, the builder stopped paying for it
 	const redMain = ledger.db.prepare("SELECT key, value FROM meta WHERE key LIKE ? AND value != '' ORDER BY key").all(buildParkedKey("%")) as Array<{ key: string; value: string }>;

@@ -15,7 +15,8 @@ import { answerValue, FOR_TESTER, loadBrief, optionFor } from "./ask.ts";
  * something changed or the owner must act; after MAX_RESOLVER_TRIES answers the owner decides. A parked or waiting unit's
  * question (quarantine, gate_env) never goes to the owner as "retry or leave": when the model's tries are used up or nothing a
  * model can do is left, the unit stays parked (br status lists it); only something a person must do or decide is
- * asked, in those words.
+ * asked, in those words. A parked unit that others wait on, or that the end of the migration waits on, is asked about
+ * once by the run (askAboutParked in src/run/run.ts).
  */
 export const RESOLVER = "resolver model";
 /** Resolver answers on one point of one unit before the owner decides: a backstop, the model hands on earlier. */
@@ -60,18 +61,25 @@ export const ASK_OWNER_BLOCKS = 20;
 
 /** Units not accepted yet that wait on `unitId`, directly or through others. */
 export function blockedBehind(ledger: Ledger, unitId: string): number {
+  return waitersOf(ledger)(unitId).length;
+}
+
+/** For any unit, the units not accepted yet that wait on it, directly or through others (one read of the units for many lookups). */
+export function waitersOf(ledger: Ledger): (unitId: string) => string[] {
   const rows = ledger.db.prepare("SELECT id, deps FROM units WHERE state != 'accepted'").all() as Array<{ id: string; deps: string }>;
   const needs = new Map<string, string[]>();
   for (const r of rows) for (const dep of JSON.parse(r.deps) as string[]) needs.set(dep, [...(needs.get(dep) ?? []), r.id]);
-  const seen = new Set<string>();
-  const stack = [...(needs.get(unitId) ?? [])];
-  while (stack.length) {
-    const id = stack.pop()!;
-    if (seen.has(id) || id === unitId) continue;
-    seen.add(id);
-    stack.push(...(needs.get(id) ?? []));
-  }
-  return seen.size;
+  return (unitId) => {
+    const seen = new Set<string>();
+    const stack = [...(needs.get(unitId) ?? [])];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id) || id === unitId) continue;
+      seen.add(id);
+      stack.push(...(needs.get(id) ?? []));
+    }
+    return [...seen];
+  };
 }
 
 /** A parked or waiting unit's question (quarantine, an environment it fails on): its "leave" keeps it parked without asking the owner. */
@@ -126,7 +134,8 @@ export async function resolveOpenQuestions(d: {
     const ctx = q.context
       ? (JSON.parse(q.context) as { forOwner?: string; forOwnerAt?: number; resolverFailed?: number; resolverFailedAt?: number; jobTried?: number })
       : {};
-    const again = ctx.forOwner !== undefined && !!d.pluginChangedAt && (ctx.forOwnerAt ?? 0) < d.pluginChangedAt;
+    // a parked unit's owner question (askAboutParked) comes after the models had their turn: it stays with the owner
+    const again = ctx.forOwner !== undefined && q.point !== "parked" && !!d.pluginChangedAt && (ctx.forOwnerAt ?? 0) < d.pluginChangedAt;
     if (ctx.forOwner !== undefined && !again) continue;
     // the resolver failed on it lately (provider outage, rate limit): wait a little longer after each failure
     const failed = ctx.resolverFailed ?? 0;

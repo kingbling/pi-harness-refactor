@@ -169,6 +169,13 @@ describe("the code job", () => {
 		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "b.txt"), "BROKEN\n"), "added b"), [], undefined, [], { build: { cmd: "sh", args: ["-c", "! grep -rn BROKEN src"] } });
 		expect(r.merged).toBe(false);
 	});
+	it("a refused job keeps the start of a long error (the boot error's message), not only its last stack frames", async () => {
+		const boom = 'if grep -rq BROKEN src; then echo "In Kernel.php line 99: Class NxrMediaFileManager not found"; i=0; while [ $i -lt 3000 ]; do echo "#$i /vendor/twig/src/Compiler.php(99): frame"; i=$((i+1)); done; exit 1; fi';
+		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "b.txt"), "BROKEN\n"), "added b"), [], undefined, [], { build: { cmd: "sh", args: ["-c", boom] } });
+		expect(r.merged).toBe(false);
+		expect(r.refused).toMatch(/Class NxrMediaFileManager not found/);
+		expect(r.refused!.length).toBeLessThan(10_000);
+	});
 	it("a question's job may not remove the stub mark of a unit not accepted yet: that unit replaces its stub", async () => {
 		const ledger = new Ledger(":memory:");
 		ledger.createUnit({ id: "billing", tier: "T1", symbolIds: [] });

@@ -33,7 +33,7 @@ import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDir
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals, HINT } from "../jev/ask.ts";
-import { MODEL_ANSWERERS, RESOLVER, resolveOpenQuestions, resolveWithModel, type Resolver } from "../jev/resolve.ts";
+import { MODEL_ANSWERERS, RESOLVER, resolveOpenQuestions, resolveWithModel, waitersOf, type Resolver } from "../jev/resolve.ts";
 import { checkLayout, renderTrees, sampleFacts, scanTree } from "./layout-check.ts";
 import { maybeTidyReview } from "./tidy.ts";
 import { findTests, warmMainCache } from "./ported.ts";
@@ -46,7 +46,7 @@ import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
-import { conflictMarkers, verdictsAtMerge, wholeProjectSteps } from "./gate.ts";
+import { clipOutput, conflictMarkers, verdictsAtMerge, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { exec } from "../proc.ts";
@@ -308,7 +308,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// healing may ask the decide model, so it runs in line with the stuck questions: one pass at a time
 		askingStuck ??= healQuarantined(ledger, config, o.root, new Set(running.keys()), log, adapters, { client: o.client })
 			.then(() => askStuckUnits({ ledger, config, root: o.root, client: o.client }))
-			.then((n) => n && log(pc.yellow(`${n} question(s): units still failing after ${config.run.maxAutoHeals} automatic tries`)), (e) => log(pc.yellow(`asking about stuck units failed: ${e?.message ?? e}`)))
+			.then((n) => {
+				if (n) log(pc.yellow(`${n} question(s): units still failing after ${config.run.maxAutoHeals} automatic tries`));
+				// parked units others wait on (or the end of the run waits on): the owner is asked, once per unit
+				const p = askAboutParked(ledger);
+				if (p) log(pc.yellow(`${p} parked unit(s) need you: other units wait on them, or nothing else is left to run → br questions`));
+			}, (e) => log(pc.yellow(`asking about stuck units failed: ${e?.message ?? e}`)))
 			.finally(() => (askingStuck = undefined));
 		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
 		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
@@ -1558,16 +1563,21 @@ export async function resubmitParkedUnits(ledger: Ledger, config: Config, root: 
 	const candidates = (ledger.db.prepare("SELECT id, state, meta FROM units WHERE state IN ('truth','implementing','gating','review') AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.unit_id = units.id AND a.ended_at IS NULL) AND NOT EXISTS (SELECT 1 FROM questions q WHERE (q.unit_id = units.id OR q.id IN (SELECT question_id FROM question_waiters w WHERE w.unit_id = units.id)) AND q.status = 'open' AND q.blocks != 'none')").all() as Array<{ id: string; state: string; meta: string }>).filter((u) => !running.has(u.id));
 	const parked: typeof candidates = [];
 	for (const u of candidates) {
-		const meta = JSON.parse(u.meta) as { parked?: { question?: number; diagnosis?: { summary?: string; note?: string } }; hold?: number; applied?: number };
+		const meta = JSON.parse(u.meta) as { parked?: { question?: number; diagnosis?: { summary?: string; note?: string } }; hold?: number; applied?: number; ownLook?: boolean };
 		// its own question, or the one it waits on with other units
-		const q = ledger.db.prepare("SELECT id, point, answer, options, answered_by FROM questions WHERE (unit_id = ? OR id IN (SELECT question_id FROM question_waiters WHERE unit_id = ?)) AND status IN ('answered','auto') AND id > ? ORDER BY id DESC LIMIT 1").get(u.id, u.id, meta.applied ?? 0) as { id: number; point: string; answer: string; options: string | null; answered_by: string | null } | undefined;
+		const q = ledger.db.prepare("SELECT id, unit_id, point, answer, options, answered_by FROM questions WHERE (unit_id = ? OR id IN (SELECT question_id FROM question_waiters WHERE unit_id = ?)) AND status IN ('answered','auto') AND id > ? ORDER BY id DESC LIMIT 1").get(u.id, u.id, meta.applied ?? 0) as { id: number; unit_id: string | null; point: string; answer: string; options: string | null; answered_by: string | null } | undefined;
 		if (meta.hold && (!q || q.id <= meta.hold)) continue; // the owner said wait: only a newer answer or br requeue moves it
 		const a = applyParkedAnswer(q?.answer, q?.options ? (JSON.parse(q.options) as string[]) : []);
 		if (a.action === "hold") {
 			ledger.updateUnit(u.id, { meta: { hold: q!.id, applied: q!.id } });
 			continue;
 		}
-		if (a.action === "quarantine") {
+		// a model left another unit's question parked: that says nothing about this unit's own failure, which only looked
+		// like it. It runs again on its own (once), and asks its own question if it fails again
+		const notMine = a.action === "quarantine" && !!q?.unit_id && q.unit_id !== u.id && MODEL_ANSWERERS.includes(q.answered_by ?? "") && !meta.ownLook;
+		if (notMine) ledger.db.prepare("DELETE FROM question_waiters WHERE question_id = ? AND unit_id = ?").run(q!.id, u.id);
+		if (notMine) ledger.updateUnit(u.id, { meta: { ownLook: true } });
+		if (a.action === "quarantine" && !notMine) {
 			// healQuestion 0: the owner's answer stands, the auto-heal does not put it back nor ask again (br requeue does).
 			// A model's leave parks it (parkedWhy): a later change on main that touches the failure brings it back
 			const byModel = MODEL_ANSWERERS.includes(q!.answered_by ?? "");
@@ -1578,7 +1588,7 @@ export async function resubmitParkedUnits(ledger: Ledger, config: Config, root: 
 			continue;
 		}
 		// what the run learned before parking (diagnosis) and the hint go to the next attempt, labelled by who gave it
-		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, a.hint && `${MODEL_ANSWERERS.includes(q?.answered_by ?? "") ? "A model's hint (not the owner's)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
+		const lesson = [meta.parked?.diagnosis?.summary && `Before this unit waited, the failure was diagnosed as: ${meta.parked.diagnosis.summary}${meta.parked.diagnosis.note ? ` (${meta.parked.diagnosis.note})` : ""}.`, notMine && `It waited on question #${q!.id} about ${q!.unit_id}; a model left that one parked, which says nothing about this unit's own failure: look at it again on its own.`, !notMine && a.hint && `${MODEL_ANSWERERS.includes(q?.answered_by ?? "") ? "A model's hint (not the owner's)" : "The owner's hint"}: ${a.hint}`].filter(Boolean).join(" ");
 		ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = ?, meta = json_set(json_remove(meta, '$.parked', '$.hold', '$.stale', '$.staleReason'), '$.applied', ?, '$.retryNote', ?) WHERE id = ?").run(new Date().toISOString(), q?.id ?? meta.applied ?? 0, lesson || null, u.id);
 		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', ?, ?)").run(u.id, u.state, `resubmitted: ${q ? `answer "${q.answer.slice(0, 80)}" on #${q.id}` : "cause resolved"}`, new Date().toISOString());
 		await removeWorktree(config.target.path, worktreeDir(root, u.id));
@@ -1839,7 +1849,25 @@ const quarantinedUnits = (ledger: Ledger) =>
  */
 async function backInQueue(ledger: Ledger, config: Config, root: string, id: string, heals: number, note: string, from: string, retriedOn: string[]): Promise<void> {
 	await requeueUnits(ledger, config, root, [id], "self-heal", { keepCode: true });
-	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion', '$.stuck', '$.parkedWhy'), '$.autoHeals', ?, '$.retryNote', ?, '$.healedFrom', ?, '$.retriedOn', json(?)) WHERE id = ?").run(heals, note, from, JSON.stringify(retriedOn), id);
+	ledger.db.prepare("UPDATE units SET meta = json_set(json_remove(meta, '$.healQuestion', '$.stuck', '$.parkedWhy', '$.parkAsked'), '$.autoHeals', ?, '$.retryNote', ?, '$.healedFrom', ?, '$.retriedOn', json(?)) WHERE id = ?").run(heals, note, from, JSON.stringify(retriedOn), id);
+}
+
+/** The failure as the decide model reads it: why it stopped, the kind of failure, and the failed step's error messages first (not the step's noisy start). */
+function failureForDecide(reason: string, kind: string, last?: { step: string; output: string }): string {
+	return `${reason}\nKind of failure: ${kind}${last ? `\n${last.step}:\n${clipOutput(last.output, 2500)}` : ""}`;
+}
+
+/**
+ * The newest answer a job (fix, code or layout job) gave after `at` on the unit's own question or one it waits on: that
+ * job changed main for this unit, so it is no plain retry.
+ */
+function jobAnswerAfter(ledger: Ledger, unitId: string, at: string): { id: number; answer: string; options: string | null; answered_by: string } | undefined {
+	const jobs = MODEL_ANSWERERS.filter((m) => m !== RESOLVER);
+	const q = ledger.db
+		.prepare(`SELECT id, answer, options, answered_by, answered_at FROM questions WHERE (unit_id = ? OR id IN (SELECT question_id FROM question_waiters WHERE unit_id = ?)) AND status = 'answered' AND answered_by IN (${jobs.map(() => "?").join(",")}) ORDER BY id DESC LIMIT 1`)
+		.get(unitId, unitId, ...jobs) as { id: number; answer: string; options: string | null; answered_by: string; answered_at: string } | undefined;
+	if (!q || ledgerTime(q.answered_at) < ledgerTime(at)) return undefined;
+	return applyParkedAnswer(q.answer, q.options ? (JSON.parse(q.options) as string[]) : []).action === "requeue" ? q : undefined;
 }
 
 /**
@@ -1887,11 +1915,14 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginSeen?: number };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginSeen?: number; parkAsked?: number; jobTried?: number; ownLook?: boolean; parked?: { question?: number } };
 		// a question withdrawn after it was asked (the unit was requeued meanwhile) answers nothing: as if none was asked
 		if (meta.healQuestion && ledger.getQuestion(meta.healQuestion)?.status === "withdrawn") {
-			ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.healQuestion') WHERE id = ?").run(r.id);
-			delete meta.healQuestion;
+			// the owner's question about a parked unit: parked as before, asked again (askAboutParked)
+			const asked = meta.healQuestion === meta.parkAsked;
+			ledger.db.prepare(asked ? "UPDATE units SET meta = json_set(json_remove(meta, '$.parkAsked'), '$.healQuestion', 0) WHERE id = ?" : "UPDATE units SET meta = json_remove(meta, '$.healQuestion') WHERE id = ?").run(r.id);
+			if (asked) (meta.healQuestion = 0), delete meta.parkAsked;
+			else delete meta.healQuestion;
 		}
 		const heals = meta.autoHeals ?? 0;
 		const why = (r.reason ?? "").slice(0, 300);
@@ -1907,8 +1938,29 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// a change counts only when the decide model says it touches this unit's own failure: a setup fix about something
 		// else would only run the unit into the same failure again
 		let changed = ledgerTime(r.at) < since;
+		// parked by a model: quietly (healQuestion 0), or with the owner asked about it (askAboutParked) and no answer yet
+		const quiet = !!meta.parkedWhy && (meta.healQuestion === 0 || (!!meta.parkAsked && meta.healQuestion === meta.parkAsked));
+		// it waited on another unit's question, and a model left that one parked: that says nothing about this unit's own
+		// failure (it only looked like it). One run on its own, which asks its own question if it fails again
+		const shared = quiet && meta.parked?.question ? ledger.getQuestion(meta.parked.question) : undefined;
+		if (shared?.unit_id && shared.unit_id !== r.id && MODEL_ANSWERERS.includes(shared.answered_by ?? "") && !meta.ownLook) {
+			await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was parked on question #${shared.id} about ${shared.unit_id}, which only looked like its own failure; a model left that one parked, which says nothing about this unit. Look at its own failure again (automatic try ${heals + 1}).${lastFailure}`, failure, retriedOn);
+			ledger.updateUnit(r.id, { meta: { ownLook: true } });
+			back.push(r.id);
+			continue;
+		}
+		// a job (code, fix or layout job) changed main for this unit's own question after it failed: one try on top of
+		// that change, past its automatic tries too (no plain retry; the decide model is not asked, the job was for it)
+		const job = quiet ? jobAnswerAfter(ledger, r.id, r.at) : undefined;
+		if (job && job.id !== meta.jobTried) {
+			const hint = applyParkedAnswer(job.answer, job.options ? (JSON.parse(job.options) as string[]) : []).hint;
+			await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined (${why}); the ${job.answered_by} changed main for its question #${job.id}, so it runs again on top of that change (automatic try ${heals + 1}).${hint ? ` The model's hint: ${hint}` : ""}${lastFailure}`, failure, retriedOn);
+			ledger.updateUnit(r.id, { meta: { jobTried: job.id } });
+			back.push(r.id);
+			continue;
+		}
 		// a unit a model parked waits for a change on main after the park, past its automatic tries (the owner's leave stands)
-		const parked = meta.healQuestion === 0 && !!meta.parkedWhy && since > (meta.parkedAt ?? 0);
+		const parked = quiet && since > (meta.parkedAt ?? 0);
 		const mayRun = (meta.healQuestion !== 0 && heals < config.run.maxAutoHeals && (meta.stuck || !meta.healQuestion)) || parked;
 		// parked before the plugin changed: what parked it may be fixed in the plugin itself (main shows no change). One
 		// more try when the plugin's own changes since the park touch what parked it (the decide model reads them, as for
@@ -1917,10 +1969,10 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// "since the park" means since the code the unit last ran on was loaded: the start of the run it was parked in
 		// (a fix committed while that run went on is new to the unit, though older than the park)
 		const ranOn = runStartBefore(meta.parkedAt ?? 0);
-		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > ranOn && (meta.pluginSeen ?? 0) < pluginAt) {
+		if (quiet && pluginAt > ranOn && (meta.pluginSeen ?? 0) < pluginAt) {
 			// only what is new since the last look: each change is judged once, while it is new, and the list stays short
 			const changes = await (o.pluginChanges ?? pluginChangesSince)(Math.max(ranOn, meta.pluginSeen ?? 0));
-			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${failureForDecide(r.reason ?? "", kind, last)}`) : true;
 			// the decide model is unavailable: asked next pass
 			if (touches === undefined) continue;
 			if (touches) {
@@ -1933,7 +1985,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		if (changed && mayRun) {
 			// a change the decide model already said does not touch this failure is not asked about again: it sees only
 			// the changes since its last no (healChecked), so a long park never pushes the newest fix out of what it reads
-			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, await changesSince(config, root, manifests, stackId, Math.max(ledgerTime(r.at), meta.healChecked ?? 0)), `${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
+			const touches = since <= (meta.healChecked ?? 0) ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, await changesSince(config, root, manifests, stackId, Math.max(ledgerTime(r.at), meta.healChecked ?? 0)), failureForDecide(r.reason ?? "", kind, last)) : true;
 			if (touches) {
 				// something changed since the unit failed that may fix it: worth a try, an open question about it or not
 				await backInQueue(ledger, config, root, r.id, heals + 1, `This unit was quarantined before (${why}); something changed since, it runs again (automatic try ${heals + 1} of ${config.run.maxAutoHeals}). Take the earlier failure into account.${parked ? ` It was parked: ${meta.parkedWhy}` : ""}${lastFailure}`, failure, retriedOn);
@@ -1960,10 +2012,10 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				else ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', 0) WHERE id = ?").run(r.id);
 				continue;
 			}
-			// a model's retry counts against the automatic tries: past them it stays parked, no question. A job changed main:
-			// parked as of the failure, its change goes through the decide model (changeTouches) next pass, never straight back
-			if (byModel && heals >= config.run.maxAutoHeals) {
-				const job = q.answered_by !== RESOLVER;
+			// a model's retry counts against the automatic tries: past them it stays parked, no question (askAboutParked asks
+			// the owner when others wait on it). A job changed main for this question: one try on top of it, past the tries too
+			const job = byModel && q.answered_by !== RESOLVER;
+			if (byModel && heals >= config.run.maxAutoHeals && !(job && meta.jobTried !== q.id)) {
 				park(`the ${q.answered_by} said to try again, but its ${config.run.maxAutoHeals} automatic tries are used up${job && a.hint ? `. Its hint: ${a.hint}` : ""}`, job ? ledgerTime(r.at) : Date.now());
 				log(pc.yellow(`⏸ ${r.id}: stays parked, no automatic try left (br requeue ${r.id} after a change)`));
 				continue;
@@ -1971,6 +2023,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 			// the owner gave more tries for the resolver's hint (ownerMayGrant): it goes with them
 			const resolverHint = !byModel && q.context ? (JSON.parse(q.context) as { resolverHint?: string }).resolverHint : undefined;
 			await backInQueue(ledger, config, root, r.id, byModel ? heals + 1 : 0, `This unit was quarantined (${why}); ${byModel ? `the ${q.answered_by}` : "the owner"} said to try again.${a.hint ? ` The ${byModel ? "model's" : "owner's"} hint: ${a.hint}` : ""}${resolverHint ? ` The resolver model's hint: ${resolverHint}` : ""}${lastFailure}`, failure, retriedOn);
+			if (job) ledger.updateUnit(r.id, { meta: { jobTried: q.id } });
 			back.push(r.id);
 			continue;
 		}
@@ -2010,7 +2063,7 @@ export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: s
 			facts: `${r.id} was quarantined and tried again automatically ${meta.autoHeals ?? 0} times${meta.stuck ? "; the last try failed the same way as the one before" : ""}: ${(r.reason ?? "").slice(0, 600)}.${last ? `\nIts last failure (${last.step}):\n${capText(last.output, 1500)}` : ""}${retry === "none" ? "\nIts automatic tries are used up: a plain retry is no answer, only a change on main (a job) or the owner." : retry ? `\nIt was already retried on this kind of failure (${kind}): a plain retry is no answer, only one with a hint that changes the attempt, or a change on main.` : ""}\nOther units with the same failure wait on this answer too.`,
 			options: [
 				{ value: "retry", facts: "try again (after you fixed something; type a hint instead to steer the next attempt)" },
-				{ value: "leave", facts: "leave it quarantined for a human" },
+				{ value: "leave", facts: "leave it parked" },
 			],
 			blocks: "unit",
 			askedBy: "orchestrator",
@@ -2021,6 +2074,52 @@ export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: s
 		// only while it is still quarantined: a self-heal may have requeued it while the question was being asked
 		d.ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.healQuestion', ?) WHERE id = ? AND state = 'quarantined'").run(q.id, r.id);
 		if (!q.shared) asked++;
+	}
+	return asked;
+}
+
+/**
+ * A unit a model parked (nothing a model can do is left) is not kept quiet when a person is needed: when units wait on
+ * it, when accepted units are built on it (it was re-opened after they were accepted), or when nothing else is left to
+ * run (the migration cannot finish without it). The owner gets one question per unit: what waits on it, why it was
+ * parked (the models' last hint), its last failure and what the last code job for it wrote. Asked once per park
+ * (meta.parkAsked); the answer is applied like the unit's other questions (healQuarantined: the owner's retry gives a
+ * fresh set of tries). Returns how many were asked.
+ */
+export function askAboutParked(ledger: Ledger): number {
+	const quarantined = quarantinedUnits(ledger);
+	const parked = quarantined.filter((r) => {
+		const m = JSON.parse(r.meta) as { healQuestion?: number; parkedWhy?: string; parkAsked?: number };
+		return m.healQuestion === 0 && !!m.parkedWhy && !m.parkAsked;
+	});
+	if (!parked.length) return 0;
+	const waiting = waitersOf(ledger);
+	// the end of the run: every unit still to do waits on a quarantined one
+	const behind = new Set(quarantined.flatMap((r) => waiting(r.id)));
+	const rest = (ledger.db.prepare("SELECT id FROM units WHERE state NOT IN ('accepted', 'quarantined') AND json_extract(meta, '$.exclude') IS NULL").all() as Array<{ id: string }>).map((r) => r.id);
+	const endGame = rest.every((id) => behind.has(id));
+	const list = (ids: string[]) => `${ids.slice(0, 8).join(", ")}${ids.length > 8 ? ` and ${ids.length - 8} more` : ""}`;
+	let asked = 0;
+	for (const r of parked) {
+		const parkedWhy = (JSON.parse(r.meta) as { parkedWhy: string }).parkedWhy;
+		const waits = waiting(r.id);
+		const builtOn = (ledger.db.prepare("SELECT id FROM units WHERE state = 'accepted' AND EXISTS (SELECT 1 FROM json_each(units.deps) WHERE value = ?)").all(r.id) as Array<{ id: string }>).map((u) => u.id);
+		if (!waits.length && !builtOn.length && !endGame) continue;
+		const needed = [waits.length && `${waits.length} unit(s) cannot start until it is done (${list(waits)})`, builtOn.length && `accepted units are built on it (${list(builtOn)})`, !waits.length && !builtOn.length && "nothing else is left to run, and the migration cannot finish without it"].filter(Boolean).join(", and ");
+		const last = lastRedReport(ledger, r.id);
+		const diff = (ledger.db.prepare("SELECT json_extract(context, '$.jobDiff') diff FROM questions WHERE unit_id = ? AND json_extract(context, '$.jobDiff') IS NOT NULL ORDER BY id DESC LIMIT 1").get(r.id) as { diff: string } | undefined)?.diff;
+		const id = ledger.askQuestion({
+			unitId: r.id,
+			point: "parked",
+			question: `${r.id} is parked: the models can do nothing more for it. You are asked because ${needed}.\nWhy it was parked: ${parkedWhy.slice(0, 1500)}${last ? `\nIts last failure (${last.step}):\n${clipOutput(last.output, 1500)}` : ""}${diff ? `\nWhat the last code job for it wrote (not merged):\n${diff.slice(0, 3000)}` : ""}\nLook at it, then give it a fresh set of tries (type a hint with what it should do differently), or leave it parked.`,
+			options: ["retry — give it a fresh set of tries (type a hint to steer it)", "leave — leave it parked"],
+			blocks: "unit",
+			askedBy: "orchestrator",
+			context: { parkedWhy, waiting: waits, builtOn },
+		});
+		ledger.markForOwner(id, needed);
+		ledger.updateUnit(r.id, { meta: { healQuestion: id, parkAsked: id } });
+		asked++;
 	}
 	return asked;
 }
@@ -2207,7 +2306,7 @@ export async function requeueUnits(ledger: Ledger, config: Config, root: string,
 		ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.crashes', '$.hold', '$.parked') WHERE id = ?").run(id);
 		// only a person's requeue gives the unit new tries (setup model, self-heal) and lets a later quarantine be healed
 		// or asked about again; automatic ones keep the caps
-		if (o.human) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.setupParks', '$.healQuestion', '$.stuck', '$.healedFrom', '$.autoHeals', '$.healChecked', '$.retriedOn', '$.parkedWhy') WHERE id = ?").run(id);
+		if (o.human) ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.setupParks', '$.healQuestion', '$.stuck', '$.healedFrom', '$.autoHeals', '$.healChecked', '$.retriedOn', '$.parkedWhy', '$.parkAsked', '$.jobTried', '$.ownLook') WHERE id = ?").run(id);
 		// what it waited on no longer holds it: back in the queue it runs, and a late answer cannot act on it any more
 		for (const q of ledger.db.prepare("SELECT id FROM questions WHERE unit_id = ? AND status = 'open' AND point NOT IN ('placement', 'area_taxonomy', 'area_overlap')").all(id) as Array<{ id: number }>) ledger.withdrawQuestion(q.id, `${id} was requeued by ${by}`);
 		ledger.db.prepare("DELETE FROM question_waiters WHERE unit_id = ?").run(id);

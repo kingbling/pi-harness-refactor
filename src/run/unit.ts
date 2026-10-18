@@ -22,7 +22,7 @@ import type { ModelClient } from "../models/types.ts";
 import { globToRegExp, spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, missingTestImports, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
-import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, SKIPPED_TEST, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
+import { changedFiles, errorSignature, findingKey, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, SKIPPED_TEST, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
@@ -154,6 +154,18 @@ export const MAX_TESTS_ONLY_ROUNDS = 2;
 
 /** Why read truth was written while the legacy env mode was "read" (the old code could not run anywhere here). */
 const NOT_RUN_HERE = "the old code does not run here";
+
+/**
+ * The key a unit's failure shares a question by. A reviewer's findings (wired_ok) are about the unit's own code: units
+ * share a question only when the findings point at the same places (file:line); findings without places stay the
+ * unit's own (a loose "reviewer findings: in App.tsx" key joined units that each missed another loader).
+ */
+export function shareKey(unitId: string, step: string, output: string): string {
+	const sig = errorSignature(step, output);
+	if (step !== "wired_ok") return sig;
+	const places = findingKey(step, output);
+	return places !== sig ? places : `${sig} (${unitId})`;
+}
 
 export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const log = o.log ?? ((l: string) => console.log(l));
@@ -892,7 +904,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		log(pc.red(`  provider failing repeatedly; asked question #${q} (only this unit waits)`));
 	};
 	const outOfScopeRoute = async (problem: string, setup: boolean): Promise<UnitRunResult | undefined> => {
-		const signature = errorSignature("wired_ok", problem);
+		const signature = shareKey(o.unitId, "wired_ok", problem);
 		// app code outside the unit is no setup gap: the question goes straight to the resolver (it can start a code or fix job)
 		const setupFixer = !setup || o.setupFixer === false ? undefined : (o.setupFixer ?? (o.spawn ? undefined : fixSetupWithModel));
 		let setupTried = "";
@@ -1047,8 +1059,9 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				o.ledger.db.prepare("UPDATE units SET deps = ? WHERE id = ?").run(JSON.stringify([...new Set([...unitDeps, ...owners])]), o.unitId);
 				o.ledger.endAttempt(attempt, { outcome: "waits_on_fix", costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: { reports } });
 				savePorted();
-				// the wait is no fresh set of tries: its next run goes on counting from here
-				o.ledger.updateUnit(o.unitId, { meta: { triesUsed: attemptNo, retryNote: `This unit waited for ${owners.join(", ")} to fix what it reported (${reports.map((r) => r.target).join(", ")}). That code is fixed now: use it.` } });
+				// the wait is no fresh set of tries: its next run goes on counting from here. The session that only reported
+				// the bug is no try of its own (nothing was gated), as for a session error
+				o.ledger.updateUnit(o.unitId, { meta: { triesUsed: attemptNo - 1, retryNote: `This unit waited for ${owners.join(", ")} to fix what it reported (${reports.map((r) => r.target).join(", ")}). That code is fixed now: use it.` } });
 				o.ledger.transitionUnit(o.unitId, "planned", `waits for ${owners.join(", ")} to fix a reported bug`);
 				log(pc.yellow(`  reported a bug in ${owners.join(", ")}: re-opened; this unit waits for the fix`));
 				return { unitId: o.unitId, state: "planned", attempts: attemptNo, costUsd: cost };
@@ -1254,8 +1267,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 
 		// the same error is already asked about for another unit: wait on that question (no triage, no doctor, no new question)
-		const signature = errorSignature(gate.failedStep ?? "", gate.steps.find((s) => !s.ok)?.output ?? "");
-		const same = await sameQuestion(askDeps, ["gate_env", "triage_gate"], signature, `Gate step ${gate.failedStep} failed:\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`, o.unitId);
+		const signature = shareKey(o.unitId, gate.failedStep ?? "", gate.steps.find((s) => !s.ok)?.output ?? "");
+		const same = await sameQuestion(askDeps, ["gate_env", "triage_gate"], signature, `Gate step ${gate.failedStep} failed:\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`, o.unitId, { failedStep: gate.failedStep });
 		cost += same.costUsd;
 		const sharedQ = same.id;
 		if (sharedQ !== undefined) {

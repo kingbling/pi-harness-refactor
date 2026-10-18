@@ -7,7 +7,7 @@ import type { QuestionBlocks, QuestionRow } from "../ledger/schema.ts";
 import type { ModelClient } from "../models/types.ts";
 import type { spawnLeaf } from "../sessions/spawn.ts";
 import { PLAIN_LANGUAGE, goalsText } from "../policy.ts";
-import { sameQuestion } from "./same.ts";
+import { sameQuestion, type FailureFacts } from "./same.ts";
 
 /**
  * Every question a human sees is phrased by a model that has read the source repo. Code only says WHAT is
@@ -410,7 +410,7 @@ export const OWN_ANSWER = "auto (your goals)";
  */
 export async function askViaModel(d: AskDeps, q: AskRequest): Promise<{ id: number; phrased: PhrasedQuestion; costUsd: number; decided?: string; shared?: boolean }> {
 	// the same problem is asked about already (same key, or the decision model says same cause): wait on that one
-	const same = q.sameAs ? await sameQuestion(d, [q.point], q.sameAs, q.facts, q.unitId) : { costUsd: 0 };
+	const same = q.sameAs ? await sameQuestion(d, [q.point], q.sameAs, q.facts, q.unitId, (q.context ?? {}) as FailureFacts) : { costUsd: 0 };
 	if (same.id !== undefined) {
 		if (q.unitId) d.ledger.addWaiter(same.id, q.unitId);
 		return { id: same.id, phrased: unphrased(q), costUsd: same.costUsd, shared: true };

@@ -11,7 +11,7 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
-import { addedLines, changedFiles, onlyComments, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { addedLines, changedFiles, clipOutput, onlyComments, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { markOwner } from "./stub-sweep.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
 import { exec } from "../proc.ts";
@@ -313,7 +313,9 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	for (const s of steps) {
 		const c = cmd(dir, s);
 		const err = await runCmd(c.cmd, c.args, dir, FULL_OUTPUT);
-		if (err !== undefined) out.push(`$ ${[c.cmd, ...c.args].join(" ")}   (${s.step})\n${err.slice(-8000)}`), failing.set(s.step, err);
+		// its start and its end, with each distinct error message first: a boot error's message is at the start, its
+		// stack frames at the end (the tail alone left only frames)
+		if (err !== undefined) out.push(`$ ${[c.cmd, ...c.args].join(" ")}   (${s.step})\n${clipOutput(err, 8000)}`), failing.set(s.step, err);
 	}
 	if (!out.length) return undefined;
 	// main may fail its checks too: an error main already has is not this job's. The builder's job must fix some of them
@@ -337,7 +339,7 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 		mine += err === undefined ? 0 : errorKeys(err, dir).length;
 		theirs += was === undefined ? 0 : errorKeys(was, mainDir).length;
 	}
-	if (added.length) return `the ${whole ? "whole-project " : ""}checks fail with ${added.length} error line(s) main does not have:\n${added.join("\n").slice(-6000)}`;
+	if (added.length) return `the ${whole ? "whole-project " : ""}checks fail with ${added.length} error line(s) main does not have:\n${clipOutput(added.join("\n"), 6000)}`;
 	if (!whole) return undefined;
 	return mine < theirs ? undefined : `the whole-project checks fail as much as on main (no error fixed):\n${out.join("\n\n")}`;
 }
