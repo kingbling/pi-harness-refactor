@@ -16,7 +16,8 @@ import type { NotAppFolder } from "./not-app.ts";
  *    left out of the module list, a commented-out enable call, a plugin turned off in config). The inventory
  *    leaves them out, unless the owner answers keep (one question per folder, blocking nothing);
  *  - features: framework folders the app switches on that give users something to see or do (pages, routes,
- *    actions, mails). They are ported like app code (units), unless the owner answers leave-out;
+ *    actions, mails) and that nothing else covers. They become units only when the owner answers port: porting a
+ *    framework part adds many units, so it is the owner's call (until then the model's opinion is the recommendation);
  *  - routeSyntax: how the framework writes route paths (optional parts, rest-of-path, type marks), in plain words,
  *    so the task cards say what `!` or `*` in a legacy path means instead of copying it.
  * Nothing about a given framework is written in code: the model reads how this one loads things.
@@ -57,9 +58,9 @@ export function switchedOff(root: string | undefined, ledger: Ledger): NotAppFol
 		.map((f) => ({ path: slash(f.path), kind: "switched-off" as const, why: `switched off: ${f.why}` }));
 }
 
-/** Framework folders ported like app code (switched on, users see them; the owner did not answer leave-out). */
+/** Framework folders ported like app code: switched on, users see them, and the owner answered port. */
 export function portedFeatures(root: string | undefined, ledger: Ledger): string[] {
-	return (loadSwitches(root)?.features ?? []).filter((f) => f.question === undefined || answerValue(ledger.getQuestion(f.question)?.answer) !== "leave-out").map((f) => slash(f.path));
+	return (loadSwitches(root)?.features ?? []).filter((f) => f.question !== undefined && answerValue(ledger.getQuestion(f.question)?.answer) === "port").map((f) => slash(f.path));
 }
 
 /** The framework's route path syntax in plain words, when a model described it. */
@@ -111,7 +112,7 @@ export async function healSwitches(o: { config: Config; root: string; ledger: Le
 			writeGlobs: [],
 			customTools: [tool],
 			transcriptPath: join(o.root, ".bigrefactor", "sessions", `__init__.switches.${Date.now()}.jsonl`),
-			systemPrompt: `You read a legacy ${o.config.source.stack}${o.config.source.framework ? `/${o.config.source.framework}` : ""} app (${src}, read-only) to find what its framework turns on and off.${o.frameworkDirs.length ? ` The framework lives in ${o.frameworkDirs.join(", ")}.` : ""} Find in the framework's code how the app switches parts on or off (a list of modules or plugins it loads at start, an enable call, a config switch), then read where the app does it. Report:\n- off: the app's own folders (modules, plugins) that exist but are switched off, so nothing loads them (a commented-out or missing enable line). Only when you saw the switch;\n- features: framework folders the app switches on that add things users see or do (pages, routes, actions, mails), which the new app needs as well. Not plumbing (database, cache, logging);\n- routeSyntax: how this framework writes route paths, read from its router code.\nUse your tools (ls, find, grep, read) and quote the file and line in each why. Record with record_switches, then end with one line.\n\n${PLAIN_LANGUAGE}`,
+			systemPrompt: `You read a legacy ${o.config.source.stack}${o.config.source.framework ? `/${o.config.source.framework}` : ""} app (${src}, read-only) to find what its framework turns on and off.${o.frameworkDirs.length ? ` The framework lives in ${o.frameworkDirs.join(", ")}.` : ""} Find in the framework's code how the app switches parts on or off (a list of modules or plugins it loads at start, an enable call, a config switch), then read where the app does it. Report:\n- off: the app's own folders (modules, plugins) that exist but are switched off, so nothing loads them (a commented-out or missing enable line). Only when you saw the switch;\n- features: framework folders the app switches on that add things users see or do (pages, routes, actions, mails), which the new app needs as well and which nothing else covers. Not plumbing (database, cache, logging); not what the target platform (${o.config.target.stacks.join(", ")}) gives by itself (login, sessions, forms, styling); not a part the app's own code builds on (an app controller or template that extends it is migrated with the app). Usually few or none;\n- routeSyntax: how this framework writes route paths, read from its router code.\nUse your tools (ls, find, grep, read) and quote the file and line in each why. Record with record_switches, then end with one line.\n\n${PLAIN_LANGUAGE}`,
 		});
 		const r = await session.run(`Find the switched-off app folders, the switched-on framework features and the route path syntax of the app at ${src}. Record them with record_switches.`);
 		cost += r.usage.cost;
@@ -139,7 +140,7 @@ export async function healSwitches(o: { config: Config; root: string; ledger: Le
 	for (const f of found.features) {
 		const q = await askViaModel({ ledger: o.ledger, config: o.config, root: o.root, client: o.client }, {
 			point: "framework_feature",
-			facts: `The app switches on the framework part ${f.path}, which gives users: ${f.what ?? "?"} (${f.why}). The new platform does not bring it by itself, so it is migrated like the app's own code.`,
+			facts: `The app switches on the framework part ${f.path}, which gives users: ${f.what ?? "?"} (${f.why}). A model found nothing in the migration that covers it. It is migrated like the app's own code only if you answer port (the units appear at the next run start).`,
 			options: [{ value: "port", facts: `migrate ${f.path}` }, { value: "leave-out", facts: `the new app does without it` }],
 			recommended: "port",
 			blocks: "none",

@@ -85,7 +85,9 @@ export async function confirmDeadCode(config: Config, root: string, ledger: Ledg
 	const alive: string[] = [];
 	const deadByFolder = new Map<string, Verdict[]>();
 	for (const v of verdicts.values()) {
-		if (v.verdict === "dead") (deadByFolder.get(dirname(v.path)) ?? deadByFolder.set(dirname(v.path), []).get(dirname(v.path))!).push(v);
+		// a framework file nothing uses is the framework's, not the app's: it stays dropped, no question
+		if (v.verdict === "dead" && fwDirs.some((d) => v.path.startsWith(d))) judged[v.path] = { alive: false, why: `dead: ${v.evidence}` };
+		else if (v.verdict === "dead") (deadByFolder.get(dirname(v.path)) ?? deadByFolder.set(dirname(v.path), []).get(dirname(v.path))!).push(v);
 		else {
 			judged[v.path] = { alive: true, why: `${v.verdict === "unsure" ? "unsure, kept" : "still runs"}: ${v.evidence}` };
 			alive.push(v.path);

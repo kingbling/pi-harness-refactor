@@ -14,7 +14,7 @@ import type { Config } from "../config.ts";
 import { projectDir } from "../init/init.ts";
 import { confirmDeadCode, uncheckedDead } from "../init/dead.ts";
 import { dbDetected, findSchemaUpdates, isDbUnitKind, refreshTablePlanReasons, schemaUpdateDrift } from "../inventory/db.ts";
-import { healSwitches, switchedOff } from "../inventory/switches.ts";
+import { healSwitches, loadSwitches, portedFeatures, switchedOff } from "../inventory/switches.ts";
 import { answerValue, askViaModel } from "../jev/ask.ts";
 import { reopenUnit } from "./recheck.ts";
 import { healNotApp, leftOut, loadNotApp } from "../inventory/not-app.ts";
@@ -61,6 +61,8 @@ async function inventoryAgain(o: { ledger: Ledger; config: Config; root: string 
 }
 
 const SWITCHES_PENDING = "switches_heal_pending";
+/** Ledger meta: the framework features ported at the last inventory (the owner answered port), as a sorted JSON list. */
+const PORTED_FEATURES = "ported_features";
 /** Ledger meta: the owner question about done tables that schema updates change ({id, units, applied}). */
 const SCHEMA_UPDATE_Q = "schema_update_question";
 
@@ -142,23 +144,37 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 				.catch((e) => o.log(pc.yellow(`the framework could not be indexed again: ${e?.message ?? e} (tried again next run start)`)));
 	}
 	// what the framework turns on and off (once, a model reads it): switched-off app folders leave the plan like notApp
-	// folders (accepted units there stay, reported); switched-on framework features become units
+	// folders (accepted units there stay, reported); switched-on framework features become units on the owner's port
 	if (o.client || o.spawn) {
 		const dirs = getSourceAdapter(config.source.stack).frameworkDirs?.(config.source.path) ?? [];
 		const got = await healSwitches({ config, root: o.root, ledger, client: o.client, spawn: o.spawn, frameworkDirs: dirs, log: (l) => o.log(pc.dim(l)) }).catch((e) => (o.log(pc.yellow(`switched-off parts not read: ${e?.message ?? e}`)), undefined));
 		if (got && (got.switches.off.length || got.switches.features.length)) ledger.setMeta(SWITCHES_PENDING, "1");
 	}
+	// framework features are ported only on the owner's port answer: when the ported set changed (an answer, or a
+	// ledger from 0.4.23 that ported them before any answer), the inventory runs again so units come or go with it
+	const portedNow = JSON.stringify(portedFeatures(o.root, ledger).sort());
+	if ((loadSwitches(o.root)?.features.length ?? 0) > 0 && ledger.getMeta(PORTED_FEATURES) !== portedNow) ledger.setMeta(SWITCHES_PENDING, "1");
 	if (ledger.getMeta(SWITCHES_PENDING) === "1") {
 		const off = switchedOff(o.root, ledger);
+		const ported = portedFeatures(o.root, ledger);
+		const notPorted = (loadSwitches(o.root)?.features ?? []).map((f) => f.path.replace(/\/?$/, "/")).filter((p) => !ported.includes(p));
 		const source = getSourceAdapter(config.source.stack);
 		const outside = (u: { meta: string }) => {
 			const files = (JSON.parse(u.meta).files ?? []) as string[];
-			return files.length > 0 && files.every((f) => leftOut(f, off, (p) => !!source.isEntryPoint?.(p)));
+			return files.length > 0 && files.every((f) => leftOut(f, off, (p) => !!source.isEntryPoint?.(p)) || notPorted.some((d) => f.startsWith(d)));
 		};
 		const units = ledger.listUnits().filter((u) => u.state !== "planned" && !isDbUnitKind(u.kind) && outside(u));
 		const started = units.filter((u) => u.state !== "accepted").map((u) => u.id);
 		if (started.length) await requeueUnits(ledger, config, o.root, started, "run start: the app switches their code off");
-		const gone = await inventoryAgain(o, "withdrawn: the app switches the unit's code off");
+		const gone = await inventoryAgain(o, "withdrawn: the app switches the unit's code off, or it is framework code not ported");
+		// dead-code questions about framework files of parts not ported: framework code, nothing to decide
+		const fw = source.frameworkDirs?.(config.source.path) ?? [];
+		for (const q of ledger.db.prepare("SELECT id, context FROM questions WHERE point = 'dead_code' AND status = 'open'").all() as Array<{ id: number; context: string | null }>) {
+			const files = ((JSON.parse(q.context ?? "{}") as { files?: string[] }).files ?? []) as string[];
+			if (files.length && files.every((f) => fw.some((d) => f.startsWith(d)) && !ported.some((d) => f.startsWith(d))))
+				ledger.db.prepare("UPDATE questions SET status = 'withdrawn', answer = ?, answered_at = ? WHERE id = ?").run("withdrawn: framework files of a part not ported, not the app's code", new Date().toISOString(), q.id);
+		}
+		ledger.setMeta(PORTED_FEATURES, JSON.stringify([...ported].sort()));
 		o.log(pc.cyan(`↻ switched-off app code: ${off.map((f) => f.path).join(", ") || "none"}; ${gone.size} unit(s) left the plan (br why <unit> says why)`));
 		const accepted = units.filter((u) => u.state === "accepted").map((u) => u.id);
 		if (accepted.length) o.log(pc.yellow(`  ${accepted.length} accepted unit(s) hold code the app switches off: ${accepted.slice(0, 20).join(", ")}${accepted.length > 20 ? ", …" : ""} (left as they are)`));

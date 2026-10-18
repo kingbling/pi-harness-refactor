@@ -116,17 +116,27 @@ describe("run start: what the app switches off and on", () => {
 		const sym = ledger.db.prepare("SELECT state, reason FROM symbols WHERE path = 'app/modules/webauthn/Cbor.php' LIMIT 1").get() as { state: string; reason: string };
 		expect(sym).toMatchObject({ state: "dropped", reason: expect.stringMatching(/^left out: switched off/) });
 		expect(ledger.checkInvariants().ok).toBe(true);
-		// the framework feature is migrated like app code
-		expect(unitOf(ledger, "fw/hijack/controller/hijack.controller.php")).toBeTruthy();
+		// the framework feature is not migrated before the owner answers port (a live run got 126 framework units by default)
+		expect(unitOf(ledger, "fw/hijack/controller/hijack.controller.php")).toBeUndefined();
 		const qs = ledger.openQuestions();
 		const offQ = qs.find((q) => q.point === "switched_off")!;
 		expect(offQ.blocks).toBe("none");
-		expect(qs.find((q) => q.point === "framework_feature")?.blocks).toBe("none");
+		const featureQ = qs.find((q) => q.point === "framework_feature")!;
+		expect(featureQ.blocks).toBe("none");
 
 		// once: the next run start asks no model about it
 		const again: Array<{ opts: SpawnOptions }> = [];
 		await healStackKnowledge({ ledger, config, root: ws, spawn: scripted({}, again), log: () => {} });
 		expect(again.some((s) => s.opts.customTools?.some((t) => t.name === "record_switches"))).toBe(false);
+		expect(unitOf(ledger, "fw/hijack/controller/hijack.controller.php")).toBeUndefined();
+
+		// port: the next run start migrates it like app code; taking it back removes the planned unit again
+		ledger.answerQuestion(featureQ.id, "port — migrate it");
+		await healStackKnowledge({ ledger, config, root: ws, spawn: scripted({}, []), log: () => {} });
+		expect(unitOf(ledger, "fw/hijack/controller/hijack.controller.php")).toBeTruthy();
+		ledger.db.prepare("UPDATE questions SET answer = 'leave-out — no' WHERE id = ?").run(featureQ.id);
+		await healStackKnowledge({ ledger, config, root: ws, spawn: scripted({}, []), log: () => {} });
+		expect(unitOf(ledger, "fw/hijack/controller/hijack.controller.php")).toBeUndefined();
 
 		// the owner keeps the module: its code is planned again
 		ledger.answerQuestion(offQ.id, "keep — migrate it anyway");
@@ -177,6 +187,22 @@ describe("run start: the dead-code check catches up", () => {
 		const again: Array<{ opts: SpawnOptions }> = [];
 		await healStackKnowledge({ ledger, config, root: ws, spawn: scripted({}, again), log: () => {} });
 		expect(again.some((s) => s.opts.customTools?.some((t) => t.name === "judge_files"))).toBe(false);
+		ledger.close();
+	});
+
+	it("a framework file judged dead stays dropped without an owner question; an app file judged dead is asked about", async () => {
+		const { ws, put, config, ledger } = workspace("load-dead-fw", { frameworkDirs: ["fw/"], notApp: [] });
+		put("fw/contrib/countries/doxygen.php", "<?php function fw_doc() { return 1; }\n");
+		put("app/old/export.php", "<?php function app_export() { return 1; }\n");
+		await inventory(config, ws, ledger);
+		for (const p of ["fw/contrib/countries/doxygen.php", "app/old/export.php"]) ledger.markDeadCode(p, "no inbound references");
+		const seen: Array<{ opts: SpawnOptions; task?: string }> = [];
+		const spawn = scripted({ judge_files: (task) => ({ files: [...task.matchAll(/^ {2}(\S+\.php)/gm)].map((m) => ({ path: m[1]!, verdict: "dead", evidence: "nothing names it" })) }) }, seen);
+		await healStackKnowledge({ ledger, config, root: ws, spawn, log: () => {} });
+		expect(seen.find((s) => s.opts.customTools?.some((t) => t.name === "judge_files"))!.task).toMatch(/fw\/contrib\/countries\/doxygen\.php/);
+		const asked = ledger.openQuestions().filter((q) => q.point === "dead_code").map((q) => q.question);
+		expect(asked.join("\n")).toMatch(/app\/old/);
+		expect(asked.join("\n")).not.toMatch(/fw\/contrib/);
 		ledger.close();
 	});
 });
