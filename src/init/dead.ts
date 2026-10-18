@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { getSourceAdapter } from "../adapters/registry.ts";
 import type { Config } from "../config.ts";
 import { askViaModel } from "../jev/ask.ts";
 import { decisionsPath, loadDecisions } from "../inventory/decisions.ts";
@@ -26,13 +27,25 @@ type Verdict = { path: string; verdict: "alive" | "dead" | "unsure"; evidence: s
 export async function confirmDeadCode(config: Config, root: string, ledger: Ledger, client: ModelClient | undefined, opts: { log?: (l: string) => void; spawn?: typeof spawnLeaf } = {}): Promise<{ asked: number; alive: string[]; questions: number; costUsd: number }> {
 	const file = loadDecisions(root);
 	const judged = file.liveness ?? {};
-	const dead = (ledger.db.prepare("SELECT path, dead_code_reason r FROM files WHERE dead_code = 1 ORDER BY path").all() as Array<{ path: string; r: string | null }>).filter((f) => !judged[f.path]);
+	// only files the index still holds: a dead mark left on a file the inventory now leaves out (a vendored library) is not asked about
+	const dead = (ledger.db.prepare("SELECT path, dead_code_reason r FROM files WHERE dead_code = 1 AND path IN (SELECT path FROM index_symbols WHERE side = 'source') ORDER BY path").all() as Array<{ path: string; r: string | null }>).filter((f) => !judged[f.path]);
 	if (!dead.length) return { asked: 0, alive: [], questions: 0, costUsd: 0 };
 	const byFolder = new Map<string, Array<{ path: string; r: string | null }>>();
 	for (const f of dead) (byFolder.get(dirname(f.path)) ?? byFolder.set(dirname(f.path), []).get(dirname(f.path))!).push(f);
 
 	const verdicts = new Map<string, Verdict>();
 	const candidates = new Set(dead.map((f) => f.path));
+	// framework files at the same place (same last folder and name): an app file there may replace the framework's
+	const fwDirs = getSourceAdapter(config.source.stack).frameworkDirs?.(config.source.path) ?? [];
+	const tail = (p: string) => p.split("/").slice(-2).join("/");
+	const fwByTail = new Map<string, string[]>();
+	if (fwDirs.length)
+		for (const { path } of ledger.db.prepare("SELECT path FROM files").all() as Array<{ path: string }>)
+			if (fwDirs.some((d) => path.startsWith(d)) && path.includes("/")) (fwByTail.get(tail(path)) ?? fwByTail.set(tail(path), []).get(tail(path))!).push(path);
+	const twins = (p: string) => {
+		const same = (fwByTail.get(tail(p)) ?? []).filter((f) => f !== p).slice(0, 3);
+		return same.length ? ` (same place as ${same.join(", ")})` : "";
+	};
 	const judgeTool = {
 		name: "judge_files",
 		label: "Judge dropped files",
@@ -57,11 +70,12 @@ export async function confirmDeadCode(config: Config, root: string, ledger: Ledg
 			writeGlobs: [],
 			customTools: [judgeTool],
 			transcriptPath: join(root, ".bigrefactor", "sessions", `__init__.dead.${Date.now()}.jsonl`),
-			systemPrompt: `You check files of a legacy ${config.source.stack}${config.source.framework ? `/${config.source.framework}` : ""} app (${config.source.path}, read-only) that no other code includes or names: are they dead, or do they still run? Something may start them without an include: a web entry point, a CLI command, a cron line, a deploy or shell script, a container file, a class or file name built from a string at runtime, a directory scan of the framework. Use your tools: grep the repo for each file's name and its classes, read the files and what might start them. Work folder by folder and record verdicts with judge_files as you go. Obsolete one-off scripts (installers and upgrades already run, old exports) are dead even when a doc mentions them. Be concrete in the evidence.\n\n${PLAIN_LANGUAGE}`,
+			systemPrompt: `You check files of a legacy ${config.source.stack}${config.source.framework ? `/${config.source.framework}` : ""} app (${config.source.path}, read-only) that no other code includes or names: are they dead, or do they still run? Something may start them without an include: a web entry point, a CLI command, a cron line, a deploy or shell script, a container file, a class or file name built from a string at runtime, a directory scan of the framework. The framework's own code${fwDirs.length ? ` (${fwDirs.join(", ")})` : ""} loads app files too: first read how it does that (how it finds a template, view, command or widget from a short name; which folders it scans; the list of modules it loads at start; whether an app file at the same place as a framework file replaces it), then check each file against it: a template the framework renders by name, a command it creates by name, a file it includes at start is alive. Use your tools: grep the app and the framework for each file's name, short name and classes, read the files and what might start them. Work folder by folder and record verdicts with judge_files as you go. Obsolete one-off scripts (installers and upgrades already run, old exports) are dead even when a doc mentions them. Be concrete in the evidence.\n\n${PLAIN_LANGUAGE}`,
 		});
-		const r = await session.run(`Framework facts (from the framework profile):\n${profileFacts(root)}\n\nFiles nothing reaches, by folder (why the inventory dropped them):\n${[...byFolder].map(([dir, fs]) => `${dir}/ (${fs.length})\n${fs.map((f) => `  ${f.path}${f.r ? ` — ${f.r}` : ""}`).join("\n")}`).join("\n")}\n\nJudge every file with judge_files, then end with one line.`);
+		const r = await session.run(`Framework facts (from the framework profile):\n${profileFacts(root)}\n\nFiles nothing reaches, by folder (why the inventory dropped them; "same place as" names a framework file with the same folders and name, which the app file may replace):\n${[...byFolder].map(([dir, fs]) => `${dir}/ (${fs.length})\n${fs.map((f) => `  ${f.path}${f.r ? ` — ${f.r}` : ""}${twins(f.path)}`).join("\n")}`).join("\n")}\n\nJudge every file with judge_files, then end with one line.`);
 		cost += r.usage.cost;
 		if (r.error) opts.log?.(`  dead code: the session ended with an error (${r.error}); files without a verdict are checked next time`);
+		else ledger.setMeta(DEAD_CHECKED, JSON.stringify([...new Set([...checkedBefore(ledger), ...candidates])].sort()));
 	} catch (e) {
 		opts.log?.(`  dead code: no session (${(e as Error).message.split("\n")[0]}); the files stay dropped until the next check`);
 	} finally {
@@ -103,6 +117,21 @@ export async function confirmDeadCode(config: Config, root: string, ledger: Ledg
 	writeFileSync(decisionsPath(root), JSON.stringify(fresh, null, 2) + "\n");
 	opts.log?.(`  dead code: ${verdicts.size}/${dead.length} dropped files checked, ${alive.length} kept as entry points, ${deadByFolder.size} folder question(s) for you, $${cost.toFixed(4)}`);
 	return { asked: verdicts.size, alive, questions: deadByFolder.size, costUsd: cost };
+}
+
+/** Ledger meta: dropped files a dead-code session already looked at (the run-start catch-up does not send them again). */
+const DEAD_CHECKED = "dead_checked";
+const checkedBefore = (ledger: Ledger): string[] => JSON.parse(ledger.getMeta(DEAD_CHECKED) || "[]") as string[];
+
+/**
+ * Run start: dropped files no dead-code session has looked at yet (a run onboarded before `br dead` existed, or
+ * files a later inventory dropped). The catch-up runs confirmDeadCode only for these, so a file the model left
+ * without a verdict is not paid for again on every start.
+ */
+export function uncheckedDead(ledger: Ledger, root: string): string[] {
+	const judged = loadDecisions(root).liveness ?? {};
+	const seen = new Set(checkedBefore(ledger));
+	return (ledger.db.prepare("SELECT path FROM files WHERE dead_code = 1 AND path IN (SELECT path FROM index_symbols WHERE side = 'source') ORDER BY path").all() as Array<{ path: string }>).map((f) => f.path).filter((p) => !judged[p] && !seen.has(p));
 }
 
 /** What the framework profile says about entry points, obsolete concerns and folders that are not the app. */

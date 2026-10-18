@@ -244,10 +244,14 @@ export interface DbTable {
 
 const abs = (config: Config, p: string) => (p.startsWith("/") ? p : join(config.source.path, p));
 
-/** Files behind config.db.schemaFiles (dirs expanded in name order, so migrations replay in sequence). */
-function schemaPaths(config: Config): string[] {
+/**
+ * Files behind config.db.schemaFiles (dirs expanded in name order, so migrations replay in sequence), then the
+ * schema update scripts a model found newer than them (findSchemaUpdates), in name order: their ALTERs land on
+ * the tables the inputs created.
+ */
+function schemaPaths(config: Config, root: string | undefined = workspaceRoot()): string[] {
 	const out: string[] = [];
-	for (const p of config.db.schemaFiles) {
+	for (const p of [...config.db.schemaFiles, ...schemaUpdates(config, root).map((u) => u.path)]) {
 		const a = abs(config, p.replace(/\/$/, ""));
 		if (!existsSync(a)) continue;
 		if (statSync(a).isDirectory()) {
@@ -279,7 +283,7 @@ export async function readSchema(config: Config, log: (l: string) => void = (l) 
 		}
 		else if (!/^\s*alter\b/i.test(t.ddl)) tables.set(key, { ...t, dbs: [...t.dbs] }); // an ALTER of a table no input creates is no table
 	};
-	for (const f of schemaPaths(config)) {
+	for (const f of schemaPaths(config, root)) {
 		const st = statSync(f);
 		const key = `${f}|${st.size}|${st.mtimeMs}`;
 		let found = scanned.get(key);
@@ -395,6 +399,134 @@ export async function findTablesByModel(config: Config, root: string, o: { spawn
 	writeFileSync(foundTablesPath(root), JSON.stringify(data, null, 2) + "\n");
 	o.log?.(`  db tables: no parser read the schema; a model found ${data.tables.length} table(s)${rejected ? `, ${rejected} rejected (file not found)` : ""}, $${cost.toFixed(4)}`);
 	return { tables: data.tables.length, costUsd: cost };
+}
+
+/** Schema update scripts a model found newer than the schema inputs (data; asked again when the inputs change). */
+export const schemaUpdatesPath = (root: string) => join(root, ".bigrefactor", "db-updates.json");
+type SchemaUpdates = { at: string; inputs: string[]; files: Array<{ path: string; why: string }> };
+
+function loadSchemaUpdates(root: string | undefined): SchemaUpdates | undefined {
+	if (!root || !existsSync(schemaUpdatesPath(root))) return undefined;
+	try {
+		return JSON.parse(readFileSync(schemaUpdatesPath(root), "utf8")) as SchemaUpdates;
+	} catch {
+		return undefined;
+	}
+}
+/** The update scripts found for the current inputs, in name order (none for other inputs: they are looked up again). */
+function schemaUpdates(config: Config, root: string | undefined): Array<{ path: string; why: string }> {
+	const u = loadSchemaUpdates(root);
+	return u && JSON.stringify(u.inputs) === JSON.stringify(config.db.schemaFiles) ? [...u.files].sort((a, b) => a.path.localeCompare(b.path)) : [];
+}
+
+/**
+ * The schema inputs (a dump, a schema file) can be older than the code: the app's own update scripts may add
+ * columns and tables after them. ONE read-only tool session finds how this app changes its schema (an updates
+ * folder, migrations, an installer step) and lists the scripts newer than the inputs, so their changes reach the
+ * DB units. Code checks every file exists; the list is kept as data per inputs (`.bigrefactor/db-updates.json`),
+ * an empty list too. Returns the files, or undefined when it was not asked (already known, no database, no session).
+ */
+export async function findSchemaUpdates(config: Config, root: string, o: { spawn?: typeof spawnLeaf; log?: (l: string) => void } = {}): Promise<{ files: Array<{ path: string; why: string }>; costUsd: number } | undefined> {
+	if (!dbDetected(config) || !config.db.schemaFiles.length) return undefined;
+	const prev = loadSchemaUpdates(root);
+	if (prev && JSON.stringify(prev.inputs) === JSON.stringify(config.db.schemaFiles)) return undefined;
+	const got = new Map<string, { path: string; why: string }>();
+	const inputs = new Set(config.db.schemaFiles.map((p) => normalize(p.replace(/^\.\//, ""))));
+	const tool = {
+		name: "record_schema_updates",
+		label: "Record schema updates",
+		description: "Record schema change scripts (SQL or code) that are newer than the schema inputs: path relative to the legacy repo root, why = how you know it is newer and what it changes (e.g. 'adds rmsformats.version; the dump has no such column'). Call it as often as you like; an empty list is fine.",
+		promptSnippet: "record_schema_updates: schema change scripts newer than the schema inputs",
+		parameters: Type.Object({ files: Type.Array(Type.Object({ path: Type.String(), why: Type.String() })) }),
+		execute: async (_id: string, p: { files: Array<{ path: string; why: string }> }) => {
+			const bad: string[] = [];
+			for (const f of p.files ?? []) {
+				const path = normalize(String(f.path ?? "").replace(/^\.\//, ""));
+				if (!path || path.startsWith("..") || path.startsWith("/") || !existsSync(join(config.source.path, path)) || statSync(join(config.source.path, path)).isDirectory()) bad.push(`${f.path}: not a file under the legacy root`);
+				else if (inputs.has(path)) bad.push(`${f.path}: already a schema input`);
+				else got.set(path, { path, why: String(f.why ?? "").trim() });
+			}
+			return { content: [{ type: "text" as const, text: `recorded ${got.size} in all${bad.length ? `; not recorded: ${bad.join("; ")}` : ""}` }], details: {} };
+		},
+	} as unknown as ToolDefinition;
+	let cost = 0;
+	let session: Awaited<ReturnType<typeof spawnLeaf>> | undefined;
+	try {
+		session = await (o.spawn ?? spawnLeaf)({
+			role: "review",
+			cwd: config.source.path,
+			config,
+			writeGlobs: [],
+			customTools: [tool],
+			transcriptPath: join(root, ".bigrefactor", "sessions", `__init__.db-updates.${Date.now()}.jsonl`),
+			systemPrompt: `The database schema of a legacy ${config.source.stack}${config.source.framework ? `/${config.source.framework}` : ""} app (${config.source.path}, read-only) is read from these inputs: ${config.db.schemaFiles.join(", ")}. They may be older than the code. Find how this app changes its schema over time (an updates or migrations folder, an installer step; read the code that runs them) and record every schema change script that is newer than the inputs: one that adds or changes a table or column the inputs do not have yet. Check against the inputs with grep (a column the dump lacks), not by file dates alone. Leave out scripts already in the inputs and data-only scripts. Record with record_schema_updates, then end with one line.\n\n${PLAIN_LANGUAGE}`,
+		});
+		const r = await session.run(`Find the schema change scripts newer than ${config.db.schemaFiles.join(", ")} and record them with record_schema_updates.`);
+		cost += r.usage.cost;
+		if (r.error) {
+			o.log?.(`  db updates: the session ended with an error (${r.error}); asked again next time`);
+			return { files: [], costUsd: cost };
+		}
+	} catch (e) {
+		o.log?.(`  db updates: no session (${(e as Error).message.split("\n")[0]}); asked again next time`);
+		return undefined;
+	} finally {
+		session?.dispose();
+	}
+	const data: SchemaUpdates = { at: new Date().toISOString(), inputs: config.db.schemaFiles, files: [...got.values()].sort((a, b) => a.path.localeCompare(b.path)) };
+	writeFileSync(schemaUpdatesPath(root), JSON.stringify(data, null, 2) + "\n");
+	o.log?.(`  db updates: ${data.files.length} schema change script(s) newer than the schema inputs${data.files.length ? `: ${data.files.map((f) => f.path).join(", ")}` : ""}, $${cost.toFixed(4)}`);
+	return { files: data.files, costUsd: cost };
+}
+
+/**
+ * Accepted DB units whose tables the update scripts change: they were built from the older schema (units not done
+ * yet read the changes in their schema text). Marked stale with the change as reason; returned so the caller can
+ * ask the owner whether to redo them.
+ */
+export async function schemaUpdateDrift(ledger: Ledger, config: Config, root: string): Promise<Array<{ unit: string; tables: string[]; files: string[] }>> {
+	const updates = schemaUpdates(config, root);
+	if (!updates.length) return [];
+	const touched = new Map<string, Set<string>>(); // table → update files
+	for (const u of updates) {
+		const f = join(config.source.path, u.path);
+		if (!existsSync(f)) continue;
+		for (const t of await scanFile(f, u.path, statSync(f).size, () => {})) (touched.get(t.name.toLowerCase()) ?? touched.set(t.name.toLowerCase(), new Set()).get(t.name.toLowerCase())!).add(u.path);
+	}
+	const out: Array<{ unit: string; tables: string[]; files: string[] }> = [];
+	for (const u of ledger.listUnits()) {
+		if (!isDbUnitKind(u.kind) || u.kind === "db_data" || u.state !== "accepted") continue;
+		const meta = JSON.parse(u.meta) as DbUnitMeta & { stale?: boolean };
+		const tables = (meta.tables ?? []).filter((t) => touched.has(t.toLowerCase()));
+		if (!tables.length) continue;
+		const files = [...new Set(tables.flatMap((t) => [...touched.get(t.toLowerCase())!]))].sort();
+		out.push({ unit: u.id, tables, files });
+		if (!meta.stale) ledger.updateUnit(u.id, { meta: { stale: true, staleReason: `schema update(s) newer than the schema inputs change ${tables.join(", ")}: ${files.join(", ")}` } });
+	}
+	return out;
+}
+
+/**
+ * The table plan's reasons that wait for an answer ("waiting for the owner's answer (question #N)") once N is
+ * answered: the reason says what the owner decided. Tables the owner chose to migrate are planned by the next
+ * `br order`; the reason says so. Returns how many reasons changed.
+ */
+export function refreshTablePlanReasons(ledger: Ledger): number {
+	const raw = ledger.getMeta(TABLE_PLAN_KEY);
+	if (!raw) return 0;
+	const plan = JSON.parse(raw) as { dropped?: Array<{ table: string; reason: string }> };
+	let n = 0;
+	for (const d of plan.dropped ?? []) {
+		const m = /^database (\S+): waiting for the owner's answer \(question #(\d+)\)$/.exec(d.reason);
+		if (!m) continue;
+		const q = ledger.getQuestion(Number(m[2]));
+		if (!q || q.status === "open" || !q.answer) continue;
+		const v = answerValue(q.answer);
+		d.reason = v === "include" ? `database ${m[1]}: the owner chose to migrate it (question #${m[2]}); br order plans its tables` : `database ${m[1]} is not migrated: the owner answered ${v || q.status} (question #${m[2]})`;
+		n++;
+	}
+	if (n) ledger.setMeta(TABLE_PLAN_KEY, JSON.stringify(plan));
+	return n;
 }
 
 async function scanFile(f: string, rel: string, size: number, log: (l: string) => void): Promise<DbTable[]> {
@@ -802,8 +934,10 @@ export async function planDbLane(ledger: Ledger, config: Config, o: { client?: M
 		const removed = removeStale(new Set());
 		return { units: [], tables: 0, dropped: 0, wired: wireDbDeps(ledger), removed, costUsd: 0 };
 	}
-	let tables = await readSchema(config, undefined, o.root ?? workspaceRoot());
 	let costUsd = 0;
+	// schema change scripts newer than the inputs (columns the code uses that a dump lacks): found once, before the tables are read
+	if (o.root && (o.client || o.spawn)) costUsd += (await findSchemaUpdates(config, o.root, { spawn: o.spawn, log: o.log }))?.costUsd ?? 0;
+	let tables = await readSchema(config, undefined, o.root ?? workspaceRoot());
 	// no parser read a table: a model with tools finds them (only when models are on: a client, or a test's scripted session)
 	if (!tables.length && o.root && (o.client || o.spawn)) {
 		costUsd += (await findTablesByModel(config, o.root, { spawn: o.spawn, log: o.log })).costUsd;

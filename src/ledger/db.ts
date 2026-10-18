@@ -141,7 +141,7 @@ export class Ledger {
 		for (const s of this.symbolsOfFile(path)) {
 			if (s.state !== "dropped") continue;
 			const last = this.db.prepare("SELECT reason FROM transitions WHERE entity = 'symbol' AND entity_id = ? ORDER BY id DESC LIMIT 1").get(s.id) as { reason: string } | undefined;
-			if (!last || !/^(dead code|framework|regenerated):/.test(last.reason ?? "")) continue;
+			if (!last || !/^(dead code|framework|regenerated|left out):/.test(last.reason ?? "")) continue;
 			this.db.prepare("UPDATE symbols SET state = 'discovered', unit_id = NULL, updated_at = ? WHERE id = ?").run(now(), s.id);
 			this.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('symbol', ?, 'dropped', 'discovered', ?, ?)").run(s.id, `inventory: ${reason}`, now());
 			n++;
@@ -511,7 +511,28 @@ export class Ledger {
 			if (this.inventoryMayDrop(s)) this.dropFromInventory(s, `framework: ${reason}`);
 		}
 	}
-	fileState(path: string): "accepted" | "dead_code" | "regenerated" | "framework" | "in_progress" | "pending" | "quarantined" | "mixed" {
+	/**
+	 * An inventory removed a planned unit (its files left the plan): the removal is recorded with its reason, and its
+	 * symbols are no longer counted as waiting for a unit. Symbols left without a unit (clustered or mapped by a unit
+	 * that is gone) are dropped with the reason their file gives, so they count as done instead of hanging forever.
+	 */
+	removeUnit(id: string, reason: string): void {
+		const u = this.getUnit(id);
+		if (!u) return;
+		this.db.prepare("UPDATE symbols SET unit_id = NULL WHERE unit_id = ?").run(id);
+		this.db.prepare("DELETE FROM units WHERE id = ?").run(id);
+		this.recordTransition("unit", id, u.state, "removed", `inventory: ${reason}`);
+	}
+	dropOrphanSymbols(reasonOf: (path: string) => string): number {
+		const rows = this.db.prepare("SELECT * FROM symbols WHERE unit_id IS NULL AND state IN ('clustered', 'in_progress', 'mapped')").all() as unknown as SymbolRow[];
+		for (const s of rows) {
+			const why = `left out: ${reasonOf(s.path)}`;
+			if (s.state === "mapped") this.transitionSymbol(s.id, "in_progress", why);
+			this.transitionSymbol(s.id, "dropped", why);
+		}
+		return rows.length;
+	}
+	fileState(path: string):"accepted" | "dead_code" | "regenerated" | "framework" | "in_progress" | "pending" | "quarantined" | "mixed" {
 		const f = this.db.prepare("SELECT * FROM files WHERE path = ?").get(path) as unknown as FileRow & { disposition?: string | null } | undefined;
 		if (!f) throw new LedgerError(`unknown file ${path}`);
 		if (f.dead_code) return "dead_code";

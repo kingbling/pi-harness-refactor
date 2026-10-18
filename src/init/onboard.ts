@@ -55,6 +55,7 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 		folders: "how the new code is organised per stack: the framework's folder convention, confirmed or changed in your words; every agent's work is checked against it",
 		setup: "bootstrap the new codebase with the official generators + chosen packages",
 		docs: "fetch the official docs of every chosen technology for the agents",
+		switches: "a model reads which app parts the framework never loads (left out) and which framework parts users see (migrated)",
 		"inventory (after decisions)": "re-index with the decisions applied",
 		label: "Jev rates every unit (difficulty → model, needs_db, has_ui), places unreached code, gives every unit its stack + area",
 		rules: "a model writes RULES.md, AGENTS.md, idioms and lint rules from the framework mapping",
@@ -401,6 +402,21 @@ export async function onboard(opts: OnboardOptions = {}): Promise<OnboardReport>
 			const { fetchDocs } = await import("./docs.ts");
 			const entries = await fetchDocs(config, root, { log: (l) => log(pc.dim(l)) });
 			return `${entries.length} docs`;
+		});
+
+		// what the app switches off (left out) and which framework parts it switches on that users see (migrated): a model reads it once;
+		// the inventory after the decisions below applies it
+		await step("switches", () => (noLlm ? "skipped (--no-llm)" : undefined), async () => {
+			const { healSwitches, loadSwitches } = await import("../inventory/switches.ts");
+			if (loadSwitches(root)) return "read before";
+			const { OpenRouterClient } = await import("../models/openrouter.ts");
+			const l = ledger();
+			try {
+				const r = await healSwitches({ config, root, ledger: l, client: new OpenRouterClient(), frameworkDirs: source.frameworkDirs?.(config.source.path) ?? [], log: (x) => log(pc.dim(x)) });
+				return r ? `${r.switches.off.length} switched-off folder(s), ${r.switches.features.length} framework feature(s) to migrate` : "nothing recorded (asked again at run start)";
+			} finally {
+				l.close();
+			}
 		});
 
 		// files the reachability walk dropped: a model with tools checks whether they still run (cron, CLI, dynamic dispatch);

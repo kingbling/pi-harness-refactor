@@ -6,15 +6,17 @@ import { loadCommandOverrides } from "../adapters/command-overrides.ts";
 import { healBuiltinWiring } from "../adapters/wiring.ts";
 import { healBoot, healCheckConfig, healMigrateFresh, healSkipMarker, healWiringFiles } from "../adapters/target/generated.ts";
 import { fixRunSetup } from "../init/setup-fixer.ts";
-import { askViaModel } from "../jev/ask.ts";
 import type { DbUnitMeta } from "../inventory/db.ts";
 import { ENGINE_SEMANTICS, ENGINE_SEMANTICS_OPTIONS, namesFileOf } from "./db-unit.ts";
 import { run } from "./gate.ts";
 import { placeUnit } from "./placement.ts";
-import { reopenUnit } from "./recheck.ts";
 import type { Config } from "../config.ts";
 import { projectDir } from "../init/init.ts";
-import { isDbUnitKind } from "../inventory/db.ts";
+import { confirmDeadCode, uncheckedDead } from "../init/dead.ts";
+import { dbDetected, findSchemaUpdates, isDbUnitKind, refreshTablePlanReasons, schemaUpdateDrift } from "../inventory/db.ts";
+import { healSwitches, switchedOff } from "../inventory/switches.ts";
+import { answerValue, askViaModel } from "../jev/ask.ts";
+import { reopenUnit } from "./recheck.ts";
 import { healNotApp, leftOut, loadNotApp } from "../inventory/not-app.ts";
 import { inventory } from "../inventory/run.ts";
 import { ROUTE_SUBCLASSES } from "../inventory/route-forms.ts";
@@ -58,6 +60,44 @@ async function inventoryAgain(o: { ledger: Ledger; config: Config; root: string 
 	return gone;
 }
 
+const SWITCHES_PENDING = "switches_heal_pending";
+/** Ledger meta: the owner question about done tables that schema updates change ({id, units, applied}). */
+const SCHEMA_UPDATE_Q = "schema_update_question";
+
+/**
+ * Accepted DB units built from a schema older than the app's update scripts: one owner question (blocking nothing)
+ * lists them; "redo" re-opens them (code kept) so the columns the code uses get added, once.
+ */
+async function redoForSchemaUpdates(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; log: (l: string) => void }): Promise<void> {
+	const { ledger } = o;
+	const prev = JSON.parse(ledger.getMeta(SCHEMA_UPDATE_Q) || "null") as { id: number; units: string[]; applied?: boolean } | null;
+	if (prev) {
+		const q = ledger.getQuestion(prev.id);
+		if (!prev.applied && q && q.status !== "open" && answerValue(q.answer) === "redo") {
+			for (const id of prev.units) {
+				if (ledger.getUnit(id)?.state !== "accepted") continue;
+				ledger.clearStale(id);
+				reopenUnit(ledger, id, `The app's schema update scripts change this unit's tables after the dump it was built from (see the schema text): add those changes.`, `re-opened: schema updates newer than the dump (question #${prev.id})`);
+			}
+			ledger.setMeta(SCHEMA_UPDATE_Q, JSON.stringify({ ...prev, applied: true }));
+			o.log(pc.cyan(`↻ ${prev.units.length} DB unit(s) re-opened for schema updates newer than the dump (question #${prev.id})`));
+		}
+		return;
+	}
+	const drift = await schemaUpdateDrift(ledger, o.config, o.root);
+	if (!drift.length) return;
+	const q = await askViaModel({ ledger, config: o.config, root: o.root, client: o.client }, {
+		point: "schema_update",
+		facts: `The database schema was read from ${o.config.db.schemaFiles.join(", ")}, but the app's own update scripts change it after that, and these tables are already done without the changes:\n${drift.map((d) => `- ${d.tables.join(", ")} (done in ${d.unit}): changed by ${d.files.join(", ")}`).join("\n").slice(0, 3000)}\nCode that uses the new columns fails on the new database until they are added.`,
+		options: [{ value: "redo", facts: "add the changes: those tables are done again, their code kept" }, { value: "leave", facts: "keep the tables as they are" }],
+		recommended: "redo",
+		blocks: "none",
+		askedBy: "db lane",
+	});
+	ledger.setMeta(SCHEMA_UPDATE_Q, JSON.stringify({ id: q.id, units: drift.map((d) => d.unit) }));
+	o.log(pc.yellow(`schema updates newer than the dump change ${drift.length} done DB unit(s): question #${q.id}`));
+}
+
 export async function healStackKnowledge(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; spawn?: typeof spawnLeaf; log: (l: string) => void }): Promise<void> {
 	const { ledger, config } = o;
 	// the profile keeps notApp as soon as the session wrote it; a requeue + inventory that did not finish (stopped,
@@ -90,6 +130,55 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		await inventoryAgain(o, "withdrawn: the unit was regrouped when the app's own route classes were indexed")
 			.then((gone) => o.log(pc.cyan(`↻ the source index now counts the app's own route classes: ${before} → ${count()} routes (${JSON.parse(ledger.getMeta(ROUTE_SUBCLASSES) ?? "[]").join(", ") || "none"})${gone.size ? `; ${gone.size} planned unit(s) regrouped` : ""}`)))
 			.catch((e) => o.log(pc.yellow(`the source index could not be rebuilt with the app's own route classes: ${e?.message ?? e} (tried again next run start)`)));
+	}
+	// an index built while a notApp "vendored" entry left the framework itself out: the framework's loading of app files
+	// (a template it renders by name, a folder it scans) was lost, and those app files looked dead. Built again once.
+	{
+		const dirs = getSourceAdapter(config.source.stack).frameworkDirs?.(config.source.path) ?? [];
+		const has = (sql: string) => dirs.some((d) => !!ledger.db.prepare(sql).get(`${d}%`));
+		if (ledger.getMeta("inventory_at") && has("SELECT 1 FROM files WHERE disposition = 'framework' AND path LIKE ? LIMIT 1") && !has("SELECT 1 FROM index_symbols WHERE side = 'source' AND path LIKE ? LIMIT 1"))
+			await inventoryAgain(o, "withdrawn: the unit was regrouped when the framework was indexed again")
+				.then((gone) => o.log(pc.cyan(`↻ the framework (${dirs.join(", ")}) is indexed again, so the app files it loads count as used${gone.size ? `; ${gone.size} planned unit(s) regrouped` : ""}`)))
+				.catch((e) => o.log(pc.yellow(`the framework could not be indexed again: ${e?.message ?? e} (tried again next run start)`)));
+	}
+	// what the framework turns on and off (once, a model reads it): switched-off app folders leave the plan like notApp
+	// folders (accepted units there stay, reported); switched-on framework features become units
+	if (o.client || o.spawn) {
+		const dirs = getSourceAdapter(config.source.stack).frameworkDirs?.(config.source.path) ?? [];
+		const got = await healSwitches({ config, root: o.root, ledger, client: o.client, spawn: o.spawn, frameworkDirs: dirs, log: (l) => o.log(pc.dim(l)) }).catch((e) => (o.log(pc.yellow(`switched-off parts not read: ${e?.message ?? e}`)), undefined));
+		if (got && (got.switches.off.length || got.switches.features.length)) ledger.setMeta(SWITCHES_PENDING, "1");
+	}
+	if (ledger.getMeta(SWITCHES_PENDING) === "1") {
+		const off = switchedOff(o.root, ledger);
+		const source = getSourceAdapter(config.source.stack);
+		const outside = (u: { meta: string }) => {
+			const files = (JSON.parse(u.meta).files ?? []) as string[];
+			return files.length > 0 && files.every((f) => leftOut(f, off, (p) => !!source.isEntryPoint?.(p)));
+		};
+		const units = ledger.listUnits().filter((u) => u.state !== "planned" && !isDbUnitKind(u.kind) && outside(u));
+		const started = units.filter((u) => u.state !== "accepted").map((u) => u.id);
+		if (started.length) await requeueUnits(ledger, config, o.root, started, "run start: the app switches their code off");
+		const gone = await inventoryAgain(o, "withdrawn: the app switches the unit's code off");
+		o.log(pc.cyan(`↻ switched-off app code: ${off.map((f) => f.path).join(", ") || "none"}; ${gone.size} unit(s) left the plan (br why <unit> says why)`));
+		const accepted = units.filter((u) => u.state === "accepted").map((u) => u.id);
+		if (accepted.length) o.log(pc.yellow(`  ${accepted.length} accepted unit(s) hold code the app switches off: ${accepted.slice(0, 20).join(", ")}${accepted.length > 20 ? ", …" : ""} (left as they are)`));
+		ledger.setMeta(SWITCHES_PENDING, "0");
+	}
+	// files the reachability walk dropped that no dead-code session looked at yet (a run onboarded before the check
+	// existed, or files a later inventory dropped): checked now; the ones still running become units again
+	if ((o.client || o.spawn) && uncheckedDead(ledger, o.root).length) {
+		const r = await confirmDeadCode(config, o.root, ledger, o.client, { spawn: o.spawn, log: (l) => o.log(pc.dim(l)) }).catch((e) => (o.log(pc.yellow(`dead code not checked: ${e?.message ?? e}`)), undefined));
+		if (r?.alive.length) {
+			await inventoryAgain(o, "withdrawn: the unit was regrouped when dropped files came alive");
+			o.log(pc.cyan(`↻ ${r.alive.length} dropped file(s) still run and are migrated again: ${r.alive.slice(0, 8).join(", ")}${r.alive.length > 8 ? ", …" : ""}`));
+		}
+	}
+	// the database: schema change scripts newer than the schema inputs (once per inputs); accepted DB units built from
+	// the older schema are flagged and the owner is asked once whether to redo them
+	if (dbDetected(config)) {
+		if (o.client || o.spawn) await findSchemaUpdates(config, o.root, { spawn: o.spawn, log: (l) => o.log(pc.dim(l)) }).catch((e) => o.log(pc.yellow(`schema updates not looked up: ${e?.message ?? e}`)));
+		await redoForSchemaUpdates(o).catch((e) => o.log(pc.yellow(`schema updates not checked against done tables: ${e?.message ?? e}`)));
+		refreshTablePlanReasons(ledger);
 	}
 	if (o.client) {
 		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });

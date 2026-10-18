@@ -11,7 +11,8 @@ import { git, headOf, isRepo } from "../git.ts";
 import { exec } from "../proc.ts";
 import { loadDecisions } from "./decisions.ts";
 import { answerValue } from "../jev/ask.ts";
-import { leftOut, loadNotApp } from "./not-app.ts";
+import { leftOut, loadNotApp, notAppOf } from "./not-app.ts";
+import { portedFeatures, switchedOff } from "./switches.ts";
 import { isDbUnitKind, wireDbDeps } from "./db.ts";
 import { resolveCodeMap, writeCodeMap } from "./codemap.ts";
 import { ROUTE_SUBCLASSES, routeSubclasses } from "./route-forms.ts";
@@ -41,10 +42,15 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 
 	// folders the profile model found are not the app (tooling, stubs, vendored libraries, docs, one-off scripts,
 	// tests) are left out on top of the adapter's minimal defaults; a file the adapter calls an entry point stays
-	const notApp = loadNotApp(_root);
+	// app folders the app switches off (a model read the switch, src/inventory/switches.ts) are left out the same way
+	const notApp = [...loadNotApp(_root), ...switchedOff(_root, ledger)];
 	const profilePath = join(_root, ".bigrefactor", "framework-profile.json");
 	if (existsSync(profilePath) && !/"notApp"\s*:/.test(readFileSync(profilePath, "utf8"))) console.log(pc.yellow("the framework profile names no folders that are not app code (it predates that field): docs, tooling and vendored copies are indexed as app code; br run adds them at start"));
-	const files = listFiles(srcRoot, adapter).filter((f) => !leftOut(f, notApp, (p) => !!adapter.isEntryPoint?.(p)));
+	// framework parts the app switches on and users see (switches.ts) are ported like app code, not mapped per concern
+	const ported = portedFeatures(_root, ledger);
+	const frameworkPrefixes = adapter.frameworkDirs?.(srcRoot) ?? [];
+	const isFramework = (p: string) => frameworkPrefixes.some((d) => p.startsWith(d)) && !ported.some((d) => p.startsWith(d));
+	const files = listFiles(srcRoot, adapter).filter((f) => !leftOut(f, notApp, (p) => !!adapter.isEntryPoint?.(p), frameworkPrefixes));
 	const indexes: FileIndex[] = [];
 	for (const rel of files) {
 		const source = readFileSync(join(srcRoot, rel), "utf8");
@@ -88,8 +94,6 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		}
 		return hit;
 	};
-	const frameworkPrefixes = adapter.frameworkDirs?.(srcRoot) ?? [];
-	const isFramework = (p: string) => frameworkPrefixes.some((d) => p.startsWith(d));
 	/**
 	 * One target for a name, or none. Several files declaring the name (a bare file name like `enabled.inc.php`
 	 * that every module has, a class declared twice) give no edge: picking the first one made one 3-line file
@@ -334,6 +338,9 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 			if (!fileOf.has(f.path)) continue; // removed upstream: drift handles it
 			ledger.reviveFile(f.path, "re-inventory found references (profile/decision change)");
 		}
+		// files an earlier run left out (not app code, switched off) that are indexed again (the owner kept them)
+		const back = ledger.db.prepare("SELECT DISTINCT path FROM symbols WHERE state = 'dropped' AND reason LIKE 'left out:%'").all() as Array<{ path: string }>;
+		for (const { path } of back) if (fileOf.has(path)) ledger.reviveFile(path, "indexed again (the owner kept it, or the folder list changed)");
 	}
 	// ---- units: one per condensed component (usually one file), leaves first.
 	// Re-runs are stable: a component with the same file set keeps its unit id; files owned by a unit that
@@ -361,7 +368,8 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 		compUnit.set(ci, id);
 		unitIds.push(id);
 		const symbolIds = comp.flatMap((p) => fileOf.get(p)!.symbols.map((s) => s.id));
-		const deps = [...(cond.deps.get(ci) ?? [])].map((d) => compUnit.get(d)).filter((x): x is string => !!x);
+		// several components can belong to one started unit: each dep once
+		const deps = [...new Set([...(cond.deps.get(ci) ?? [])].map((d) => compUnit.get(d)).filter((x): x is string => !!x))];
 		// a unit that reported a bug in another unit's code waits for that fix (a dep the run added): kept
 		for (const r of ledger.db.prepare("SELECT DISTINCT e.unit_id u FROM evidence e JOIN units o ON o.id = e.unit_id WHERE e.type = 'bug_reported' AND json_extract(e.payload, '$.by') = ?").all(id) as Array<{ u: string }>)
 			if (r.u !== id && !deps.includes(r.u)) deps.push(r.u);
@@ -405,19 +413,22 @@ export async function inventory(config: Config, _root: string, ledger: Ledger): 
 	for (const p of regenerated) ledger.markRegenerated(p, excluded[p] ?? `registration file; the ${config.target.stacks.join("/")} adapter regenerates module/route wiring from the ledger (index_routes)`);
 	// planned units from an earlier inventory that this run did not produce (files regrouped, now dead,
 	// framework or regenerated) are no longer units; their symbols already point at the new unit
+	// Why a file is no longer a unit's: kept with the removed unit and its symbols (br why), never a silent delete.
+	const goneWhy = (p: string): string =>
+		deadSet.has(p) ? "dead code" : frameworkSet.has(p) ? "framework file" : regenerated.includes(p) ? (excluded[p] ?? "registration file") : !fileOf.has(p) ? (notAppOf(p, notApp)?.why ?? "no longer in the source") : "regrouped into another unit";
+	const unitGoneWhy = (files: string[]) => [...new Set(files.map(goneWhy))].join("; ") || "no files";
 	const produced = new Set(unitIds);
 	for (const u of ledger.listUnits({ state: "planned" })) {
 		if (produced.has(u.id) || isDbUnitKind(u.kind)) continue; // DB units come from the schema (planDbLane), not from files
-		ledger.db.prepare("UPDATE symbols SET unit_id = NULL WHERE unit_id = ?").run(u.id);
-		ledger.db.prepare("DELETE FROM units WHERE id = ?").run(u.id);
+		ledger.removeUnit(u.id, unitGoneWhy((JSON.parse(u.meta).files ?? []) as string[]));
 	}
 	for (const u of ledger.listUnits({ state: "planned" })) {
 		const files = (JSON.parse(u.meta).files ?? []) as string[];
-		if (files.length && files.every((f) => regenerated.includes(f) || dead.includes(f) || frameworkSet.has(f))) {
-			ledger.db.prepare("UPDATE symbols SET unit_id = NULL WHERE unit_id = ?").run(u.id);
-			ledger.db.prepare("DELETE FROM units WHERE id = ?").run(u.id);
-		}
+		if (files.length && files.every((f) => regenerated.includes(f) || dead.includes(f) || frameworkSet.has(f))) ledger.removeUnit(u.id, unitGoneWhy(files));
 	}
+	// symbols whose unit is gone and whose file became no unit (left out of the index, dead, framework): dropped with
+	// that reason, so they count as done (they stayed 'clustered' with no unit before)
+	ledger.dropOrphanSymbols(goneWhy);
 
 	// code units' deps were rewritten above: their DB deps (tables their SQL names) are wired again
 	wireDbDeps(ledger);

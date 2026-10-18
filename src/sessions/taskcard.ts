@@ -12,8 +12,22 @@ import { noBehaviour } from "../run/gate.ts";
 import { callTree } from "../inventory/codemap.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { exec } from "../proc.ts";
+import { routeSyntax } from "../inventory/switches.ts";
 import { legacyCallerLines } from "./tools.ts";
 import { markPatterns, stubNames } from "../run/stub-sweep.ts";
+
+/** A unit this big, with this many routes, is worked through by route group (the first two parts of each path). */
+const GIANT_LOC = 1500;
+const GIANT_ROUTES = 10;
+export function giantRouteGroups(loc: number, routes: Array<{ path: string }>): string[] | undefined {
+	if (loc < GIANT_LOC || routes.length < GIANT_ROUTES) return undefined;
+	const groups = new Map<string, number>();
+	for (const r of routes) {
+		const key = r.path.replace(/^[a-z]+:\/\//i, "").replace(/^\/+/, "").split("/").filter((s) => s && !s.startsWith("{")).slice(0, 2).join("/") || "/";
+		groups.set(key, (groups.get(key) ?? 0) + 1);
+	}
+	return groups.size > 1 ? [...groups].sort((a, b) => a[0].localeCompare(b[0])).map(([g, n]) => `${g} (${n} route${n > 1 ? "s" : ""})`) : undefined;
+}
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -71,6 +85,10 @@ export interface TaskCard {
 	moduleDir?: string;
 	/** The area's module as it is now (binding dir, contents, sibling units): units of one area extend it, never fork it. */
 	areaModule?: AreaModule;
+	/** How the legacy framework writes route paths (optional parts, rest of path), as a model read it (switches.ts). */
+	routeSyntax?: string;
+	/** A big unit's routes by their first path parts: worked through one group at a time (giantRouteGroups). */
+	routeGroups?: string[];
 	/** The target stack's data-access convention (TargetLayout.dataAccessHint). */
 	dataAccessHint?: string;
 }
@@ -195,7 +213,7 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
 	await breathe();
 	const area = opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined;
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, otherStackStubs: found.other, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, otherStackStubs: found.other, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area, routeSyntax: routes.length ? routeSyntax(opts.root) : undefined, routeGroups: giantRouteGroups((JSON.parse(unit.meta) as { loc?: number }).loc ?? 0, routes) };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -356,7 +374,12 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	}
 	if (card.routes.length) {
 		L.push("", "## Routes");
+		if (card.routeSyntax) L.push(`Legacy route path syntax (write the new routes in the target's own form, never copy these marks): ${card.routeSyntax}`);
 		for (const r of card.routes) L.push(`- ${r.method ?? "ANY"} ${r.path} → ${r.handler}`);
+	}
+	if (card.routeGroups?.length) {
+		L.push("", "## A big file: one route group at a time", "Finish each group fully (handlers, their logic, tests) before you start the next; a group you cannot finish this pass stays whole for the next pass, never half-stubbed.");
+		for (const g of card.routeGroups) L.push(`- ${g}`);
 	}
 	if (card.queries.length) {
 		L.push("", `## Database access${card.dataAccessHint ? ` (${card.dataAccessHint})` : ""}`);

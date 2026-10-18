@@ -16,7 +16,8 @@ export const NOT_APP_KINDS = ["tooling", "stubs", "vendored", "docs", "scripts",
 export interface NotAppFolder {
 	/** Folder prefix relative to the legacy root, trailing slash. */
 	path: string;
-	kind: (typeof NOT_APP_KINDS)[number];
+	/** switched-off: app code the framework never loads (src/inventory/switches.ts); never in the profile model's notApp list. */
+	kind: (typeof NOT_APP_KINDS)[number] | "switched-off";
 	why: string;
 	/** Vendored: the library's name. */
 	name?: string;
@@ -40,10 +41,18 @@ export function notAppOf(path: string, folders: NotAppFolder[]): NotAppFolder | 
 	return folders.find((f) => path.startsWith(f.path));
 }
 
-/** The inventory leaves the file out: it is in a notApp folder, and not an entry point outside vendored code. */
-export function leftOut(path: string, folders: NotAppFolder[], isEntryPoint?: (p: string) => boolean): boolean {
+/**
+ * The inventory leaves the file out: it is in a notApp folder, and not an entry point outside vendored or
+ * switched-off code. The framework itself stays in even when the profile calls it a vendored copy (a notApp folder
+ * that holds a whole framework folder): it is indexed so the framework's loading of app files counts (a template
+ * it renders by name, a folder it scans); without it, those app files looked dead. A notApp folder inside the
+ * framework (its tests, its docs) is still left out.
+ */
+export function leftOut(path: string, folders: NotAppFolder[], isEntryPoint?: (p: string) => boolean, frameworkDirs: string[] = []): boolean {
 	const n = notAppOf(path, folders);
-	return !!n && (n.kind === "vendored" || !isEntryPoint?.(path));
+	if (!n) return false;
+	if (frameworkDirs.some((d) => path.startsWith(d) && d.startsWith(n.path))) return false;
+	return n.kind === "vendored" || n.kind === "switched-off" || !isEntryPoint?.(path);
 }
 
 /**
@@ -106,7 +115,7 @@ export function validateNotApp(json: unknown, sourceRoot: string): string[] {
 	for (const f of list as Array<Partial<NotAppFolder>>) {
 		if (!f || typeof f.path !== "string" || !f.path) problems.push(`notApp entry ${JSON.stringify(f)} needs a path`);
 		else if (!existsSync(join(sourceRoot, f.path))) problems.push(`notApp folder ${f.path} does not exist in the legacy repo`);
-		if (!NOT_APP_KINDS.includes(f?.kind as NotAppFolder["kind"])) problems.push(`notApp ${f?.path}: kind must be one of ${NOT_APP_KINDS.join("|")}`);
+		if (!NOT_APP_KINDS.includes(f?.kind as (typeof NOT_APP_KINDS)[number])) problems.push(`notApp ${f?.path}: kind must be one of ${NOT_APP_KINDS.join("|")}`);
 		if (!f?.why) problems.push(`notApp ${f?.path}: say why`);
 	}
 	return problems;

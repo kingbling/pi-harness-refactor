@@ -410,6 +410,8 @@ describe("DB lane: tables no parser reads are found by a model with tools", () =
 		expect(await readSchema(config, () => {}, undefined)).toEqual([]);
 		const seen: { opts?: SpawnOptions; task?: string; runs: number } = { runs: 0 };
 		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => {
+			// the schema-updates lookup (another session) finds none here
+			if (opts.customTools?.some((t) => t.name === "record_schema_updates")) return { run: async () => ({ text: "none", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} } as unknown as LeafSession;
 			seen.opts = opts;
 			return {
 				run: async (task: string) => {
@@ -442,7 +444,7 @@ describe("DB lane: tables no parser reads are found by a model with tools", () =
 		write(join(ws, "legacy", "db", "schema.rb"), 'create_table "invoices" do |t|\nend\n');
 		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
 		let runs = 0;
-		const spawn = (async (): Promise<LeafSession> => ({ run: async () => (runs++, { text: "", error: "provider down", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession) as never;
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> => ({ run: async () => (opts.customTools?.some((t) => t.name === "record_tables") && runs++, { text: "", error: "provider down", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession) as never;
 		const config = cfg({ from: ["postgresql"], schemaFiles: ["db/schema.rb"] });
 		await planDbLane(new Ledger(":memory:"), config, { root: ws, spawn });
 		expect(existsSync(foundTablesPath(ws))).toBe(false);
