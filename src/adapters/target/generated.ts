@@ -63,6 +63,8 @@ export interface AdapterManifest {
 		sourceExtensions: string[];
 		langByExtension: Record<string, string>;
 		skipMarker: string;
+		/** One line of test code per skip, focus and incomplete form of the test runner (from its docs): skipMarker must match each. Older manifests have none (healSkipMarker asks once). */
+		skipSamples?: string[];
 		/** Older manifests have none. */
 		suppressMarker?: string;
 		interfaceHint: string;
@@ -248,6 +250,7 @@ export function validateManifest(m: AdapterManifest): string[] {
 	if (!m.probeTest?.path || m.probeTest.path.startsWith("/") || m.probeTest.path.includes("..")) out.push("probeTest.path must be project-relative");
 	if (m.probeTest?.failing !== undefined && m.probeTest.failing.trim() === (m.probeTest.content ?? "").trim()) out.push("probeTest.failing must differ from probeTest.content (the same test with a wrong expected value)");
 	if (!m.layout?.sourceExtensions?.length) out.push("layout.sourceExtensions is empty");
+	out.push(...skipProblems(m.layout?.skipMarker ?? "", m.layout?.skipSamples));
 	for (const [k, ps] of [["layout.dataDirs", m.layout?.dataDirs], ["layout.wiringFiles", m.layout?.wiringFiles]] as const) for (const p of ps ?? []) if (!p || p.startsWith("/") || p.includes("..")) out.push(`${k} "${p}" must be project-relative`);
 	if (!m.patternKinds?.length) out.push("patternKinds is empty");
 	if (m.layout?.rules) {
@@ -256,6 +259,20 @@ export function validateManifest(m: AdapterManifest): string[] {
 		out.push(...validateLayoutRules(r).map((p) => `layout.rules: ${p}`));
 	}
 	return out;
+}
+
+/** The skip samples the skip marker does not match (none when there are no samples: an older manifest). */
+export function skipProblems(marker: string, samples: string[] | undefined): string[] {
+	if (!samples) return [];
+	if (!samples.length) return ["layout.skipSamples is empty: give one line of test code per skip, focus and incomplete form of the test runner"];
+	let re: RegExp;
+	try {
+		re = new RegExp(marker);
+	} catch {
+		return []; // reported as an invalid regex
+	}
+	const missed = samples.filter((x) => !re.test(x));
+	return missed.length ? [`layout.skipMarker ${marker} does not match these skip samples: ${missed.join(" | ")}`] : [];
 }
 
 /**
@@ -351,7 +368,7 @@ export const MANIFEST_SCHEMA = obj({
 	migrateFresh: CMD,
 	boot: CMD,
 	toolchain: obj({ ecosystem: S, packageName: S, packageExamples: SA, manifestFiles: SA, installed: obj({ file: S, keys: SA, list: CMD, listPattern: S }), add: CMD, worktreeLinks: SA, ignoredPaths: SA }),
-	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, suppressMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
+	layout: obj({ moduleDir: S, structureDoc: S, sharedDirs: SA, testFileGlobs: SA, testFileRegex: S, sourceExtensions: SA, langByExtension: MAP, skipMarker: S, skipSamples: SA, suppressMarker: S, interfaceHint: S, testHint: S, legacyMarker: S, dataAccessHint: S, ignoreDirs: SA, dataDirs: SA, wiringFiles: SA, rules: LAYOUT_RULES_SCHEMA }),
 	platform: MAP,
 	stackChoices: { type: "array", items: obj({ key: S, question: S, default: S, options: { type: "array", items: OPTION } }) },
 	protectedGlobs: SA,
@@ -373,7 +390,7 @@ const SYSTEM = [
 	`- layout.rules: the stack's OFFICIAL feature-folder convention as data the tool enforces. moduleDir equals layout.moduleDir. files: every file a feature folder may hold, as path patterns relative to it ({area} {Area} {area_snake}; {name}/{Name}/{name_snake} any kebab-case/PascalCase/snake_case name, use the one this stack names its files with; {sub} a sub-feature folder named after what it does, spelled like the feature folders; (a|b) either word), each with a short doc. require: only files the framework itself needs to load a feature folder (none when the framework finds the code on its own, e.g. autoloading or service discovery); never an empty class just to have one. place: code that may only live in some files (text = regex on the file, in = patterns). forbidDirs: catch-all folder names this stack's convention does NOT use (consider ${DEFAULT_FORBID_DIRS.join(", ")}; leave out any the official convention uses, e.g. Angular core/). maxLines: 400. source: where the convention comes from (the docs page or generator).`,
 	"- layout.dataDirs: the folders (project-relative, trailing slash) where this stack's official docs keep database code: schema/models/entities, migrations, seed scripts (e.g. a Spring project with Flyway: src/main/resources/db/migration/ plus the entity package folder). Database work may write only there. layout.dataAccessHint: one line on how data access is written in this stack (ORM entities, query builder, SQL with generated code, …).",
 	"- layout.wiringFiles: the files (project-relative paths or globs) where this stack registers a new feature by hand (router/route table, main module, URL config), from the official docs; [] when the framework finds handlers on its own (annotations, file-system routing). A file layout.rules.require names is registered somewhere: that file belongs here. Units edit these files to wire what they add.",
-	"- layout.skipMarker: a regex matching a test that is skipped, focused or left incomplete in this stack: every skip, only and incomplete call or annotation its test runner has (from its docs), so a placeholder test is caught.",
+	"- layout.skipMarker: a regex matching a test that is skipped, focused or left incomplete in this stack: every skip, only and incomplete call or annotation its test runner has (from its docs), so a placeholder test is caught. layout.skipSamples: one line of test code for each of those forms, written the way a test file uses it (the runner's own calls and annotations, never a marker of your own); the tool checks that skipMarker matches every sample.",
 	"- layout.suppressMarker: a regex matching a comment or annotation that silences this stack's type checker, compiler warnings or linter for a line or a file (every such form the tools have, from their docs), so code that hides an error instead of fixing it is caught.",
 	"- migrateFresh: one command that applies every migration of the project, in order, to a NEW EMPTY throwaway database (in-memory, or a temporary one the command itself points at; never the dev, legacy or production database), and fails when a migration cannot be applied. {cmd: \"\", args: []} when the stack has no migrations.",
 	"- boot: one command that loads the whole app the way it starts and then exits (the framework's own start, config or container check from its docs), and fails when the app cannot start (a missing folder in config, a service or route that cannot be built). Never a server, watch mode or database. {cmd: \"\", args: []} when the stack has no such check.",
@@ -552,7 +569,7 @@ export async function healBoot(root: string, opts: { client: ModelClient; model:
 			}
 			boot = c;
 			const bad = validateManifest({ ...m, boot: c }).filter((p) => p.startsWith("boot"));
-			const failed = bad.length ? bad.join("\n") : await bootFails(fromManifest({ ...m, boot: c }).boot!(dir)!, dir);
+			const failed = bad.length ? bad.join("\n") : await commandFails(fromManifest({ ...m, boot: c }).boot!(dir)!, dir);
 			if (failed === undefined) break;
 			if (round > 0) boot = { cmd: "", args: [] }; // still failing with a new command: none rather than a wrong one
 			messages.push({ role: "assistant", content: JSON.stringify({ boot: c }) }, { role: "user", content: `That command failed in the project (${dir}):\n${failed.slice(-3000)}\nFix the command, or answer the same one if it is right and the app itself does not start.` });
@@ -601,8 +618,107 @@ export async function healCheckConfig(root: string, opts: { client: ModelClient;
 	return done;
 }
 
-/** Runs a boot command in `dir`: undefined when it exits 0, else its output (it must exit by itself within minutes). */
-function bootFails(c: Cmd, dir: string): Promise<string | undefined> {
+/**
+ * A saved manifest written before skipSamples was asked for: its skip marker was never checked (one written as a
+ * marker of the model's own let every skipped and incomplete PHPUnit test through). One question to the model: the
+ * marker and one line of test code per skip, focus and incomplete form of the runner; code checks that the marker
+ * matches each, and a miss goes back to the model once. Only the marker and its samples change. Returns the ids healed.
+ */
+export async function healSkipMarker(root: string, opts: { client: ModelClient; model: string; log?: (l: string) => void }): Promise<string[]> {
+	const done: string[] = [];
+	for (const m of loadManifests(root)) {
+		if (m.layout.skipSamples) continue;
+		const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+			{ role: "system", content: SYSTEM },
+			{ role: "user", content: `The ${m.id} manifest's layout.skipMarker is ${JSON.stringify(m.layout.skipMarker)} and was never checked against the test runner. Its test command: ${[m.test.cmd, ...m.test.args].join(" ")}; its tests: ${m.layout.testHint}\n\nAnswer only layout.skipMarker and layout.skipSamples, as the rule above says.` },
+		];
+		let healed: { skipMarker: string; skipSamples: string[] } | undefined;
+		for (let round = 0; round < 2 && !healed; round++) {
+			const res = await opts.client.chat({ model: opts.model, effort: "medium", schema: obj({ skipMarker: S, skipSamples: SA }), messages });
+			const a = (res.json ?? {}) as { skipMarker?: string; skipSamples?: string[] };
+			const samples = (a.skipSamples ?? []).filter((x) => typeof x === "string" && x.trim());
+			const bad = a.skipMarker ? skipProblems(a.skipMarker, samples) : ["no layout.skipMarker given"];
+			try {
+				new RegExp(a.skipMarker ?? "");
+			} catch {
+				bad.push("layout.skipMarker is not a valid regex");
+			}
+			if (!bad.length) healed = { skipMarker: a.skipMarker!, skipSamples: samples };
+			else messages.push({ role: "assistant", content: JSON.stringify(a) }, { role: "user", content: `${bad.join("\n")}\nFix the marker so it matches every sample.` });
+		}
+		// no working answer: the old marker stays, asked again at the next start
+		if (!healed) {
+			opts.log?.(`  adapter ${m.id}: no skip marker that matches the runner's skip forms; the old one stays`);
+			continue;
+		}
+		m.layout = { ...m.layout, ...healed };
+		saveManifest(root, m);
+		opts.log?.(`  adapter ${m.id}: skipped and incomplete tests are found by ${healed.skipMarker}`);
+		done.push(m.id);
+	}
+	return done;
+}
+
+/**
+ * A saved manifest written before migrateFresh was asked for: the database work's check that every migration applies,
+ * in order, to an empty database never ran. One question to the model (with the project's files): the command, and
+ * the folders that hold database code when the manifest names none. Code runs the command on main's project (`dirOf`);
+ * a failure goes back to the model once: it fixes the command, or answers the same one when the migrations themselves
+ * fail (the check should say so). When no command exists yet but the project has migrations, `writeTool` (the setup
+ * model) may add one to the project and set it as the workspace's command. None is saved as an empty command, so it
+ * is asked once. A stack whose workspace already sets one (`hasOwn`) or whose project is not there yet is left alone.
+ * Returns the ids changed.
+ */
+export async function healMigrateFresh(root: string, opts: { client: ModelClient; model: string; dirOf: (stackId: string) => string; hasOwn?: (stackId: string) => boolean; writeTool?: (stackId: string, problem: string) => Promise<boolean>; log?: (l: string) => void }): Promise<string[]> {
+	const done: string[] = [];
+	for (const m of loadManifests(root)) {
+		const dir = opts.dirOf(m.id);
+		if ("migrateFresh" in m || opts.hasOwn?.(m.id) || !existsSync(dir)) continue;
+		const files = await exec("git", ["-C", dir, "ls-files"]).then(
+			(out) => out.split("\n").filter((f) => f && f.split("/").length <= 2),
+			() => readdirSync(dir),
+		);
+		const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+			{ role: "system", content: SYSTEM },
+			{ role: "user", content: `The ${m.id} manifest has no migrateFresh command yet${m.layout.dataDirs?.length ? "" : " and no layout.dataDirs"} (test: ${[m.test.cmd, ...m.test.args].join(" ")}; data access: ${m.layout.dataAccessHint || "not said"}). The project's tracked files, two folders deep:\n${files.slice(0, 400).join("\n")}${files.length > 400 ? `\n… ${files.length - 400} more` : ""}\n\nAnswer migrateFresh and layout.dataDirs as the rules above say (dataDirs: keep the folders that already hold the project's database code), and hasMigrations: whether the project keeps database migrations at all.` },
+		];
+		const schema = obj({ migrateFresh: CMD, dataDirs: SA, hasMigrations: { type: "boolean" } });
+		let fresh: Cmd = { cmd: "", args: [] };
+		let said: { migrateFresh?: Cmd; dataDirs?: string[]; hasMigrations?: boolean } = {};
+		let failed: string | undefined;
+		for (let round = 0; round < 2; round++) {
+			const res = await opts.client.chat({ model: opts.model, effort: "medium", schema, messages });
+			said = { ...said, ...((res.json ?? {}) as typeof said) };
+			const c: Cmd = said.migrateFresh?.cmd ? { cmd: said.migrateFresh.cmd, args: said.migrateFresh.args ?? [] } : { cmd: "", args: [] };
+			// the same command again after its failure: the model says the migrations themselves fail
+			if (!c.cmd || (round > 0 && c.cmd === fresh.cmd && c.args.join("\0") === fresh.args.join("\0"))) {
+				fresh = c;
+				break;
+			}
+			fresh = c;
+			const bad = validateManifest({ ...m, migrateFresh: c }).filter((p) => p.startsWith("migrateFresh"));
+			failed = bad.length ? bad.join("\n") : await commandFails(fromManifest({ ...m, migrateFresh: c }).migrateFresh!(dir)!, dir);
+			if (failed === undefined) break;
+			if (round > 0) fresh = { cmd: "", args: [] }; // still failing with a new command: none rather than a wrong one
+			messages.push({ role: "assistant", content: JSON.stringify(said) }, { role: "user", content: `That command failed in the project (${dir}):\n${failed.slice(-3000)}\nFix the command, or answer the same one if it is right and the migrations themselves fail.` });
+		}
+		const dataDirs = (said.dataDirs ?? []).filter((p) => p && !p.startsWith("/") && !p.includes("..")).map(slashed);
+		const newDirs = !m.layout.dataDirs?.length && dataDirs.length > 0;
+		if (newDirs) m.layout = { ...m.layout, dataDirs };
+		// migrations but no command for them: the setup model adds one to the project and sets it for this workspace
+		const tool = !fresh.cmd && said.hasMigrations && opts.writeTool
+			? await opts.writeTool(m.id, `The database work's check needs one command that applies every migration of the project, in order, to a new empty throwaway database and fails when one cannot be applied; the project has none.${failed ? ` The command tried last failed:\n${failed.slice(-2000)}` : ""}\nAdd a small tool script to the project that does this (it makes its own empty database, applies the migrations with the project's migration tool, and removes the database again; several checks may run it at once) and set it with set_gate_command step migrateFresh. Do not change the migrations: a migration that fails is what the check is for.`).catch(() => false)
+			: false;
+		m.migrateFresh = fresh;
+		saveManifest(root, m);
+		opts.log?.(`  adapter ${m.id}: migrations on an empty database: ${fresh.cmd ? [fresh.cmd, ...fresh.args].join(" ") : tool ? "a command the setup model set for this workspace" : "none"}${newDirs ? `; database code in ${dataDirs.join(", ")}` : ""}`);
+		done.push(m.id);
+	}
+	return done;
+}
+
+/** Runs a command in `dir`: undefined when it exits 0, else its output (it must exit by itself within minutes). */
+function commandFails(c: Cmd, dir: string): Promise<string | undefined> {
 	return new Promise((res) =>
 		execFile(c.cmd, c.args, { cwd: dir, timeout: 5 * 60_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, CI: "1" } }, (e, out, err) => res(e ? `${String(out)}\n${String(err)}${e.killed ? "\n[timed out]" : ""}`.trim() || String(e.message) : undefined)),
 	);
@@ -694,7 +810,8 @@ function fromModel(json: unknown, id: string, role: "server" | "ui"): AdapterMan
 		postScaffold: j.postScaffold ?? [],
 		platform: asMap(j.platform),
 		layout: { ...j.layout, langByExtension: asMap(j.layout?.langByExtension) },
-		migrateFresh: j.migrateFresh?.cmd ? j.migrateFresh : undefined,
+		// asked and answered: none is saved as an empty command, so the run-start heal does not ask again
+		migrateFresh: j.migrateFresh?.cmd ? j.migrateFresh : { cmd: "", args: [] },
 		boot: j.boot?.cmd ? j.boot : undefined,
 		stackChoices: (j.stackChoices ?? []).map((c) => ({ ...c, options: c.options.map((o) => ({ ...o, platform: asMap(o.platform) })) })),
 	};
@@ -723,7 +840,7 @@ export async function verifyManifest(m: AdapterManifest, opts: { keepAt?: string
 		mkdirSync(dirname(join(dir, probe.path)), { recursive: true });
 		writeFileSync(join(dir, probe.path), probe.content);
 		if (!a.layout.isTestFile(probe.path)) return `probeTest.path ${probe.path} does not match layout.testFileRegex ${m.layout.testFileRegex}`;
-		for (const [step, c] of [["build", a.build(dir)], ["test", a.test(dir, [probe.path])], ...(a.migrateFresh ? [["migrateFresh", a.migrateFresh(dir)] as const] : []), ...(a.boot ? [["boot", a.boot(dir)!] as const] : [])] as const) {
+		for (const [step, c] of [["build", a.build(dir)], ["test", a.test(dir, [probe.path])], ...(a.migrateFresh ? [["migrateFresh", a.migrateFresh(dir)!] as const] : []), ...(a.boot ? [["boot", a.boot(dir)!] as const] : [])] as const) {
 			try {
 				await runCommand(c.cmd, c.args, { cwd: dir });
 			} catch (e: any) {

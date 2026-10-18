@@ -1,8 +1,17 @@
 import pc from "picocolors";
-import { builtinTarget, getSourceAdapter, registerGeneratedTargets } from "../adapters/registry.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { builtinTarget, getSourceAdapter, getTargetAdapter, registerGeneratedTargets } from "../adapters/registry.ts";
 import { loadCommandOverrides } from "../adapters/command-overrides.ts";
 import { healBuiltinWiring } from "../adapters/wiring.ts";
-import { healBoot, healCheckConfig, healWiringFiles } from "../adapters/target/generated.ts";
+import { healBoot, healCheckConfig, healMigrateFresh, healSkipMarker, healWiringFiles } from "../adapters/target/generated.ts";
+import { fixRunSetup } from "../init/setup-fixer.ts";
+import { askViaModel } from "../jev/ask.ts";
+import type { DbUnitMeta } from "../inventory/db.ts";
+import { ENGINE_SEMANTICS, ENGINE_SEMANTICS_OPTIONS, namesFileOf } from "./db-unit.ts";
+import { run } from "./gate.ts";
+import { placeUnit } from "./placement.ts";
+import { reopenUnit } from "./recheck.ts";
 import type { Config } from "../config.ts";
 import { projectDir } from "../init/init.ts";
 import { isDbUnitKind } from "../inventory/db.ts";
@@ -27,6 +36,13 @@ import { requeueUnits } from "./run.ts";
  *   model (healCheckConfig); code jobs may change the other protected files from then on.
  * - A source index built before the app's own subclasses of the profile's route classes counted as routes: the
  *   inventory runs again once (no model), so those routes reach slices and parity steps.
+ * - A generated adapter whose skip marker was never checked against the test runner: one question to the model
+ *   (healSkipMarker); accepted units whose own tests skip or leave tests incomplete then go back for the tester.
+ * - A generated adapter without migrateFresh: one question to the model, tried on main's project, or a tool the setup
+ *   model adds (healMigrateFresh). Then, at every start, the migrations run on an empty database from main's project:
+ *   the accepted database work whose migration fails goes back, and green gives the accepted ones their verdict.
+ * - Database work that ports tables to another engine: how behaviour the new engine cannot copy exactly is treated is
+ *   asked once (the run decides it from the owner's goals when it can), and the database work and its reviewer follow it.
  */
 const NOT_APP_PENDING = "not_app_heal_pending";
 
@@ -79,11 +95,124 @@ export async function healStackKnowledge(o: { ledger: Ledger; config: Config; ro
 		const changed = await healWiringFiles(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });
 		const booted = await healBoot(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), hasOwn: (id) => !!loadCommandOverrides(o.root, id).boot, log: (l) => o.log(pc.dim(l)) });
 		const checks = await healCheckConfig(o.root, { client: o.client, model: config.models.escalate.id, dirOf: (id) => projectDir(config, id), log: (l) => o.log(pc.dim(l)) });
-		if (changed.length || booted.length || checks.length) registerGeneratedTargets(o.root);
+		const skips = await healSkipMarker(o.root, { client: o.client, model: config.models.escalate.id, log: (l) => o.log(pc.dim(l)) });
+		for (const id of skips) ledger.setMeta(skipRecheckKey(id), "1");
+		const fresh = await healMigrateFresh(o.root, {
+			client: o.client,
+			model: config.models.escalate.id,
+			dirOf: (id) => projectDir(config, id),
+			hasOwn: (id) => !!loadCommandOverrides(o.root, id).migrateFresh,
+			// the setup model adds the tool and sets it as this workspace's command; code reads it from there
+			writeTool: async (id, problem) => {
+				await fixRunSetup({ config, root: o.root, adapter: await getTargetAdapter(id), projectDir: projectDir(config, id), problem, ledger });
+				return !!loadCommandOverrides(o.root, id).migrateFresh;
+			},
+			log: (l) => o.log(pc.dim(l)),
+		});
+		if (changed.length || booted.length || checks.length || skips.length || fresh.length) registerGeneratedTargets(o.root);
 		// a built-in stack that registers features by hand: the project's wiring files, found once by a model
 		for (const id of config.target.stacks) {
 			const adapter = await builtinTarget(id);
 			if (adapter) await healBuiltinWiring(o.root, adapter, projectDir(config, id), { client: o.client, model: config.models.escalate.id, log: (l) => o.log(pc.dim(l)) });
 		}
 	}
+	for (const id of config.target.stacks) {
+		if (ledger.getMeta(skipRecheckKey(id)) !== "1") continue;
+		const back = await reopenSkippedTests({ ledger, config, root: o.root, stackId: id });
+		if (back.length) o.log(pc.yellow(`${back.length} accepted unit(s) of ${id} have tests that are skipped or left incomplete: back to planned (code kept) so the tester makes them run: ${back.slice(0, 20).join(", ")}${back.length > 20 ? ", …" : ""}`));
+		ledger.setMeta(skipRecheckKey(id), "0");
+	}
+	await checkMigrationsOnMain({ ledger, config, root: o.root, log: o.log });
+	await askEngineSemantics({ ledger, config, root: o.root, client: o.client, log: o.log });
+}
+
+/** Ledger meta: the stack's skip marker was just checked; its accepted units' tests are looked at once (kept across a stop). */
+const skipRecheckKey = (stackId: string) => `skip_recheck:${stackId}`;
+
+/**
+ * Accepted units of the stack whose own ported tests skip a test or leave it incomplete (the stack's checked skip
+ * marker): those tests never proved anything. Back to planned with their code kept; the gate then sends the tests to
+ * the tester to make them run. Returns the unit ids.
+ */
+export async function reopenSkippedTests(o: { ledger: Ledger; config: Config; root: string; stackId: string; adapterOf?: typeof getTargetAdapter }): Promise<string[]> {
+	let adapter;
+	try {
+		adapter = await (o.adapterOf ?? getTargetAdapter)(o.stackId);
+	} catch {
+		return [];
+	}
+	const dir = projectDir(o.config, o.stackId);
+	const tests = o.ledger.db.prepare("SELECT DISTINCT ported_test_path p FROM truth_cases WHERE unit_id = ? AND ported_test_path IS NOT NULL");
+	const out: string[] = [];
+	for (const u of o.ledger.listUnits()) {
+		if (u.state !== "accepted" || isDbUnitKind(u.kind) || placeUnit(o.config, u.meta, o.root).stackId !== o.stackId) continue;
+		const skipping = (tests.all(u.id) as Array<{ p: string }>).map((r) => r.p).filter((f) => existsSync(join(dir, f)) && adapter.layout.skipMarker.test(readFileSync(join(dir, f), "utf8")));
+		if (!skipping.length) continue;
+		reopenUnit(o.ledger, u.id, `This unit's tests skip tests or leave them incomplete (${skipping.join(", ")}), so they never proved the behaviour. Its code stays on the branch: the tester makes those tests run against it, then the code is checked as usual.`, "its tests skip or leave tests incomplete: back for the tester");
+		out.push(u.id);
+	}
+	return out;
+}
+
+/**
+ * Every migration of main's project on an empty database (the stack's migrateFresh), at run start. Green: accepted
+ * database work that never had this check gets it. Red: the accepted database work whose migration the error names
+ * goes back to planned with its code kept and the error as its note (one fails until it is fixed, so each start
+ * looks again). The rest of the run does not wait for it.
+ */
+export async function checkMigrationsOnMain(o: { ledger: Ledger; config: Config; root: string; log: (l: string) => void; run?: typeof run; adapterOf?: typeof getTargetAdapter }): Promise<void> {
+	const exec = o.run ?? run;
+	for (const id of o.config.target.stacks) {
+		let c: { cmd: string; args: string[] } | undefined;
+		const dir = projectDir(o.config, id);
+		try {
+			c = (await (o.adapterOf ?? getTargetAdapter)(id)).migrateFresh?.(dir);
+		} catch {
+			continue;
+		}
+		if (!c?.cmd || !existsSync(dir)) continue;
+		const units = o.ledger.listUnits().filter((u) => u.state === "accepted" && isDbUnitKind(u.kind) && u.kind !== "db_data" && placeUnit(o.config, u.meta, o.root).stackId === id);
+		if (!units.length) continue;
+		const r = await exec(c.cmd, c.args, dir, 240_000);
+		if (r.ok) {
+			const judged = units.filter((u) => !o.ledger.hasEvidence(u.id, "migrate_ok"));
+			for (const u of judged) o.ledger.addEvidence(u.id, "migrate_ok", { by: "run start", note: "every migration of main applied to an empty database" });
+			if (judged.length) o.log(pc.dim(`${id}: every migration applies to an empty database; ${judged.length} accepted database unit(s) now have that check`));
+			continue;
+		}
+		const owners = units.filter((u) => namesFileOf(o.ledger, u.id, r.output));
+		for (const u of owners) reopenUnit(o.ledger, u.id, `The project's migrations fail on a new empty database, and the error names a migration of this unit. Fix it so every migration applies in order (a migration runs after every migration that creates a table it references; give it a later version when it must). The error:\n${r.output.slice(-3000)}`, "its migration fails on an empty database: back to fix it");
+		const first = r.output.split("\n").find((l) => /error|fail|exception/i.test(l))?.trim().slice(0, 200) ?? "";
+		o.log(pc.yellow(`${id}: the migrations fail on an empty database${first ? ` (${first})` : ""}; ${owners.length ? `back to planned: ${owners.map((u) => u.id).join(", ")}` : "the error names no accepted database unit's migration"}`));
+	}
+}
+
+/**
+ * Database work that ports tables to another engine meets behaviour the new engine cannot copy exactly (collation,
+ * trailing spaces, case-insensitive enums, zero dates). How to treat it is asked once, for the whole project; the run
+ * decides it itself from the owner's goals when it can (askViaModel), else the owner answers. Nothing waits on it:
+ * until it is answered, such differences are written down and are not defects (engineSemantics).
+ */
+export async function askEngineSemantics(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; log: (l: string) => void }): Promise<void> {
+	if (o.ledger.db.prepare("SELECT 1 FROM questions WHERE point = ? LIMIT 1").get(ENGINE_SEMANTICS)) return;
+	const moves = o.ledger
+		.listUnits()
+		.filter((u) => u.kind === "db_schema" || u.kind === "db_design")
+		.map((u) => JSON.parse(u.meta) as DbUnitMeta)
+		.filter((m) => m.to && m.from?.some((f) => f !== m.to));
+	if (!moves.length) return;
+	const pairs = [...new Set(moves.map((m) => `${m.from.join(" + ")} → ${m.to}`))].join(", ");
+	const r = await askViaModel(
+		{ ledger: o.ledger, config: o.config, root: o.root, client: o.client },
+		{
+			point: ENGINE_SEMANTICS,
+			facts: `The database tables move to another engine (${pairs}). Some legacy behaviour cannot be copied exactly there: collation rules (case-insensitive comparison, trailing spaces ignored in comparisons), case-insensitive enum values, zero dates, time zones. Without one rule for the whole project, the database reviewer judges each table on its own and has sent ports back again and again for these differences.`,
+			options: ENGINE_SEMANTICS_OPTIONS.map((x) => ({ value: x.value, facts: x.label })),
+			recommended: ENGINE_SEMANTICS_OPTIONS[0]!.value,
+			guess: true,
+			blocks: "none",
+			askedBy: "orchestrator",
+		},
+	).catch((e) => (o.log(pc.yellow(`the database engine question could not be asked: ${e?.message ?? e}`)), undefined));
+	if (r) o.log(pc.dim(r.decided ? `database behaviour the new engine cannot copy exactly: decided from your goals (${r.decided})` : `question #${r.id}: how database behaviour the new engine cannot copy exactly is treated (nothing waits on it)`));
 }

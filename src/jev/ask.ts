@@ -357,6 +357,8 @@ const DECIDES_ITSELF: Record<string, (value: string) => boolean> = {
 	triage_gate: (v) => v === "retry",
 	// the first units' tree: the model read it with the code's findings and calls it right → the run goes on
 	layout_sample: (v) => v === "approve",
+	// how database behaviour the new engine cannot copy exactly is treated: a policy the owner's goals settle
+	db_engine_semantics: () => true,
 };
 
 /** The value the run picks itself, or undefined when the owner must answer. */

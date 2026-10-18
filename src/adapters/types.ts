@@ -416,7 +416,7 @@ export interface TargetAdapter {
 	/** Loads the whole app the way it starts (its own start or container check, one command that exits) and fails when it cannot start: a whole-project step. None = not checked. */
 	boot?(root: string): { cmd: string; args: string[] } | undefined;
 	/** Applies every migration, in order, to a new empty throwaway database: a DB unit's last gate step. None = skipped. */
-	migrateFresh?(root: string): { cmd: string; args: string[] };
+	migrateFresh?(root: string): { cmd: string; args: string[] } | undefined;
 	/** Paths the implementer may never write (protected). */
 	protectedGlobs: string[];
 	/**

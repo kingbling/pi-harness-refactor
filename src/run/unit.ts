@@ -22,7 +22,7 @@ import type { ModelClient } from "../models/types.ts";
 import { globToRegExp, spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, missingTestImports, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
-import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
+import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, SKIPPED_TEST, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
@@ -1164,16 +1164,19 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		// build or lint errors only in the unit's own test files: the implementer may not edit them, so the tester fixes
 		// them (behaviour unchanged) and the gate runs again on the same code; the try is not counted (a few times per run).
-		// A fix that changed no test goes on to triage as usual
-		if ((gate.failedStep === "build_ok" || gate.failedStep === "lint_ok") && testsOnlyRounds < MAX_TESTS_ONLY_ROUNDS && !o.stopped?.()) {
-			const out = gate.steps.find((s) => !s.ok)?.output ?? "";
+		// A fix that changed no test goes on to triage as usual. So do skipped or incomplete tests: a test that does not
+		// run proves nothing, and only the tester may make it run
+		const failedOut = gate.steps.find((s) => !s.ok)?.output ?? "";
+		const skippedOnly = gate.failedStep === "antigaming_ok" && failedOut.split("\n").every((l) => !l.trim() || l.startsWith(SKIPPED_TEST));
+		if ((gate.failedStep === "build_ok" || gate.failedStep === "lint_ok" || skippedOnly) && testsOnlyRounds < MAX_TESTS_ONLY_ROUNDS && !o.stopped?.()) {
+			const out = failedOut;
 			const own = await ownTests(o.ledger, o.unitId, targetProjectDir, testFiles.map((t) => t.path), adapter.toolchain.ignoredPaths);
 			const named = filesNamed(out, targetProjectDir, adapter.layout.sourceExtensions);
 			if (named.length && named.every((f) => own.some((t) => samePath(f, t)))) {
 				testsOnlyRounds++;
 				log(pc.yellow(`  ${gate.failedStep} fails only in the unit's own test files: the tester fixes them, this round uses no try (${testsOnlyRounds}/${MAX_TESTS_ONLY_ROUNDS})`));
 				const before = JSON.stringify(loadTests());
-				if (await runTruth(`The gate's ${gate.failedStep} fails only in your test files (${named.join(", ")}); the implementer may not edit them. Fix the errors in the TEST files, behaviour unchanged; code the tests call that does not exist yet is the implementer's to write, not yours. check_ported_tests runs the same check.\n${out.slice(-4000)}`, true, { codeWritten: true })) testFiles = loadTests();
+				if (await runTruth(skippedOnly ? `Your test files skip tests or leave them incomplete (${named.join(", ")}): a test that does not run proves nothing, so the gate refuses it. Make every one of them run and check the legacy behaviour its truth case recorded; code the tests call that does not exist yet is the implementer's to write, not a reason to skip. A test that can only run on some machines (a missing locale or extension) checks the same behaviour without needing it. check_ported_tests runs the same check.\n${out.slice(-4000)}` : `The gate's ${gate.failedStep} fails only in your test files (${named.join(", ")}); the implementer may not edit them. Fix the errors in the TEST files, behaviour unchanged; code the tests call that does not exist yet is the implementer's to write, not yours. check_ported_tests runs the same check.\n${out.slice(-4000)}`, true, { codeWritten: true })) testFiles = loadTests();
 				lastRetest = { progress: JSON.stringify(loadTests()) !== before };
 				if (lastRetest.progress) {
 					regate = true;

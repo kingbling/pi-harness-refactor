@@ -13,7 +13,7 @@ import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
 import { setStep } from "./watchdog.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
-import { FAIL_ON_MAIN_TOO, runPortedTests, STALE_NOT_COUNTED } from "./ported.ts";
+import { FAIL_ON_MAIN_TOO, onlyOwnTests, runPortedTests, STALE_NOT_COUNTED } from "./ported.ts";
 import { exec } from "../proc.ts";
 
 /**
@@ -216,11 +216,13 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 		}
 		problems.push(`write outside unit scope: ${f}${tracked.has(f) ? "" : " (a new file, not on main: remove it with remove_file, or put what it holds into your own files)"}`);
 	}
+	// skipped or incomplete tests count in the unit's own test files only: an earlier unit's are its own to fix
+	const mine = new Set(await onlyOwnTests(g.ledger, g.unitId, g.targetProjectDir, g.testFiles.map((t) => t.path), g.adapter.toolchain.ignoredPaths));
 	for (const t of g.testFiles) {
 		const p = join(g.targetProjectDir, t.path);
 		if (!existsSync(p)) problems.push(`test file removed: ${t.path}`);
 		else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
-		else if (g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`skipped/only test in ${t.path}`);
+		else if (mine.has(t.path) && g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`${SKIPPED_TEST} in ${t.path}`);
 	}
 	for (const f of await othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
 	// a comment that silences the type check or the linter hides an error instead of fixing it (only lines this unit added)
@@ -240,6 +242,9 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 	if (prodFiles.length === 0 && !reuse && !early && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
 	return { ok: problems.length === 0, output: problems.length ? problems.join("\n") : reuse ? "no production file changed (reuse): the ported tests and the reviewer decide" : `${prodFiles.length} production file(s) changed within scope; tests untouched` };
 }
+
+/** The antigaming finding for a test that is skipped, focused or left incomplete: a test that does not run proves nothing. */
+export const SKIPPED_TEST = "skipped, focused or incomplete test";
 
 /**
  * structure_ok: files follow the stack layout (one module per area, no per-legacy-file folders) and nothing re-creates
@@ -758,6 +763,41 @@ export function wholeProjectSteps(adapter: TargetAdapter, dir: string): Array<{ 
 	const boot = adapter.boot?.(dir);
 	if (boot?.cmd) out.push({ step: "boot", ...boot });
 	return out;
+}
+
+/** Where a stack keeps database code when its adapter names no folders. */
+export const DEFAULT_DATA_DIRS = ["db/", "migrations/"];
+
+/**
+ * The top folders of the project's own code: the feature root, the shared folders, the test homes and the database
+ * folders, from the adapter's layout (not config, tools or the framework's entry files).
+ */
+export function codeFolders(adapter: TargetAdapter): string[] {
+	const top = (p: string) => p.split("/").find((x) => x && x !== ".") ?? "";
+	const out: string[] = [...(adapter.layout.sharedDirs ?? []), ...(adapter.layout.dataDirs?.length ? adapter.layout.dataDirs : DEFAULT_DATA_DIRS)];
+	try {
+		const area = adapter.layout.moduleDir("zzarea");
+		out.push(area, ...adapter.layout.testFileGlobs(area));
+	} catch {
+		/* no feature root known */
+	}
+	return [...new Set(out.map(top))].filter((d) => d && !/[*?[{]/.test(d) && !d.toLowerCase().includes("zzarea"));
+}
+
+/**
+ * What the builder runs on main: the whole-project steps, and a build that takes files run on every tracked file of
+ * the stack's languages in the project's code folders (codeFolders). The gate builds each unit's own files only, so
+ * without it nothing type-checks the code between them (tests, migrations, code a later change broke).
+ */
+export async function builderSteps(adapter: TargetAdapter, dir: string): Promise<Array<{ step: "build" | "lint" | "boot"; cmd: string; args: string[]; shown?: string }>> {
+	const steps = wholeProjectSteps(adapter, dir);
+	if (steps.some((s) => s.step === "build")) return steps;
+	const folders = codeFolders(adapter);
+	const files = (await trackedFiles(dir)).filter((f) => folders.includes(f.split("/")[0]!) && adapter.layout.lang?.(f) && existsSync(join(dir, f)));
+	if (!files.length) return steps;
+	// the command as a model reads it: the folders, not thousands of file names
+	const shown = adapter.build(dir, [...new Set(files.map((f) => f.split("/")[0]!))]);
+	return [{ step: "build", ...adapter.build(dir, files), shown: [shown.cmd, ...shown.args].join(" ") }, ...steps];
 }
 
 /**

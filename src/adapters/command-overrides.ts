@@ -7,8 +7,11 @@ export interface Cmd {
 	cmd: string;
 	args: string[];
 }
-/** testLenient: the test command with the runner's own flags so deprecations and notices alone do not fail a run. boot: the app's own start check (whole project). */
-export type CommandStep = "build" | "lint" | "test" | "testLenient" | "boot";
+/**
+ * testLenient: the test command with the runner's own flags so deprecations and notices alone do not fail a run. boot: the
+ * app's own start check (whole project). migrateFresh: every migration, in order, on a new empty throwaway database.
+ */
+export type CommandStep = "build" | "lint" | "test" | "testLenient" | "boot" | "migrateFresh";
 /** Per-workspace replacements of a stack's gate commands; `{files}` in an arg expands to the files (may be none). */
 export type CommandOverrides = Partial<Record<CommandStep, Cmd>> & {
 	why?: string;
@@ -47,7 +50,14 @@ export function saveCommandOverride(root: string, stackId: string, step: Command
 	const cur = loadCommandOverrides(root, stackId);
 	const p = overridesPath(root, stackId);
 	mkdirSync(dirname(p), { recursive: true });
-	writeFile(p, JSON.stringify({ ...cur, [step]: c, why: [cur.why, `${step}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+	writeFile(p, JSON.stringify({ ...cur, [step]: c, why: addWhy(cur.why, `${step}: ${why}`) }, null, 2) + "\n");
+}
+
+/** The why note with one reason per setting: a setting saved again replaces its older reason instead of adding one more. */
+export function addWhy(why: string | undefined, reason: string): string {
+	const key = (r: string) => r.slice(0, r.indexOf(":") + 1);
+	const parts = (why ?? "").split(/; (?=(?:build|lint|test|testLenient|boot|migrateFresh|worktree copy of [^:;]+): )/).filter(Boolean);
+	return [...parts.filter((r) => key(r) !== key(reason)), reason].join("; ");
 }
 
 /** What the setup fixer's own tools last wrote per overrides file: a session running meanwhile does not undo it. */
@@ -90,6 +100,7 @@ export function withCommandOverrides(adapter: TargetAdapter, root: string | unde
 		test: (r, files) => (o().test ? expand(o().test!, files) : adapter.test(r, files)),
 		testLenient: (r, files) => (o().testLenient ? expand(o().testLenient!, files) : adapter.testLenient?.(r, files)),
 		boot: (r) => (o().boot ? expand(o().boot!, []) : adapter.boot?.(r)),
+		migrateFresh: (r) => (o().migrateFresh ? expand(o().migrateFresh!, []) : adapter.migrateFresh?.(r)),
 	};
 }
 
@@ -106,6 +117,6 @@ export function saveWorktreeCopy(root: string, stackId: string, dir: string, why
 	if (cur.worktreeCopy?.includes(dir)) return false;
 	const p = overridesPath(root, stackId);
 	mkdirSync(dirname(p), { recursive: true });
-	writeFile(p, JSON.stringify({ ...cur, worktreeCopy: [...new Set([...(cur.worktreeCopy ?? []), dir])], why: [cur.why, `worktree copy of ${dir}: ${why}`].filter(Boolean).join("; ") }, null, 2) + "\n");
+	writeFile(p, JSON.stringify({ ...cur, worktreeCopy: [...new Set([...(cur.worktreeCopy ?? []), dir])], why: addWhy(cur.why, `worktree copy of ${dir}: ${why}`) }, null, 2) + "\n");
 	return true;
 }

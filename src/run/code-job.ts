@@ -285,8 +285,10 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	const wholeSteps: string[] = whole ? wholeProjectSteps(adapter, dir).map((w) => w.step) : addedOrMoved && adapter.boot?.(dir)?.cmd ? ["boot"] : [];
 	// the builder's job: also the tests of accepted units that import the changed code
 	const related = whole && code.length ? await testsImporting(dir, [...tracked].filter((t) => adapter.layout.isTestFile(t) && adapter.layout.sourceExtensions.some((e) => t.endsWith(e)) && !tests.includes(t)), code) : [];
-	// each step with the files it checks (none: the whole project), so the same step can run on main
-	const steps: Array<{ step: string; files?: string[] }> = [...wholeSteps.map((step) => ({ step })), ...(code.length && !wholeSteps.includes("build") ? [{ step: "build", files: code }] : []), ...(tests.length + related.length ? [{ step: "test", files: [...tests, ...related] }] : [])];
+	// each step with the files it checks (none: the whole project), so the same step can run on main. The builder's
+	// build covers test files too (builderSteps): its job is measured on the test files it changed as well
+	const built = whole ? present : code;
+	const steps: Array<{ step: string; files?: string[] }> = [...wholeSteps.map((step) => ({ step })), ...(built.length && !wholeSteps.includes("build") ? [{ step: "build", files: built }] : []), ...(tests.length + related.length ? [{ step: "test", files: [...tests, ...related] }] : [])];
 	const cmd = (d: string, s: { step: string; files?: string[] }) => (s.step === "test" ? adapter.test(d, s.files!) : s.step === "boot" ? adapter.boot!(d)! : s.files ? adapter.build(d, s.files) : wholeProjectSteps(adapter, d).find((w) => w.step === s.step)!);
 	const out: string[] = [];
 	const failing = new Map<string, string>();

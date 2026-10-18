@@ -15,7 +15,7 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { mentionsCase } from "./ported.ts";
 import { reopenUnit } from "./recheck.ts";
-import { errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { builderSteps, errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { exec } from "../proc.ts";
 import { rm } from "node:fs/promises";
 import { setStep } from "./watchdog.ts";
@@ -301,7 +301,7 @@ export function createBuilder(o: {
 			// the test files found are named to the runner: a run without files may skip folders its config does not
 			// list, and "no tests ran" would pass
 			const tests = (await trackedFiles(dir)).filter((f) => adapter.layout.isTestFile(f) && adapter.layout.sourceExtensions.some((e) => f.endsWith(e)));
-			const steps: Array<{ step: string; cmd: string; args: string[] }> = [...wholeProjectSteps(adapter, dir), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
+			const steps: Array<{ step: string; cmd: string; args: string[]; shown?: string }> = [...(await builderSteps(adapter, dir)), ...(tests.length ? [{ step: "test", ...adapter.test(dir, tests) }] : [])];
 			if (!steps.length && !appDown) return false;
 			// `killable`: a stop kills it; the check after a repair is part of that repair and runs to its end
 			const check = async (killable = false) => {
@@ -310,7 +310,7 @@ export function createBuilder(o: {
 					if (killable && stopped) throw new BuilderStopped();
 					const err = await runCmd(s.cmd, s.args, dir, undefined, killable ? kill.signal : undefined);
 					if (killable && stopped) throw new BuilderStopped();
-					if (err !== undefined) out.push(`$ ${[s.cmd, ...s.args].join(" ")}   (${s.step})\n${err}`);
+					if (err !== undefined) out.push(`$ ${s.shown ?? [s.cmd, ...s.args].join(" ")}   (${s.step})\n${err}`);
 				}
 				return out.length ? out.join("\n\n") : undefined;
 			};

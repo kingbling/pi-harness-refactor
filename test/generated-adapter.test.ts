@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { getTargetAdapter, knownTargets, registerGeneratedTargets, TARGET_ROLES, TARGET_SUBDIRS } from "../src/adapters/registry.ts";
@@ -254,7 +254,6 @@ describe("stack knowledge is checked when the adapter is written", () => {
 
 	it("run start: a saved manifest without boot gets that one question; the command is tried on main's project, a failure goes back once", async () => {
 		const { execFileSync } = await import("node:child_process");
-		const { chmodSync } = await import("node:fs");
 		const { healBoot, loadManifests } = await import("../src/adapters/target/generated.ts");
 		const ws = join(here, ".sim", "heal-boot");
 		const proj = join(ws, "project");
@@ -312,6 +311,67 @@ describe("stack knowledge is checked when the adapter is written", () => {
 		expect(lockedForCodeJobs(a, "phpunit.xml.dist")).toBe(true);
 		expect(await healCheckConfig(ws, { client, model: "m" })).toEqual([]); // asked once
 		expect(client.calls.length).toBe(1);
+	});
+
+	it("a skip marker must match every skip sample the model gives; an older manifest gets that one question at run start", async () => {
+		const { healSkipMarker, loadManifests } = await import("../src/adapters/target/generated.ts");
+		expect(validateManifest(php({ skipMarker: "@migration-skip", skipSamples: ["$this->markTestIncomplete('x');"] })).join("\n")).toMatch(/does not match these skip samples: \$this->markTestIncomplete/);
+		expect(validateManifest(php({ skipMarker: "markTest(Skipped|Incomplete)\\(", skipSamples: ["$this->markTestIncomplete('x');", "self::markTestSkipped('y');"] }))).toEqual([]);
+		const ws = join(here, ".sim", "heal-skip-marker");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+		writeFileSync(join(ws, ".bigrefactor", "adapters", "sym-test.json"), JSON.stringify(php({ skipMarker: "@migration-skip" })));
+		// first a marker that misses a sample, then one that matches all of them
+		const answers = [
+			{ skipMarker: "markTestSkipped", skipSamples: ["self::markTestSkipped('a');", "self::markTestIncomplete('b');"] },
+			{ skipMarker: "markTest(Skipped|Incomplete)\\(|#\\[Group\\('skip'\\)\\]", skipSamples: ["self::markTestSkipped('a');", "self::markTestIncomplete('b');", "#[Group('skip')]"] },
+		];
+		const client = new FakeModelClient({ chat: () => ({ json: answers.shift() }) });
+		expect(await healSkipMarker(ws, { client, model: "m" })).toEqual(["sym-test"]);
+		expect(JSON.stringify((client.calls[1]!.req as { messages: unknown[] }).messages)).toContain("does not match these skip samples: self::markTestIncomplete");
+		const healed = loadManifests(ws)[0]!;
+		expect(fromManifest(healed).layout.skipMarker.test("        self::markTestIncomplete('Workflow implementation pending.');")).toBe(true);
+		expect(await healSkipMarker(ws, { client, model: "m" })).toEqual([]); // asked once
+		expect(client.calls.length).toBe(2);
+	});
+
+	it("run start: a manifest without migrateFresh gets the command tried on main's project, or a tool from the setup model; the data folders too", async () => {
+		const { healMigrateFresh, loadManifests } = await import("../src/adapters/target/generated.ts");
+		const ws = join(here, ".sim", "heal-migrate-fresh");
+		const proj = join(ws, "project");
+		rmSync(ws, { recursive: true, force: true });
+		mkdirSync(join(ws, ".bigrefactor", "adapters"), { recursive: true });
+		mkdirSync(join(proj, "bin"), { recursive: true });
+		writeFileSync(join(proj, "bin", "migrate"), "#!/bin/sh\n[ \"$1\" = \"--fresh\" ] || { echo \"unknown option $1\"; exit 1; }\necho \"Version20260623000000: relation users does not exist\"; exit 1\n");
+		chmodSync(join(proj, "bin", "migrate"), 0o755);
+		const save = () => writeFileSync(join(ws, ".bigrefactor", "adapters", "sym-test.json"), JSON.stringify(php()));
+		save();
+		// the command fails because a migration does: answered the same after its output, it is kept
+		const answers = [
+			{ migrateFresh: { cmd: "bin/migrate", args: ["--fresh"] }, dataDirs: ["migrations", "/etc"], hasMigrations: true },
+			{ migrateFresh: { cmd: "bin/migrate", args: ["--fresh"] }, dataDirs: ["migrations"], hasMigrations: true },
+		];
+		const client = new FakeModelClient({ chat: () => ({ json: answers.shift() }) });
+		expect(await healMigrateFresh(ws, { client, model: "m", dirOf: () => proj })).toEqual(["sym-test"]);
+		expect(JSON.stringify((client.calls[1]!.req as { messages: unknown[] }).messages)).toContain("relation users does not exist");
+		let m = loadManifests(ws)[0]!;
+		expect(m.migrateFresh).toEqual({ cmd: "bin/migrate", args: ["--fresh"] });
+		expect(m.layout.dataDirs).toEqual(["migrations/"]);
+		expect(await healMigrateFresh(ws, { client, model: "m", dirOf: () => proj })).toEqual([]); // asked once
+		// no command yet, but migrations: the setup model is asked for a tool; none is saved so it is not asked again
+		save();
+		const none = new FakeModelClient({ chat: () => ({ json: { migrateFresh: { cmd: "", args: [] }, dataDirs: [], hasMigrations: true } }) });
+		const asked: string[] = [];
+		await healMigrateFresh(ws, { client: none, model: "m", dirOf: () => proj, writeTool: async (_id, problem) => (asked.push(problem), true) });
+		expect(asked[0]).toMatch(/set_gate_command step migrateFresh/);
+		m = loadManifests(ws)[0]!;
+		expect(m.migrateFresh).toEqual({ cmd: "", args: [] });
+		expect(fromManifest(m).migrateFresh).toBeUndefined();
+		// the workspace already sets one: not asked
+		save();
+		const own = new FakeModelClient({ chat: () => ({ json: {} }) });
+		expect(await healMigrateFresh(ws, { client: own, model: "m", dirOf: () => proj, hasOwn: () => true })).toEqual([]);
+		expect(own.calls.length).toBe(0);
 	});
 
 	it("the implementer is never told the stack needs no registration when the adapter never said so", async () => {

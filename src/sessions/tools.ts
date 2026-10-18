@@ -590,6 +590,9 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 				// the same build and lint the gate runs, on this unit's own test files (other units' are not the tester's to fix);
 				// a whole-project one is not the tester's to fix either
 				const own = await ownTests(d.ledger, d.unitId, d.targetProjectDir, cov.files, d.adapter.toolchain.ignoredPaths);
+				// the gate refuses a skipped, focused or incomplete test in the unit's own files (antigaming_ok)
+				const skipping = own.filter((f) => existsSync(join(d.targetProjectDir, f)) && d.adapter.layout.skipMarker.test(readFileSync(join(d.targetProjectDir, f), "utf8")));
+				if (skipping.length) out.push(`SKIPPED FAILED: ${skipping.join(", ")} skip tests or leave them incomplete (${d.adapter.layout.skipMarker.source}); a test that does not run proves nothing and the gate refuses it. Make each one run and check the recorded behaviour.`);
 				for (const name of ["build", "lint"] as const) {
 					const r = await checkTests(d.targetProjectDir, d.adapter, name, own);
 					const NAME = name.toUpperCase();
