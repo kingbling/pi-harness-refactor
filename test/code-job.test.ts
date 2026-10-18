@@ -13,7 +13,7 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; boot?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean; checkConfigGlobs?: string[]; test?: (dir: string, files: string[]) => { cmd: string; args: string[] }; probeTest?: { path: string; content: string; failing?: string }; unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> } } = {}) {
+	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; boot?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean; checkConfigGlobs?: string[]; test?: (dir: string, files: string[]) => { cmd: string; args: string[] }; probeTest?: { path: string; content: string; failing?: string }; unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> }; forUnit?: string; waiting?: string[] } = {}) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
@@ -49,6 +49,8 @@ describe("the code job", () => {
 			what: "make the test pass",
 			label: o.whole ? "build-fake-1" : "q1",
 			whole: o.whole,
+			forUnit: o.forUnit,
+			waiting: o.waiting,
 			linkAll: () => {},
 			mergeFix: async (wt) => {
 				merged = true;
@@ -177,6 +179,9 @@ describe("the code job", () => {
 		expect(r.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:billing\)/);
 		// adding code next to the stubs is fine
 		expect((await job((dir) => (code(dir), "added b"), [], undefined, [], main)).merged).toBe(true);
+		// a job for billing's own question, or one billing waits on, replaces billing's stub: its marks are the job's to remove
+		expect((await job(unmark, [], undefined, [], { ...main, forUnit: "billing" })).merged).toBe(true);
+		expect((await job(unmark, [], undefined, [], { ...main, forUnit: "other", waiting: ["billing"] })).merged).toBe(true);
 		// the unit is accepted: its marks are anyone's to remove
 		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'billing'").run();
 		expect((await job(unmark, [], undefined, [], main)).merged).toBe(true);

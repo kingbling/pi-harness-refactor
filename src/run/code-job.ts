@@ -143,6 +143,8 @@ export async function runCodeJob(o: {
 	unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> };
 	/** the unit whose question the job serves: the tests it writes count as that unit's own (a reopened unit may change them) */
 	forUnit?: string;
+	/** the units waiting on that question: the job is for them too, so their stub marks are its to remove */
+	waiting?: string[];
 }): Promise<string | undefined> {
 	const key = o.whole ? `${o.adapter.id}:build` : o.adapter.id;
 	while (busy.has(key)) await busy.get(key)!.catch(() => undefined);
@@ -190,7 +192,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		if (locked.diffs.length) o.onLocked?.({ files: [...locked.files], diff: locked.diffs.join("\n").slice(0, 8000) });
 		const changed = await changedFiles(dir, o.adapter.toolchain.ignoredPaths);
 		const problem = changed.length
-			? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger, withUnit ? o.unitWork!.unitId : undefined)
+			? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger, [o.forUnit, o.unitWork?.unitId, ...(o.waiting ?? [])].filter((u): u is string => !!u))
 			: locked.files.size ? `only files that decide how the checks run were changed (put back): ${[...locked.files].slice(0, 5).join(", ")}` : "nothing was changed";
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, lockedFiles: [...locked.files], problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
@@ -245,13 +247,13 @@ async function removedMarks(dir: string, changed: string[]): Promise<string[]> {
  * than main and none main does not have: a job that fixes part of a big red main is not thrown away. Any other job's
  * failing steps run again on main (`mainDir`): it fails only on a step green on main or error lines main does not have.
  */
-async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean, ledger: Ledger, servedUnit?: string): Promise<string | undefined> {
+async function check(adapter: TargetAdapter, dir: string, changed: string[], mainDir: string, whole: boolean, ledger: Ledger, served: string[] = []): Promise<string | undefined> {
 	// a deleted test checks nothing: the job may not make the check green by removing what was red
 	const deleted = changed.filter((f) => !existsSync(join(dir, f)) && adapter.layout.isTestFile(f));
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
 	// a stub's TODO(br:<unit>) mark tells that unit which files it may edit to replace the stub: it is the unit's to
 	// remove, not a question's job (the builder's job may: it only makes main build)
-	const marks = whole ? [] : (await removedMarks(dir, changed)).filter((u) => u !== servedUnit && (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
+	const marks = whole ? [] : (await removedMarks(dir, changed)).filter((u) => !served.includes(u) && (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
 	if (marks.length) return `stub marks of units not accepted yet were removed: ${marks.slice(0, 5).map((u) => `TODO(br:${u})`).join(", ")}; leave the stubs and their marks to those units`;
 	// app config the job may change, but no check setting: the test command must still fail a failing test
 	const app = changed.filter((f) => appConfig(adapter, f));
