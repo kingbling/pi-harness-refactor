@@ -1,4 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,6 +13,13 @@ import { startWatchdog } from "../run/watchdog.ts";
 export const ABORT_KILL_MS = 60_000;
 /** A run process started again on new code that ends with an error within this time failed at start: the run waits for the next higher version. */
 export const FAILED_START_MS = 60_000;
+
+/**
+ * A run process that ends without its done (a crash, a kill) leaves its exit and its last output lines here: Pi shows
+ * them only on its screen, and the run itself can write no record any more.
+ */
+export const CRASH_LOG = "run-crashes.log";
+const CRASH_LINES = 60;
 
 /** What Pi hands the run process (src/run/run-child.ts). */
 export interface ChildArgs {
@@ -172,7 +181,13 @@ export async function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise
 			let over = false;
 			// whatever the child prints lands in the feed, never on Pi's screen
 			const rls = [child.stdout, child.stderr].flatMap((s) => (s ? [createInterface({ input: s })] : []));
-			for (const rl of rls) rl.on("line", (l) => !over && progress.log(l));
+			const last: string[] = [];
+			for (const rl of rls)
+				rl.on("line", (l) => {
+					last.push(l);
+					if (last.length > CRASH_LINES) last.shift();
+					if (!over) progress.log(l);
+				});
 			const finish = (out: RunOutcome & { restart?: boolean }) => {
 				if (over) return;
 				over = true;
@@ -198,6 +213,11 @@ export async function runInChild(args: ChildArgs, o: { ask?: (q: Ask) => Promise
 				if (live.done) return finish(fromDone(live.done));
 				const error = `the run process ended unexpectedly (${live.gone})`;
 				progress.log(error);
+				try {
+					appendFileSync(join(live.args.cwd, ".bigrefactor", CRASH_LOG), `${new Date().toISOString()} ${error}; started ${new Date(live.startedAt).toISOString()}, plugin ${live.head ?? "?"}\n${last.map((l) => `  ${l}`).join("\n")}\n`);
+				} catch {
+					/* no .bigrefactor folder: nothing to keep */
+				}
 				finish({ error });
 			};
 			child.on("message", onMessage);

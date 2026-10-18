@@ -154,6 +154,8 @@ describe("migration run in its own process", () => {
 		progress.begin("migration run");
 		const out = await runInChild({ cwd: ws, flags: [], hasUI: false, job: "migration run" });
 		expect(out.error).toMatch(/run process ended unexpectedly \(exit code 3\)/);
+		// kept on disk too: Pi's screen is the only other place that shows it
+		expect(readFileSync(join(ws, ".bigrefactor", "run-crashes.log"), "utf8")).toMatch(/ended unexpectedly \(exit code 3\); started /);
 		progress.end(out.error);
 	}, 60_000);
 
