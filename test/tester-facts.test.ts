@@ -81,7 +81,7 @@ describe("the tester knows where things are", () => {
 		const tester = blockedHint("outside this unit's scope: src/x.ts", { cwd: "/ws", writeGlobs: [".bigrefactor/truth/u1/**", "migrated/src/a/**/*.spec.ts"], customTools: testerTools({ ledger, config, unitId: "u1", root: ws, targetProjectDir: ws, adapter: nestjsAdapter }) });
 		expect(tester).toContain("You may write only: /ws/.bigrefactor/truth/u1/**, /ws/migrated/src/a/**/*.spec.ts");
 		expect(tester).not.toMatch(/ledger_prove/);
-		expect(blockedHint("x", { cwd: "/t", writeGlobs: ["src/a/**"], customTools: [{ name: "ledger_prove" } as never] })).toMatch(/ledger_prove/);
+		expect(blockedHint("x", { cwd: "/t", writeGlobs: ["src/a/**"], customTools: [{ name: "ledger_prove" } as never] })).toMatch(/final message[^]*never prove it as dropped/);
 		expect(blockedHint("x", { cwd: "/t", writeGlobs: [] })).toMatch(/may not write files/);
 	});
 });

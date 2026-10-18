@@ -488,15 +488,27 @@ describe("models fix each other's work", () => {
 		const r = await tool.execute("x", {
 			proofs: [
 				{ srcSymbol: "app/agency/create.cmd.php::create", op: "moved", targetSymbols: ["src/features/agency/agency.service.ts::create"], why: "1:1" },
-				{ srcSymbol: "app/agency/create.cmd.php::update", op: "dropped", why: "the form does it now" },
-				{ srcSymbol: "app/agency/nope.php::x", op: "dropped", why: "x" },
+				{ srcSymbol: "app/agency/create.cmd.php::update", op: "dropped", dropKind: "platform", why: "the form does it now" },
+				{ srcSymbol: "app/agency/nope.php::x", op: "dropped", dropKind: "dead", why: "x" },
 			],
 		});
 		expect(ledger.getSymbol("app/agency/create.cmd.php::create")!.state).toBe("mapped");
 		expect(ledger.getSymbol("app/agency/create.cmd.php::update")!.state).toBe("dropped");
+		// the kind leads the reason the reviewer reads
+		expect((ledger.db.prepare("SELECT why FROM moves WHERE src_symbol = 'app/agency/create.cmd.php::update'").get() as { why: string }).why).toBe("platform: the form does it now");
 		expect(r.content[0]!.text).toMatch(/app\/agency\/nope\.php::x: unknown symbol/);
 		expect(r.content[0]!.text).toMatch(/1 symbol\(s\) of this unit still unproven: app\/agency\/create\.cmd\.php::remove/);
 		expect(r.details.left).toBe(1);
+	});
+
+	it("ledger_prove refuses a drop without its kind: work not done or put off is no drop", async () => {
+		ledger.upsertFile({ path: "app/agency/create.cmd.php", hash: "h", lang: "php", loc: 1 });
+		ledger.upsertSymbol({ id: "app/agency/create.cmd.php::report", path: "app/agency/create.cmd.php", kind: "function", name: "report" });
+		ledger.db.prepare("UPDATE symbols SET unit_id = 'u1', state = 'clustered' WHERE id = 'app/agency/create.cmd.php::report'").run();
+		const tool = ledgerProve({ ledger, unitId: "u1" } as ToolDeps) as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }>; details: { left: number } }> };
+		const r = await tool.execute("x", { proofs: [{ srcSymbol: "app/agency/create.cmd.php::report", op: "dropped", why: "Report generation is not implemented." }] });
+		expect(ledger.getSymbol("app/agency/create.cmd.php::report")!.state).toBe("clustered");
+		expect(r.content[0]!.text).toMatch(/a drop needs dropKind[^]*Work not done, put off, or left to another unit is no drop/);
 	});
 
 	it("an implementer that says DONE with symbols still unproven gets one more turn naming them, not a red gate", async () => {

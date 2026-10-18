@@ -186,6 +186,20 @@ describe("the code job", () => {
 		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'billing'").run();
 		expect((await job(unmark, [], undefined, [], main)).merged).toBe(true);
 	});
+	it("a loose mark of a unit not accepted yet is that unit's too; a new mark must name a unit still to come; files with only comments and tests on a mark are refused", async () => {
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "U5_sales_controller", tier: "T1", symbolIds: [] });
+		ledger.setMeta("stub_owner_names", JSON.stringify({ "sales.controller": "U5_sales_controller" }));
+		const main = { main: { "src/stub.txt": "// TODO(br:sales.controller) stand-in\n" }, ledger };
+		const unmark = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "stub.txt"), "real\n"), "replaced the stub"), [], undefined, [], main);
+		expect(unmark.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:sales\.controller\)/);
+		const invented = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "c.txt"), "// TODO(br:campaign editor owner)\nx\n"), "stubbed c"), [], undefined, [], main);
+		expect(invented.refused).toMatch(/^new stub marks no unit will replace: TODO\(br:campaign editor owner\) names no unit/);
+		const empty = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "Deferral.txt"), "// owner-dependent: U5\n"), "deferred"), [], undefined, [], main);
+		expect(empty.refused).toMatch(/^files with only comments, no code: src\/Deferral\.txt/);
+		const onMark = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "c.test.txt"), "expect(text).toContain('TODO(br:U5_sales_controller)')\n"), "tested"), [], undefined, [], main);
+		expect(onMark.refused).toMatch(/^tests check a stub mark/);
+	});
 	it("a removed SQL comment stub mark (-- TODO(br:u)) counts as removed, though its diff line starts with ---", async () => {
 		const ledger = new Ledger(":memory:");
 		ledger.createUnit({ id: "u", tier: "T1", symbolIds: [] });

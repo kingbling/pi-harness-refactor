@@ -15,6 +15,7 @@ import { setStep } from "./watchdog.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 import { FAIL_ON_MAIN_TOO, onlyOwnTests, runPortedTests, STALE_NOT_COUNTED } from "./ported.ts";
 import { exec } from "../proc.ts";
+import { markPatterns, stubNames } from "./stub-sweep.ts";
 
 /**
  * The gate: deterministic, cheapest-first, stops at the first failure. Runs AFTER the implementer
@@ -235,8 +236,14 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 		const why = stubOwnerProblem(g.ledger, g.unitId, m[1]!.trim());
 		if (why) problems.push(`${f}:${l.line}: TODO(br:${m[1]}) ${why}`);
 	}
+	// a file with only comments is no code: a note that defers the behaviour, or a test file with no test in it (also
+	// one an earlier pass of this unit left on main: the unit was sent back for it, see reopenCommentOnly)
+	const left = (JSON.parse(g.ledger.getUnit(g.unitId)?.meta ?? "{}") as { commentOnly?: string[] }).commentOnly ?? [];
+	for (const f of new Set([...changed, ...left])) if (!own.has(f) && g.adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && existsSync(join(g.targetProjectDir, f)) && onlyComments(readFileSync(join(g.targetProjectDir, f), "utf8"))) problems.push(`${f}: ${ONLY_COMMENTS}`);
+	// a test that checks a stub mark's text keeps the stub in place
+	for (const f of changed) if (!own.has(f) && g.adapter.layout.isTestFile(f) && existsSync(join(g.targetProjectDir, f))) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) if (l.text.includes("TODO(br:")) problems.push(`${f}:${l.line}: ${TEST_ON_MARK}`);
 	// stubs earlier units left for this unit (the task card listed them): once it is accepted nobody replaces them
-	for (const hit of await stubsLeftFor(g.targetProjectDir, g.unitId)) if (!problems.some((p) => p.startsWith(`${hit.file}:${hit.line}:`))) problems.push(`${hit.file}:${hit.line}: ${STUB_LEFT}`);
+	for (const hit of await stubsLeftFor(g.targetProjectDir, stubNames(g.ledger, g.unitId))) if (!problems.some((p) => p.startsWith(`${hit.file}:${hit.line}:`))) problems.push(`${hit.file}:${hit.line}: ${STUB_LEFT}`);
 	// no code written but ported tests to run: existing code may already do it (reuse); the tests and the reviewer decide
 	const reuse = prodFiles.length === 0 && g.testFiles.length > 0;
 	if (prodFiles.length === 0 && !reuse && !early && !nothingToWrite(g)) problems.push(NOTHING_WRITTEN);
@@ -842,11 +849,21 @@ export const NOTHING_WRITTEN = "no production files were written";
 /** Also the implementer's own to fix: a stub an earlier unit left for this unit, still in place. */
 export const STUB_LEFT = "stub left for this unit is still here: replace it with your code, or point its callers at your code, and remove it; if it stands in for another unit's code, mark it with that unit instead (symbol_lookup)";
 
-/** Lines in the worktree's tracked files that still carry this unit's stub mark TODO(br:<unitId>). */
-async function stubsLeftFor(dir: string, unitId: string): Promise<Array<{ file: string; line: number }>> {
+/** A file the gate refuses for holding only comments. */
+export const ONLY_COMMENTS = "holds only comments, no code: write the code it stands for (a test file: the tests), or delete the file";
+/** A test the gate refuses for checking a stub mark. */
+export const TEST_ON_MARK = "a test checks a stub mark (TODO(br:...)): test the behaviour, not the stub";
+
+/** True when the text holds no code once comments (line and block comments, HTML comments) and PHP's open and close tags are taken out. */
+export function onlyComments(text: string): boolean {
+	return !text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\/\/(?!\/).*$/gm, "").replace(/<\?php|\?>/g, "").trim();
+}
+
+/** Lines in the worktree's tracked files that still carry this unit's stub mark TODO(br:<name>), under any of its `names` (stubNames). */
+async function stubsLeftFor(dir: string, names: string[]): Promise<Array<{ file: string; line: number }>> {
 	let out: string;
 	try {
-		out = await exec("git", ["grep", "-n", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: dir });
+		out = await exec("git", ["grep", "-n", ...markPatterns(names), "--", "."], { cwd: dir });
 	} catch {
 		return []; // no match, or not a repo
 	}

@@ -157,6 +157,21 @@ describe("wired_ok: the reviewer model", () => {
 		expect(system).toMatch(/A stub marked TODO\(br:u1\) \(grep for it\) that stands in for this unit's own legacy code[^:]*: one still there[^.]* is a finding/);
 	});
 
+	it("sees the unit's drops with their reasons and is told that work not done is no drop; another stack's stubs are not the implementer's", async () => {
+		const { dir, ledger, config } = project();
+		ledger.upsertFile({ path: "app/report.php", hash: "h", lang: "php", loc: 1 });
+		ledger.upsertSymbol({ id: "app/report.php::sales", path: "app/report.php", kind: "function", name: "sales" });
+		ledger.db.prepare("UPDATE symbols SET unit_id = 'u1' WHERE id = 'app/report.php::sales'").run();
+		ledger.db.prepare("INSERT INTO moves(unit_id, src_symbol, op, target_symbols, why, created_at) VALUES ('u1', 'app/report.php::sales', 'dropped', '[]', 'Sales KPI report execution is not implemented.', 'now')").run();
+		let system = "";
+		const prompts: string[] = [];
+		const spawn = (async (opts: SpawnOptions) => ((system = opts.systemPrompt ?? ""), { run: async (p: string) => (prompts.push(p), { text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} })) as never;
+		await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
+		expect(prompts[0]).toMatch(/Legacy symbols the implementer marked dropped[^\n]*\n- app\/report\.php::sales: Sales KPI report execution is not implemented\./);
+		expect(system).toMatch(/A drop that is really work not done, put off for later, or left to another unit or to the owner is a finding/);
+		expect(system).toMatch(/such a stub in another stack's files[^]*?is not the implementer's to write, and neither a finding nor outOfScope/);
+	});
+
 	it("gets its earlier open findings, says which are fixed and lists all open ones at once", async () => {
 		const { dir, ledger, config } = project();
 		let system = "";

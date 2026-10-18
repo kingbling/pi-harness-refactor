@@ -123,6 +123,30 @@ describe("gate: own scope", () => {
 		expect(step(await gate({ writeGlobs: ["src/features/agency/**", "src/features/billing/billing.service.ts"] }), "antigaming_ok")?.ok).toBe(true);
 	});
 
+	it("a stub left for this unit under a loose name (its short id, a name a model mapped to it) counts as its own", async () => {
+		ledger.createUnit({ id: "U12_sales_controller", tier: "T0", symbolIds: [] });
+		ledger.setMeta("stub_owner_names", JSON.stringify({ "sales.controller": "U12_sales_controller" }));
+		stubOnMain("src/features/billing/a.service.ts", "export const a = 0; // TODO(br:sales.controller)\n");
+		stubOnMain("src/features/billing/b.service.ts", "export const b = 0; // TODO(br:U12)\n");
+		const out = step(await gate({ unitId: "U12_sales_controller" }), "antigaming_ok")?.output ?? "";
+		expect(out).toContain("src/features/billing/a.service.ts:1: stub left for this unit is still here");
+		expect(out).toContain("src/features/billing/b.service.ts:1: stub left for this unit is still here");
+	});
+
+	it("a file with only comments, or a test that checks a stub mark, fails antigaming_ok; one an earlier pass left on main too", async () => {
+		write("src/features/agency/AgencyDeferral.ts", "// The table logic is owned by U2117.\n/* owner-dependent */\n");
+		write("src/features/agency/agency.view.spec.ts", "it('shows the stub', () => expect(text).toContain('TODO(br: campaign editor owner)'));\n");
+		const out = step(await gate(), "antigaming_ok")?.output ?? "";
+		expect(out).toContain("src/features/agency/AgencyDeferral.ts: holds only comments, no code");
+		expect(out).toMatch(/agency\.view\.spec\.ts:1: a test checks a stub mark/);
+		// a file the unit was sent back for (reopenCommentOnly) is checked though this pass did not touch it
+		write("src/features/agency/AgencyDeferral.ts", "export const x = 1;\n");
+		write("src/features/agency/agency.view.spec.ts", "it('x', () => expect(1).toBe(1));\n");
+		stubOnMain("src/features/billing/Old.ts", "// nothing here\n");
+		ledger.updateUnit("u1", { meta: { commentOnly: ["src/features/billing/Old.ts"] } });
+		expect(step(await gate(), "antigaming_ok")?.output).toContain("src/features/billing/Old.ts: holds only comments");
+	});
+
 	it("a stub the unit was told to replace passes structure_ok when sanctioned", async () => {
 		stubOnMain("src/features/billing/billing.service.ts", "export class BillingService {\n\t// TODO(br:u1)\n}\n");
 		ledger.addEvidence("u1", "truth_none", { reason: "a contract only" });

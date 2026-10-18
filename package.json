@@ -1,6 +1,6 @@
 {
   "name": "pi-bigrefactor",
-  "version": "0.4.20",
+  "version": "0.4.21",
   "description": "Ledger-driven autonomous legacy migration: a Pi package (extension + br CLI)",
   "type": "module",
   "keywords": [

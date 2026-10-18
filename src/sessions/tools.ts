@@ -321,12 +321,16 @@ export function truthLookup(d: ToolDeps): ToolDefinition {
 	});
 }
 
+/** The kinds of drop ledger_prove takes: code the new system does not need. Not done or put off is no drop. */
+export const DROP_KINDS = ["dead", "platform", "owner"] as const;
+const NO_DROP_KIND = "a drop needs dropKind: dead (nothing reaches it), platform (the target does it) or owner (the owner decided). Work not done, put off, or left to another unit is no drop: prove it merged_into the code that does it, or leave it unproven and say why in your final message";
+
 export function ledgerProve(d: ToolDeps): ToolDefinition {
 	return def({
 		name: "ledger_prove",
 		label: "Ledger prove",
 		description:
-			"Record what happened to legacy symbols of this unit: a list, one entry per symbol (prove them all in one call when you can). Required for every symbol in the task card before you finish. op: moved (1:1 port), extracted (split into several target symbols), merged_into (deduplicated into an existing/another target symbol), inlined (body folded into its caller), split, dropped (not needed in the new system — say why). targetSymbols are target ids `<project-relative file>::<symbol>` as target_lookup prints them. A symbol proven before keeps its proof; prove it again only when what it points to changed.",
+			"Record what happened to legacy symbols of this unit: a list, one entry per symbol (prove them all in one call when you can). Required for every symbol in the task card before you finish. op: moved (1:1 port), extracted (split into several target symbols), merged_into (deduplicated into an existing/another target symbol), inlined (body folded into its caller), split, dropped (not needed in the new system: give dropKind and say why). A drop is only for code the new system does not need: dead (nothing in the legacy app reaches it), platform (the target framework or platform does it; say where) or owner (the owner decided it; name the question). Work not done, put off for later, or left to another unit or to the owner is never a drop: when other code already does it, prove it merged_into that code; when you cannot do it, leave it unproven and say why in your final message. The reviewer checks every drop against the legacy code. targetSymbols are target ids `<project-relative file>::<symbol>` as target_lookup prints them. A symbol proven before keeps its proof; prove it again only when what it points to changed.",
 		promptSnippet: "ledger_prove: account for the legacy symbols, a list in one call (moved/extracted/merged_into/inlined/split/dropped + why)",
 		promptGuidelines: ["Call ledger_prove with every legacy symbol of the task card (a list, one call); the unit cannot pass the gate with unproven symbols."],
 		parameters: Type.Object({
@@ -335,6 +339,7 @@ export function ledgerProve(d: ToolDeps): ToolDefinition {
 					srcSymbol: Type.String(),
 					op: Type.Union(MOVE_OPS.map((o) => Type.Literal(o))),
 					targetSymbols: Type.Optional(Type.Array(Type.String())),
+					dropKind: Type.Optional(Type.Union(DROP_KINDS.map((k) => Type.Literal(k)), { description: "op dropped only: dead, platform or owner" })),
 					why: Type.String({ description: "one sentence a reviewer can verify" }),
 				}),
 				{ minItems: 1 },
@@ -346,10 +351,12 @@ export function ledgerProve(d: ToolDeps): ToolDefinition {
 			// each entry on its own: a refused one is named, the others are recorded
 			for (const q of p.proofs) {
 				const sym = d.ledger.getSymbol(q.srcSymbol);
-				let problem = !sym ? "unknown symbol; use the exact ids from the task card" : sym.unit_id !== d.unitId ? `belongs to unit ${sym.unit_id}, not ${d.unitId}; only prove your own symbols` : undefined;
+				let problem = !sym ? "unknown symbol; use the exact ids from the task card" : sym.unit_id !== d.unitId ? `belongs to unit ${sym.unit_id}, not ${d.unitId}; only prove your own symbols` : q.op === "dropped" && !q.dropKind ? NO_DROP_KIND : undefined;
 				if (!problem)
 					try {
-						d.ledger.prove({ unitId: d.unitId, srcSymbol: q.srcSymbol, op: q.op as MoveOp, targetSymbols: q.targetSymbols, why: q.why, attemptId: d.attemptId });
+						// the kind leads the reason: the reviewer and later checks read what the drop claims
+						const why = q.op === "dropped" && !q.why.startsWith(`${q.dropKind}:`) ? `${q.dropKind}: ${q.why}` : q.why;
+						d.ledger.prove({ unitId: d.unitId, srcSymbol: q.srcSymbol, op: q.op as MoveOp, targetSymbols: q.targetSymbols, why, attemptId: d.attemptId });
 					} catch (e: any) {
 						problem = `rejected: ${e?.message ?? e}`;
 					}

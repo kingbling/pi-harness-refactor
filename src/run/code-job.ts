@@ -11,7 +11,8 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
-import { addedLines, changedFiles, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { addedLines, changedFiles, onlyComments, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { markOwner } from "./stub-sweep.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
 import { exec } from "../proc.ts";
 
@@ -217,9 +218,9 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 	}
 }
 
-/** Units whose TODO(br:<unit>) mark the changed files lost (a mark moved to another changed file is kept). */
-async function removedMarks(dir: string, changed: string[]): Promise<string[]> {
-	const mark = /TODO\(br:([^)\s]+)\)/g;
+/** Owner names whose TODO(br:<owner>) mark the changed files lost, and the ones they gained (a mark moved to another changed file is neither). */
+async function markChanges(dir: string, changed: string[]): Promise<{ removed: string[]; added: string[] }> {
+	const mark = /TODO\(br:([^)]+)\)/g;
 	const removed = new Set<string>();
 	const added = new Set<string>();
 	const diff = await exec("git", ["diff", "-U0", "HEAD", "--", ...changed], { cwd: dir, maxBuffer: 64 * 1024 * 1024 });
@@ -230,12 +231,12 @@ async function removedMarks(dir: string, changed: string[]): Promise<string[]> {
 		else if (l.startsWith("@@")) header = false;
 		if (header) continue;
 		const into = l.startsWith("-") ? removed : l.startsWith("+") ? added : undefined;
-		for (const m of into ? l.matchAll(mark) : []) into!.add(m[1]!);
+		for (const m of into ? l.matchAll(mark) : []) into!.add(m[1]!.trim());
 	}
 	// a new file is not in the diff against HEAD
 	const tracked = new Set(await trackedFiles(dir));
-	for (const f of changed) if (existsSync(join(dir, f)) && !tracked.has(f)) for (const m of readFileSync(join(dir, f), "utf8").matchAll(mark)) added.add(m[1]!);
-	return [...removed].filter((u) => !added.has(u));
+	for (const f of changed) if (existsSync(join(dir, f)) && !tracked.has(f)) for (const m of readFileSync(join(dir, f), "utf8").matchAll(mark)) added.add(m[1]!.trim());
+	return { removed: [...removed].filter((u) => !added.has(u)), added: [...added].filter((u) => !removed.has(u)) };
 }
 
 /**
@@ -253,8 +254,19 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	if (deleted.length) return `tests were deleted: ${deleted.slice(0, 5).join(", ")}`;
 	// a stub's TODO(br:<unit>) mark tells that unit which files it may edit to replace the stub: it is the unit's to
 	// remove, not a question's job (the builder's job may: it only makes main build)
-	const marks = whole ? [] : (await removedMarks(dir, changed)).filter((u) => !served.includes(u) && (ledger.getUnit(u)?.state ?? "accepted") !== "accepted");
+	// (a loose owner name counts as the unit it stands for)
+	const changes = whole ? { removed: [], added: [] } : await markChanges(dir, changed);
+	const marks = changes.removed.filter((u) => {
+		const unit = markOwner(ledger, u) ?? u;
+		return !served.includes(unit) && (ledger.getUnit(unit)?.state ?? "accepted") !== "accepted";
+	});
 	if (marks.length) return `stub marks of units not accepted yet were removed: ${marks.slice(0, 5).map((u) => `TODO(br:${u})`).join(", ")}; leave the stubs and their marks to those units`;
+	// a new stub mark must name a unit still to come (the gate's rule): any other is a stub nobody replaces
+	const badMarks = changes.added.flatMap((u) => {
+		const why = stubOwnerProblem(ledger, "", u);
+		return why ? [`TODO(br:${u}) ${why}`] : [];
+	});
+	if (badMarks.length) return `new stub marks no unit will replace: ${badMarks.slice(0, 5).join("\n")}`;
 	// app config the job may change, but no check setting: the test command must still fail a failing test
 	const app = changed.filter((f) => appConfig(adapter, f));
 	if (app.length) {
@@ -278,6 +290,12 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	if (silenced.length) return `checks were silenced instead of fixed: ${silenced.slice(0, 5).join(", ")}`;
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
+	// a file with only comments, or a test that checks a stub mark: the gate's rules, so no unit gets them from a job
+	const empty = whole ? [] : present.filter((f) => onlyComments(readFileSync(join(dir, f), "utf8")));
+	if (empty.length) return `files with only comments, no code: ${empty.slice(0, 5).join(", ")}`;
+	const onMark: string[] = [];
+	if (!whole) for (const f of tests) for (const l of await addedLines(dir, f, tracked.has(f))) if (l.text.includes("TODO(br:")) onMark.push(`${f}:${l.line}`);
+	if (onMark.length) return `tests check a stub mark (TODO(br:...)) instead of the behaviour: ${onMark.slice(0, 5).join(", ")}`;
 	if (code.length && !tests.length && !whole) return `code changed without a test: ${code.slice(0, 5).join(", ")}`;
 	// a source file added or moved may keep the app from loading (a folder its config scans), which no changed test
 	// shows: the app's boot check runs too (the builder's job runs it with the other whole-project checks)

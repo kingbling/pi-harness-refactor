@@ -13,6 +13,7 @@ import { callTree } from "../inventory/codemap.ts";
 import { loadDecisions } from "../inventory/decisions.ts";
 import { exec } from "../proc.ts";
 import { legacyCallerLines } from "./tools.ts";
+import { markPatterns, stubNames } from "../run/stub-sweep.ts";
 
 /**
  * Task card: the whole context an implementer or tester gets pushed. Everything else is pulled
@@ -32,6 +33,8 @@ export interface TaskCard {
 	depOwners: Record<string, string>;
 	/** Target files with a stub earlier units left for this unit's code (TODO(br:<this unit>)): it replaces them. */
 	waitingStubs: string[];
+	/** Files of the repo's other stacks (repo-relative) with a stub marked for this unit: not its to write; a code job of that stack replaces them once it is accepted. */
+	otherStackStubs?: string[];
 	/** Who calls this unit, one line each with the caller's unit, state and stack (the reviewer's lines: see legacyCallerLines). */
 	callers: string[];
 	/** The stack's wiring files (none when generated or not named), with the stack: the card says who registers this unit's code. */
@@ -103,7 +106,8 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]>; stubFiles?: string[] };
 	const files = meta.files ?? [];
 	// the stub files stay this unit's to edit once found: its restored work or a code job may have removed the marks since
-	const waitingStubs = [...new Set([...(meta.stubFiles ?? []), ...(await stubsWaitingFor(opts.targetProjectDir, unitId))])];
+	const found = await stubsWaitingFor(opts.targetProjectDir, stubNames(ledger, unitId));
+	const waitingStubs = [...new Set([...(meta.stubFiles ?? []), ...found.own])];
 	if (waitingStubs.length !== (meta.stubFiles ?? []).length) ledger.updateUnit(unitId, { meta: { stubFiles: waitingStubs } });
 	const db = ledger.db;
 
@@ -191,7 +195,7 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
 	await breathe();
 	const area = opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined;
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, otherStackStubs: found.other, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -320,6 +324,7 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 		for (const [owner, deps] of byOwner) L.push(`- TODO(br:${owner}): ${deps.join(", ")}`);
 	}
 	if (card.waitingStubs.length) L.push("", `## Stubs waiting for you: earlier units stubbed this unit's code, marked TODO(br:${card.unit.id}) (grep for it). Replace each stub that stands in for this unit's code with the real code, or point its callers at the real code, and remove the stub; you may edit these files for that: ${card.waitingStubs.join(", ")}`);
+	if (card.otherStackStubs?.length) L.push("", `## Stubs for you in another stack: these files of the repo (paths from the repo root) hold stubs marked for this unit: ${card.otherStackStubs.join(", ")}. They are not yours to write: once you are accepted, a code job of that stack replaces them with calls to your code. Read them to see what they expect from you, build your side of it completely (the endpoint and the fields they need), and say in your final line how they call it.`);
 	L.push("", "## Legacy callers (caller, unit, state, stack; who_calls for more) — keep behaviour compatible");
 	L.push(...(card.callers.length > 20 ? [...card.callers.slice(0, 20), `- (${card.callers.length - 20} more; who_calls)`] : card.callers.length ? card.callers : ["- none in the index (an entry point is reached by the framework)"]));
 	// the wiring rule next to the facts it applies to: who registers this unit's code follows from the callers' stack and state.
@@ -383,15 +388,20 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 }
 
 /**
- * Files of the project (relative to it) that carry the mark of a stub left for `unitId`; none when it is not a git repo.
+ * Files that carry the mark of a stub left for a unit (any of its `names`), in the whole repo: `own` in this project
+ * (relative to it), `other` in the repo's other stacks (relative to the repo); none when it is not a git repo.
  * Searches the index, not the disk: a requeued unit's restored work has already replaced the marks on disk.
  */
-async function stubsWaitingFor(projectDir: string, unitId: string): Promise<string[]> {
+async function stubsWaitingFor(projectDir: string, names: string[]): Promise<{ own: string[]; other: string[] }> {
+	let files: string[];
+	let prefix: string;
 	try {
-		return (await exec("git", ["grep", "--cached", "-l", "-F", `TODO(br:${unitId})`, "--", "."], { cwd: projectDir })).split("\n").filter(Boolean);
+		prefix = (await exec("git", ["rev-parse", "--show-prefix"], { cwd: projectDir })).trim();
+		files = (await exec("git", ["grep", "--cached", "-l", "--full-name", ...markPatterns(names), "--", ":/"], { cwd: projectDir })).split("\n").filter(Boolean);
 	} catch {
-		return []; // no match, or not a repo
+		return { own: [], other: [] }; // no match, or not a repo
 	}
+	return { own: files.filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length)), other: files.filter((f) => !f.startsWith(prefix)) };
 }
 
 /** Files under `dir` of the project (relative to `dir`), tests included. Uncapped: the renderer bounds and says so. */

@@ -40,7 +40,7 @@ import { findTests, warmMainCache } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
-import { createStubSweep } from "./stub-sweep.ts";
+import { createStubSweep, resolveOwnersWithModel, SWEEP_TRIES } from "./stub-sweep.ts";
 import { finishCheck, finishDue, lastFinish, renderFinishLine } from "./finish-check.ts";
 import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
@@ -215,6 +215,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	if (!o.dry && !o.spawn) {
 		const { healStackKnowledge } = await import("./stack-heal.ts");
 		await waitOn("updating stack knowledge", () => healStackKnowledge({ ledger, config, root: o.root, client: o.client, log })).catch((e) => log(pc.yellow(`stack knowledge not updated: ${e?.message ?? e}`)));
+		// accepted units that left a file with only comments on main (before the gate refused them) go back to planned
+		const { reopenCommentOnly } = await import("./drop-check.ts");
+		await waitOn("looking for files with only comments", () => reopenCommentOnly({ ledger, config, log })).catch((e) => log(pc.yellow(`files with only comments not checked: ${e?.message ?? e}`)));
 	}
 	// ---- placement: every planned unit gets its stack + area before anything runs (code → Jev → question)
 	if (!o.dry) await waitOn("placing units: picking each unit's stack and folder", () => resolvePlacements({ ledger, config, root: o.root, client: o.client, log: (l) => log(pc.dim(l)) }));
@@ -415,13 +418,18 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				return sha;
 			}),
 	});
-	// stubs on main no unit will replace (owner accepted or no unit): after merges a code job gets them, each once
+	// stubs on main no unit will replace (owner accepted or no unit): at the start and after merges a code job gets
+	// them (every stack: a unit's marks may sit in another stack), each a few times; then the owner is asked once
 	const stubSweep = o.setupFixer === false || (!o.setupFixer && o.spawn) || o.dry
 		? undefined
 		: createStubSweep({
 				ledger,
 				log,
 				dirOf: (stackId) => projectDir(config, stackId),
+				repo: config.target.stacks.length > 1 ? config.target.path : undefined,
+				resolveOwners: resolveOwnersWithModel({ ledger, config }),
+				ask: async (stackId, marks) =>
+					(await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "stub_sweep", facts: `${marks.length} stub mark(s) in ${stackId} are still on main after ${SWEEP_TRIES} code jobs tried to replace them; no unit will replace them (their owner is accepted or names no unit):\n${marks.slice(0, 30).map((m) => `- ${m.file}:${m.line} TODO(br:${m.owner}) ${m.text}`).join("\n")}${marks.length > 30 ? "\n- …" : ""}\nThe code jobs' transcripts are under .bigrefactor/sessions/__code__.stubs-${stackId}-*.jsonl.`, options: [{ value: "retry", facts: "the marks go to code jobs again" }, { value: "leave", facts: "the marks stay; the owner replaces them by hand" }], blocks: "none", askedBy: "stub-sweep" })).id,
 				codeJob: async (stackId, what) => {
 					let merged: string | undefined;
 					const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `stubs-${stackId}-${Date.now()}`, linkAll, log, what, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
@@ -457,6 +465,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		}).catch((e) => (log(pc.yellow(`finish check failed: ${e?.message ?? e}`)), undefined));
 		return !!r?.merged;
 	};
+	// marks left from earlier runs (a job that did not merge, a loose owner name) are looked at once at the start too
+	if (stubSweep) for (const s of config.target.stacks) void stubSweep.afterMerge(s);
 	// parity: can the old app and the new app each start here as a local server? decided once per workspace, on the
 	// side (lanes never wait); a side that does not start asks the owner once, blocking nothing
 	const probeAsk: { ask: ProbeAsker; answer: ProbeAnswer } = {
@@ -648,6 +658,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					await writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, freeLanes: () => (stopRecord ? 0 : laneLimit - running.size), log });
 				})
 				.catch((e) => log(pc.yellow(`truth scripts: ${e?.message ?? e}`)));
+
+	// accepted units' drops, on the side: the ones that read like work not done are judged by a model, a few per run
+	const dropCheck = o.dry || o.spawn
+		? undefined
+		: import("./drop-check.ts")
+				.then(({ checkAcceptedDrops }) => checkAcceptedDrops({ ledger, config, root: o.root, client: o.client, stopped: () => !!stopRecord, log }))
+				.catch((e) => log(pc.yellow(`drop check: ${e?.message ?? e}`)));
 
 	let decisionBlocked = new Map<string, string[]>();
 	let waitingNote = "";
@@ -914,7 +931,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 						if (!o.dry) {
 							builder.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
 							pusher.afterMerge();
-							void stubSweep?.afterMerge(placementOf(ledger.getUnit(unitId)!.meta).stackId);
+							for (const s of config.target.stacks) void stubSweep?.afterMerge(s);
 							const sl = sliceOf(unitId);
 							if (sl && parityOnAccept(ledger, sl, unitId)) queueParity(sl);
 						}
@@ -1340,6 +1357,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		else await waitOn("a code job is fixing a difference many slices share", () => sharedRunning!);
 	// a stop lets the running truth script finish; otherwise this run's share is written before it ends
 	if (truthScripts) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts);
+	if (dropCheck) await waitOn("checking the drops of accepted units", () => dropCheck);
 	// a stop ends the cleaner between items; it does not outlive the run
 	if (cleaner) await waitOn("finishing the cleanup pass", () => cleaner.stop());
 	// a stub sweep's code job finishes (it merges on main) before the run ends

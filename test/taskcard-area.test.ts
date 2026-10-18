@@ -162,6 +162,20 @@ describe("stubs carry the owning unit; that unit replaces them", () => {
 		expect((await card("agency_pay")).waitingStubs).toEqual([]);
 	});
 
+	it("stubs for the unit in another stack's files are listed as not its to write; a loose short id counts as its mark", async () => {
+		const repo = join(ws, "migrated");
+		execFileSync("git", ["init", "-q"], { cwd: repo });
+		ledger.createUnit({ id: "U77_billing_ctl", tier: "T1", meta: { files: ["legacy/billing_ctl.php"], place: { stack: "nestjs", area: "billing", shared: false, source: "code" } }, symbolIds: [] });
+		write("src/features/billing/billing.stub.ts", "// TODO(br:U77) minimal stand-in\nexport class B {}\n");
+		mkdirSync(join(repo, "web", "src", "pages"), { recursive: true });
+		writeFileSync(join(repo, "web", "src", "pages", "Billing.tsx"), "// TODO(br:U77_billing_ctl) loader\nexport const P = 1;\n");
+		execFileSync("git", ["add", "-A"], { cwd: repo });
+		const c = await card("U77_billing_ctl");
+		expect(c.waitingStubs).toEqual(["src/features/billing/billing.stub.ts"]);
+		expect(c.otherStackStubs).toEqual(["web/src/pages/Billing.tsx"]);
+		expect(renderTaskCard(c, config, { includeSource: false })).toMatch(/## Stubs for you in another stack: [^\n]*web\/src\/pages\/Billing\.tsx\. They are not yours to write: once you are accepted, a code job of that stack replaces them/);
+	});
+
 	it("a requeued unit's restored work replaced the marks on disk: its card still lists its stub files", async () => {
 		execFileSync("git", ["init", "-q"], { cwd: api });
 		write("src/features/agency/billing.stub.ts", "// TODO(br:billing) minimal stand-in\nexport class Billing {}\n");
