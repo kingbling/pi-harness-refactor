@@ -1771,10 +1771,24 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 	const sinces = new Map<string, number>();
 	const sinceOf = (stackId: string) => o.since ?? (sinces.get(stackId) ?? sinces.set(stackId, lastFixAt(config, root, manifests, stackId)).get(stackId)!);
 	const now = o.now ?? Date.now();
+	// when each run started (its code was loaded then): runs.jsonl and the run going on
+	const runStarts: number[] = [];
+	try {
+		for (const l of readFileSync(join(root, ".bigrefactor", "runs.jsonl"), "utf8").split("\n")) if (l.trim()) runStarts.push(Date.parse((JSON.parse(l) as RunRecord).startedAt));
+	} catch {
+		/* no runs written yet */
+	}
+	try {
+		const open = ledger.getMeta(OPEN_RUN);
+		if (open) runStarts.push(Date.parse((JSON.parse(open) as { startedAt: string }).startedAt));
+	} catch {
+		/* no run going on */
+	}
+	const runStartBefore = (t: number) => Math.max(0, ...runStarts.filter((s) => s <= t)) || t;
 	const back: string[] = [];
 	for (const r of quarantinedUnits(ledger)) {
 		if (running.has(r.id)) continue;
-		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginChecked?: number };
+		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; healedFrom?: string; stuck?: boolean; healChecked?: number; retriedOn?: string[]; parkedWhy?: string; parkedAt?: number; pluginSeen?: number };
 		// a question withdrawn after it was asked (the unit was requeued meanwhile) answers nothing: as if none was asked
 		if (meta.healQuestion && ledger.getQuestion(meta.healQuestion)?.status === "withdrawn") {
 			ledger.db.prepare("UPDATE units SET meta = json_remove(meta, '$.healQuestion') WHERE id = ?").run(r.id);
@@ -1801,9 +1815,12 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 		// more try when the plugin's own changes since the park touch what parked it (the decide model reads them, as for
 		// a change on main), counted, past the automatic tries too (like a change on main after the park: a fix in the
 		// plugin is no plain retry); asked once per plugin version, and a new park after that try is newer than the plugin
-		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > (meta.parkedAt ?? 0) && (meta.pluginChecked ?? 0) < pluginAt) {
+		// "since the park" means since the code the unit last ran on was loaded: the start of the run it was parked in
+		// (a fix committed while that run went on is new to the unit, though older than the park)
+		const ranOn = runStartBefore(meta.parkedAt ?? 0);
+		if (meta.healQuestion === 0 && meta.parkedWhy && pluginAt > ranOn && (meta.pluginSeen ?? 0) < pluginAt) {
 			// only what is new since the last look: each change is judged once, while it is new, and the list stays short
-			const changes = await (o.pluginChanges ?? pluginChangesSince)(Math.max(meta.parkedAt ?? 0, meta.pluginChecked ?? 0));
+			const changes = await (o.pluginChanges ?? pluginChangesSince)(Math.max(ranOn, meta.pluginSeen ?? 0));
 			const touches = !changes ? false : o.client ? await changeTouches({ ledger, config, client: o.client }, r.id, `The migration tool (plugin) changed:\n${changes}`, `Parked: ${meta.parkedWhy}\n${r.reason ?? ""}${last ? `\n${last.step}: ${last.output}` : ""}`) : true;
 			// the decide model is unavailable: asked next pass
 			if (touches === undefined) continue;
@@ -1812,7 +1829,7 @@ export async function healQuarantined(ledger: Ledger, config: Config, root: stri
 				back.push(r.id);
 				continue;
 			}
-			ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.pluginChecked', ?) WHERE id = ?").run(pluginAt, r.id);
+			ledger.db.prepare("UPDATE units SET meta = json_set(meta, '$.pluginSeen', ?) WHERE id = ?").run(pluginAt, r.id);
 		}
 		if (changed && mayRun) {
 			// a change the decide model already said does not touch this failure is not asked about again: it sees only

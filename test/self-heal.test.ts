@@ -248,6 +248,28 @@ describe("answers are applied per option", () => {
 		expect(await heal(later, "abc4 code jobs may change app config", true)).toEqual([]);
 	});
 
+	it("a plugin fix committed while the run went on is new to a unit parked later in that run (it ran on the code loaded at the run's start)", async () => {
+		const { root, config, ledger, mk } = await workspace();
+		const { healQuarantined } = await import("../src/run/run.ts");
+		mk("U1", "billing", "implementing");
+		ledger.transitionUnit("U1", "quarantined", "db lane: gate still red after 5 attempts (ported_tests_green)");
+		const parkedAt = Date.now() - 60_000;
+		const runStart = parkedAt - 3_600_000;
+		const fixAt = parkedAt - 1_800_000; // committed during the run, before the park
+		writeFileSync(join(root, ".bigrefactor", "runs.jsonl"), JSON.stringify({ startedAt: new Date(runStart).toISOString(), endedAt: new Date(parkedAt + 1000).toISOString(), outcome: "stopped" }) + "\n");
+		// an old look (with the window from the park) does not count: the unit is judged again
+		ledger.updateUnit("U1", { meta: { healQuestion: 0, parkedWhy: "db tests could not run", parkedAt, autoHeals: config.run.maxAutoHeals, pluginChecked: fixAt } });
+		const since: number[] = [];
+		const back = await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, {
+			since: 0,
+			pluginChangedAt: fixAt,
+			pluginChanges: async (t) => (since.push(t), "abc5 DB sessions can run their tests"),
+			client: new FakeModelClient({ decide: () => ({ touches: 0.9 }) }),
+		});
+		expect(back).toEqual(["U1"]);
+		expect(since).toEqual([runStart]);
+	});
+
 	it("the plugin's changes come from its own git history: each commit's subject and files", async () => {
 		const { pluginChangesSince } = await import("../src/run/run.ts");
 		expect(await pluginChangesSince(0)).toMatch(/^[0-9a-f]{7,} \S[\s\S]*\| +\d+/);
