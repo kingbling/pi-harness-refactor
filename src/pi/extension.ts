@@ -58,6 +58,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	questions: "open questions waiting for you (list)",
 	requeue: "requeue <unit...> | --all [--fresh]: put quarantined or waiting units back into the queue (after a fix); --fresh: the tester drafts the interface and tests again",
 	recheck: "recheck [--limit N] [--again] [--then-run]: accepted units under the newer checks; failures go back to planned with their code kept (background); --then-run starts the migration run when it is done",
+	finish: "finish: is the new app really done? stub marks left, pages the entry never feeds, frontend calls with no backend route, stacks not joined, migrations on an empty database (background report; br run does it at the end and hands the gaps to code jobs)",
 	parity: "parity --probe [--again]: can the old and the new app start here · parity <slice> [--rewrite] [--no-judge]: send the same requests to both, compare, judge (background; br run does it by itself for finished slices)",
 	answer: "answer: walk through the open questions one dialog at a time (identical ones together) · answer <id> <text>",
 	init: "init: give the old and the new folder; gathers data, asks the decisions, builds the workspace",
@@ -775,6 +776,22 @@ export default function (pi: ExtensionAPI) {
 						// --then-run: the migration run starts right after (recheck and run never touch main at the same time)
 						if (rest.includes("--then-run")) return { lines: [...lines, "starting the migration run"], next: async () => startRun(pi, ctx, []) };
 						return { lines: [...lines, "continue with /br run"] };
+					} finally {
+						ledger.close();
+					}
+				});
+			}
+			if (sub === "finish") {
+				return startJob(pi, ctx, "finish check of the whole app", async () => {
+					const cp = findConfigPath(ctx.cwd);
+					if (!cp) return { error: "no bigrefactor.config.json here" };
+					const { config, root } = loadConfig(cp);
+					const { finishCommand } = await import("../run/finish-cli.ts");
+					const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
+					try {
+						return { lines: await finishCommand({ ledger, config, root, log: (l) => progress.log(l) }) };
+					} catch (e: any) {
+						return { error: String(e?.message ?? e) };
 					} finally {
 						ledger.close();
 					}

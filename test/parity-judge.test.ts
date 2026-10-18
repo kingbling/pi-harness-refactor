@@ -98,6 +98,9 @@ describe("judging parity differences", () => {
 		const line = renderStatus(ledger, { color: false }).split("\n").find((l) => l.startsWith("parity"))!;
 		expect(line).toMatch(/same 0 +differ 1 +not compared 1 +differences: bugs 1 +quirks 0/);
 		expect(line).toMatch(/not compared: auth/);
+		// routes a slice skipped are shown next to its outcome
+		ledger.db.prepare("INSERT INTO parity_runs(slice, outcome, skipped, started_at) VALUES ('users', 'same', 3, datetime('now'))").run();
+		expect(renderStatus(ledger, { color: false }).split("\n").find((l) => l.startsWith("parity"))).toMatch(/same 1 .*routes skipped 3/);
 	});
 
 	it("a difference only the test setup causes re-opens no unit: it goes to that app's parity setup, and the judge sees how each app runs", async () => {
@@ -111,6 +114,29 @@ describe("judging parity differences", () => {
 		expect(status(r)).toEqual(["setup"]);
 		expect(ledger.getUnit("U1")!.state).toBe("accepted");
 		expect(loadApps(root)["nestjs"]!.setupProblem).toMatch(/body\.total[\s\S]*without the snapshot data/);
+	});
+
+	it("the same setup difference is not judged again, and a run left with only setup differences answers like the old app", async () => {
+		const { root, config, ledger, run, ids, status } = workspace();
+		saveApp(root, "nestjs", { up: true });
+		const r1 = run([{ step: "one", path: "data.sessions", legacy: "a", target: "b" }]);
+		await judgeRun({ ledger, config, root, runId: r1, slice: "invoices", judge: async () => [{ diffs: ids(r1), verdict: "setup", unit: "", app: "nestjs", problem: "the session keeps the server address" }], log: () => {} });
+		expect(ledger.db.prepare("SELECT outcome, note FROM parity_runs WHERE id = ?").get(r1)).toMatchObject({ outcome: "same", note: expect.stringMatching(/only from the test setup/) });
+		saveApp(root, "nestjs", { setupProblem: undefined });
+		// the next run: the same difference is setup again without the judge; a new one is still judged
+		const r2 = run([{ step: "one", path: "data.sessions", legacy: "a", target: "b" }, { step: "one", path: "body.total", legacy: 10, target: 11 }]);
+		const asked: string[] = [];
+		const judge: ParityJudge = async (o) => (asked.push(o.facts), [{ diffs: [ids(r2)[1]!], verdict: "bug", unit: "U1", problem: "tax" }]);
+		const res = await judgeRun({ ledger, config, root, runId: r2, slice: "invoices", judge, log: () => {} });
+		expect(res).toMatchObject({ setup: 1, bugs: 1 });
+		expect(status(r2)).toEqual(["setup", "bug"]);
+		expect(asked[0]).not.toMatch(/data\.sessions/);
+		expect(loadApps(root)["nestjs"]!.setupProblem).toBeUndefined();
+		expect(ledger.db.prepare("SELECT outcome FROM parity_runs WHERE id = ?").get(r2)).toEqual({ outcome: "differs" });
+		// only the remembered setup difference: no judge at all
+		const r3 = run([{ step: "one", path: "data.sessions", legacy: "a", target: "b" }]);
+		await judgeRun({ ledger, config, root, runId: r3, slice: "invoices", judge: async () => { throw new Error("not asked"); }, log: () => {} });
+		expect(status(r3)).toEqual(["setup"]);
 	});
 
 	it("a verdict naming an unknown unit or another run's differences changes nothing; what is not judged stays open", async () => {
@@ -252,6 +278,17 @@ describe("judging parity differences", () => {
 		ledger.db.prepare("INSERT INTO parity_diffs(run_id, slice, step, route, kind, path, legacy, target, status, unit_id) VALUES (?, 'invoices', 's1', 'GET /x', 'status', 'status', '302', '503', 'bug', ?)").run(id, other!);
 		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, created_at) VALUES ('unit', ?, 'review', 'accepted', '2026-10-15T01:21:31.985Z')").run(other!);
 		expect(parityOnAccept(ledger, "invoices", other!)).toBe(true);
+	});
+
+	it("older ledgers get the count of skipped routes on their comparisons (0 for the runs before it)", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "br-paritymig-")), "ledger.sqlite");
+		const first = new Ledger(path);
+		first.db.exec("ALTER TABLE parity_runs DROP COLUMN skipped");
+		first.db.prepare("INSERT INTO parity_runs(slice, outcome, started_at) VALUES ('s', 'same', datetime('now'))").run();
+		first.close();
+		const again = new Ledger(path);
+		expect(again.db.prepare("SELECT skipped FROM parity_runs").get()).toMatchObject({ skipped: 0 });
+		again.close();
 	});
 
 	it("older ledgers: comparisons an app's start or data reset stopped are turned into setup once", () => {

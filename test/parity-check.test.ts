@@ -9,8 +9,8 @@ import { inventory } from "../src/inventory/run.ts";
 import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { LEGACY, loadApps } from "../src/run/parity.ts";
-import { checkSlice, compareRuns, dataChanges, MAX_SETUP_RETRIES, runSteps, selfRedirect, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
+import { LEGACY, loadApps, saveApp } from "../src/run/parity.ts";
+import { checkSlice, compareRuns, dataChanges, loginWall, MAX_SETUP_RETRIES, plainValue, runSteps, selfRedirect, skippedRoutes, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
@@ -96,6 +96,49 @@ describe("comparing the old and the new app", () => {
 		expect(stepsProblem({ steps: [{ ...step("a"), route: "dashboard/ajax" }] }, ["ANY dashboard/ajax", "ANY ssp/dashboard"], ["nestjs"])).toMatch(/ANY ssp\/dashboard/);
 	});
 
+	it("a slice may skip at most half its routes; with a test account its steps must log in", () => {
+		const routes = ["GET /a", "GET /b", "GET /c", "GET /d"];
+		const skip = (...r: string[]) => Object.fromEntries(r.map((x) => [x, "needs an existing id"]));
+		expect(stepsProblem({ steps: [step("a")], skipped: skip("GET /b", "GET /c", "GET /d") }, routes, ["nestjs"])).toMatch(/3 of 4 routes are only skipped/);
+		expect(stepsProblem({ steps: [step("a"), step("b")], skipped: skip("GET /c", "GET /d") }, routes, ["nestjs"])).toBeUndefined();
+		// one route of one is not "most": a slice with a single route that cannot be called still passes
+		expect(stepsProblem({ steps: [step("x")], skipped: skip("GET /a") }, ["GET /a"], ["nestjs"])).toBeUndefined();
+		expect(skippedRoutes({ steps: [step("a")], skipped: skip("GET /a", "GET /b") }, routes)).toEqual(["GET /b"]);
+		const steps = [step("a"), step("b"), step("c"), step("d")];
+		expect(stepsProblem({ steps }, routes, ["nestjs"], { login: true })).toMatch(/test account is known: log in first/);
+		expect(stepsProblem({ steps: [{ ...step("in", "none"), route: "setup", method: "POST", path: "/login" }, ...steps] }, routes, ["nestjs"], { login: true })).toBeUndefined();
+	});
+
+	it("a step after the login that the old app sends back to the login page is not compared: only the login wall was seen", () => {
+		const s: Step[] = [step("before"), { ...step("in", "none"), route: "setup", method: "POST", path: "/login" }, step("a"), step("b")];
+		const old: StepResult[] = [{ status: 302, location: "/login" }, { status: 302, location: "/" }, { status: 302, location: "/login?back=%2Fa" }, { status: 200, body: 1 }];
+		expect([...loginWall(s, old)]).toEqual([2]);
+		const c = compareRuns(s, old, old, [{ status: 302, location: "/login" }, {}, { status: 200 }, { status: 200, body: 1 }], false);
+		// the logged-out step before the login is still compared
+		expect(c.compared).toBe(2);
+		expect(c.notCompared).toEqual(["a (the old app sends it to the login page: the login before it did not hold)"]);
+	});
+
+	it("each app's own address and a dump's base64 text are the harness's noise, not a difference", async () => {
+		const text = "_GYSS__|history|s:35:\"http://127.0.0.1:18081/api/rest/doc\";";
+		expect(plainValue({ data: { base64: Buffer.from(text).toString("base64") }, n: 1 }, ["127.0.0.1:18081"])).toEqual({ data: '_GYSS__|history|s:35:"http://(this app)/api/rest/doc";', n: 1 });
+		expect(plainValue("http://localhost:18080/x?to=http%3A%2F%2Flocalhost%3A18080%2Fy", ["localhost:18080"])).toBe(`http://(this app)/x?to=http%3A%2F%2F${encodeURIComponent("(this app)")}%2Fy`);
+		// bytes that are no text stay as they are
+		const bin = { base64: Buffer.from([0xff, 0xfe, 0x00]).toString("base64") };
+		expect(plainValue(bin, [])).toEqual(bin);
+		// runSteps: body and written rows of both apps come out alike
+		const port = await freePort();
+		const server = createServer((q, s) => s.end(JSON.stringify({ back: `http://localhost:${port}/a` }))).listen(port);
+		try {
+			let n = 0;
+			const dump = () => ({ sessions: n++ ? [{ url: { base64: Buffer.from(`http://localhost:${port}/a`).toString("base64") } }] : [] });
+			const [r] = await runSteps([{ ...step("p"), method: "POST" }], { side: "legacy", base: () => `http://localhost:${port}/`, dump });
+			expect(r).toMatchObject({ status: 200, body: { back: "http://(this app)/a" }, data: { sessions: { added: [{ url: "http://(this app)/a" }], removed: [] } } });
+		} finally {
+			server.close();
+		}
+	});
+
 	it("a slice end to end: steps written once, the old app run twice, the new app in a worktree of main, differences in the ledger", async () => {
 		const root = mkdtempSync(join(tmpdir(), "br-paritycheck-"));
 		const legacy = join(root, "legacy");
@@ -152,7 +195,12 @@ describe("comparing the old and the new app", () => {
 			];
 			writeFileSync(join(o.dir, "steps.json"), JSON.stringify({ steps }));
 		};
-		const r = await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer, log: () => {} });
+		// each app gets its test account before the steps are checked: the old app has one now, so steps must log in
+		const asked: string[][] = [];
+		const ensureLogins = async (sides: string[]) => (asked.push(sides), void saveApp(root, LEGACY, { login: { user: "t", password: "p", steps: [{ method: "GET", path: "/login" }] } }));
+		const r = await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer, log: () => {}, ensureLogins });
+		expect(asked).toEqual([["nestjs"]]);
+		expect(ledger.db.prepare("SELECT skipped FROM parity_runs WHERE id = ?").get(r.runId!)).toMatchObject({ skipped: 0 });
 		expect(r.outcome).toBe("differs");
 		expect(r.compared).toBe(3);
 		expect(r.diffs.map((d) => `${d.step} ${d.path}`).sort()).toEqual(["add status", "one body.total"]);
@@ -166,11 +214,14 @@ describe("comparing the old and the new app", () => {
 		expect(writes).toBe(1);
 		// an old app that only sends requests on to itself over https: nothing is compared, and it is marked for another probe
 		const hop: StepWriter = async (o) => {
-			const steps: Step[] = [{ id: "list", route: "GET /invoices", compare: "data", method: "GET", path: "/invoices", headers: { "x-force-https": "1" } }];
+			const steps: Step[] = [{ id: "in", route: "setup", compare: "none", method: "GET", path: "/login" }, { id: "list", route: "GET /invoices", compare: "data", method: "GET", path: "/invoices", headers: { "x-force-https": "1" } }];
 			writeFileSync(join(o.dir, "steps.json"), JSON.stringify({ steps, skipped: { "GET /invoices/{id}": "t", "POST /invoices": "t" } }));
 		};
 		const h = await checkSlice({ ledger, config, root, slice: "invoices", linkAll: () => {}, serverStack: "nestjs", writer: hop, rewrite: true, log: () => {} });
 		expect(h).toMatchObject({ outcome: "error", compared: 0, diffs: [] });
+		// the routes it skipped are recorded with the run
+		expect(h.note).toMatch(/1 of 3 route\(s\) skipped/);
+		expect(ledger.db.prepare("SELECT skipped FROM parity_runs WHERE id = ?").get(h.runId!)).toMatchObject({ skipped: 1 });
 		expect(loadApps(root)[LEGACY]!.selfRedirect).toBe("GET /invoices → 301 https://(this app)/invoices");
 		// a new app that does not start on main: said as such, so the run hands it to the builder as a main problem
 		const broken = { dir: ".", start: { cmd: process.execPath, args: ["-e", "console.error('no such mapping dir'); process.exit(1)"] }, ready: `http://localhost:${newPort}/invoices` };

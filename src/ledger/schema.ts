@@ -359,6 +359,7 @@ CREATE TABLE IF NOT EXISTS parity_runs (
   outcome TEXT NOT NULL,              -- same|differs|error
   steps INTEGER NOT NULL DEFAULT 0,
   compared INTEGER NOT NULL DEFAULT 0,
+  skipped INTEGER NOT NULL DEFAULT 0, -- slice routes with no compared step, only a reason they were skipped
   note TEXT,
   started_at TEXT NOT NULL, ended_at TEXT,
   commit_sha TEXT                     -- the target's main the new app ran from: compared again once main moves

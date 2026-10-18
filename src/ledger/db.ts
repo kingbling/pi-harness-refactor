@@ -72,6 +72,8 @@ export class Ledger {
 		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('decisions') WHERE name = 'state'").get())) this.db.exec("ALTER TABLE decisions ADD COLUMN state TEXT");
 		// ledgers from before parity_runs.commit_sha
 		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('parity_runs') WHERE name = 'commit_sha'").get())) this.db.exec("ALTER TABLE parity_runs ADD COLUMN commit_sha TEXT");
+		// ledgers from before parity_runs.skipped
+		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('parity_runs') WHERE name = 'skipped'").get())) this.db.exec("ALTER TABLE parity_runs ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0");
 		// ledgers from before the "setup" outcome: a comparison an app's start or data reset stopped (the plugin's own
 		// notes) is no error of the code and must not use up the slice's tries; once
 		if (!this.getMeta("parity_setup_outcome")) {

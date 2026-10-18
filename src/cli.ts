@@ -48,6 +48,9 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   br parity <slice> [--rewrite] [--no-judge]  send the same requests to the old app (twice) and the new app, compare the answers and the written data; a judge model re-opens the units that answer wrong and turns odd old behaviour into quirks for you (br run does this by itself when a slice is finished); --rewrite writes the requests anew
   br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, ported tests on main, the reviewer model on the code as it is now); failures go back to planned, code kept
   br status                    ledger dashboard
+  br finish                    is the new app really done? stub marks left, pages the app entry never feeds, frontend calls with no
+                               backend route, stacks not joined into one app, migrations on an empty database (report; br run
+                               does this when no unit is left to run and hands what it finds to code jobs)
   br lanes [n] [--gates m]     show/change parallel units and gate slots; a running run applies it live
   br push [on|off] [remote]    push the migration branch to the target repo's remote after merges
   br push replace              overwrite the remote's migration branch with this repo's (when push says it has another history)
@@ -279,6 +282,11 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 		const { config, root, ledger } = open();
 		await refuseDuringRun(root, "br parity"); // the run's own parity job uses the same worktree and ports
 		for (const l of await parityCommand({ ledger, config, root, client: makeClient(), args })) console.log(l);
+	},
+	finish: async () => {
+		const { finishCommand } = await import("./run/finish-cli.ts");
+		const { config, root, ledger } = open();
+		for (const l of await finishCommand({ ledger, config, root, log: (l) => console.log(l) })) console.log(l);
 	},
 	recheck: async (args) => {
 		const { recheckAccepted } = await import("./run/recheck.ts");

@@ -78,7 +78,32 @@ export interface AppState {
 	bootQuestion?: number;
 	/** Set once its setup checked whether the data reset keeps a full second copy of a large database (which is then dropped). */
 	resetSpaceChecked?: boolean;
+	/** The test account the comparison logs in with on this app, found or made by its setup model (set_test_login). */
+	login?: TestLogin;
+	/** How often its setup model was asked for a test account (at most MAX_LOGIN_TRIES until the owner says retry). */
+	loginTries?: number;
+	/** The owner question asked once those tries found no account: "retry" gives them back. */
+	loginQuestion?: number;
 	at?: string;
+}
+
+/** One request of a login, as a slice step sends it (without route and compare). */
+export interface LoginRequest {
+	method: string;
+	path: string;
+	headers?: Record<string, string>;
+	form?: Record<string, string>;
+	body?: unknown;
+	save?: Record<string, string>;
+}
+
+/** A test account: the requests that log it in, or `none` when the app has no login of its own. */
+export interface TestLogin {
+	user?: string;
+	password?: string;
+	steps?: LoginRequest[];
+	said?: string;
+	none?: string;
 }
 
 export const LEGACY = "legacy";
@@ -420,7 +445,57 @@ export function appBootTools(config: Config, root: string, side: string): ToolDe
 			return out(`saved: ${[r.start.cmd, ...r.start.args].join(" ")} in ${r.dir}, ready at ${r.ready}`);
 		},
 	};
-	return [check, set] as unknown as ToolDefinition[];
+	const LoginRequestParams = Type.Object({
+		method: Type.String(),
+		path: Type.String({ description: "starts with /" }),
+		headers: Type.Optional(Type.Record(Type.String(), Type.String())),
+		form: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "form fields, sent url-encoded" })),
+		body: Type.Optional(Type.Unknown({ description: "JSON body" })),
+		save: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "name → regex; group 1 of the first match in the answer is used as {{name}} in later requests (a CSRF token)" })),
+	});
+	const tryRequests = {
+		name: "try_requests",
+		label: "Try requests on the app",
+		description: "Start the app with its saved recipe, send these requests in order with one cookie jar (as a slice comparison does), show each answer (status, redirect, the start of the body), stop it. Use it to check a login: a page behind the login must answer as logged in after it.",
+		promptSnippet: "try_requests: start the app, send requests with one cookie jar, see the answers",
+		parameters: Type.Object({ requests: Type.Array(LoginRequestParams) }),
+		execute: async (_id: string, p: { requests: LoginRequest[] }) => {
+			const recipe = loadApps(root)[side]?.recipe;
+			if (!recipe) return out("refused: this app has no saved recipe yet (set_app_boot first)");
+			const bad = p.requests.find((r) => !r.method || !String(r.path ?? "").startsWith("/"));
+			if (bad) return out("refused: every request needs a method and a path starting with /");
+			const b = await bootApp(recipe, appRoot(config, root, side));
+			if (!b.ok) return out(`the app did not start: ${b.error}`);
+			try {
+				const { runSteps } = await import("./parity-check.ts");
+				const steps = p.requests.map((r, i) => ({ ...r, id: `r${i + 1}`, route: "setup", compare: "none" as const }));
+				const res = await runSteps(steps, { side: "legacy", base: () => recipe.ready });
+				return out(steps.map((s, i) => `${s.id} ${s.method} ${s.path} → ${res[i]!.error ? `ERROR ${res[i]!.error}` : `${res[i]!.status}${res[i]!.location ? ` → ${res[i]!.location}` : ""} ${String(typeof res[i]!.body === "string" ? res[i]!.body : JSON.stringify(res[i]!.body)).slice(0, 300)}`}`).join("\n"));
+			} finally {
+				await b.stop();
+			}
+		},
+	};
+	const setLogin = {
+		name: "set_test_login",
+		label: "Save the test account",
+		description: "Save the test account the comparison logs in with on this app: the user, its password and the requests that log it in (as tried with try_requests). Or, when this app has no login of its own, only `none` with why.",
+		promptSnippet: "set_test_login: save the test account and how it logs in",
+		parameters: Type.Object({
+			user: Type.Optional(Type.String()),
+			password: Type.Optional(Type.String()),
+			steps: Type.Optional(Type.Array(LoginRequestParams, { description: "the login requests, in order; {{name}} uses a value an earlier one saved" })),
+			said: Type.Optional(Type.String({ description: "where the account comes from and what it may see" })),
+			none: Type.Optional(Type.String({ description: "only when the app has no login of its own: why" })),
+		}),
+		execute: async (_id: string, p: TestLogin) => {
+			if (p.none) return saveApp(root, side, { login: { none: p.none } }), out("saved: this app has no login of its own");
+			if (!p.steps?.length || p.steps.some((r) => !r.method || !String(r.path ?? "").startsWith("/"))) return out("refused: give the login requests (each with a method and a path starting with /), or none with why");
+			saveApp(root, side, { login: { user: p.user, password: p.password, steps: p.steps, said: p.said } });
+			return out(`saved: the test account${p.user ? ` ${p.user}` : ""} (${p.steps.length} login request(s))`);
+		},
+	};
+	return [check, set, tryRequests, setLogin] as unknown as ToolDefinition[];
 }
 
 // ---- the probe -------------------------------------------------------------------------------------------
@@ -601,4 +676,90 @@ export async function askBootOwner(o: { root: string; side: string; error: strin
 /** The app whose start the owner was asked about and has not said "retry" yet: slice checks wait for that answer. */
 export function bootWaits(apps: Record<string, AppState>, answer: ProbeAnswer): string | undefined {
 	return Object.entries(apps).find(([, a]) => a.bootQuestion !== undefined && answer(a.bootQuestion) !== "retry")?.[0];
+}
+
+// ---- the test account ------------------------------------------------------------------------------------
+
+/** How often an app's setup model is asked for a test account before the owner is asked (once). */
+export const MAX_LOGIN_TRIES = 2;
+
+const appName = (side: string) => (side === LEGACY ? "the old app" : `the new ${side} app`);
+
+/** What the setup model is told when it should find or make a test account (a new app is told the old app's). */
+function loginProblem(config: Config, root: string, side: string): string {
+	const old = side === LEGACY ? undefined : loadApps(root)[LEGACY]?.login;
+	const a = loadApps(root)[side];
+	const where = side === LEGACY ? "the old app (it runs from the workspace copy; the legacy repo stays read-only)" : `the new ${side} app (${appRoot(config, root, side)})`;
+	return [
+		`The app already starts with the saved recipe${a?.recipe ? ` (ready at ${a.recipe.ready})` : ""}. Keep how it starts.`,
+		`Now give the comparison a test account on ${where}. The same requests go to the old and the new app; without a login, every route behind the login only shows the login redirect, so their real answers are never compared.`,
+		"Find one with your tools: a test or development user the project already has (fixtures, seeds, docs, env files, the data the app runs on here), or make one in this app's local data here (its own database copy, never the legacy repo and never data another project uses). Give it rights to see the app's pages. When the recipe has a data reset, the account must still be there after it (make it part of the reset).",
+		...(old?.steps ? [`The old app's test account: user ${old.user ?? "?"}, password ${old.password ?? "?"}, logged in with ${JSON.stringify(old.steps)}${old.said ? ` (${old.said})` : ""}. Use the same account in this app's data when you can, so one login works on both.`] : []),
+		"Check it with try_requests (it starts the app, sends the login and then a page behind it, stops it): that page must answer as logged in. Save it with set_test_login. When this app has no login of its own (it only serves files, say), save none with why.",
+	].join("\n");
+}
+
+/**
+ * Before a slice check: each app gets a test account from its setup model (MAX_LOGIN_TRIES at most), so the steps
+ * can log in. The old app first; a new app is told the old app's account, to use the same one. Tries used up with no
+ * account: the owner is asked once (a person may know or make one), "retry" gives the tries back. `sides`: the new
+ * apps the check sends requests to; they run in the parity worktree, prepared here when one is asked.
+ */
+export async function ensureTestLogins(o: { config: Config; root: string; sides: string[]; linkAll: (wt: string) => void | Promise<void>; fixer?: AppFixer; log?: (l: string) => void; ask?: ProbeAsker; answer?: ProbeAnswer }): Promise<void> {
+	const log = o.log ?? ((l: string) => console.log(l));
+	const due = (side: string) => {
+		const a = loadApps(o.root)[side];
+		if (!a?.up || !a.recipe || a.login) return false;
+		if (a.loginQuestion !== undefined && o.answer?.(a.loginQuestion) === "retry") saveApp(o.root, side, { loginTries: 0, loginQuestion: undefined });
+		return (loadApps(o.root)[side]!.loginTries ?? 0) < MAX_LOGIN_TRIES;
+	};
+	const ask = async (side: string) => {
+		const a = loadApps(o.root)[side];
+		if (!a?.up || a.login || a.loginQuestion !== undefined || (a.loginTries ?? 0) < MAX_LOGIN_TRIES) return;
+		const qid = await o
+			.ask?.({
+				facts: `To compare the old and the new app behind the login, the comparison needs a test account on ${appName(side)}. Its setup model looked ${MAX_LOGIN_TRIES} times and found or made none. Until there is one, routes behind the login are compared logged out only (both apps sending to the login page). The migration goes on.`,
+				options: [
+					{ value: "retry", facts: "I made a test account or wrote where one is (docs, env, fixtures): look again" },
+					{ value: "skip", facts: "compare logged out only" },
+				],
+				recommended: "retry",
+			})
+			.catch(() => undefined);
+		if (qid !== undefined) saveApp(o.root, side, { loginQuestion: qid });
+	};
+	const one = async (side: string) => {
+		if (!due(side)) return ask(side);
+		setStep(`parity: a test account for ${appName(side)}`);
+		const said = await (o.fixer ?? findAppBootWithModel)({ config: o.config, root: o.root, side, appDir: appRoot(o.config, o.root, side), problem: loginProblem(o.config, o.root, side) }).catch((e) => `setup model failed: ${e?.message ?? e}`);
+		const a = saveApp(o.root, side, { loginTries: (loadApps(o.root)[side]?.loginTries ?? 0) + 1 });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${side} → test account: ${a.login ? (a.login.none ? `none needed (${a.login.none})` : `saved${a.login.user ? ` (${a.login.user})` : ""}`) : `none found: ${String(said ?? "").replace(/\s+/g, " ").slice(0, 300)}`}\n`);
+		log(a.login ? pc.green(`parity: ${appName(side)} has a test account now`) : pc.yellow(`parity: no test account found for ${appName(side)} — routes behind the login are compared logged out`));
+		await ask(side);
+	};
+	await one(LEGACY);
+	// the new apps follow a known old account: without one there is nothing to log in with on both
+	if (!loadApps(o.root)[LEGACY]?.login?.steps) return;
+	const sides = o.sides.filter((s) => s !== LEGACY && due(s));
+	for (const s of o.sides.filter((x) => x !== LEGACY && !sides.includes(x))) await ask(s);
+	if (!sides.length) return;
+	const wt = await prepareTargetCopy(o.config, o.root, o.linkAll);
+	try {
+		for (const s of sides) await one(s);
+	} finally {
+		await removeWorktree(o.config.target.path, wt);
+	}
+}
+
+/** What the step writer is told about the test accounts. `login`: the old app has one, so the steps must log in. */
+export function loginFacts(root: string, stacks: string[]): { text: string; login: boolean } {
+	const apps = loadApps(root);
+	if (!apps[LEGACY]?.login?.steps) return { text: "No test account is known yet: routes behind a login can only be compared logged out (their redirect to the login page).", login: false };
+	const of = (side: string) => {
+		const l = apps[side]?.login;
+		if (!l) return `${appName(side)}: no account of its own known (try the old app's)`;
+		if (l.none) return `${appName(side)}: no login of its own (${l.none})`;
+		return `${appName(side)}: user ${l.user ?? "?"}, password ${l.password ?? "?"}; it logs in with ${JSON.stringify(l.steps)}${l.said ? ` (${l.said})` : ""}`;
+	};
+	return { text: `Test accounts (each app's setup found or made them in the data the apps run on here):\n${[LEGACY, ...stacks].map((s) => `- ${of(s)}`).join("\n")}`, login: true };
 }

@@ -41,6 +41,7 @@ import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
 import { createStubSweep } from "./stub-sweep.ts";
+import { finishCheck, finishDue, lastFinish, renderFinishLine } from "./finish-check.ts";
 import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
 import { routeOwners } from "./parity-check.ts";
@@ -427,6 +428,35 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					if (said) noteFix(o.root, stackId, merged, `stub sweep code job: ${said}`);
 				},
 			});
+	// when no unit is left to run: the finish check looks at the app as a whole (stubs left, pages the entry never feeds,
+	// calls no backend route serves, stacks not joined) and hands what it finds to code jobs. Once per main commit, at
+	// most a few times a run: a job that merged changes main, and the next pass looks at the new main
+	let finishPasses = 0;
+	const finishOn = !(o.setupFixer === false || (!o.setupFixer && o.spawn) || o.dry) && o.limit === undefined && !o.units?.length && !o.slice;
+	const runFinish = async (): Promise<boolean> => {
+		if (!finishOn || !finishDue(ledger, await headOf(config.target.path), finishPasses)) return false;
+		finishPasses++;
+		const r = await finishCheck({
+			ledger,
+			config,
+			root: o.root,
+			adapters,
+			linkAll,
+			log,
+			sweep: (stackId) => stubSweep?.afterMerge(stackId),
+			codeJob: async (stackId, what) => {
+				let merged: string | undefined;
+				let locked: { files: string[]; diff: string } | undefined;
+				const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `finish-${stackId}-${Date.now()}`, linkAll, log, what, onLocked: (l) => (locked = l), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+				if (said) noteFix(o.root, stackId, merged, `finish check code job: ${said}`);
+				// a dev server proxy or a test config change: files that decide how the checks run, the setup model's to judge
+				if (locked) await lockedToSetup(adapters.get(stackId)!, stackId, "the finish check", locked);
+				return !!merged;
+			},
+			ask: async (facts, sameAs) => (ledger.openQuestionFor("finish_check", sameAs) ?? (await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "finish_check", facts, options: [{ value: "done", facts: "I settled it; check the app again" }, { value: "leave", facts: "leave it as it is" }], recommended: "done", blocks: "none", askedBy: "orchestrator", sameAs })).id),
+		}).catch((e) => (log(pc.yellow(`finish check failed: ${e?.message ?? e}`)), undefined));
+		return !!r?.merged;
+	};
 	// parity: can the old app and the new app each start here as a local server? decided once per workspace, on the
 	// side (lanes never wait); a side that does not start asks the owner once, blocking nothing
 	const probeAsk: { ask: ProbeAsker; answer: ProbeAnswer } = {
@@ -470,7 +500,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			// an app that does not start here (its data reset, start or no answer) goes to its setup model first, then the check goes on
 			const fix = setupFixer({ config, root: o.root, log, answer: probeAsk.answer });
 			const fixSetup = (side: string, error: string) => (showParity(`setting up ${side === "legacy" ? "the old app" : `the new ${side} app`} again: it did not start`), fix(side, error));
-			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, log, fixSetup });
+			// each app gets a test account from its setup first, so the steps compare the routes behind the login logged in
+			const { ensureTestLogins } = await import("./parity.ts");
+			const ensureLogins = (sides: string[]) => (showParity("finding a test account for the old and the new app"), ensureTestLogins({ config, root: o.root, sides, linkAll, log, ...probeAsk }));
+			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, log, fixSetup, ensureLogins });
 			// its setup ran out of fixes: a person must look, asked once
 			if (r.setup) await askBootOwner({ root: o.root, side: r.setup.side, error: r.note, ask: probeAsk.ask });
 			// the new app does not start on main: a red main the builder fixes, not only a parity error. A stack with no
@@ -1266,6 +1299,11 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					await new Promise((r) => setTimeout(r, 3000));
 					continue;
 				}
+				// nothing left to run: is the app really done? A code job it merged may let units run again
+				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("finish check: is the app really done", runFinish))) {
+					lastResubmitCheck = 0;
+					continue;
+				}
 				break;
 			}
 			passError = ""; // a pass that got through ends the streak of a repeating error
@@ -1321,6 +1359,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	cost = Math.max(cost, progress.tally().costUsd - usageAtStart.costUsd);
 	log(`\nrun ${stopRecord ? "stopped" : "finished"}: ${acceptedNow} accepted, ${quarantined} quarantined, ${waiting} still planned${ledger.ownDecisions(startedAt).length ? `, ${ledger.ownDecisions(startedAt).length} routine question(s) decided from your goals` : ""}${ledger.openQuestions().length ? `, ${ledger.openQuestions().length} question(s) open → br questions` : ""}, $${cost.toFixed(3)}`);
 	if (!o.dry) log(pc.dim(renderForecastLine(forecast(ledger))));
+	// finished is not verified: what the last finish check left open and what is not proven yet
+	if (!o.dry && lastFinish(ledger)) log(pc.dim(renderFinishLine(lastFinish(ledger)!)));
 	if (!o.dry) ledger.setMeta(OPEN_RUN, "");
 	if (!o.dry) writeRunRecord(ledger, o.root, { startedAt, endedAt: new Date().toISOString(), outcome: stopRecord ? "stopped" : "finished", stop: stopRecord ? { ...stopRecord, lanes } : undefined, accepted: acceptedNow, quarantined, planned: waiting, openQuestions: ledger.openQuestions().length, costUsd: Number(cost.toFixed(4)), units: ran.map((r) => ({ unit: r.unitId, state: r.state })) });
 	return { ran, accepted: acceptedNow, quarantined, waiting, costUsd: cost };

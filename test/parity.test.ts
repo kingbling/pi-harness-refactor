@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { appBootTools, askBootOwner, bootApp, bootWaits, clipError, dumpData, LEGACY, loadApps, MAX_DUMP_MB, MAX_FIXUPS, probeApp, saveApp, setupFixer, type AppFixer } from "../src/run/parity.ts";
+import { appBootTools, askBootOwner, bootApp, bootWaits, clipError, dumpData, ensureTestLogins, LEGACY, loadApps, loginFacts, MAX_DUMP_MB, MAX_FIXUPS, MAX_LOGIN_TRIES, probeApp, saveApp, setupFixer, type AppFixer } from "../src/run/parity.ts";
 
 /**
  * Differential parity starts with: can each app run here as a local server? The setup model saves a recipe;
@@ -340,4 +340,52 @@ describe("starting the apps for parity", () => {
 		expect(loadApps(root)[LEGACY]).toMatchObject({ bootProbes: 1 });
 		expect(loadApps(root)[LEGACY]!.bootQuestion).toBeUndefined();
 	});
+	it("each app gets a test account from its setup (a new app is told the old one's); with none after a few tries the owner is asked once, retry looks again", async () => {
+		const { root, legacy, config: base } = workspace();
+		writeFileSync(join(legacy, "login.js"), "require('http').createServer((q, s) => q.method === 'POST' && q.url === '/login' ? s.writeHead(302, { 'set-cookie': 'sid=1; Path=/', location: '/home' }).end() : q.url === '/home' ? (q.headers.cookie === 'sid=1' ? s.end('welcome') : s.writeHead(302, { location: '/login' }).end()) : s.end('login form')).listen(Number(process.argv[2]));\n");
+		const target = join(root, "new");
+		mkdirSync(target, { recursive: true });
+		await ensureRepo(target);
+		await commitAll(target, "scaffold", { allowEmpty: true });
+		const config = ConfigSchema.parse({ ...base, target: { path: target, stacks: ["nestjs"] } });
+		const [port, newPort] = [await freePort(), await freePort()];
+		const first: AppFixer = async (o) => (await call(legacyCopyTool(o.root, o.config), { why: "copy" }), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), args: ["login.js", String(port)] }), "node serves it");
+		expect(await probeApp({ config, root, side: LEGACY, fixer: first, log: () => {} })).toBe(true);
+		saveApp(root, "nestjs", { up: true, recipe: asRecipe(serverRecipe(newPort)) });
+		expect(loginFacts(root, ["nestjs"])).toMatchObject({ login: false, text: expect.stringMatching(/No test account is known yet/) });
+		// no account found: tried MAX_LOGIN_TRIES times, then the owner is asked once; the new app waits for the old one's
+		const problems: Array<{ side: string; problem: string }> = [];
+		const none: AppFixer = async (o) => (problems.push(o), "no user table found");
+		const asked: string[] = [];
+		let answer: string | undefined;
+		const opts = { config, root, sides: ["nestjs"], linkAll: () => {}, log: () => {}, ask: async (q: { facts: string }) => (asked.push(q.facts), 9), answer: () => answer };
+		for (let i = 0; i < MAX_LOGIN_TRIES + 1; i++) await ensureTestLogins({ ...opts, fixer: none });
+		expect(problems.map((p) => p.side)).toEqual(Array(MAX_LOGIN_TRIES).fill(LEGACY));
+		expect(problems[0]!.problem).toMatch(/test account on the old app[\s\S]*try_requests[\s\S]*set_test_login/);
+		expect(asked).toHaveLength(1);
+		expect(asked[0]).toMatch(/needs a test account on the old app/);
+		// the owner's retry: the setup model looks again, tries the login, saves it; the new app is told the old account
+		answer = "retry";
+		const found: AppFixer = async (o) => {
+			problems.push(o);
+			const tools = appBootTools(o.config, o.root, o.side);
+			if (o.side !== LEGACY) return void (await call(tool(tools, "set_test_login"), { none: "serves files only" }));
+			const login = [{ method: "POST", path: "/login", form: { user: "parity", password: "pw" } }];
+			expect((await call(tool(tools, "try_requests"), { requests: [...login, { method: "GET", path: "/home" }] })).content[0]!.text).toMatch(/r1 POST \/login → 302 → \/home[\s\S]*r2 GET \/home → 200 welcome/);
+			expect((await call(tool(tools, "set_test_login"), { user: "parity" })).content[0]!.text).toMatch(/^refused/);
+			await call(tool(tools, "set_test_login"), { user: "parity", password: "pw", steps: login, said: "made in the copy's user table" });
+		};
+		await ensureTestLogins({ ...opts, fixer: found });
+		expect(loadApps(root)[LEGACY]).toMatchObject({ login: { user: "parity", password: "pw" }, loginTries: 1 });
+		expect(loadApps(root)[LEGACY]!.loginQuestion).toBeUndefined();
+		expect(problems.at(-1)).toMatchObject({ side: "nestjs", problem: expect.stringMatching(/old app's test account: user parity, password pw/) });
+		expect(loadApps(root)["nestjs"]!.login).toEqual({ none: "serves files only" });
+		const facts = loginFacts(root, ["nestjs"]);
+		expect(facts.login).toBe(true);
+		expect(facts.text).toMatch(/the old app: user parity, password pw; it logs in with .*\/login[\s\S]*the new nestjs app: no login of its own/);
+		// known: no more sessions
+		const n = problems.length;
+		await ensureTestLogins({ ...opts, fixer: found });
+		expect(problems).toHaveLength(n);
+	}, 30_000);
 });

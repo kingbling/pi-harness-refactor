@@ -178,6 +178,13 @@ export async function judgeRun(o: {
 		} else if (before) set.run("quirk", before.unit_id, before.quirk_id, "waiting for the owner's keep/drop", d.id), quirks++;
 	}
 
+	// the same difference (same step, place and values) an earlier judge put down to the test setup is setup again:
+	// the judge is not asked again, and that app's setup is not sent the same problem twice
+	for (const d of rows()) {
+		const before = db.prepare("SELECT note FROM parity_diffs WHERE slice = ? AND step = ? AND path = ? AND legacy IS ? AND target IS ? AND status = 'setup' AND run_id != ? ORDER BY id DESC LIMIT 1").get(o.slice, d.step, d.path, d.legacy, d.target, o.runId) as { note: string | null } | undefined;
+		if (before) set.run("setup", null, null, before.note, d.id), setup++;
+	}
+
 	// a shared cause takes the group unless its jobs did not fix it: then its units are re-opened as before
 	const sharedIds = new Set<string>();
 	let sharedBugs = 0;
@@ -272,6 +279,9 @@ export async function judgeRun(o: {
 	}
 	const bugCount = [...bugs.values()].reduce((a, b) => a + b.length, 0) + sharedBugs;
 	const stillOpen = (db.prepare("SELECT COUNT(*) AS n FROM parity_diffs WHERE run_id = ? AND status = 'open'").get(o.runId) as { n: number }).n;
+	// every difference comes only from how the apps run here: the code answers like the old app
+	const onlySetup = db.prepare("SELECT COUNT(*) AS n, SUM(status = 'setup') AS s FROM parity_diffs WHERE run_id = ?").get(o.runId) as { n: number; s: number | null };
+	if (onlySetup.n && onlySetup.s === onlySetup.n) db.prepare("UPDATE parity_runs SET outcome = 'same', note = COALESCE(note, '') || ? WHERE id = ? AND outcome = 'differs'").run(`; the ${onlySetup.n} difference(s) left come only from the test setup`, o.runId);
 	log(pc.cyan(`parity ${o.slice}: ${bugCount} bug(s)${reopened.length ? ` → re-opened ${reopened.join(", ")}` : ""}${sharedIds.size ? ` → shared cause ${[...sharedIds].join(", ")} (one code job)` : ""}, ${quirks} quirk(s) for the owner, ${allowed} allowed${setup ? `, ${setup} from the test setup` : ""}${stillOpen ? `, ${stillOpen} not judged` : ""}`));
 	return { reopened, bugs: bugCount, quirks, setup, allowed, open: stillOpen, shared: [...sharedIds] };
 }

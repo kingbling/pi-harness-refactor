@@ -1,5 +1,6 @@
 import { forecast, renderForecastLine } from "../run/forecast.ts";
 import { buildParkedKey } from "../run/builder.ts";
+import { lastFinish, notProven, renderFinishLine } from "../run/finish-check.ts";
 import { renderLastRun, type RunRecord } from "../run/run.ts";
 import pc from "picocolors";
 import type { Ledger } from "../ledger/db.ts";
@@ -51,7 +52,9 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 	}
 	{
 		// parity: the last comparison of each slice with the old app, and what its differences became
-		const last = ledger.db.prepare("SELECT id, slice, outcome FROM parity_runs WHERE id IN (SELECT MAX(id) FROM parity_runs GROUP BY slice)").all() as Array<{ id: number; slice: string; outcome: string }>;
+		const last = ledger.db.prepare("SELECT id, slice, outcome, skipped FROM parity_runs WHERE id IN (SELECT MAX(id) FROM parity_runs GROUP BY slice)").all() as Array<{ id: number; slice: string; outcome: string; skipped: number }>;
+		// routes a slice's steps skip are not compared, whatever its outcome says
+		const skipped = last.reduce((n, r) => n + (r.skipped ?? 0), 0);
 		if (last.length) {
 			const by = (o: string) => last.filter((r) => r.outcome === o).length;
 			const ids = last.map((r) => r.id);
@@ -60,10 +63,17 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 			// "setup": an app did not start here, nothing was compared either
 			const errors = last.filter((r) => r.outcome === "error" || r.outcome === "setup").map((r) => r.slice);
 			lines.push(
-				`parity  slices ${c.green(`same ${by("same")}`)}  ${by("differs") ? c.yellow(`differ ${by("differs")}`) : "differ 0"}  ${errors.length ? c.red(`not compared ${errors.length}`) : "not compared 0"}   differences: bugs ${n("bug")}  quirks ${n("quirk")}  allowed ${n("allowed")}  not judged ${n("open")}` +
+				`parity  slices ${c.green(`same ${by("same")}`)}  ${by("differs") ? c.yellow(`differ ${by("differs")}`) : "differ 0"}  ${errors.length ? c.red(`not compared ${errors.length}`) : "not compared 0"}${skipped ? c.yellow(`  routes skipped ${skipped}`) : ""}   differences: bugs ${n("bug")}  quirks ${n("quirk")}  allowed ${n("allowed")}  not judged ${n("open")}` +
 					c.dim(errors.length ? `  (not compared: ${errors.slice(0, 3).join(", ")}${errors.length > 3 ? " …" : ""} → br parity <slice>)` : "  (br parity <slice>)"),
 			);
 		}
+	}
+	{
+		// "accepted" is not "verified": slices never compared with the old app, and the last finish check of the whole app
+		const f = lastFinish(ledger);
+		const never = notProven(ledger).neverCompared;
+		if (f) lines.push(c.dim(`${renderFinishLine(f)}  (br finish)`));
+		else if (never.length && (u["accepted"] ?? 0)) lines.push(c.yellow(`parity  ${never.length} slice${never.length > 1 ? "s" : ""} never compared with the old app (${never.slice(0, 4).join(", ")}${never.length > 4 ? " …" : ""})`));
 	}
 	const accepted = u["accepted"] ?? 0;
 	lines.push(`first-pass accepted ${s.firstPassAccepted}/${accepted}${accepted ? ` (${Math.round((100 * s.firstPassAccepted) / accepted)}%)` : ""}   cost $${s.costUsd.toFixed(3)}`);
