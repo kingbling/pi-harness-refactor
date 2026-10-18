@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { getTargetAdapter } from "../src/adapters/registry.ts";
 import { ConfigSchema } from "../src/config.ts";
+import { FOR_TESTER } from "../src/jev/ask.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { truthBrokenKey } from "../src/run/legacy-env.ts";
@@ -130,6 +131,51 @@ describe("a requeue keeps the truth", () => {
 			expect(existsSync(join(ws, ".bigrefactor", "truth", id, "ported"))).toBe(false);
 			expect(existsSync(join(ws, ".bigrefactor", "truth", id, "cases.json"))).toBe(true);
 		}
+		ledger.close();
+	});
+});
+
+describe("a requeue with a hint for the tester", () => {
+	it("runs the tester first (once) although the truth was kept; a stray saved file outside the test paths is dropped, not put back", async () => {
+		const ws = join(here, ".sim", "requeue-tester-hint");
+		rmSync(ws, { recursive: true, force: true });
+		write(join(ws, "legacy", "app", "agency", "create.cmd.php"), "<?php\n");
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		write(join(ws, "migrated", "package.json"), "{}");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: { files: ["app/agency/create.cmd.php"], place: { stack: "nestjs", area: "agency", shared: false, source: "code" } }, symbolIds: [] });
+		const truthDir = join(ws, ".bigrefactor", "truth", "u1");
+		write(join(truthDir, "interface.md"), "src/features/agency/agency.service.ts exports AgencyService\n");
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
+		// the saved tests: the unit's own, and a file a tester wrote straight into the saved folder at the project root
+		write(join(truthDir, "ported", SPEC), "it('u1#1 creates an agency', () => {});\n");
+		write(join(truthDir, "ported", "agency.spec.ts"), "it.skip('u1#1', () => {});\n");
+		ledger.transitionUnit("u1", "truth", "t");
+		ledger.transitionUnit("u1", "planned", "resubmitted");
+		const fresh = join(ws, "worktrees", "u1");
+		write(join(fresh, "package.json"), "{}");
+		const seen: Array<{ role: string; prompt: string; protectedGlobs: string[] }> = [];
+		const spawn = (async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async (prompt: string) => (seen.push({ role: opts.role, prompt, protectedGlobs: opts.protectedGlobs ?? [] }), { text: opts.role === "test" ? "TESTER DONE" : "IMPLEMENTER DONE", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }),
+				dispose() {},
+			}) as unknown as LeafSession) as never;
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: true, steps: [], changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		const retryNote = `A model's hint (not the owner's): ${FOR_TESTER}case u1#1 expects 2, not 1 (the legacy code adds one).`;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", workDir: fresh, reuseTruth: true, retryNote, spawn, gate, legacyFixer: false, log: () => {} });
+		expect(seen.map((s) => s.role)).toEqual(["test", "implement"]);
+		expect(seen[0]!.prompt).toMatch(/saved tests or truth cases are wrong[\s\S]*expects 2, not 1/);
+		// the tester never writes into the saved folder itself
+		expect(seen[0]!.protectedGlobs).toContain(".bigrefactor/truth/u1/ported/**");
+		expect(existsSync(join(fresh, SPEC))).toBe(true);
+		expect(existsSync(join(fresh, "agency.spec.ts"))).toBe(false);
+		expect(existsSync(join(truthDir, "ported", "agency.spec.ts"))).toBe(false);
+		// a second round of the same run (a merge conflict) does not pay for the tester again
+		seen.length = 0;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", workDir: fresh, reuseTruth: true, retryNote, spawn, gate, legacyFixer: false, log: () => {} });
+		expect(seen.map((s) => s.role)).not.toContain("test");
 		ledger.close();
 	});
 });

@@ -459,6 +459,12 @@ export function answerValue(answer: string | null | undefined): string {
 export const HINT = "\nhint: ";
 
 /**
+ * A hint that starts with this is for the tester (a saved test or truth case is wrong). It rides in the unit's note,
+ * so a unit whose truth was kept (the tester skipped) runs the tester with it first. The owner may type it too.
+ */
+export const FOR_TESTER = "For the tester: ";
+
+/**
  * Open questions grouped so one answer can serve several: identical questions, or model-phrased ones that ask
  * the same decision (same point, same option values, same recommendation) with per-unit wording. Groups keep
  * ledger order; a group whose texts differ is shown with every member so the owner can still go one by one.

@@ -49,6 +49,11 @@ export async function triageGate(d: TriageDeps, unitId: string, gate: GateReport
 		// once). Not when the problem is the implementer's own to fix: having written nothing is answered by another
 		// attempt that is told so, never by the owner.
 		const prevFailed = previous?.steps.find((s) => !s.ok);
+		// only skipped or .only tests in the ported tests: the implementer may not edit tests, so another attempt cannot
+		// pass. The tester fixes them (once; a retest that did not help goes on below)
+		const skipped = failed.output.split("\n").every((l) => l.startsWith("skipped/only test in "));
+		if (skipped && attemptNo < maxTotal && !(lastRetest && (sameFinding(gate, previous) || !lastRetest.progress)))
+			return deterministic(d, unitId, "test_bug", "retest", "skipped or .only tests in the ported tests: the implementer may not edit them, the tester fixes them");
 		const own = failed.output.split("\n").every((l) => l.trim() === NOTHING_WRITTEN || l.endsWith(STUB_LEFT));
 		if (!own && prevFailed?.name === "antigaming_ok" && prevFailed.output === failed.output) return deterministic(d, unitId, "env", "ask_human", "identical anti-gaming failure twice → not the model's fault");
 		if (own) return deterministic(d, unitId, "scope", attemptNo < maxTotal ? "retry" : "quarantine", `${failed.output.includes(STUB_LEFT) ? "stubs left for this unit" : NOTHING_WRITTEN}: the implementer is told and tries again`);

@@ -15,11 +15,11 @@ import { projectDir } from "../init/init.ts";
 import { addedSyntaxErrors } from "../inventory/treesitter.ts";
 import { describeCapabilities } from "../inventory/capabilities.ts";
 import { indexTarget } from "../inventory/target.ts";
-import { askViaModel } from "../jev/ask.ts";
+import { askViaModel, FOR_TESTER } from "../jev/ask.ts";
 import { sameQuestion } from "../jev/same.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
+import { globToRegExp, spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, missingTestImports, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
 import { changedFiles, errorSignature, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
@@ -310,7 +310,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			globRoot: o.root,
 			config: o.config,
 			writeGlobs: testerWriteGlobs,
-			protectedGlobs: testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [],
+			// the saved tests (ported/) are code's copy of the project's tests: a file written there comes back on every run
+			protectedGlobs: [`${truthDirRel}/ported/**`, ...(testsOnly ? truthFiles.map((f) => `${truthDirRel}/${f}`) : [])],
 			systemPrompt: testerSystemPrompt(o.config, { ...placeOpts, unitId: o.unitId, truthMode, tryScript: envMode === "read", truthRun: describeTruthRun(o.root, o.config, sourceAdapter, join(truthDirAbs, sourceAdapter.truth.scriptName)), truthDir: truthDirAbs, targetProjectDir, workDir: o.root, writeGlobs: testerWriteGlobs.map(absGlob), testWriteGlobs: testerTestGlobs.map(absGlob), rules, source: sourceAdapter, target: adapter, projectNotes: adapter.projectNotes?.(targetProjectDir) ?? [] }),
 			customTools: [
 				...testerTools({ ...deps, attemptId: attempt, truthDir: truthDirAbs, currentTruth, checkLayout, sanctioned, codeWritten: more.codeWritten, slot: gateSlot, onDispute: (dsp) => {
@@ -467,13 +468,19 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// a case already recorded keeps its id and its link to its test; a new one gets the next free number
 		const ids = caseIds(o.unitId, old, cases);
 		// read truth whose expected value a retest changed once the code existed: nobody but the tester checked it, so the
-		// reviewer confirms it against the legacy code (new cases stay allowed)
+		// reviewer confirms it against the legacy code (new cases stay allowed). Once accepted, the unit is first in line for
+		// a script that runs it on the old code (inLine), tried again even if one was tried in this environment before
 		if (codeWritten && mode === "read") {
 			const was = new Map(old.map((c) => [c.id, c]));
+			let bent = false;
 			cases.forEach((c, i) => {
 				const before = was.get(ids[i]!);
-				if (before && before.verified_on_old === 0 && before.expected !== JSON.stringify(c.expected)) o.ledger.addEvidence(o.unitId, "truth_changed_after_code", { case: ids[i], symbol: c.symbol, inputs: before.inputs.slice(0, 300), old: before.expected.slice(0, 500), new: JSON.stringify(c.expected).slice(0, 500), why: lastTesterText.slice(-600) });
+				if (before && before.verified_on_old === 0 && before.expected !== JSON.stringify(c.expected)) {
+					o.ledger.addEvidence(o.unitId, "truth_changed_after_code", { case: ids[i], symbol: c.symbol, inputs: before.inputs.slice(0, 300), old: before.expected.slice(0, 500), new: JSON.stringify(c.expected).slice(0, 500), why: lastTesterText.slice(-600) });
+					bent = true;
+				}
 			});
+			if (bent) o.ledger.updateUnit(o.unitId, { meta: { truthScriptEnv: undefined, truthUpgradeEnv: undefined } });
 		}
 		const linked = new Map(old.map((c) => [c.id, c.ported_test_path]));
 		o.ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(o.unitId);
@@ -654,7 +661,13 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	if (hasTruth && existsSync(portedDir)) {
 		// truth was captured ahead: put its ported tests into this worktree (never over newer files)
 		const walk = (d: string): string[] => readdirSync(d).flatMap((n) => (statSync(join(d, n)).isDirectory() ? walk(join(d, n)) : [join(d, n)]));
-		const saved = walk(portedDir).map((abs) => relative(portedDir, abs));
+		const all = walk(portedDir).map((abs) => relative(portedDir, abs));
+		// only test files where the stack keeps the area's tests (what savePorted saves): another file there was written
+		// by hand (a tester with an absolute path) and would fail the scope check on every run, so it is dropped
+		const saved = keptTests(all, adapter.layout.testFileGlobs(moduleDir), (f) => adapter.layout.isTestFile(f));
+		const stray = all.filter((f) => !saved.includes(f));
+		for (const f of stray) rmSync(join(portedDir, f), { force: true });
+		if (stray.length) log(pc.yellow(`  ${stray.length} saved file(s) outside the area's test paths dropped: ${stray.slice(0, 5).join(", ")}`));
 		// a path main ever had is not this unit's unmerged test: another unit's, or one tidy moved or removed since
 		const onMainOnce = await everOnMain(targetProjectDir, saved);
 		for (const f of saved) {
@@ -680,6 +693,14 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	if (o.testsNote) {
 		log(pc.dim("  the merge was refused for errors in the ported tests: the tester fixes them first"));
 		await runTruth(o.testsNote, true);
+	}
+	// the note has a hint for the tester (a saved test or truth case is wrong, says the resolver or the owner): a unit
+	// whose truth was kept skipped the tester, and the implementer may not edit tests, so the tester runs with it first
+	// Once per requeue: a tester session since the unit last went back to planned already had the note (a merge round)
+	const testerSinceRequeue = () => !!o.ledger.db.prepare("SELECT 1 FROM attempts WHERE unit_id = ? AND role = 'test' AND started_at > COALESCE((SELECT MAX(created_at) FROM transitions WHERE entity = 'unit' AND entity_id = ? AND to_state = 'planned'), '')").get(o.unitId, o.unitId);
+	if (hasTruth && o.retryNote?.includes(FOR_TESTER) && !testerSinceRequeue()) {
+		log(pc.dim("  the note has a hint for the tester: the tester fixes the saved tests and truth first"));
+		await runTruth(`The note from the orchestrator below says this unit's saved tests or truth cases are wrong (the part "${FOR_TESTER.trim()}"). Check it against the legacy code and fix the tests and truth cases it names; keep what the legacy code shows is right.`);
 	}
 	let testFiles = loadTests();
 	if (!testFiles.length) log(pc.yellow("  no ported test files found — the gate cannot prove behaviour"));
@@ -813,6 +834,27 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let regateOnly = false;
 	// the tester re-ported: triage never sends a retest that did not help to the tester again
 	let lastRetest: LastRetest | undefined;
+	// truth run on the old code (verified_on_old) is what the old code really returned: no dispute or weak-tests retest
+	// bends a test away from it (a model's argument is no run). Its text values as the linked test files hold them now
+	const verifiedInTests = () => {
+		const rows = o.ledger.db.prepare("SELECT id, expected, ported_test_path AS path FROM truth_cases WHERE unit_id = ? AND verified_on_old = 1 AND ported_test_path IS NOT NULL").all(o.unitId) as Array<{ id: string; expected: string; path: string }>;
+		const read = (f: string) => (existsSync(join(targetProjectDir, f)) ? readFileSync(join(targetProjectDir, f), "utf8") : undefined);
+		return rows.flatMap((r) => {
+			const text = read(r.path);
+			return text !== undefined && textValueIn(r.expected, text) ? [{ ...r, text }] : [];
+		});
+	};
+	// after the retest: a test file that lost such a value while the case still holds it goes back as it was; its names
+	const keepVerifiedInTests = (was: ReturnType<typeof verifiedInTests>): string[] => {
+		const still = o.ledger.db.prepare("SELECT 1 FROM truth_cases WHERE id = ? AND expected = ? AND verified_on_old = 1");
+		const back = new Map<string, string>();
+		for (const c of was) {
+			const now = existsSync(join(targetProjectDir, c.path)) ? readFileSync(join(targetProjectDir, c.path), "utf8") : "";
+			if (still.get(c.id, c.expected) && !textValueIn(c.expected, now)) back.set(c.path, c.text);
+		}
+		for (const [f, text] of back) writeFileSync(join(targetProjectDir, f), text);
+		return [...back.keys()];
+	};
 	// every retest runs from the implement loop: the code is in place, so check_ported_tests runs the tests against it
 	const retest = async (extra: string, more?: { codeWritten?: boolean; disputeText?: string; stronger?: boolean }) => {
 		// the run is stopping: no tester round, the loop hands the lane back
@@ -821,7 +863,12 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (o.stopped?.()) return;
 		const files = () => JSON.stringify([loadTests(), readTruthFiles(), loadIface()]);
 		const before = files();
-		if (await runTruth(extra, false, { codeWritten: true, ...more })) testFiles = loadTests();
+		const verified = verifiedInTests();
+		const ok = await runTruth(extra, false, { codeWritten: true, ...more });
+		// a value the old code returned when run stands: a test that held it and lost it in this retest is put back
+		const bent = keepVerifiedInTests(verified);
+		if (bent.length) log(pc.yellow(`  the tester changed tests away from values run on the old code; put back: ${bent.join(", ")}`));
+		if (ok || bent.length) testFiles = loadTests();
 		// no test, truth file or interface.md changed: no progress
 		lastRetest = { progress: files() !== before };
 		// the last attempt is used up, but the tester changed the tests: the gate runs once more on them and the same code
@@ -1177,7 +1224,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			if (disputeNote) o.ledger.addEvidence(o.unitId, "test_disputed", { note: disputeNote.slice(0, 2000) });
 			if (weakDrove) o.ledger.addEvidence(o.unitId, "tests_weak", { note: testsNote.slice(0, 2000) });
 			log(pc.yellow(`  the tests are questioned by another model: the tester re-checks them against the legacy code`));
-			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. End with one line per test: "<test>: fixed — …", "<test>: kept — <why>" (the other model is wrong), or "<test>: could not — <why>" (it is right, but you could not rewrite the test). The implementer reads your answer.`, { disputeText: disputeNote || undefined, stronger });
+			await retest(`${testsNote}\n\nRe-check each against the legacy code (source_symbol_body, read_function, run it on the old code). Where the other model is right, fix the test and its truth case; where it is wrong, keep the test. A case that was run on the old code (truth_lookup does not mark it "read from the old code, not run") keeps its expected value: only running the old code again can change it, never an argument about what the code probably returns (a test changed away from such a value is put back). End with one line per test: "<test>: fixed — …", "<test>: kept — <why>" (the other model is wrong), or "<test>: could not — <why>" (it is right, but you could not rewrite the test). The implementer reads your answer.`, { disputeText: disputeNote || undefined, stronger });
 			lastGateText += `\n\n## The tester re-checked the questioned tests\n${lastTesterText.slice(-2000)}`;
 			// a stopping run had no tester round: its answer and its rounds stay as they were
 			if (weakDrove && !o.stopped?.()) {
@@ -1425,6 +1472,23 @@ function truthCounts(ledger: Ledger, unitId: string): { truthCases: number; trut
 export function legacyWordsFor(words: string[] | undefined, target: TargetAdapter): string[] | undefined {
 	const own = new Set(target.layout.sourceExtensions.map((e) => e.replace(/^\./, "").toLowerCase()));
 	return words?.filter((w) => !own.has(w));
+}
+
+/** A truth case's expected value (JSON) is a plain text a test file holds as it is (short or quoted text is not checked). */
+export function textValueIn(expected: string, text: string): boolean {
+	let v: unknown;
+	try {
+		v = JSON.parse(expected);
+	} catch {
+		return false;
+	}
+	return typeof v === "string" && v.length >= 3 && !/["'\\\n]/.test(v) && text.includes(v);
+}
+
+/** The saved ported tests that may go back into a worktree: test files inside the area's test globs (project paths). */
+export function keptTests(saved: string[], testGlobs: string[], isTestFile: (f: string) => boolean): string[] {
+	const res = testGlobs.map(globToRegExp);
+	return saved.filter((f) => isTestFile(f) && res.some((r) => r.test(f)));
 }
 
 /** Which of `paths` (relative to `dir`) main's history ever held; none when `dir` is not in a git checkout. */

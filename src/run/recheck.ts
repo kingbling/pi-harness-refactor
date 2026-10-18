@@ -238,7 +238,7 @@ export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root
 		else if ((JSON.parse(o.ledger.getUnit(id)!.meta) as { truthUpgradeEnv?: string }).truthUpgradeEnv !== env) todo.push(id);
 	}
 	const left = Math.max(0, todo.length - (o.cap ?? Infinity));
-	const queue = byValue(o.ledger, todo).slice(0, o.cap ?? Infinity);
+	const queue = inLine(o.ledger, todo).slice(0, o.cap ?? Infinity);
 	if (queue.length > 20) log(pc.cyan(`truth upgrade: ${queue.length} unit(s) with read-only truth run their script on the old code${left ? ` (${left} in later runs)` : ""}`));
 	let down = false;
 	const one = async (id: string) => {
@@ -282,6 +282,21 @@ export function byValue(ledger: Ledger, ids: string[]): string[] {
 	const value = new Map(rows.map((r) => [r.id, r]));
 	const v = (id: string) => value.get(id) ?? { compared: 0, needed: 0 };
 	return [...ids].sort((a, b) => v(b).compared - v(a).compared || v(b).needed - v(a).needed || (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * The order read truth is checked in: first units whose read truth a retest changed after their code existed (code and
+ * tests may have met halfway), then units the script writer never tried (a red script tried again must not starve
+ * them run after run), then the rest; each group most useful first (byValue).
+ */
+export function inLine(ledger: Ledger, ids: string[]): string[] {
+	const sorted = byValue(ledger, ids);
+	if (sorted.length < 2) return sorted;
+	const bent = new Set((ledger.db.prepare("SELECT DISTINCT unit_id FROM evidence WHERE type = 'truth_changed_after_code'").all() as Array<{ unit_id: string }>).map((r) => r.unit_id));
+	const tried = (id: string) => !!(JSON.parse(ledger.getUnit(id)?.meta ?? "{}") as { truthScriptEnv?: string }).truthScriptEnv;
+	const first = sorted.filter((id) => bent.has(id));
+	const fresh = sorted.filter((id) => !bent.has(id) && !tried(id));
+	return [...first, ...fresh, ...sorted.filter((id) => !bent.has(id) && tried(id))];
 }
 
 /**
@@ -379,7 +394,7 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 	});
 	res.left = Math.max(0, ids.length - o.cap);
 	if (!ids.length) return res;
-	const queue = byValue(o.ledger, ids).slice(0, o.cap);
+	const queue = inLine(o.ledger, ids).slice(0, o.cap);
 	log(pc.cyan(`truth scripts: ${queue.length} of ${ids.length} accepted unit(s) with read-only truth get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
 	let down = false;
 	const one = async (id: string) => {
@@ -390,10 +405,18 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 		res.tried++;
 		const before = existsSync(join(truthDir, source.truth.scriptName)) ? await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []) : undefined;
 		const failed = before && (before.ok ? `it runs, but its cases do not match the recorded ones (other symbols or inputs, or other keys in expected); it printed these (expected left out): ${JSON.stringify(before.cases.map((c) => ({ symbol: c.symbol, inputs: c.inputs }))).slice(0, 1000)}` : before.error ?? "it does not run");
-		const said = await (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases, failed }).catch((e) => `failed: ${e?.message ?? e}`);
+		const write = (why?: string) => (o.writer ?? writeTruthScriptWithModel)({ config: o.config, root: o.root, source, unitId: id, truthDir, legacyFiles: meta.files ?? [], cases, failed: why }).catch((e) => `failed: ${e?.message ?? e}`);
+		let said = await write(failed);
 		// the unit may have been re-opened meanwhile (parity, a bug report): then its truth is redone anyway
 		if (o.ledger.getUnit(id)?.state !== "accepted") return void o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
-		const ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		let ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		// red with the old code's runtime up: often a bug in the script itself (a class declared twice, a method that does
+		// not exist, nothing printed). The writer gets one more try with that error, like the unit's own tester gets
+		if (!ran.ok && existsSync(join(truthDir, source.truth.scriptName)) && (await probeRunsNow(o.root, o.config, source)) !== false) {
+			said = await write(String(ran.error ?? said ?? "it does not run").slice(-2000));
+			if (o.ledger.getUnit(id)?.state !== "accepted") return void o.ledger.updateUnit(id, { meta: { truthScriptEnv: env } });
+			ran = await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []);
+		}
 		// red because the old code's runtime is down, not because of the script: tried again later, nothing more starts now
 		if (!ran.ok && (await probeRunsNow(o.root, o.config, source)) === false) {
 			if (!down) log(pc.yellow(`truth scripts: the old code's runtime is down (the probe does not run either); the rest wait for the next run`));

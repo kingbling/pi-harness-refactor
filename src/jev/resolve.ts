@@ -5,7 +5,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { QuestionRow } from "../ledger/schema.ts";
 import { goalsText } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { answerValue, loadBrief, optionFor } from "./ask.ts";
+import { answerValue, FOR_TESTER, loadBrief, optionFor } from "./ask.ts";
 
 /**
  * Before an open question reaches the owner, a model with read tools tries it: it reads the legacy code, the new
@@ -354,12 +354,12 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier, ret
     customTools: [
       tool(
         "answer_question",
-        "Answer the question: an option's value, or (where the question takes one) a short hint for the next attempt in your own words. why: what you read that settles it. hint: what the next attempt should do differently (the cause you found, the file and the change); it goes to the unit with your answer.",
-        Type.Object({ answer: Type.String(), why: Type.String(), hint: Type.Optional(Type.String()) }),
-        (p) => ({ answer: p.answer, why: p.why, hint: p.hint }),
+        "Answer the question: an option's value, or (where the question takes one) a short hint for the next attempt in your own words. why: what you read that settles it. hint: what the next attempt should do differently (the cause you found, the file and the change); it goes to the unit with your answer. for_tester: true when the hint is for the tester (the unit's saved test or truth case is wrong): the tester then runs first on the retry with it.",
+        Type.Object({ answer: Type.String(), why: Type.String(), hint: Type.Optional(Type.String()), for_tester: Type.Optional(Type.Boolean()) }),
+        (p) => ({ answer: p.answer, why: p.why, hint: p.for_tester ? `${FOR_TESTER}${p.hint}` : p.hint }),
         // a retry that changes nothing goes back to the model: it picks a job, a real hint, or says what is left
         // a retry with a hint past the unit's tries is recorded: the owner is asked to give the tries (ownerMayGrant)
-        (p) => (parks(q) && !ownerMayGrant(q, p.answer, p.hint) ? retryRefused(q, p.answer, p.hint, retried) : undefined),
+        (p) => (p.for_tester && !p.hint?.trim() ? "for_tester needs a hint naming the test or truth case and the exact change" : parks(q) && !ownerMayGrant(q, p.answer, p.hint) ? retryRefused(q, p.answer, p.hint, retried) : undefined),
       ),
       tool(
         "fix_job",
@@ -399,7 +399,7 @@ export const resolveWithModel: Resolver = async ({ config, root, q, earlier, ret
     systemPrompt: `An automated migration (${config.source.stack} → ${config.target.stacks.join(" + ")}) raised a question for its owner. Before the owner is bothered, you try to settle it. Legacy code: ${config.source.path}. New project: ${config.target.path}.
 Read the files the question is about with your tools, then call exactly one tool:
 - answer_question when the code, the facts and the owner's goals settle it. Never pick an option that says the owner did something (fixed the environment, raised a budget, edited a file by hand) — you cannot do that for them. A hint for the next attempt is fine when you found the cause and can say what to change.
-- When the unit's own saved test is wrong (it contradicts itself or the legacy code), answer_question with retry and a hint naming the test and the exact change: the tester checks it again on the retry. fix_job and code_job cannot edit a unit's saved tests.
+- When the unit's own saved test is wrong (it contradicts itself or the legacy code), answer_question with retry, for_tester true and a hint naming the test (or truth case) and the exact change: the tester runs first on the retry and fixes it. Without for_tester only the implementer gets the hint, and it may not edit tests. fix_job and code_job cannot edit a unit's saved tests.
 - fix_job when the cause is in the project setup and a model can change it (a missing file a config loads, a package, a service binding, a tool config, an env file): the fix runs first, the question waits; never send the owner a setup fix a model can make.
 - code_job when app code is missing outside the unit's files (an endpoint, a service, wiring, a fixture the unit's tests need): a model writes it, the question waits. Missing code is never the owner's job, and "leave parked" or "retry" do not make it appear.
 - The gate's "write outside unit scope" red (the unit wrote a file outside its own list) is never a code_job: answer_question with retry and a hint to keep its changes inside its own files (its stubs too).

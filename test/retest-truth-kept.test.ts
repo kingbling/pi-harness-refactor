@@ -85,4 +85,18 @@ describe("a retest keeps the recorded truth", () => {
 		expect(ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = 'u1'").all()).toEqual([{ id: "u1#1" }]);
 		expect(logs.join("\n")).toMatch(/does not load after the retest[\s\S]*put back cases\.json/);
 	});
+
+	it("a dispute never bends a test away from a value run on the old code: the test file goes back", async () => {
+		// the case was run on the old code: it returned "made AB-1", and the test asserts it
+		ledger.db.prepare("UPDATE truth_cases SET expected = ?, verified_on_old = 1 WHERE id = 'u1#1'").run(JSON.stringify("made AB-1"));
+		ledger.addEvidence("u1", "truth_green_on_old", { cases: 1 });
+		const was = "it('u1#1 creates', () => expect(make()).toBe('made AB-1'));\n";
+		write(join(ws, "migrated", SPEC), was);
+		const checks: string[] = [];
+		let n = 0;
+		const logs: string[] = [];
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(() => write(join(ws, "migrated", SPEC), "it('u1#1 creates', () => expect(make()).toBe('made AB1'));\n"), checks), gate: async (g) => (++n === 1 ? red(g) : green(g)), log: (l) => logs.push(l) });
+		expect(readFileSync(join(ws, "migrated", SPEC), "utf8")).toBe(was);
+		expect(logs.join("\n")).toMatch(/changed tests away from values run on the old code; put back: src\/features\/agency\/agency\.service\.spec\.ts/);
+	});
 });

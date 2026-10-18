@@ -7,8 +7,32 @@ import type { SpawnOptions } from "../src/sessions/spawn.ts";
 const seen: SpawnOptions[] = [];
 vi.mock("../src/sessions/spawn.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../src/sessions/spawn.ts")>()),
-	spawnLeaf: async (o: SpawnOptions) => (seen.push(o), { run: async () => ({ text: "" }), dispose: () => {} }),
+	spawnLeaf: async (o: SpawnOptions) => (seen.push(o), { run: async () => (await act?.(o), { text: "" }), dispose: () => {} }),
 }));
+// what the model does in its session (calls a tool); none by default
+let act: ((o: SpawnOptions) => Promise<unknown>) | undefined;
+const call = (name: string, p: unknown) => (o: SpawnOptions) => (o.customTools!.find((t) => t.name === name)! as unknown as { execute: (id: string, p: unknown) => Promise<{ content: Array<{ text: string }> }> }).execute("1", p);
+
+describe("a hint for the tester", () => {
+	it("for_tester marks the hint, so the unit's next run starts the tester with it; without a hint it is refused", async () => {
+		const { resolveWithModel } = await import("../src/jev/resolve.ts");
+		const { FOR_TESTER } = await import("../src/jev/ask.ts");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const id = ledger.askQuestion({ unitId: "u1", point: "gate_env", question: "skipped/only test in src/a.spec.ts", options: ["retry — run it again"], askedBy: "orchestrator" });
+		const said: string[] = [];
+		act = async (o) => {
+			said.push((await call("answer_question", { answer: "retry", why: "w", for_tester: true })(o)).content[0]!.text);
+			said.push((await call("answer_question", { answer: "retry", why: "w", hint: "drop the it.todo in src/a.spec.ts", for_tester: true })(o)).content[0]!.text);
+		};
+		const r = await resolveWithModel({ config, root: "/nowhere", q: ledger.getQuestion(id)! });
+		act = undefined;
+		expect(said[0]).toMatch(/not recorded: for_tester needs a hint/);
+		expect(r).toMatchObject({ answer: "retry", hint: `${FOR_TESTER}drop the it.todo in src/a.spec.ts` });
+		expect(seen.at(-1)!.systemPrompt).toMatch(/retry, for_tester true and a hint naming the test/);
+	});
+});
 
 describe("the resolver's prompt", () => {
 	it("says a 'write outside unit scope' red is never a code job", async () => {

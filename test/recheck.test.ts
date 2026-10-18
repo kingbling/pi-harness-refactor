@@ -318,4 +318,35 @@ describe("a script for truth that was only read", () => {
 		// the next run takes the rest; a unit already tried in this environment is not tried again
 		expect((await writeTruthScripts({ ...opts, cap: 2, writer })).tried).toBe(1);
 	});
+
+	it("order: truth a retest changed after the code first, then units never tried, then red scripts tried again", async () => {
+		const { ledger } = workspace();
+		const { inLine } = await import("../src/run/recheck.ts");
+		ledger.updateUnit("fine", { meta: { truthScriptEnv: "old" } });
+		ledger.updateUnit("typed", { meta: { truthScriptEnv: "old" } });
+		ledger.addEvidence("typed", "truth_changed_after_code", { case: "typed#1" });
+		expect(inLine(ledger, ["fine", "stub", "typed"])).toEqual(["typed", "stub", "fine"]);
+	});
+
+	it("a script that is red with the old code's runtime up gets one more try with its error (often a bug in the script itself)", async () => {
+		const { root, config, ledger } = workspace();
+		const { writeTruthScripts } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		writeFileSync(join(root, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "run" }));
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = 'fine'").run();
+		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 0 WHERE unit_id = 'fine'").run();
+		ledger.addEvidence("fine", "truth_read", {});
+		rmSync(join(root, ".bigrefactor", "truth", "fine", "cases.php"));
+		const told: Array<string | undefined> = [];
+		const writer = async (o: { truthDir: string; failed?: string }) => {
+			told.push(o.failed);
+			writeFileSync(join(o.truthDir, "cases.sh"), told.length === 1 ? "echo 'Cannot declare class Status in cases.sh line 3' >&2; exit 1\n" : `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"$(printf %s.%s 123 45)"'}]'\n`);
+		};
+		const r = await writeTruthScripts({ ledger, config, root, source, cap: 1, writer, log: () => {} });
+		expect(told).toHaveLength(2);
+		expect(told[0]).toBeUndefined();
+		expect(told[1]).toMatch(/Cannot declare class Status/);
+		expect(r.upgraded).toEqual(["fine"]);
+	});
 });
