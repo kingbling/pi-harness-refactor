@@ -68,6 +68,22 @@ describe("the tester checks its paths with the layout", () => {
 		expect(r.details.layout).toEqual([expect.stringMatching(/^src\/features\/offers\/pages\/OfferEditPage\.tsx: .*\(imported by src\/features\/offers\/pages\/OfferEditPage\.test\.tsx\)$/)]);
 		ledger.close();
 	});
+	it("check_ported_tests says what is missing before the list of test files it searched, and shortens a long list", async () => {
+		const ws = mkdtempSync(join(tmpdir(), "br-tl-"));
+		const target = join(ws, "migrated");
+		for (let i = 0; i < 30; i++) write(join(target, `${MOD}/pages/Other${i}.test.tsx`), "it('x', () => {});\n");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: target, stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		const adapter = { ...nestjsAdapter, layout: { ...nestjsAdapter.layout, testFileGlobs: (m: string) => [`${m}/**/*.test.tsx`] }, lint: () => ({ cmd: "true", args: [] }), build: () => ({ cmd: "true", args: [] }) } as never;
+		const tool = checkPortedTestsTool({ ledger, config, unitId: "u1", root: ws, targetProjectDir: target, adapter, moduleDir: MOD, currentTruth: () => ({ ok: true, cases: [{ symbol: "s", inputs: [], expected: 1 }] }) });
+		const text = (await (tool as unknown as { execute: (i: string, p: object) => Promise<{ content: Array<{ text: string }> }> }).execute("x", {})).content.map((c) => c.text).join("\n");
+		expect(text.indexOf("MISSING: 1 of 1 case id(s)")).toBeGreaterThanOrEqual(0);
+		expect(text.indexOf("MISSING:")).toBeLessThan(text.indexOf("Searched 30 test file(s)"));
+		expect(text).toMatch(/, and 10 more\./);
+		ledger.close();
+	});
 });
 
 describe("a layout finding on a path a test imports goes to the tester", () => {

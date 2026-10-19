@@ -575,8 +575,11 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 				if (truth) out.push(`Your truth cases do not load yet: ${truth.error ?? "unknown error"}${ids.length ? `\nChecked the ${ids.length} case id(s) recorded earlier instead.` : ""}`);
 			}
 			const cov = caseCoverage(d.targetProjectDir, moduleDir, d.adapter.layout, ids);
-			out.push(`Searched for test files matching ${cov.globs.join(", ")} in ${d.targetProjectDir}: ${cov.files.length ? cov.files.join(", ") : "none found"}.`);
+			// the verdict first: a module with many test files made a list long enough to bury it (a tester called its
+			// missing ids present after reading only the list)
 			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
+			const LISTED = 20;
+			out.push(`Searched ${cov.files.length} test file(s) matching ${cov.globs.join(", ")} in ${d.targetProjectDir}${cov.files.length ? `: ${cov.files.slice(0, LISTED).join(", ")}${cov.files.length > LISTED ? `, and ${cov.files.length - LISTED} more` : ""}` : ": none found"}.`);
 			// what the test files really import counts too: a leftover or renamed test can import a path code_files does not name
 			const imported = missingTestImports(d.targetProjectDir, cov.files, d.adapter.layout.sourceExtensions);
 			const codeFiles = [...new Set([...(p.code_files ?? []).map((f) => f.replace(/^\.\//, "")).filter((f) => !existsSync(join(d.targetProjectDir, f))), ...imported.keys()])];
