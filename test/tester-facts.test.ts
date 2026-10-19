@@ -253,6 +253,30 @@ describe("truth case ids stay put", () => {
 		expect(tasks[1]).toMatch(/no ported test yet: u1#4/);
 	});
 
+	it("coverage retests the model never answered are no retests: after 3 the unit goes back to the queue, not parked", async () => {
+		let tests = 0;
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => {
+					if (opts.role !== "test") return { text: "done", ...ok };
+					tests++;
+					if (tests === 1) {
+						write(join(truthDir(), "cases.json"), casesOf([1, 2]));
+						write(join(ws, "migrated", SPEC), "it('u1#1', () => {});\n");
+						return { text: "done", ...ok };
+					}
+					// the provider never answers: no tool call, an error
+					return { text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 }, error: "idle_timeout: no model or tool activity for 300s" };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: spawn as never, gate: async (g) => green(g), log: () => {} });
+		expect(r.state).toBe("planned");
+		expect(tests).toBe(4);
+		expect(ledger.getUnit("u1")!.state).toBe("planned");
+		expect(ledger.db.prepare("SELECT reason FROM transitions WHERE entity_id = 'u1' ORDER BY id DESC LIMIT 1").get()).toEqual({ reason: expect.stringMatching(/did not answer 3 times in a row/) });
+	});
+
 	it("a truth re-run inside the implement loop links the cases again: a new case without a test gets a coverage retest", async () => {
 		const tasks: string[] = [];
 		let gates = 0;

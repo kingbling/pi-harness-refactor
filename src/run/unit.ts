@@ -236,6 +236,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// run: expected values come from running the old code; read: it cannot run here (decided once per workspace,
 	// or for this unit after running failed), so the tester writes them from reading it — marked in the ledger
 	let lastTesterText = "";
+	/** The last tester session failed before doing any work (the model provider did not answer): no retest of its own. */
+	let lastTesterDead = false;
 	// the writes the last tester session was refused (a quarantine's red attempt carries them)
 	let lastTesterBlocked: string[] = [];
 	// earlier units' tests the implementer disputed and the tester then fixed, or the tester disputed itself with
@@ -371,6 +373,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		cost += res.usage.cost;
 		lastTesterText = res.text;
+		lastTesterDead = !!res.error && res.toolCalls === 0;
 		// tests of earlier units prove accepted behaviour: the tester may add to them, but a changed or removed line it
 		// did not dispute with evidence is undone (and it is told)
 		const changedOthers = await othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);
@@ -623,7 +626,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	};
 	// `quarantine` false: a re-run inside the implement loop, which goes on with the tests it has
 	const coverTruth = async (quarantine = true): Promise<boolean> => {
-		for (let i = 0; ; i++) {
+		for (let i = 0, dead = 0; ; i++) {
 			const missing = uncoveredCases();
 			if (!missing.length) return (linkedOnce = true);
 			if (i === 2) {
@@ -644,6 +647,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			// why ids written into an earlier unit's test file are gone
 			const undone = lastTesterText.split("\n").find((l) => l.startsWith("(Your changes to tests of earlier units were undone"));
 			await runTruth(`These truth cases have no ported test yet: ${missing.join(", ")}. The orchestrator searches the test files matching ${globs} for each case id as exact text, "#" included (e.g. "${missing[0]}"); a changed spelling does not count. ${seen.length ? `It searched ${seen.join(", ")} and did not find these ids.` : "It found no test files there."} Every case gets its own test asserting the case's expected value, with the exact id in its name, or next to it in a comment or test description where a name cannot hold it. check_ported_tests shows what is still missing.${undone ? `\n${undone}` : ""}`, true);
+			// a session the model provider never answered is no retest: the unit is not parked for an outage. Three in a
+			// row: back to the queue with its tests kept, tried again later
+			if (lastTesterDead) {
+				i--;
+				if (++dead >= 3) {
+					if (!quarantine || o.truthOnly) return false;
+					savePorted();
+					o.ledger.transitionUnit(o.unitId, "planned", `the tester's model did not answer ${dead} times in a row (${lastTesterText || "provider error"}): tried again later`);
+					log(pc.yellow(`  the tester's model did not answer ${dead} times in a row: back to the queue, its tests kept`));
+					return false;
+				}
+			} else dead = 0;
 		}
 	};
 
