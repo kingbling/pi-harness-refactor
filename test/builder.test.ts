@@ -117,6 +117,17 @@ describe("the builder", () => {
 		expect(kept).not.toMatch(/\x1b\[/);
 	});
 
+	it("the code job gets the list of files the errors name and is told to work through all of them", async () => {
+		const { root, config, adapter, ledger, mergeFix } = (await setup());
+		const naming = { ...adapter, test: () => ({ cmd: "sh", args: ["-c", 'echo "Failed src/a.test.txt (exit 1)"; echo "src/a.txt:1 wrong value"; exit 1'] }) } as unknown as TargetAdapter;
+		const jobs: string[] = [];
+		const b = createBuilder({ config, root, ledger, adapters: new Map([["fake", naming]]), log: () => {}, linkAll: () => {}, mergeFix, codeJob: async (_s, what) => (jobs.push(what), undefined), every: { units: 1, minutes: 60 } });
+		b.afterMerge("fake");
+		await b.finish();
+		expect(jobs[0]).toMatch(/Files the errors name \(2\): (src\/a\.test\.txt, src\/a\.txt|src\/a\.txt, src\/a\.test\.txt)/);
+		expect(jobs[0]).toMatch(/do not stop after the first/);
+	});
+
 	it("the builder's record stays small: past its cap only the newer half is kept, whole lines", () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-builderlog-")));
 		mkdirSync(join(root, ".bigrefactor"));
