@@ -670,13 +670,14 @@ function namedTopic(answer: string, config: Config): { stack?: string; name: str
 /**
  * Units an earlier version put in the stack's catch-all shared dir although their placement answer named the topic
  * in its hint: a banned folder name, so every new file there failed the structure check. Moved to the named topic
- * (only units not running or accepted; their saved tests outside the new test paths are dropped when they run).
+ * (only units not running or accepted; their saved tests outside the new test paths are dropped when they run). A
+ * parked one is queued again and its open park question withdrawn.
  */
 export function replaceCatchAllTopics(ledger: Ledger, config: Config, root: string): string[] {
 	const rows = ledger.db
-		.prepare(`SELECT u.id, q.id qid, q.answer, q.context FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.placeQuestion')
+		.prepare(`SELECT u.id, u.state, q.id qid, q.answer, q.context FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.placeQuestion')
 		 WHERE u.state IN ('planned', 'quarantined') AND json_extract(u.meta, '$.place.area') = ? AND json_extract(u.meta, '$.place.source') = 'answer'`)
-		.all(SHARED_AREA) as Array<{ id: string; qid: number; answer: string | null; context: string | null }>;
+		.all(SHARED_AREA) as Array<{ id: string; state: string; qid: number; answer: string | null; context: string | null }>;
 	const moved: string[] = [];
 	for (const r of rows) {
 		if (answerValue(r.answer) !== NEW_TOPIC) continue;
@@ -688,6 +689,11 @@ export function replaceCatchAllTopics(ledger: Ledger, config: Config, root: stri
 		ledger.updateUnit(r.id, { meta: { place: { stack, area, shared: true, source: "answer" } satisfies StoredPlace } });
 		recordArea(root, stack, area, `named in answer to placement question #${r.qid}`, true);
 		moved.push(`${r.id} → ${stack}:shared/${area}`);
+		// parked for the banned folder: tried again in the new one; a question about the park is moot
+		if (r.state === "quarantined") {
+			for (const q of ledger.openQuestions().filter((x) => x.unit_id === r.id && x.point === "quarantine")) ledger.withdrawQuestion(q.id, `the unit moved to ${stack}:shared/${area} and is tried again`);
+			ledger.transitionUnit(r.id, "planned", `placed in the topic its answer named (${stack}:shared/${area}); tried again`);
+		}
 	}
 	return moved;
 }

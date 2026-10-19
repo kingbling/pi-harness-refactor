@@ -455,6 +455,13 @@ describe("placement: what no area holds, siblings, re-placement, overlaps", () =
 		expect(replaceCatchAllTopics(ledger, config, ws)).toEqual(["uuid → nestjs:shared/password-hashing"]);
 		expect(place("uuid")).toMatchObject({ area: "password-hashing", shared: true });
 		expect(replaceCatchAllTopics(ledger, config, ws)).toEqual([]);
+		// parked in the catch-all: queued again, its park question withdrawn
+		ledger.updateUnit("uuid", { meta: { place: { stack: "nestjs", area: "common", shared: true, source: "answer" } } });
+		ledger.transitionUnit("uuid", "quarantined", "gate still red");
+		const park = ledger.askQuestion({ point: "quarantine", unitId: "uuid", question: "parked", blocks: "unit", askedBy: "orchestrator" });
+		expect(replaceCatchAllTopics(ledger, config, ws)).toHaveLength(1);
+		expect(ledger.getUnit("uuid")!.state).toBe("planned");
+		expect(ledger.getQuestion(park)!.status).toBe("withdrawn");
 	});
 
 	it("facts: folder siblings placed in the same pass count; what uses the unit counts only where its placement holds", async () => {
