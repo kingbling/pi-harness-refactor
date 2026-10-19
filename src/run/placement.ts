@@ -632,9 +632,9 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 		}
 		// "new-topic: cron" names the topic; a bare "new-topic" names nothing and is asked again, once: a second bare
 		// one puts the unit in the stack's shared dir (a tidy review can move it to a topic later) instead of asking forever
-		const named = /^new-topic\s*:\s*([\w-]+)/i.exec(r.answer ?? "");
+		const named = v === NEW_TOPIC ? namedTopic(r.answer ?? "", config) : undefined;
 		const bareAgain = v === NEW_TOPIC && !named && !!(JSON.parse(r.meta) as UnitMeta).bareTopic;
-		const m = named ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", named[1]] as const) : bareAgain ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", SHARED_AREA] as const) : /^([\w-]+):(shared\/)?([\w-]+)$/.exec(v);
+		const m = named ? ([v, named.stack ?? ctx.defaultStack ?? stackFor(config, "server"), "shared/", named.name] as const) : bareAgain ? ([v, ctx.defaultStack ?? stackFor(config, "server"), "shared/", SHARED_AREA] as const) : /^([\w-]+):(shared\/)?([\w-]+)$/.exec(v);
 		const stack = m && config.target.stacks.includes(m[1]!) ? m[1]! : (ctx.defaultStack ?? stackFor(config, "server"));
 		const area = v === NEW_TOPIC && !named && !bareAgain ? "" : kebab(m ? m[3]! : v);
 		if (!area) {
@@ -651,6 +651,45 @@ export function applyPlacementAnswers(ledger: Ledger, config: Config, root: stri
 	}
 	if (done.length) placeCoveredWaiting(ledger, config, root);
 	return done;
+}
+
+/**
+ * The topic a "new-topic" answer names: inline ("new-topic: cron"), or as <stack>:shared/<name> in its hint (the
+ * resolver picks the option and names the topic there). Never the stack's catch-all shared dir.
+ */
+function namedTopic(answer: string, config: Config): { stack?: string; name: string } | undefined {
+	const inline = /^new-topic\s*:\s*([\w-]+)/i.exec(answer);
+	if (inline && kebab(inline[1]!) !== SHARED_AREA) return { name: inline[1]! };
+	// <stack>:shared/<name> first; a bare shared/<name> only when it is no file path (src/Shared/Persistence/…)
+	const ok = (n: string) => kebab(n) !== SHARED_AREA;
+	for (const h of answer.matchAll(/\b([\w-]+):shared\/([\w-]+)/g)) if (config.target.stacks.includes(h[1]!) && ok(h[2]!)) return { stack: h[1]!, name: h[2]! };
+	for (const h of answer.matchAll(/(?<![\w/:])shared\/([\w-]+)(?![\w/.-])/g)) if (ok(h[1]!)) return { name: h[1]! };
+	return undefined;
+}
+
+/**
+ * Units an earlier version put in the stack's catch-all shared dir although their placement answer named the topic
+ * in its hint: a banned folder name, so every new file there failed the structure check. Moved to the named topic
+ * (only units not running or accepted; their saved tests outside the new test paths are dropped when they run).
+ */
+export function replaceCatchAllTopics(ledger: Ledger, config: Config, root: string): string[] {
+	const rows = ledger.db
+		.prepare(`SELECT u.id, q.id qid, q.answer, q.context FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.placeQuestion')
+		 WHERE u.state IN ('planned', 'quarantined') AND json_extract(u.meta, '$.place.area') = ? AND json_extract(u.meta, '$.place.source') = 'answer'`)
+		.all(SHARED_AREA) as Array<{ id: string; qid: number; answer: string | null; context: string | null }>;
+	const moved: string[] = [];
+	for (const r of rows) {
+		if (answerValue(r.answer) !== NEW_TOPIC) continue;
+		const t = namedTopic(r.answer ?? "", config);
+		if (!t) continue;
+		const ctx = (r.context ? JSON.parse(r.context) : {}) as { defaultStack?: string };
+		const stack = t.stack ?? ctx.defaultStack ?? stackFor(config, "server");
+		const area = kebab(t.name);
+		ledger.updateUnit(r.id, { meta: { place: { stack, area, shared: true, source: "answer" } satisfies StoredPlace } });
+		recordArea(root, stack, area, `named in answer to placement question #${r.qid}`, true);
+		moved.push(`${r.id} → ${stack}:shared/${area}`);
+	}
+	return moved;
 }
 
 /** Units still waiting on a placement question that the new rules now place for sure: placed, their question withdrawn. */

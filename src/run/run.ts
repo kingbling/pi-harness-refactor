@@ -29,7 +29,7 @@ import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
 import { SYSTEMIC_FAILURE, JEV_ACT, noulOf } from "../jev/questions.ts";
-import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDirs, resolvePlacements, unplacedReason } from "./placement.ts";
+import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDirs, replaceCatchAllTopics, resolvePlacements, unplacedReason } from "./placement.ts";
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
 import { answerValue, askViaModel, decideOpenFromGoals, HINT } from "../jev/ask.ts";
@@ -336,6 +336,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	// Each unit lands in the stack placement picks; a worktree holds the whole target repo, so every stack's
 	// dependency dirs (adapter-declared) are linked into it.
 	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
+	for (const m of replaceCatchAllTopics(ledger, config, o.root)) log(pc.cyan(`↻ placed in the topic its answer named: ${m}`));
 	// area folders the plugin now spells differently move in git first, so new units land next to the old code
 	if (!o.dry && await isRepo(config.target.path)) {
 		try {

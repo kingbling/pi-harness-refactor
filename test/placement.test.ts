@@ -7,7 +7,7 @@ import { FakeModelClient } from "../src/models/fake.ts";
 import { draftedOutside, runUnit } from "../src/run/unit.ts";
 import { getTargetAdapter, knownTargets, TARGET_ROLES, TARGET_SUBDIRS, targetIdFor } from "../src/adapters/registry.ts";
 import { curateAreas } from "../src/run/taxonomy.ts";
-import { applyPlacementAnswers, codePlace, placeUnit, pruneRules, planPlacements, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
+import { applyPlacementAnswers, codePlace, placeUnit, pruneRules, planPlacements, replaceCatchAllTopics, resolvePlacements, unplacedReason } from "../src/run/placement.ts";
 
 /**
  * Placement: one legacy area → one feature module per stack. The area model writes prefix rules (placement.json)
@@ -438,6 +438,23 @@ describe("placement: what no area holds, siblings, re-placement, overlaps", () =
 		ask();
 		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["uuid"]);
 		expect(place("uuid")).toMatchObject({ stackId: "nestjs", area: "common", shared: true });
+	});
+
+	it("a 'new-topic' answer that names the topic in its hint goes there, not to the banned catch-all; earlier such units move at run start", () => {
+		const ask = (answer: string) => {
+			const q = ledger.askQuestion({ point: "placement", unitId: "uuid", question: "q", blocks: "unit", askedBy: "placement", context: { defaultStack: "nestjs" } });
+			ledger.updateUnit("uuid", { meta: { placeQuestion: q, bareTopic: true } });
+			ledger.answerQuestion(q, answer, "resolver model");
+		};
+		// a file path in the hint is no topic name
+		ask("new-topic — Create a shared topic (recommended)\nhint: Unlike src/Shared/Persistence/Repo.php, register nestjs:shared/password-hashing for it");
+		expect(applyPlacementAnswers(ledger, config, ws)).toEqual(["uuid"]);
+		expect(place("uuid")).toMatchObject({ stackId: "nestjs", area: "password-hashing", shared: true, source: "answer" });
+		// placed in the catch-all by an earlier version: moved to the topic its answer named
+		ledger.updateUnit("uuid", { meta: { place: { stack: "nestjs", area: "common", shared: true, source: "answer" } } });
+		expect(replaceCatchAllTopics(ledger, config, ws)).toEqual(["uuid → nestjs:shared/password-hashing"]);
+		expect(place("uuid")).toMatchObject({ area: "password-hashing", shared: true });
+		expect(replaceCatchAllTopics(ledger, config, ws)).toEqual([]);
 	});
 
 	it("facts: folder siblings placed in the same pass count; what uses the unit counts only where its placement holds", async () => {
