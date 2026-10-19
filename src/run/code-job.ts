@@ -11,7 +11,8 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
-import { addedLines, changedFiles, clipOutput, onlyComments, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
+import { onlyComments } from "./comment-only.ts";
+import { addedLines, changedFiles, clipOutput, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { markOwner } from "./stub-sweep.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
 import { exec } from "../proc.ts";
@@ -291,7 +292,8 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	const tests = present.filter((f) => adapter.layout.isTestFile(f));
 	const code = present.filter((f) => !adapter.layout.isTestFile(f));
 	// a file with only comments, or a test that checks a stub mark: the gate's rules, so no unit gets them from a job
-	const empty = whole ? [] : present.filter((f) => onlyComments(readFileSync(join(dir, f), "utf8")));
+	const empty: string[] = [];
+	if (!whole) for (const f of present) if (await onlyComments(readFileSync(join(dir, f), "utf8"), f, { lang: adapter.layout.lang?.(f), ledger })) empty.push(f);
 	if (empty.length) return `files with only comments, no code: ${empty.slice(0, 5).join(", ")}`;
 	const onMark: string[] = [];
 	if (!whole) for (const f of tests) for (const l of await addedLines(dir, f, tracked.has(f))) if (l.text.includes("TODO(br:")) onMark.push(`${f}:${l.line}`);

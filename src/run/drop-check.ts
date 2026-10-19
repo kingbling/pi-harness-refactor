@@ -13,7 +13,7 @@ import { PLAIN_LANGUAGE } from "../policy.ts";
 import { exec } from "../proc.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { findCapabilityTool, readFunctionTool, sourceSymbolBody, targetLookup, whoCalls } from "../sessions/tools.ts";
-import { onlyComments } from "./gate.ts";
+import { onlyComments } from "./comment-only.ts";
 import { placementDir, placeUnit } from "./placement.ts";
 import { reopenUnit } from "./recheck.ts";
 
@@ -165,7 +165,7 @@ export async function reopenCommentOnly(o: { ledger: Ledger; config: Config; log
 			continue; // not a repo yet
 		}
 		for (const f of tracked) {
-			if (!existsSync(join(dir, f)) || !onlyComments(readFileSync(join(dir, f), "utf8"))) continue;
+			if (!existsSync(join(dir, f)) || !(await onlyComments(readFileSync(join(dir, f), "utf8"), f, { lang: adapter.layout.lang?.(f), ledger: o.ledger }))) continue;
 			const log = await exec("git", ["log", "--diff-filter=A", "--format=%B", "--", f], { cwd: dir }).catch(() => "");
 			const unit = /bigrefactor: unit ([^\s,]+)/.exec(log)?.[1];
 			if (unit && o.ledger.getUnit(unit)?.state === "accepted") files.set(unit, [...(files.get(unit) ?? []), f]);

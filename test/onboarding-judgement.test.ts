@@ -112,6 +112,19 @@ describe("framework profile: the model's picks", () => {
 		expect(phpAdapter.validateProfile!({ ...exampleProfileJson(), legacyWords: ["x.tpl"] })).toContainEqual(expect.stringMatching(/legacyWords/));
 		expect(phpAdapter.validateProfile!({ ...exampleProfileJson(), loaders: [] })).toContainEqual(expect.stringMatching(/loaders/));
 	});
+
+	it("another language's profile is checked by the shared rules: a framework in the repo needs no loaders (annotations, DI); the model sees a non-PHP example too", async () => {
+		const { exampleSourceManifest, fromSourceManifest } = await import("../src/adapters/source/generated.ts");
+		const { expressProfileExample, validateProfileJson } = await import("../src/adapters/source/profile.ts");
+		const java = fromSourceManifest({ ...exampleSourceManifest(), id: "java", language: "java" }, join(here, ".sim", "profile-java"));
+		const spring = { id: "spring", frameworkDirs: ["framework/"], loaders: [], entryPoint: "Application\\.java$", concerns: ["routing", "orm", "auth", "jobs"].map((c) => ({ match: `^${c}`, concern: c, legacy: c, verdict: "platform" as const })) };
+		expect(java.validateProfile!(spring)).toEqual([]);
+		expect(phpAdapter.validateProfile!(spring)).toContainEqual(expect.stringMatching(/loaders must be a non-empty array/)); // PHP keeps its rule
+		expect(validateProfileJson(expressProfileExample())).toEqual([]);
+		const { examples, schemaDoc } = java.profileExample!() as { examples: Array<{ id: string }>; schemaDoc: string };
+		expect(examples.map((e) => e.id)).toEqual(["express", "gyro"]);
+		expect(schemaDoc).toMatch(/\[\] when the framework finds code without such calls/);
+	});
 });
 
 describe("tiers: no name-based cross-cutting tier", () => {

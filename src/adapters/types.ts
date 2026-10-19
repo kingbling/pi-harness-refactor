@@ -224,8 +224,8 @@ export interface SourceAdapter {
 	unitGroupOf?(path: string): string | undefined;
 	/** Names a file is known by at runtime besides its symbols (template keys, command names…); a string literal hit keeps it alive. */
 	fileAliases?(path: string): string[];
-	/** Framework-profile generation (`br profile`): the worked example + format doc the model sees, and a code validator for what it wrote. */
-	profileExample?(): { example: unknown; schemaDoc: string };
+	/** Framework-profile generation (`br profile`): worked examples (they show the format only) + format doc the model sees, and a code validator for what it wrote. */
+	profileExample?(): { examples: unknown[]; schemaDoc: string };
 	/** Drop any cached framework profile so the next call re-reads `.bigrefactor/framework-profile.json` (after `br profile`). */
 	reloadProfile?(): void;
 	validateProfile?(json: unknown): string[];

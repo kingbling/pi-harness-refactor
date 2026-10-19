@@ -9,6 +9,7 @@ import { disputeEarlierTestTool } from "../sessions/tools.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findTests, runPortedTests } from "./ported.ts";
+import { gitIgnoredDirs, skipDir } from "../inventory/ignored.ts";
 import { fixRunSetup, fixSetupWithModel } from "../init/setup-fixer.ts";
 import { DEFAULT_DATA_DIRS, errorSignature, run, runGate, renderGate, sha1, trackedFiles, type GateReport } from "./gate.ts";
 import { reviewWithModel } from "./review.ts";
@@ -74,7 +75,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 	const schema = await schemaTextFor(o.config, meta.tables ?? []);
 	const task = (TASK[unit.kind ?? ""] ?? TASK["db_schema"]!)(meta, dataDirs[0]!);
 	// what earlier DB units wrote: the model reads them and orders its migration after every table it references
-	const existing = dataFiles(targetProjectDir, dataDirs, (p) => !adapter.layout.isTestFile(p));
+	const existing = await dataFiles(targetProjectDir, dataDirs, (p) => !adapter.layout.isTestFile(p), adapter.toolchain.ignoredPaths);
 	// a reopened unit's own earlier tests are its to change: DB units have no truth cases to mark them as theirs
 	const own = ownTests(o.ledger, o.unitId, adapter.layout.isTestFile);
 	const system = [
@@ -115,7 +116,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 			promptSnippet: "check_my_tests: run the gate's test step on the data dirs' tests now",
 			parameters: Type.Object({}),
 			execute: async () => {
-				const r = await runPortedTests({ ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, tests: dataTests(targetProjectDir, dataDirs, adapter.layout).map((t) => t.path), mainDir, timeoutMs: 240_000, slot: gateSlot });
+				const r = await runPortedTests({ ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, tests: (await dataTests(targetProjectDir, dataDirs, adapter)).map((t) => t.path), mainDir, timeoutMs: 240_000, slot: gateSlot });
 				return { content: [{ type: "text" as const, text: `${r.ok ? "TESTS GREEN" : "TESTS RED"}\n${r.output.slice(-6000)}` }], details: {} };
 			},
 		} as unknown as ToolDefinition,
@@ -144,7 +145,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		log(pc.dim(`  db ${role} #${n}: ${res.toolCalls} tool calls, $${res.usage.cost.toFixed(4)}${res.error ? pc.red(` ERROR: ${res.error}`) : ""}`));
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${n}`);
 		// the tests the session wrote are this unit's proof: hashed now, so the gate sees them untouched
-		const testFiles = dataTests(targetProjectDir, dataDirs, adapter.layout);
+		const testFiles = await dataTests(targetProjectDir, dataDirs, adapter);
 		// the same reviewer as code units judges the schema and its tests (the review never holds a CPU slot)
 		const review = reviewer
 			? async (changedFiles: string[]) => {
@@ -247,20 +248,21 @@ export function namesFileOf(ledger: Ledger, unitId: string, output: string, extr
 }
 
 /** The test files in the data dirs and where the stack keeps tests for them. */
-function dataTests(projectDir: string, dataDirs: string[], layout: TargetAdapter["layout"]): Array<{ path: string; sha1: string }> {
-	const files = new Set([...dataFiles(projectDir, dataDirs, layout.isTestFile), ...dataDirs.flatMap((d) => findTests(projectDir, d.replace(/\/$/, ""), layout))]);
+async function dataTests(projectDir: string, dataDirs: string[], adapter: TargetAdapter): Promise<Array<{ path: string; sha1: string }>> {
+	const files = new Set([...(await dataFiles(projectDir, dataDirs, adapter.layout.isTestFile, adapter.toolchain.ignoredPaths)), ...dataDirs.flatMap((d) => findTests(projectDir, d.replace(/\/$/, ""), adapter.layout))]);
 	return [...files].sort().map((p) => ({ path: p, sha1: sha1(readFileSync(join(projectDir, p))) }));
 }
 
-/** Files under the data dirs that `keep` accepts, relative to the project. */
-function dataFiles(projectDir: string, dataDirs: string[], keep: (p: string) => boolean): string[] {
+/** Files under the data dirs that `keep` accepts, relative to the project; the toolchain's generated paths (`ignored`) and what git ignores are skipped. */
+async function dataFiles(projectDir: string, dataDirs: string[], keep: (p: string) => boolean, ignored: string[] = []): Promise<string[]> {
+	const skip = skipDir(projectDir, ignored, await gitIgnoredDirs(projectDir));
 	const out: string[] = [];
 	const walk = (rel: string) => {
 		const abs = join(projectDir, rel);
 		if (!existsSync(abs)) return;
 		for (const n of readdirSync(abs)) {
-			if (n === "node_modules") continue;
 			const r = rel ? `${rel}/${n}` : n;
+			if (skip(join(projectDir, r))) continue;
 			if (statSync(join(projectDir, r)).isDirectory()) walk(r);
 			else if (keep(r)) out.push(r);
 		}

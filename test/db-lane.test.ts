@@ -50,7 +50,7 @@ describe("DB lane", () => {
 	it("one question for every store: Enter takes what was found; plain paths are read by code, own words by a model; paths are checked", async () => {
 		mkdirSync(join(ws, "legacy", "database", "migrations"), { recursive: true });
 		write(join(ws, "legacy", "dumps", "arango"), "x");
-		expect(findDbFiles(join(ws, "legacy")).schema).toEqual(["database/migrations/", "db/schema.sql"]);
+		expect((await findDbFiles(join(ws, "legacy"))).schema).toEqual(["database/migrations/", "db/schema.sql"]);
 		const ask = async (answers: Array<string | undefined>, o = {}) => {
 			const asked: Array<[string, string]> = [];
 			const got = await askDbInputs(cfg({ from: ["mariadb", "arangodb"] }), { text: async (m, i) => (asked.push([m, i]), answers.shift()), log: () => {} }, false, o);

@@ -15,6 +15,7 @@ import { progress } from "../progress.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { workspaceRoot } from "../spend.ts";
+import { gitIgnoredDirs, skipDir } from "./ignored.ts";
 
 /**
  * The database lane: only when the survey detected a data store (config.db.from) and the strategy is not
@@ -44,10 +45,19 @@ const SCHEMA_EXT = new Set([".sql", ".prisma", ".dbml"]);
 const SQLITE_EXT = new Set([".sqlite", ".sqlite3", ".db"]);
 const DUMP_RE = /(dump|backup|snapshot|seed|data)[^/]*\.(sql|sql\.gz|gz|zip|bak|dump)$/i;
 const MIGRATION_DIR_RE = /^(migrations?|db|database|schema|sql)$/i;
-const SKIP_DIRS = new Set(["node_modules", "vendor", ".git", "dist", "build", "var", "cache", "tmp"]);
 
-/** Candidate DB inputs in the legacy repo: schema files, migration dirs, SQLite files, dumps. Code only. */
-export function findDbFiles(sourceRoot: string): { schema: string[]; dumps: string[] } {
+/** The source adapter's dependency folders (vendorDirs): scans of the legacy repo skip them, with what git ignores. */
+const vendorDirs = (config: Config): string[] => {
+	try {
+		return findSourceAdapter(config.source.stack)?.traits?.vendorDirs ?? [];
+	} catch {
+		return [];
+	}
+};
+
+/** Candidate DB inputs in the legacy repo: schema files, migration dirs, SQLite files, dumps. Code only. `vendor`: the source adapter's dependency folders. */
+export async function findDbFiles(sourceRoot: string, vendor: string[] = []): Promise<{ schema: string[]; dumps: string[] }> {
+	const skip = skipDir(sourceRoot, vendor, await gitIgnoredDirs(sourceRoot));
 	const schema: string[] = [];
 	const dumps: string[] = [];
 	const visit = (dir: string, depth: number) => {
@@ -59,8 +69,8 @@ export function findDbFiles(sourceRoot: string): { schema: string[]; dumps: stri
 			return;
 		}
 		for (const n of names) {
-			if (n.startsWith(".") || SKIP_DIRS.has(n)) continue;
 			const p = join(dir, n);
+			if (n.startsWith(".") || skip(p)) continue;
 			const rel = relative(sourceRoot, p);
 			let st;
 			try {
@@ -131,7 +141,8 @@ type DbInputs = Pick<Config["db"], "schemaFiles" | "snapshot" | "url" | "exports
  * suggested) and keeps passwords out of the config. `--yes` takes what was detected.
  */
 export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean, o: { client?: ModelClient; model?: string } = {}): Promise<DbInputs> {
-	const found = findDbFiles(config.source.path);
+	const found = await findDbFiles(config.source.path, vendorDirs(config));
+	const topSkip = skipDir(config.source.path, vendorDirs(config), await gitIgnoredDirs(config.source.path));
 	const relational = relationalCheck(config);
 	const sql = config.db.from.filter(relational);
 	const docs = config.db.from.filter((e) => !relational(e));
@@ -141,7 +152,7 @@ export async function askDbInputs(config: Config, ui: DbPrompter, yes: boolean, 
 	// a mistyped path is often the right file under another top folder (php/gyro/… → gyro-php/gyro/…)
 	const top = (() => {
 		try {
-			return readdirSync(config.source.path).filter((n) => !n.startsWith(".") && !SKIP_DIRS.has(n));
+			return readdirSync(config.source.path).filter((n) => !topSkip(join(config.source.path, n)));
 		} catch {
 			return [];
 		}

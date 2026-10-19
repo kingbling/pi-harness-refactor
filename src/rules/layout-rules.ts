@@ -3,6 +3,7 @@ import { join, matchesGlob, resolve } from "node:path";
 import { CONFIG_FILE } from "../config.ts";
 import type { StructureContext, TargetAdapter } from "../adapters/types.ts";
 import { exec } from "../proc.ts";
+import { gitIgnoredDirs, skipDir } from "../inventory/ignored.ts";
 
 /**
  * The feature-folder layout of one stack as DATA: `.bigrefactor/rules/<stack>/layout.json`. Decided at onboarding
@@ -351,7 +352,7 @@ function placeProblems(projectDir: string, f: string, mod: string, area: string,
 /** Every feature folder has the required files (on disk or written by this unit). */
 function missingRequired(projectDir: string, mod: string, area: string, r: LayoutRules, written: string[], ignore?: string[]): string[] {
 	if (!r.require?.length) return [];
-	const have = new Set([...listFiles(join(projectDir, mod), ignore), ...written.filter((f) => f.startsWith(mod)).map((f) => f.slice(mod.length))]);
+	const have = new Set([...listFiles(join(projectDir, mod), skipDir(projectDir, ignore)), ...written.filter((f) => f.startsWith(mod)).map((f) => f.slice(mod.length))]);
 	return r.require.filter((q) => ![...have].some((h) => compileFor(r, q, area).test(h))).map((q) => `${mod}: missing ${show(q, area)} (every feature folder has ${r.require.map((x) => show(x, area)).join(", ")}); create it`);
 }
 
@@ -367,7 +368,8 @@ export async function checkLayoutTree(projectDir: string, r: LayoutRules, o: Lay
 	const placeholder = r.moduleDir.replace(/\/$/, "").split("/").at(-1)!;
 	const skip = new Set([...notAreas, ...[...o.sharedDirs, ...(o.dataDirs ?? [])].map((d) => topUnder(d, root)).filter((x): x is string => !!x)]);
 	const out: string[] = [];
-	const dirs = listDirs(join(projectDir, root), o.ignoreDirs).filter((d) => !skip.has(d));
+	const skipped = skipDir(projectDir, o.ignoreDirs, await gitIgnoredDirs(projectDir));
+	const dirs = listDirs(join(projectDir, root), skipped).filter((d) => !skip.has(d));
 	for (const d of dirs) {
 		// a big tree: Pi draws between the area folders
 		await new Promise((res) => setImmediate(res));
@@ -377,14 +379,14 @@ export async function checkLayoutTree(projectDir: string, r: LayoutRules, o: Lay
 			if (!want || [...want].some((f) => f.startsWith(`${root}/${d}/`))) out.push(`${root}/${d}/: folder "${d}" does not follow ${r.moduleDir}`);
 			continue;
 		}
-		const files = listFiles(join(projectDir, mod), o.ignoreDirs).map((f) => `${mod}/${f}`).filter((f) => !scaffold.has(f));
+		const files = listFiles(join(projectDir, mod), skipped).map((f) => `${mod}/${f}`).filter((f) => !scaffold.has(f));
 		const checked = want ? files.filter((f) => want.has(f)) : files;
 		if (!checked.length) continue;
 		// required files: the whole tree always; with `only`, a folder these files start (a code job's new folder)
 		out.push(...checkLayoutRules(checked, mod, area, projectDir, r, o, {}, !want || files.every((f) => want.has(f))));
 		for (const f of checked.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, mod, area, r, o));
 	}
-	const shared = o.sharedDirs.map(slashed).flatMap((s) => listFiles(join(projectDir, s), o.ignoreDirs).map((f) => s + f)).filter((f) => !scaffold.has(f) && (!want || want.has(f)));
+	const shared = o.sharedDirs.map(slashed).flatMap((s) => listFiles(join(projectDir, s), skipped).map((f) => s + f)).filter((f) => !scaffold.has(f) && (!want || want.has(f)));
 	out.push(...checkLayoutRules(shared, "\0none", "", projectDir, r, o));
 	for (const f of shared.filter((f) => isSource(f, o) && !o.isTestFile(f))) out.push(...perFile(projectDir, f, undefined, undefined, r, o));
 	return [...new Set(out)];
@@ -651,21 +653,19 @@ function read(projectDir: string, f: string): string {
 	}
 }
 
-/** Dot folders, node_modules and the stack's ignoreDirs are never code. */
-const skipped = (n: string, ignore: string[] = []) => n.startsWith(".") || n === "node_modules" || ignore.includes(n);
-
-function listDirs(dir: string, ignore?: string[]): string[] {
+/** Dot files and folders, the stack's ignoreDirs and (in the tree walk) the folders git ignores are never code (`skip` from skipDir). */
+function listDirs(dir: string, skip: (abs: string) => boolean): string[] {
 	try {
-		return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !skipped(e.name, ignore)).map((e) => e.name).sort();
+		return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !skip(join(dir, e.name))).map((e) => e.name).sort();
 	} catch {
 		return [];
 	}
 }
 
-function listFiles(dir: string, ignore?: string[], prefix = ""): string[] {
+function listFiles(dir: string, skip: (abs: string) => boolean, prefix = ""): string[] {
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
-		.filter((n) => !skipped(n, ignore))
+		.filter((n) => !skip(join(dir, n)))
 		.sort()
-		.flatMap((n) => (statSync(join(dir, n)).isDirectory() ? listFiles(join(dir, n), ignore, `${prefix}${n}/`) : [`${prefix}${n}`]));
+		.flatMap((n) => (statSync(join(dir, n)).isDirectory() ? listFiles(join(dir, n), skip, `${prefix}${n}/`) : [`${prefix}${n}`]));
 }

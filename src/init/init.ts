@@ -13,6 +13,7 @@ import { createProjectWithModel, fixSetupWithModel, type ProjectCreator, type Se
 import { withCommandOverrides } from "../adapters/command-overrides.ts";
 import { libraryPlan, parseChoiceFlag, parseReplaceFlag, renderStackPlan, resolveChoices } from "./stack.ts";
 import { loadDecisions, recordEarlyDecision } from "../inventory/decisions.ts";
+import { gitIgnoredDirs, skipDir } from "../inventory/ignored.ts";
 import { cp, rm } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 
@@ -593,10 +594,13 @@ export async function sourceCandidates(root: string): Promise<PromptOption[]> {
 	const out: PromptOption[] = recentSources().filter((d) => d !== root).map((d) => ({ value: rel(d), label: rel(d), hint: "used before" }));
 	const seen = new Set(out.map((o) => resolve(root, o.value)));
 	const dirs: string[] = [];
+	// dependency folders the source adapters name, and what git ignores, hold no old code of the app
+	const vendor = knownSources().flatMap((id) => getSourceAdapter(id).traits?.vendorDirs ?? []);
 	for (const base of [root, dirname(root)])
 		try {
+			const skip = skipDir(base, vendor, await gitIgnoredDirs(base));
 			for (const e of readdirSync(base, { withFileTypes: true }))
-				if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules" && !e.name.endsWith("-new")) dirs.push(join(base, e.name));
+				if (e.isDirectory() && !skip(join(base, e.name)) && !e.name.endsWith("-new")) dirs.push(join(base, e.name));
 		} catch {
 			/* unreadable folder */
 		}

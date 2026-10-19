@@ -7,9 +7,11 @@ import type { Config } from "../../config.ts";
 import { getLanguage, matches, normalizedAst, parse, registerGrammar, walk, type Node } from "../../inventory/treesitter.ts";
 import type { CodeCall, CodeComment, CodeContainer, CodeFunction, FileIndex, IndexedDep, IndexedQuery, IndexedRoute, IndexedSymbol, SourceAdapter, StoreKind } from "../types.ts";
 import { STORE_KINDS } from "../types.ts";
-import { exampleProfileJson, phpAdapter, profileFromJson, type FrameworkProfileJson } from "./php.ts";
+import { exampleProfileJson, profileFromJson } from "./php.ts";
+import { expressProfileExample, PROFILE_SCHEMA_DOC, validateProfileJson, type FrameworkProfileJson } from "./profile.ts";
 import { sqlTables } from "./sql.ts";
 import { exec } from "../../proc.ts";
+import { gitIgnoredDirs, skipDir } from "../../inventory/ignored.ts";
 
 /**
  * A source (legacy) adapter for a language bigrefactor has no hand-written adapter for. A model looks at the
@@ -318,6 +320,8 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 						deps.push({ from: owner(named.node), to: `${recv.text}::${name}`, kind: "static_call" });
 						for (const g of prof?.loaders(recv.text, name, stringArgs(named.node, m.nodes.strings)) ?? []) deps.push({ from: owner(named.node), to: `glob:${g}`, kind: "load" });
 					}
+					// a loader called on an object or module (Load.models, res.render): the profile's loaders apply too
+					if (kind === "member" && recv) for (const g of prof?.loaders(recv.text, name, stringArgs(named.node, m.nodes.strings)) ?? []) deps.push({ from: owner(named.node), to: `glob:${g}`, kind: "load" });
 					if (kind === "member" && recv) call.receiver = /^(this|self|\$this|@)$/.test(recv.text) ? "this" : /^[$@]?\w+$/.test(recv.text) ? recv.text : undefined;
 					if (kind === "function" && dynamic.has(name)) dynamicMarkers.add(name);
 					const index = addCall(named.node, call, callNodeOf(named.node));
@@ -410,9 +414,9 @@ export function fromSourceManifest(m: SourceManifest, root: string): SourceAdapt
 			profileCache = { key: "" };
 		},
 		profileExample() {
-			return { example: exampleProfileJson(), schemaDoc: phpAdapter.profileExample!().schemaDoc };
+			return { examples: [expressProfileExample(), exampleProfileJson()], schemaDoc: PROFILE_SCHEMA_DOC };
 		},
-		validateProfile: (json) => phpAdapter.validateProfile!(json),
+		validateProfile: validateProfileJson,
 		truth: {
 			scriptName: m.truth.scriptName,
 			run: (sourceRoot, script) => ({ cmd: m.truth.run.cmd.replaceAll("{script}", script).replaceAll("{root}", sourceRoot), args: m.truth.run.args.map((a) => a.replaceAll("{script}", script).replaceAll("{root}", sourceRoot)) }),
@@ -429,7 +433,7 @@ async function countMatching(dir: string, m: SourceManifest, limit: number): Pro
 	const { globToRegExp } = await import("../../sessions/spawn.ts");
 	const inc = m.include.map(globToRegExp);
 	const exc = m.exclude.map(globToRegExp);
-	const skip = new Set([".git", "node_modules", ...(m.traits?.vendorDirs ?? [])]);
+	const skip = skipDir(dir, m.traits?.vendorDirs, await gitIgnoredDirs(dir));
 	let n = 0;
 	const visit = (abs: string, depth: number) => {
 		if (n >= limit || depth > 5) return;
@@ -443,7 +447,7 @@ async function countMatching(dir: string, m: SourceManifest, limit: number): Pro
 			if (n >= limit) return;
 			const rel = relative(dir, join(abs, e.name)).split("\\").join("/");
 			if (e.isDirectory()) {
-				if (!skip.has(e.name)) visit(join(abs, e.name), depth + 1);
+				if (!skip(join(abs, e.name))) visit(join(abs, e.name), depth + 1);
 			} else if (inc.some((r) => r.test(rel)) && !exc.some((r) => r.test(rel))) n++;
 		}
 	};

@@ -11,6 +11,7 @@ import type { EvidenceType } from "../ledger/schema.ts";
 import { activeRuleFiles } from "../rules/layout.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { checkTree } from "./layout-check.ts";
+import { onlyComments } from "./comment-only.ts";
 import { setStep } from "./watchdog.ts";
 import { globToRegExp } from "../sessions/spawn.ts";
 import { FAIL_ON_MAIN_TOO, onlyOwnTests, runPortedTests, STALE_NOT_COUNTED } from "./ported.ts";
@@ -239,7 +240,7 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 	// a file with only comments is no code: a note that defers the behaviour, or a test file with no test in it (also
 	// one an earlier pass of this unit left on main: the unit was sent back for it, see reopenCommentOnly)
 	const left = (JSON.parse(g.ledger.getUnit(g.unitId)?.meta ?? "{}") as { commentOnly?: string[] }).commentOnly ?? [];
-	for (const f of new Set([...changed, ...left])) if (!own.has(f) && g.adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && existsSync(join(g.targetProjectDir, f)) && onlyComments(readFileSync(join(g.targetProjectDir, f), "utf8"))) problems.push(`${f}: ${ONLY_COMMENTS}`);
+	for (const f of new Set([...changed, ...left])) if (!own.has(f) && g.adapter.layout.sourceExtensions.some((e) => f.endsWith(e)) && existsSync(join(g.targetProjectDir, f)) && (await onlyComments(readFileSync(join(g.targetProjectDir, f), "utf8"), f, { lang: g.adapter.layout.lang(f), ledger: g.ledger }))) problems.push(`${f}: ${ONLY_COMMENTS}`);
 	// a test that checks a stub mark's text keeps the stub in place
 	for (const f of changed) if (!own.has(f) && g.adapter.layout.isTestFile(f) && existsSync(join(g.targetProjectDir, f))) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) if (l.text.includes("TODO(br:")) problems.push(`${f}:${l.line}: ${TEST_ON_MARK}`);
 	// stubs earlier units left for this unit (the task card listed them): once it is accepted nobody replaces them
@@ -853,11 +854,6 @@ export const STUB_LEFT = "stub left for this unit is still here: replace it with
 export const ONLY_COMMENTS = "holds only comments, no code: write the code it stands for (a test file: the tests), or delete the file";
 /** A test the gate refuses for checking a stub mark. */
 export const TEST_ON_MARK = "a test checks a stub mark (TODO(br:...)): test the behaviour, not the stub";
-
-/** True when the text holds no code once comments (line and block comments, HTML comments) and PHP's open and close tags are taken out. */
-export function onlyComments(text: string): boolean {
-	return !text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\/\/(?!\/).*$/gm, "").replace(/<\?php|\?>/g, "").trim();
-}
 
 /** Lines in the worktree's tracked files that still carry this unit's stub mark TODO(br:<name>), under any of its `names` (stubNames). */
 async function stubsLeftFor(dir: string, names: string[]): Promise<Array<{ file: string; line: number }>> {

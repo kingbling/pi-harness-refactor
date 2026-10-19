@@ -102,6 +102,16 @@ describe("br advise: models make the judgment calls", () => {
 		expect((ledger.db.prepare("SELECT COUNT(*) n FROM decisions WHERE point = 'advise:store:arangodb'").get() as { n: number }).n).toBe(1);
 		ledger.close();
 	});
+
+	it("a relational store going to a relational target is the keep-schema path whatever the engines: no store question", async () => {
+		const ws = legacyWithData("advise-relational");
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, db: { strategy: "keep-schema", from: ["sqlite", "postgresql", "arangodb"], to: "sqlserver" }, models: {} });
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		const ds = await openDecisions(ledger, config, getSourceAdapter("php"), [await getTargetAdapter("nestjs")], ws);
+		expect(ds.filter((d) => d.id.startsWith("store:")).map((d) => d.id)).toEqual(["store:arangodb"]);
+		ledger.close();
+	});
 });
 
 describe("OpenRouter client", () => {

@@ -23,6 +23,11 @@ export function registerGrammar(lang: string, wasmModule: string, opts: { reload
 	GRAMMARS[lang] = wasmModule;
 }
 
+/** True when some adapter registered a grammar for `lang`. */
+export function hasGrammar(lang: string | undefined): boolean {
+	return !!lang && GRAMMARS[lang] !== undefined;
+}
+
 function forget(lang: string): void {
 	languages.delete(lang);
 	for (const k of queries.keys()) if (k.startsWith(`${lang}\u0000`)) queries.delete(k);

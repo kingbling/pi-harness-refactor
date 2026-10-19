@@ -202,6 +202,8 @@ describe("the code job", () => {
 		expect(unmark.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:sales\.controller\)/);
 		const invented = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "c.txt"), "// TODO(br:campaign editor owner)\nx\n"), "stubbed c"), [], undefined, [], main);
 		expect(invented.refused).toMatch(/^new stub marks no unit will replace: TODO\(br:campaign editor owner\) names no unit/);
+		// .txt has no grammar: the comment syntax a model gave once for it (learnCommentSyntax) decides
+		ledger.setMeta("comment_syntax", JSON.stringify({ ".txt": { line: ["//"], block: [] } }));
 		const empty = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "Deferral.txt"), "// owner-dependent: U5\n"), "deferred"), [], undefined, [], main);
 		expect(empty.refused).toMatch(/^files with only comments, no code: src\/Deferral\.txt/);
 		const onMark = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "c.test.txt"), "expect(text).toContain('TODO(br:U5_sales_controller)')\n"), "tested"), [], undefined, [], main);

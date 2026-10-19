@@ -4,6 +4,7 @@ import { effectivePlatform } from "../init/stack.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
+import { relationalCheck } from "./db.ts";
 import { planFrameworks } from "./frameworks.ts";
 import { applySlicePlan, planSlices } from "./slices.ts";
 import { TARGET_ROLES } from "../adapters/registry.ts";
@@ -114,11 +115,11 @@ export async function openDecisions(ledger: Ledger, config: Config, source: Sour
 
 	// --- data stores beyond the target engine
 	const target = (config.db.to ?? "").toLowerCase();
-	const sameFamily = (a: string, b: string) => /mysql|maria/.test(a) && /mysql|maria/.test(b) || /postgres|pg/.test(a) && /postgres|pg/.test(b) || a === b;
+	const relational = relationalCheck(config);
 	for (const store of config.db.from) {
 		if (dims.some((d) => d.key === `data:${store}`)) continue; // rated as a dimension: target:data:<store>
-		if (sameFamily(store.toLowerCase(), target)) continue;
-		if (store.toLowerCase() === "mariadb" || store.toLowerCase() === "mysql") continue; // relational → relational is the keep-schema translation path, not a decision
+		if (store.toLowerCase() === target) continue;
+		if (relational(store) && (!target || relational(target))) continue; // relational → relational (any engines) is the keep-schema translation path, not a decision
 		out.push({ id: `store:${store}`, topic: "data", question: `${store} is a second data store. What happens to it?`, evidence: `config.db.from includes ${store}; target engine ${config.db.to ?? "unset"}`, recommended: "keep", options: [{ value: "keep", label: `keep ${store}, new client library`, hint: "lowest risk; its commands port as services" }, { value: "fold", label: `fold into ${config.db.to ?? "the target DB"}`, hint: "new-schema path (JSONB tables + ETL); larger scope" }, { value: "drop", label: "drop: its features are dead", hint: "only if the inventory shows no live referrers" }] });
 	}
 

@@ -215,6 +215,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	if (!o.dry && !o.spawn) {
 		const { healStackKnowledge } = await import("./stack-heal.ts");
 		await waitOn("updating stack knowledge", () => healStackKnowledge({ ledger, config, root: o.root, client: o.client, log })).catch((e) => log(pc.yellow(`stack knowledge not updated: ${e?.message ?? e}`)));
+		// a target file type no grammar reads: a model says once how its comments are written (the comment-only check)
+		const { learnCommentSyntax } = await import("./comment-only.ts");
+		await waitOn("learning comment syntax", async () => learnCommentSyntax({ ledger, client: o.client, model: config.models.implement.id, adapters: await Promise.all(config.target.stacks.map((id) => getTargetAdapter(id))) })).catch((e) => log(pc.yellow(`comment syntax not learned: ${e?.message ?? e}`)));
 		// accepted units that left a file with only comments on main (before the gate refused them) go back to planned
 		const { reopenCommentOnly } = await import("./drop-check.ts");
 		await waitOn("looking for files with only comments", () => reopenCommentOnly({ ledger, config, log })).catch((e) => log(pc.yellow(`files with only comments not checked: ${e?.message ?? e}`)));
