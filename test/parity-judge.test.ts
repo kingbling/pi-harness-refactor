@@ -56,7 +56,10 @@ describe("judging parity differences", () => {
 			} else {
 				expect(res.reopened).toEqual([]);
 				expect(ledger.getUnit("U1")!.state).toBe("accepted");
-				expect(ledger.openQuestions().filter((q) => q.point === "parity")).toHaveLength(1);
+				const q = ledger.openQuestions().filter((q) => q.point === "parity");
+				expect(q).toHaveLength(1);
+				// the problem is where the answers differ: the resolver's tries on other differences of U1 are not its tries
+				expect(JSON.parse(q[0]!.context!).sameAs).toBe("parity:U1:GET /invoices/{id} body.total");
 			}
 		}
 	});

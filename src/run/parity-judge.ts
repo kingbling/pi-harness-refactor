@@ -273,7 +273,7 @@ export async function judgeRun(o: {
 		} else {
 			await askViaModel(
 				{ ledger: o.ledger, config: o.config, root: o.root, client: o.client },
-				{ point: "parity", unitId, facts: `${note}\nThe unit was re-opened ${n} times for this and still differs.`, options: [{ value: "retry", facts: "re-open it once more" }, { value: "leave", facts: "leave it as it is" }], recommended: "leave", blocks: "none", askedBy: "parity", sameAs: `parity:${unitId}` },
+				{ point: "parity", unitId, facts: `${note}\nThe unit was re-opened ${n} times for this and still differs.`, options: [{ value: "retry", facts: "re-open it once more" }, { value: "leave", facts: "leave it as it is" }], recommended: "leave", blocks: "none", askedBy: "parity", sameAs: parityProblem(db, o.runId, unitId) },
 			).catch(() => undefined);
 		}
 	}
@@ -288,3 +288,13 @@ export async function judgeRun(o: {
 
 const short = (v: string | null, n = 200) => (v && v.length > n ? `${v.slice(0, n)}…` : (v ?? "null"));
 const describe = (d: Pick<DiffRow, "step" | "route" | "kind" | "path" | "legacy" | "target">) => `step ${d.step} (${d.route}) ${d.kind}${d.path ? ` at ${d.path}` : ""}: old ${short(d.legacy)}, new ${short(d.target)}`;
+
+/**
+ * The problem a parity question is about: the unit and where its answers differ (route and field, numbers left out).
+ * The resolver's tries count per problem: answers to other differences of the same unit (a login redirect last week,
+ * a session value now) are not this problem's tries.
+ */
+export function parityProblem(db: Ledger["db"], runId: number, unitId: string): string {
+	const at = (db.prepare("SELECT DISTINCT route, path FROM parity_diffs WHERE run_id = ? AND unit_id = ? AND status = 'bug'").all(runId, unitId) as Array<{ route: string; path: string }>).map((r) => `${r.route} ${r.path.replace(/\[\d+\]|\b\d+\b/g, "N")}`);
+	return `parity:${unitId}:${[...new Set(at)].sort().join("|")}`;
+}
