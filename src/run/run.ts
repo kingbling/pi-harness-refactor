@@ -320,7 +320,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			.finally(() => (askingStuck = undefined));
 		// open questions: a model tries each first; only what it cannot settle waits for the owner (context.forOwner)
 		const resolver = o.resolver === false ? undefined : (o.resolver ?? (o.spawn ? undefined : resolveWithModel));
-		if (resolver)
+		// not while stopping: its answers start code and setup jobs, and a stop starts nothing new
+		if (resolver && !stop)
 			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, codeJob, layoutJob, pluginChangedAt: PLUGIN_TIME, log: (l) => log(pc.cyan(l)) })
 				.then((r) => ((resolvedSome ||= r.answered > 0), r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`))), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
 				.finally(() => (resolving = undefined));
@@ -458,7 +459,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			adapters,
 			linkAll,
 			log,
-			sweep: (stackId) => stubSweep?.afterMerge(stackId),
+			sweep: (stackId) => (stop ? undefined : stubSweep?.afterMerge(stackId)),
 			codeJob: async (stackId, what) => {
 				let merged: string | undefined;
 				let locked: { files: string[]; diff: string } | undefined;
@@ -641,6 +642,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		if (stopRecord) return;
 		stop = true;
 		stopRecord = { at: new Date().toISOString(), reason, finishing: [...running.keys()] };
+		// no parity slice or shared-cause job starts while the lanes finish (a running one finishes)
+		parityStopped = true;
 		if (!o.dry) ledger.setMeta(OPEN_RUN, JSON.stringify({ startedAt, stop: stopRecord }));
 		// the builder starts nothing new from now on (no check, repair or code job while the lanes finish); its running
 		// check is killed, a running repair or code job finishes; the run's end waits for it
