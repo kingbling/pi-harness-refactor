@@ -40,7 +40,7 @@ import { findTests, warmMainCache } from "./ported.ts";
 import type { TargetAdapter } from "../adapters/types.ts";
 import { createTidyJobs } from "./tidy-job.ts";
 import { runCodeJob } from "./code-job.ts";
-import { createStubSweep, resolveOwnersWithModel, SWEEP_TRIES } from "./stub-sweep.ts";
+import { createStubSweep, resolveOwnersWithModel } from "./stub-sweep.ts";
 import { finishCheck, finishDue, lastFinish, renderFinishLine } from "./finish-check.ts";
 import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
@@ -433,8 +433,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				dirOf: (stackId) => projectDir(config, stackId),
 				repo: config.target.stacks.length > 1 ? config.target.path : undefined,
 				resolveOwners: resolveOwnersWithModel({ ledger, config }),
-				ask: async (stackId, marks) =>
-					(await askViaModel({ ledger, config, root: o.root, client: o.client }, { point: "stub_sweep", facts: `${marks.length} stub mark(s) in ${stackId} are still on main after ${SWEEP_TRIES} code jobs tried to replace them; no unit will replace them (their owner is accepted or names no unit):\n${marks.slice(0, 30).map((m) => `- ${m.file}:${m.line} TODO(br:${m.owner}) ${m.text}`).join("\n")}${marks.length > 30 ? "\n- …" : ""}\nThe code jobs' transcripts are under .bigrefactor/sessions/__code__.stubs-${stackId}-*.jsonl.`, options: [{ value: "retry", facts: "the marks go to code jobs again" }, { value: "leave", facts: "the marks stay; the owner replaces them by hand" }], blocks: "none", askedBy: "stub-sweep" })).id,
+				otherStacks: (stackId) => config.target.stacks.filter((s) => s !== stackId),
 				codeJob: async (stackId, what) => {
 					let merged: string | undefined;
 					const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackId)!, label: `stubs-${stackId}-${Date.now()}`, linkAll, log, what, mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });

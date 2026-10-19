@@ -177,6 +177,8 @@ export async function learnOwnerNames(ledger: Ledger, names: string[], resolve: 
 
 const HANDED = "stub_sweep_handed";
 const ASKED = "stub_sweep_asked";
+/** Marks (key) whose spent tries were handed once to a code job of the other stacks (what the stubs wait for there). */
+const BACKED = "stub_sweep_backed";
 /** Marks per code job: a job with hundreds of stubs would not finish; the next merge hands the next ones. */
 export const SWEEP_BATCH = 25;
 /** Code jobs one mark gets: a job that did not merge (a race with a unit, a merge conflict) leaves the mark on main. */
@@ -188,11 +190,19 @@ export function stubSweepPrompt(marks: DeadMark[], repo?: string): string {
 ${marks.map((m) => `- ${m.file}:${m.line}  TODO(br:${m.owner}) (${who(m)})  ${m.text}`).join("\n")}`;
 }
 
+/** For the other stacks: the stubs of one stack still wait for something there (often a frontend page waiting for its data). */
+export function stubBackPrompt(marks: DeadMark[], stackId: string): string {
+	return `Code jobs of the ${stackId} project could not replace the stubs below (TODO(br:<owner>) marks; no unit will come back for them). Most often they wait for something in THIS project: the data, route or endpoint the ${stackId} code needs (read the stub texts and the ${stackId} code around them, and the legacy code for the behaviour). Add what is missing here, with tests, the way this project already does it (search for a similar endpoint first). Do not edit the ${stackId} project; its stubs get another code job after yours.
+${marks.map((m) => `- ${m.file}:${m.line}  TODO(br:${m.owner})  ${m.text}`).join("\n")}`;
+}
+
 /**
  * After merges: one sweep at a time per stack. Each mark (owner + file) goes to a code job up to SWEEP_TRIES times,
  * kept in the ledger so a new run counts on: marks no job has had come first, a mark still on main after its job is
- * tried again. A mark still there after its last try goes to the owner once, in one question per sweep (blocking
- * nothing); "retry" gives those marks new tries.
+ * tried again. A mark still there after its last try goes once to a code job of each other stack (a page's stub
+ * often waits for its data or endpoint there), then gets one more try here. After that it stays for the finish check's
+ * report: no "retry or leave" question to the owner (a model or code settles that). Owner answers "retry" to earlier
+ * questions still give new tries.
  */
 export function createStubSweep(o: {
 	ledger: Ledger;
@@ -202,8 +212,8 @@ export function createStubSweep(o: {
 	codeJob: (stackId: string, what: string) => Promise<unknown>;
 	/** decides which unit loose owner names mean (none: such names count as no unit) */
 	resolveOwners?: OwnerResolver;
-	/** asks the owner about marks no code job could replace (blocks nothing); the question's id. An answer "retry …" gives them new tries */
-	ask?: (stackId: string, marks: DeadMark[]) => Promise<number | undefined>;
+	/** the target's other stacks, for marks this stack's jobs could not replace (none: those marks just stay) */
+	otherStacks?: (stackId: string) => string[];
 	/** the target repo, when it has several stacks (named in the job's prompt) */
 	repo?: string;
 	log: (l: string) => void;
@@ -222,17 +232,26 @@ export function createStubSweep(o: {
 		// marks the owner was asked about (key → question): "retry" gives them new tries, any other answer leaves them
 		const asked = JSON.parse(o.ledger.getMeta(ASKED) ?? "{}") as Record<string, number | null>;
 		for (const [k, q] of Object.entries(asked)) {
-			const answer = q ? o.ledger.getQuestion(q)?.answer : undefined;
-			if (answer && /^retry\b/i.test(answer.trim())) (tries[k] = 0), delete asked[k];
-		}
-		const dead = await deadStubMarks(o.ledger, dir);
-		const open = dead.filter((m) => (tries[key(m)] ?? 0) < SWEEP_TRIES);
-		const ask = dead.filter((m) => (tries[key(m)] ?? 0) >= SWEEP_TRIES && !(key(m) in asked));
-		if (ask.length && o.ask) {
-			const q = await o.ask(stackId, ask);
-			for (const m of ask) asked[key(m)] = q ?? null;
+			const question = q ? o.ledger.getQuestion(q) : undefined;
+			if (question?.answer && /^retry\b/i.test(question.answer.trim())) (tries[k] = 0), delete asked[k];
+			// a question an earlier version asked and nobody answered: the other stacks' code job takes it over
+			else if (q && question?.status === "open") o.ledger.db.prepare("UPDATE questions SET status = 'withdrawn', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'").run("withdrawn: a code job of the other stacks adds what the stubs wait for, then they get one more try", new Date().toISOString(), q);
 		}
 		o.ledger.setMeta(ASKED, JSON.stringify(asked));
+		const dead = await deadStubMarks(o.ledger, dir);
+		// tries spent here: once, the other stacks get a code job for what the stubs wait for there, then one more try here
+		const backed = JSON.parse(o.ledger.getMeta(BACKED) ?? "{}") as Record<string, 1>;
+		const spent = dead.filter((m) => (tries[key(m)] ?? 0) >= SWEEP_TRIES && !backed[key(m)]).slice(0, SWEEP_BATCH);
+		const others = o.otherStacks?.(stackId) ?? [];
+		if (spent.length && others.length) {
+			for (const m of spent) (backed[key(m)] = 1), (tries[key(m)] = SWEEP_TRIES - 1);
+			o.ledger.setMeta(BACKED, JSON.stringify(backed));
+			o.ledger.setMeta(HANDED, JSON.stringify(tries));
+			o.log(pc.cyan(`stub sweep ${stackId}: ${spent.length} stub(s) still there after ${SWEEP_TRIES} code jobs: ${others.join(", ")} first adds what they wait for, then they get one more try`));
+			for (const other of others) await o.codeJob(other, stubBackPrompt(spent, stackId));
+			return;
+		}
+		const open = dead.filter((m) => (tries[key(m)] ?? 0) < SWEEP_TRIES);
 		if (!open.length) return;
 		// the marks with the fewest tries (none first): a mark tried before waits until every new one had its job.
 		// Whole files at a time, so a file's stubs are replaced together

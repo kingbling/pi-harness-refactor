@@ -62,29 +62,58 @@ describe("loose owner names, decided by a model with ledger lookups", () => {
 });
 
 describe("stub sweep", () => {
-	it("hands the marks of accepted owners and of no unit to a code job; marks still there are handed again, up to the tries, then the owner is asked once", async () => {
+	it("hands the marks of accepted owners and of no unit to a code job; marks still there are handed again, up to the tries, then once to the other stacks and once more here; no question to the owner", async () => {
 		write("src/agency/lookup.ts", "export const lookup = () => []; // TODO(br:U1708_agency)\n");
 		write("src/campaign/editor.ts", "// TODO(br:campaign editor owner) stub\nexport const e = 1;\n");
 		write("src/open/x.ts", "export const x = 0; // TODO(br:U2000_open)\n");
 		commit();
-		const jobs: string[] = [];
-		const asked: string[][] = [];
-		const make = () => createStubSweep({ ledger, dirOf: () => ws, codeJob: async (_s, what) => void jobs.push(what), ask: async (_s, marks) => (asked.push(marks.map((m) => m.file)), ledger.askQuestion({ point: "stub_sweep", question: "q", options: ["retry", "leave"], blocks: "none", askedBy: "t" })), log: () => {} });
+		const jobs: Array<{ stack: string; what: string }> = [];
+		const make = () => createStubSweep({ ledger, dirOf: () => ws, codeJob: async (stack, what) => void jobs.push({ stack, what }), otherStacks: (s) => ["symfony", "nestjs"].filter((x) => x !== s), log: () => {} });
 		const sweep = make();
 		await sweep.afterMerge("nestjs");
 		expect(jobs).toHaveLength(1);
-		expect(jobs[0]).toContain("src/agency/lookup.ts:1  TODO(br:U1708_agency) (U1708_agency is accepted)");
-		expect(jobs[0]).toContain("src/campaign/editor.ts:1  TODO(br:campaign editor owner) (names no unit)");
-		expect(jobs[0]).not.toContain("U2000_open");
+		expect(jobs[0]!.what).toContain("src/agency/lookup.ts:1  TODO(br:U1708_agency) (U1708_agency is accepted)");
+		expect(jobs[0]!.what).toContain("src/campaign/editor.ts:1  TODO(br:campaign editor owner) (names no unit)");
+		expect(jobs[0]!.what).not.toContain("U2000_open");
 		// the job did not remove them: tried again (a new run counts on), until the tries are used up
-		for (let i = 1; i < SWEEP_TRIES + 2; i++) await make().afterMerge("nestjs");
-		expect(jobs).toHaveLength(SWEEP_TRIES);
-		expect(asked).toEqual([["src/agency/lookup.ts", "src/campaign/editor.ts"]]);
-		// "retry" gives them new tries
-		const q = (ledger.db.prepare("SELECT id FROM questions WHERE point = 'stub_sweep'").get() as { id: number }).id;
-		ledger.answerQuestion(q, "retry — give them to a code job again", "owner");
+		for (let i = 1; i < SWEEP_TRIES; i++) await make().afterMerge("nestjs");
+		expect(jobs.map((j) => j.stack)).toEqual(Array(SWEEP_TRIES).fill("nestjs"));
+		// spent: the other stack adds what they wait for, then one more try here, then they stay (finish check)
 		await make().afterMerge("nestjs");
-		expect(jobs).toHaveLength(SWEEP_TRIES + 1);
+		expect(jobs[SWEEP_TRIES]!.stack).toBe("symfony");
+		expect(jobs[SWEEP_TRIES]!.what).toMatch(/Do not edit the nestjs project/);
+		await make().afterMerge("nestjs");
+		expect(jobs[SWEEP_TRIES + 1]!.stack).toBe("nestjs");
+		for (let i = 0; i < 3; i++) await make().afterMerge("nestjs");
+		expect(jobs).toHaveLength(SWEEP_TRIES + 2);
+		expect(ledger.db.prepare("SELECT COUNT(*) n FROM questions WHERE point = 'stub_sweep'").get()).toEqual({ n: 0 });
+	});
+
+	it("an owner's retry to a question from an earlier version still gives the marks new tries", async () => {
+		write("src/agency/lookup.ts", "export const lookup = () => []; // TODO(br:U1708_agency)\n");
+		commit();
+		const k = "nestjs\0U1708_agency\0src/agency/lookup.ts";
+		ledger.setMeta("stub_sweep_handed", JSON.stringify({ [k]: SWEEP_TRIES }));
+		ledger.setMeta("stub_sweep_backed", JSON.stringify({ [k]: 1 }));
+		const q = ledger.askQuestion({ point: "stub_sweep", question: "q", options: ["retry", "leave"], blocks: "none", askedBy: "t" });
+		ledger.setMeta("stub_sweep_asked", JSON.stringify({ [k]: q }));
+		ledger.answerQuestion(q, "retry — give them to a code job again", "owner");
+		const jobs: string[] = [];
+		await createStubSweep({ ledger, dirOf: () => ws, codeJob: async (_s, what) => void jobs.push(what), log: () => {} }).afterMerge("nestjs");
+		expect(jobs).toHaveLength(1);
+	});
+
+	it("an open question an earlier version asked is withdrawn: the other stacks' job takes it over", async () => {
+		write("src/agency/lookup.ts", "export const lookup = () => []; // TODO(br:U1708_agency)\n");
+		commit();
+		const k = "nestjs\0U1708_agency\0src/agency/lookup.ts";
+		ledger.setMeta("stub_sweep_handed", JSON.stringify({ [k]: SWEEP_TRIES }));
+		const q = ledger.askQuestion({ point: "stub_sweep", question: "q", options: ["retry", "leave"], blocks: "none", askedBy: "t" });
+		ledger.setMeta("stub_sweep_asked", JSON.stringify({ [k]: q }));
+		const jobs: string[] = [];
+		await createStubSweep({ ledger, dirOf: () => ws, codeJob: async (s) => void jobs.push(s), otherStacks: () => ["symfony"], log: () => {} }).afterMerge("nestjs");
+		expect(ledger.getQuestion(q)!.status).toBe("withdrawn");
+		expect(jobs).toEqual(["symfony"]);
 	});
 
 	it("an older ledger's handed list counts as one try each", async () => {
