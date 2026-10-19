@@ -318,11 +318,13 @@ function triedBefore(ledger: Ledger, q: QuestionRow): { earlier: string[]; tries
   const rows = (
     ledger.db
       .prepare(
-        `SELECT unit_id, answered_at, answer, answered_by, json_extract(context, '$.outOfScope') IS NOT NULL AS outOfScope FROM questions WHERE id != ? AND point = ? AND (unit_id IS ? OR json_extract(context, '$.sameAs') = ?) AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
+        `SELECT unit_id, answered_at, answer, answered_by, json_extract(context, '$.outOfScope') IS NOT NULL AS outOfScope, json_extract(context, '$.sameAs') AS same FROM questions WHERE id != ? AND point = ? AND (unit_id IS ? OR json_extract(context, '$.sameAs') = ?) AND answered_by IN (?, ?, ?, ?) ORDER BY id`,
       )
-      .all(q.id, q.point, q.unit_id, sameAs ?? null, ...MODEL_ANSWERERS) as Array<{ unit_id: string | null; answered_at: string; answer: string; answered_by: string; outOfScope: number }>
+      .all(q.id, q.point, q.unit_id, sameAs ?? null, ...MODEL_ANSWERERS) as Array<{ unit_id: string | null; answered_at: string; answer: string; answered_by: string; outOfScope: number; same: string | null }>
   ).filter((r) => !(r.answered_by === RESOLVER && answerValue(r.answer).toLowerCase() === "leave"));
-  const own = rows.filter((r) => r.unit_id === q.unit_id);
+  // only answers to the same problem count as tries: a unit retried three times for a skipped test days ago is not
+  // parked unasked when a new, different problem of the same kind comes up (questions name their problem in sameAs)
+  const own = rows.filter((r) => r.unit_id === q.unit_id && (r.same ?? null) === (sameAs ?? null));
   return {
     earlier: rows.map((r) => `${r.answered_at}${r.unit_id === q.unit_id ? "" : ` (unit ${r.unit_id})`}: ${r.answer}${r.answered_by === RESOLVER ? "" : ` (after a ${r.answered_by})`}`),
     tries: own.length,

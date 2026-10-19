@@ -66,6 +66,30 @@ describe("resolver model before the owner", () => {
 		expect(seen).toEqual([...Array(MAX_RESOLVER_TRIES).keys()]);
 	});
 
+	it("tries count per problem: a unit retried up to the cap for one problem gets the model again for a new one of the same kind", async () => {
+		const { MAX_RESOLVER_TRIES } = await import("../src/jev/resolve.ts");
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: "/l", stack: "php" }, target: { path: "/t", stacks: ["nestjs"] }, models: {} });
+		ledger.createUnit({ id: "u1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		let calls = 0;
+		const resolver: Resolver = async () => (calls++, { answer: "retry", why: "w" });
+		const ask = (sameAs: string) => ledger.askQuestion({ unitId: "u1", point: "gate_env", question: sameAs, options: ["retry — retry", "leave — leave"], context: { sameAs }, askedBy: "orchestrator" });
+		for (let i = 0; i < MAX_RESOLVER_TRIES; i++) {
+			ask("antigaming_ok: skipped test in a.test.tsx");
+			await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+		}
+		// the same problem again: parked without the model
+		const same = ask("antigaming_ok: skipped test in a.test.tsx");
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+		expect(calls).toBe(MAX_RESOLVER_TRIES);
+		expect(ledger.getQuestion(same)!.answer).toMatch(/^leave.*\nhint: .*came back/s);
+		// a new problem: the model answers it
+		const other = ask("wired_ok: the page data comes from AssetPages");
+		await resolveOpenQuestions({ ledger, config, root: "/r", resolver });
+		expect(calls).toBe(MAX_RESOLVER_TRIES + 1);
+		expect(ledger.getQuestion(other)!.answer).toMatch(/^retry/);
+	});
+
 	it("a setup cause runs a fix job first: fixed → answered with the resolver's option and what changed; nothing changed → parked, or the owner on other points", async () => {
 		const { FIX_JOB } = await import("../src/jev/resolve.ts");
 		const ledger = new Ledger(":memory:");
