@@ -497,6 +497,10 @@ describe("a reopened DB unit's own tests", () => {
 		green("DB_a", ["migrations/RedTest.php"], "gate_red:tests");
 		green("DB_b", ["migrations/SharedTest.php", "migrations/BTest.php"]);
 		expect(ownTests(ledger, "DB_a", (f) => f.endsWith("Test.php"))).toEqual(["migrations/ATest.php"]);
+		// other units' reports are not read file by file (thousands of them froze the run)
+		const seen: string[] = [];
+		ownTests(ledger, "DB_a", (f) => (seen.push(f), f.endsWith("Test.php")));
+		expect(seen).not.toContain("migrations/BTest.php");
 	});
 
 	it("include the tests a code job merged for one of its questions", async () => {

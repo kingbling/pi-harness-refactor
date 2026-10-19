@@ -282,13 +282,18 @@ async function dataFiles(projectDir: string, dataDirs: string[], keep: (p: strin
  * also wrote: those prove that unit's schema.
  */
 export function ownTests(ledger: Ledger, unitId: string, isTestFile: (f: string) => boolean): string[] {
-	const rows = ledger.db.prepare("SELECT unit_id, json_extract(gate_report, '$.changedFiles') files FROM attempts WHERE outcome = 'gate_green' AND json_extract(gate_report, '$.changedFiles') IS NOT NULL").all() as Array<{ unit_id: string; files: string }>;
+	// only this unit's rows are read in JS; the check against other units runs in SQL (thousands of large gate reports)
+	const rows = ledger.db.prepare("SELECT json_extract(gate_report, '$.changedFiles') files FROM attempts WHERE unit_id = ? AND outcome = 'gate_green' AND json_extract(gate_report, '$.changedFiles') IS NOT NULL").all(unitId) as Array<{ files: string }>;
 	// a code job merged for one of the unit's questions wrote its tests for that unit (older jobs name the question only in their task)
-	const jobs = ledger.db.prepare("SELECT json_extract(gate_report, '$.forUnit') forUnit, json_extract(gate_report, '$.what') what, json_extract(gate_report, '$.changedFiles') files FROM attempts WHERE unit_id IS NULL AND outcome = 'fixed' AND json_extract(gate_report, '$.changedFiles') IS NOT NULL").all() as Array<{ forUnit: string | null; what: string | null; files: string }>;
+	const jobs = ledger.db.prepare("SELECT json_extract(gate_report, '$.forUnit') forUnit, json_extract(gate_report, '$.what') what, json_extract(gate_report, '$.changedFiles') files FROM attempts WHERE unit_id IS NULL AND outcome = 'fixed' AND json_extract(gate_report, '$.changedFiles') IS NOT NULL AND (json_extract(gate_report, '$.forUnit') = ? OR (json_extract(gate_report, '$.forUnit') IS NULL AND json_extract(gate_report, '$.what') LIKE '%question #%'))").all(unitId) as Array<{ forUnit: string | null; what: string | null; files: string }>;
 	const jobUnit = (j: (typeof jobs)[number]) => j.forUnit ?? ((q) => (q ? ledger.getQuestion(Number(q))?.unit_id : undefined))(/question #(\d+)/.exec(j.what ?? "")?.[1]);
 	const mine = new Set<string>();
-	const others = new Set<string>();
-	for (const r of rows) for (const f of JSON.parse(r.files) as string[]) if (isTestFile(f)) (r.unit_id === unitId ? mine : others).add(f);
+	for (const r of rows) for (const f of JSON.parse(r.files) as string[]) if (isTestFile(f)) mine.add(f);
 	for (const j of jobs) if (jobUnit(j) === unitId) for (const f of JSON.parse(j.files) as string[]) if (isTestFile(f)) mine.add(f);
-	return [...mine].filter((f) => !others.has(f)).sort();
+	if (!mine.size) return [];
+	const list = [...mine];
+	const others = new Set(
+		(ledger.db.prepare(`SELECT DISTINCT j.value f FROM attempts a, json_each(a.gate_report, '$.changedFiles') j WHERE a.outcome = 'gate_green' AND (a.unit_id IS NULL OR a.unit_id <> ?) AND j.value IN (${list.map(() => "?").join(",")})`).all(unitId, ...list) as Array<{ f: string }>).map((r) => r.f),
+	);
+	return list.filter((f) => !others.has(f)).sort();
 }
