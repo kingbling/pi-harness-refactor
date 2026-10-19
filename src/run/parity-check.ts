@@ -249,7 +249,10 @@ export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; ba
 			const headText = [...res.headers].map(([k, v]) => `${k}: ${v}`).join("\n");
 			for (const [n, re] of Object.entries(s.save ?? {})) {
 				const m = new RegExp(re).exec(headText) ?? new RegExp(re).exec(text);
-				if (m?.[1] !== undefined) vars.set(n, m[1]);
+				// the pattern missed (the page writes the attributes in another order, or JSON): the value of the form
+				// field a later step sends it in, read from the page's inputs or JSON
+				const v = m?.[1] ?? fieldsFor(steps, n, o.side).map((f) => fieldValue(text, f)).find((x) => x !== undefined);
+				if (v !== undefined) vars.set(n, v);
 			}
 		} catch (e: any) {
 			r.error = String(e?.cause?.message ?? e?.message ?? e);
@@ -283,6 +286,43 @@ function view(s: Step, r: StepResult, withData: boolean): Record<string, unknown
 	return v;
 }
 
+/** The form fields (or JSON keys) later steps fill with `{{name}}`, as this side sends them. */
+function fieldsFor(steps: Step[], name: string, side: "legacy" | "target"): string[] {
+	const out = new Set<string>();
+	for (const s of steps) {
+		const t = side === "target" ? s.target ?? {} : {};
+		for (const fields of [t.form ?? s.form, t.body ?? s.body])
+			if (fields && typeof fields === "object") for (const [k, v] of Object.entries(fields as Record<string, unknown>)) if (v === `{{${name}}}`) out.add(k);
+	}
+	return [...out];
+}
+
+/** The value of form field `name` in an answer: an <input> with that name (attributes in any order), or a JSON key. */
+export function fieldValue(text: string, name: string): string | undefined {
+	for (const tag of text.match(/<input\b[^>]*>/gi) ?? []) {
+		const attr = (a: string) => new RegExp(`\\s${a}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag);
+		const n = attr("name");
+		if (n && (n[1] ?? n[2] ?? n[3]) === name) {
+			const v = attr("value");
+			return v ? (v[1] ?? v[2] ?? v[3] ?? "") : "";
+		}
+	}
+	try {
+		const find = (x: unknown): string | undefined => {
+			if (!x || typeof x !== "object") return undefined;
+			for (const [k, v] of Object.entries(x as Record<string, unknown>)) {
+				if (k === name && (typeof v === "string" || typeof v === "number")) return String(v);
+				const deeper = find(v);
+				if (deeper !== undefined) return deeper;
+			}
+			return undefined;
+		};
+		return find(JSON.parse(text));
+	} catch {
+		return undefined;
+	}
+}
+
 /** The old app sent the request on to itself over another scheme (http → https): no handler answered it. */
 export const selfRedirect = (r: StepResult) => (r.status ?? 0) >= 300 && (r.status ?? 0) < 400 && /^\w+:\/\/\(this app\)/.test(r.location ?? "");
 
@@ -290,12 +330,12 @@ export const selfRedirect = (r: StepResult) => (r.status ?? 0) >= 300 && (r.stat
  * The steps after a login (a "none" step) that the answers send back to that login's page: the login did not hold, so
  * the step only shows the login wall. Returns their indexes.
  */
-export function loginWall(steps: Step[], results: StepResult[]): Set<number> {
+export function loginWall(steps: Step[], results: StepResult[], side: "legacy" | "target" = "legacy"): Set<number> {
 	const pathOf = (p: string) => p.split(/[?#]/)[0]!.replace(/\/+$/, "") || "/";
 	const pages = new Set<string>();
 	const out = new Set<number>();
 	steps.forEach((s, i) => {
-		if (s.compare === "none") return void pages.add(pathOf(s.path));
+		if (s.compare === "none") return void pages.add(pathOf(side === "target" ? s.target?.path ?? s.path : s.path));
 		const r = results[i];
 		if (pages.size && r && (r.status ?? 0) >= 300 && (r.status ?? 0) < 400 && r.location?.startsWith("/") && pages.has(pathOf(r.location))) out.add(i);
 	});
@@ -310,17 +350,24 @@ const covers = (noise: string, path: string) => path === noise || path.startsWit
  * and so is one it sends back to the login page after a login (the login did not hold: only the login wall was seen),
  * and so is one it only redirects to itself on https: both apps forcing https says nothing about the handler.
  */
-export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[], neu: StepResult[], withData: boolean): { diffs: Diff[]; compared: number; notCompared: string[] } {
+export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[], neu: StepResult[], withData: boolean): { diffs: Diff[]; compared: number; notCompared: string[]; newLoginFailed?: boolean } {
 	const diffs: Diff[] = [];
 	const notCompared: string[] = [];
 	let compared = 0;
 	const wall = loginWall(steps, old1);
+	// the new app sends every step after the login that the old app answered logged in back to its login page: the
+	// comparison's login did not hold there (a token it could not read, a test account that does not work), so those
+	// steps show only the login wall. That is no page's bug: they are not compared, and no unit is blamed for them.
+	const loggedIn = steps.map((s, i) => i).filter((i) => steps[i]!.compare !== "none" && steps.slice(0, i).some((x) => x.compare === "none") && !wall.has(i) && !old1[i]!.error && (old1[i]!.status ?? 0) < 300);
+	const newWall = loginWall(steps, neu, "target");
+	const newLoginFailed = loggedIn.length > 0 && loggedIn.every((i) => newWall.has(i));
 	steps.forEach((s, i) => {
 		const a = old1[i]!;
 		if (s.compare === "none") return;
 		if (a.error || (a.status ?? 0) >= 500) return void notCompared.push(`${s.id} (the old app: ${a.error ?? `status ${a.status}`})`);
 		if (selfRedirect(a)) return void notCompared.push(`${s.id} (the old app only redirects it to itself: ${a.status} → ${a.location})`);
 		if (wall.has(i)) return void notCompared.push(`${s.id} (the old app sends it to the login page: the login before it did not hold)`);
+		if (newLoginFailed && newWall.has(i)) return void notCompared.push(`${s.id} (the new app sends it to the login page: the comparison's login did not hold there)`);
 		// a failed second old run would make everything look like noise and hide every real difference
 		const a2 = old2[i]!;
 		if (a2.error || (a2.status ?? 0) >= 500) return void notCompared.push(`${s.id} (the old app's second run: ${a2.error ?? `status ${a2.status}`})`);
@@ -334,7 +381,7 @@ export function compareRuns(steps: Step[], old1: StepResult[], old2: StepResult[
 			diffs.push({ step: s.id, route: s.route, kind: top === "redirect" ? "redirect" : top === "body" ? "body" : top === "data" ? "data" : "status", path: d.path, legacy: d.a, target: d.b });
 		}
 	});
-	return { diffs, compared, notCompared };
+	return { diffs, compared, notCompared, ...(newLoginFailed ? { newLoginFailed } : {}) };
 }
 
 // ---- the tester that writes the steps ---------------------------------------------------------------------
@@ -532,7 +579,8 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	if (hop >= 0 && !apps[LEGACY]?.selfRedirect) saveApp(o.root, LEGACY, { selfRedirect: `${steps[hop]!.method} ${steps[hop]!.path} → ${old1[hop]!.status} ${old1[hop]!.location}` });
 	const skipped = skippedRoutes(loadSteps(o.root, o.slice)!, routes);
 	const note = [`${c.compared} step(s) compared`, skipped.length ? `${skipped.length} of ${routes.length} route(s) skipped` : "", withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : "", held.length ? `not compared yet (unit not accepted): ${held.join(", ")}` : ""].filter(Boolean).join("; ");
-	const res = record({ outcome: c.diffs.length ? "differs" : c.compared ? "same" : "error", diffs: c.diffs, compared: c.compared, note }, steps.length, skipped.length);
+	if (c.newLoginFailed) log(pc.yellow(`parity ${o.slice}: the comparison could not log in to the new app (every page after the login went back to it): those pages are not compared and no unit is blamed`));
+	const res = record({ outcome: c.diffs.length ? "differs" : c.compared && !c.newLoginFailed ? "same" : "error", diffs: c.diffs, compared: c.compared, note: c.newLoginFailed ? `the new app's login did not hold; ${note}` : note }, steps.length, skipped.length);
 	log(c.diffs.length ? pc.yellow(`parity ${o.slice}: ${c.diffs.length} difference(s) in ${new Set(c.diffs.map((d) => d.step)).size} step(s) — ${note}`) : pc.green(`parity ${o.slice}: the new app answers like the old one — ${note}`));
 	return res;
 }

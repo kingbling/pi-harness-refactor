@@ -10,7 +10,7 @@ import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
 import { LEGACY, loadApps, saveApp } from "../src/run/parity.ts";
-import { checkSlice, compareRuns, dataChanges, loginWall, MAX_SETUP_RETRIES, plainValue, runSteps, selfRedirect, skippedRoutes, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
+import { checkSlice, compareRuns, dataChanges, fieldValue, loginWall, MAX_SETUP_RETRIES, plainValue, runSteps, selfRedirect, skippedRoutes, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
@@ -117,6 +117,43 @@ describe("comparing the old and the new app", () => {
 		// the logged-out step before the login is still compared
 		expect(c.compared).toBe(2);
 		expect(c.notCompared).toEqual(["a (the old app sends it to the login page: the login before it did not hold)"]);
+	});
+
+	it("the new app sending every page after the login back to its login page is a login that did not hold: not compared, no difference", () => {
+		const s = [step("a"), { ...step("in", "none"), path: "/login" }, step("b"), step("c")];
+		const old: StepResult[] = [{ status: 302, location: "/login" }, {}, { status: 200, body: 1 }, { status: 200, body: 2 }];
+		const c = compareRuns(s, old, old, [{ status: 302, location: "/login" }, {}, { status: 302, location: "/login" }, { status: 302, location: "/login" }], false);
+		expect(c.newLoginFailed).toBe(true);
+		expect(c.diffs).toEqual([]);
+		expect(c.notCompared).toEqual(["b (the new app sends it to the login page: the comparison's login did not hold there)", "c (the new app sends it to the login page: the comparison's login did not hold there)"]);
+		// only some pages back at the login: the login held, those pages differ
+		const some = compareRuns(s, old, old, [{ status: 302, location: "/login" }, {}, { status: 302, location: "/login" }, { status: 200, body: 2 }], false);
+		expect(some.newLoginFailed).toBeUndefined();
+		expect(some.diffs.map((d) => d.step)).toContain("b");
+	});
+
+	it("a saved token whose pattern misses is read from the form field the login sends it in, attributes in any order", async () => {
+		expect(fieldValue('<input type="hidden" value="t0k" name="csrf_f" class="hidden" />', "csrf_f")).toBe("t0k");
+		expect(fieldValue("<input name='csrf_f' type=hidden value='a b'>", "csrf_f")).toBe("a b");
+		expect(fieldValue('{"form":{"csrf_f":"j1"}}', "csrf_f")).toBe("j1");
+		expect(fieldValue("<p>none</p>", "csrf_f")).toBeUndefined();
+		const port = await freePort();
+		let posted = "";
+		const server = createServer((q, r) => {
+			if (q.method === "GET") return void r.end('<form><input type="hidden" value="T123" name="csrf_f"></form>');
+			let b = "";
+			q.on("data", (d) => (b += d)).on("end", () => ((posted = b), r.end("ok")));
+		}).listen(port);
+		try {
+			const steps: Step[] = [
+				{ id: "s0", route: "setup", compare: "none", method: "GET", path: "/login", save: { csrf: 'name="csrf_f"\\s+value="([^"]+)"' } },
+				{ id: "s00", route: "setup", compare: "none", method: "POST", path: "/login", form: { user: "u", csrf_f: "{{csrf}}" } },
+			];
+			await runSteps(steps, { side: "target", base: () => `http://localhost:${port}` });
+			expect(posted).toBe("user=u&csrf_f=T123");
+		} finally {
+			server.close();
+		}
 	});
 
 	it("each app's own address and a dump's base64 text are the harness's noise, not a difference", async () => {
