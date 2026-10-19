@@ -280,6 +280,31 @@ describe("DB lane", () => {
 		expect(prompts[0]).toContain("this stack's data-access approach");
 	});
 
+	it("a stop reaches a DB unit after a red try: no next try, back to planned", async () => {
+		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
+		write(join(ws, "migrated", "package.json"), "{}");
+		mkdirSync(join(ws, ".bigrefactor"), { recursive: true });
+		const ledger = new Ledger(join(ws, ".bigrefactor", "ledger.sqlite"));
+		await planDbLane(ledger, config);
+		let stop = false;
+		let tries = 0;
+		const spawn = async (): Promise<LeafSession> =>
+			({
+				run: async () => {
+					tries++;
+					stop = true; // /br stop while the session works
+					write(join(ws, "migrated", "src", "db", "invoice.entity.spec.ts"), "it('x', () => {});\n");
+					return { text: "done", toolCalls: 3, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+				},
+				dispose() {},
+			}) as unknown as LeafSession;
+		const gate = async (g: GateInput): Promise<GateReport> => ({ ok: false, steps: [{ name: "wired_ok", ok: false, ms: 1, output: "red" }], failedStep: "wired_ok", changedFiles: [], testFiles: g.testFiles.map((t) => t.path) });
+		const r = await runUnit({ ledger, config, root: ws, unitId: "DB_schema_invoice", spawn, gate, stopped: () => stop, log: () => {} });
+		expect(tries).toBe(1);
+		expect(r).toMatchObject({ state: "planned", stopped: true });
+		expect(ledger.transitionsOf("unit", "DB_schema_invoice").at(-1)!.reason).toMatch(/^run stopped after 1 try/);
+	});
+
 	it("the session can run the gate's tests and keep a change to an earlier unit's test it disputes with evidence", async () => {
 		const config = cfg({ from: ["mysql"], to: "postgresql", schemaFiles: ["db/schema.sql"] });
 		write(join(ws, "migrated", "package.json"), "{}");

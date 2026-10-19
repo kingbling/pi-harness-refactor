@@ -186,6 +186,12 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 		if (!testFiles.length) last = "no test files: write at least one test next to your schema files.\n";
 		last += `failed step: ${gate.failedStep}\n${gate.steps.find((x) => !x.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
+		// a stop reaches the unit here, as it reaches a code unit: no next try, its code kept for the next run
+		if (o.stopped?.()) {
+			o.ledger.transitionUnit(o.unitId, "planned", `run stopped after ${n} try(s); its code is kept for the next run`);
+			log(pc.yellow(`  db: the run is stopping: back to planned after ${n} try(s), its code kept`));
+			return { unitId: o.unitId, state: "planned", attempts: n, gate, costUsd: cost, stopped: true };
+		}
 	}
 	if (gate?.ok) o.ledger.transitionUnit(o.unitId, "review", "gate green");
 	else o.ledger.transitionUnit(o.unitId, "quarantined", `db lane: gate still red after ${n} attempts (${gate?.failedStep})`);
