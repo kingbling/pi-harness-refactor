@@ -84,6 +84,16 @@ describe("read-only truth run on the old code", () => {
 		expect(ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE unit_id = 'a'").get()).toEqual({ n: 0 });
 		expect(ledger.hasEvidence("a", "truth_read")).toBe(false);
 	});
+
+	it("a run that returns another kind of value (the text a template prints for its read behaviour) proves nothing: the unit stays accepted", async () => {
+		const { root, config, ledger, script } = workspace(["a"]);
+		ledger.db.prepare("UPDATE truth_cases SET expected = ? WHERE unit_id = 'a'").run(JSON.stringify({ cursor: "pointer" }));
+		script("a", `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":"<style>a { cursor: pointer; }</style>"}]'\n`);
+		const r = await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		expect(r.redone).toEqual([]);
+		expect(r.upgraded).toEqual([]);
+		expect(ledger.getUnit("a")!.state).toBe("accepted");
+	});
 });
 
 describe("scripts for read-only truth with none", () => {

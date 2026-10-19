@@ -312,8 +312,10 @@ function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: 
 	const byKey = new Map(cases.map((c) => [key(c.symbol, JSON.stringify(c.inputs)), c.expected]));
 	const ranFor = (c: { symbol_id: string; inputs: string }) => byKey.get(key(c.symbol_id, c.inputs));
 	const diffs = (c: { symbol_id: string; inputs: string; expected: string }) => differences(JSON.parse(c.expected), ranFor(c));
-	// wrong only where both sides hold a value: a key one side lacks proves nothing either way
-	const wrong = recorded.filter((c) => byKey.has(key(c.symbol_id, c.inputs)) && diffs(c).some((d) => d.a !== undefined && d.b !== undefined));
+	// wrong only where both sides hold a value of the same kind: a key one side lacks proves nothing either way, nor
+	// does another kind of value (read truth of a template's behaviour, {"cursor":"pointer"}, against the text it prints)
+	const kind = (v: unknown) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
+	const wrong = recorded.filter((c) => byKey.has(key(c.symbol_id, c.inputs)) && diffs(c).some((d) => d.a !== undefined && d.b !== undefined && kind(d.a) === kind(d.b)));
 	const unrun = recorded.filter((c) => !byKey.has(key(c.symbol_id, c.inputs)) || diffs(c).length);
 	if (!wrong.length && !unrun.length && recorded.length) {
 		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1 WHERE unit_id = ?").run(id);
