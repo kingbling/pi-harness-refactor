@@ -323,7 +323,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// not while stopping: its answers start code and setup jobs, and a stop starts nothing new
 		if (resolver && !stop)
 			resolving ??= resolveOpenQuestions({ ledger, config, root: o.root, resolver, fixJob, codeJob, layoutJob, pluginChangedAt: PLUGIN_TIME, log: (l) => log(pc.cyan(l)) })
-				.then((r) => ((resolvedSome ||= r.answered > 0), r.forOwner && log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`))), (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
+				.then((r) => {
+					resolvedSome ||= r.answered > 0;
+					if (r.forOwner) log(pc.yellow(`${r.forOwner} question(s) need you (the resolver model could not settle them): /br answer or br questions`));
+					// a parity answer counts now, not at the next run start: a "retry" gives the unit its re-open at the next
+					// comparison, a "leave" stops the asking (unapplied, each comparison asked again and the resolver answered again)
+					for (const sl of applyParityAnswers(ledger)) queueParity(sl);
+				}, (e) => log(pc.yellow(`resolving questions failed: ${e?.message ?? e}`)))
 				.finally(() => (resolving = undefined));
 	};
 
