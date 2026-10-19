@@ -32,6 +32,7 @@ describe("the code job", () => {
 			generatedFiles: [],
 			layout: { moduleDir: (a: string) => `src/features/${a}`, sharedDirs: ["src/shared/"], ignoreDirs: [], isTestFile: (p: string) => p.includes(".test."), sourceExtensions: [".txt"], checkTree, wiringFiles },
 			build: () => o.build ?? { cmd: "true", args: [] },
+			lint: () => ({ cmd: "true", args: [] }),
 			...(o.boot ? { boot: () => o.boot } : {}),
 			test: (dir: string, files: string[]) => o.test?.(dir, files) ?? { cmd: "true", args: [] },
 		} as unknown as TargetAdapter;
@@ -216,6 +217,17 @@ describe("the code job", () => {
 		const r = await job((dir) => (code(dir), writeFileSync(join(dir, "src", "stub.sql"), "select 1;\n"), "replaced the stub"), [], undefined, [], main);
 		expect(r.merged).toBe(false);
 		expect(r.refused).toMatch(/^stub marks of units not accepted yet were removed: TODO\(br:u\)/);
+	});
+	it("the builder's job counts by failing tests: fixing one of main's is merged, breaking another is not", async () => {
+		// a vitest-like run: each test file with "red" in it fails, with colours and a timing
+		const test = (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", 'for f in "$@"; do grep -q red "$f" && printf " \\033[31m×\\033[0m %s > works 12ms\\n" "$f" && bad=1; done; exit ${bad:-0}', "sh", ...files] });
+		const main = { "src/x.test.txt": "red\n", "src/y.test.txt": "red\n" };
+		const fixed = await job((dir) => (writeFileSync(join(dir, "src", "x.test.txt"), "green\n"), "fixed x"), [], undefined, [], { whole: true, main, test });
+		expect(fixed.refused).toBeUndefined();
+		expect(fixed.merged).toBe(true);
+		const broke = await job((dir) => (writeFileSync(join(dir, "src", "x.test.txt"), "green\n"), writeFileSync(join(dir, "src", "a.test.txt"), "red\n"), "fixed x, broke a"), [], undefined, [], { whole: true, main, test });
+		expect(broke.merged).toBe(false);
+		expect(broke.refused).toMatch(/FAIL src\/a\.test\.txt > works$/m);
 	});
 	it("the builder's job has its own turn: a question's job does not wait behind it", async () => {
 		let release = () => {};

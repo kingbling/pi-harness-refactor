@@ -12,6 +12,7 @@ import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
 import { onlyComments } from "./comment-only.ts";
+import { failureLines } from "./ported.ts";
 import { addedLines, changedFiles, clipOutput, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { markOwner } from "./stub-sweep.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
@@ -334,9 +335,15 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 		const c = files?.length === 0 ? undefined : cmd(mainDir, { ...s, files });
 		const was = c && (await runCmd(c.cmd, c.args, mainDir, FULL_OUTPUT));
 		if (err !== undefined && was === undefined) return out.join("\n\n"); // red here, green on main
-		// the builder's job is measured by the type check and the linter: a test run's output (timings, a flaky line)
-		// would read as new errors. Tests red on main too are not its job
-		if (whole && s.step === "test") continue;
+		// a test run's output (timings, counts) is not compared line by line: the builder's job is measured on its
+		// failing tests. A test that fails here and not on main is one it broke; fewer failing tests is progress
+		if (whole && s.step === "test") {
+			const now = failingTests(err ?? ""), before = new Set(failingTests(was ?? ""));
+			added.push(...now.filter((t) => !before.has(t)).map((t) => `FAIL ${t}`));
+			mine += now.length;
+			theirs += before.size;
+			continue;
+		}
 		if (err !== undefined) added.push(...newErrorLines(err, dir, was!, mainDir));
 		mine += err === undefined ? 0 : errorKeys(err, dir).length;
 		theirs += was === undefined ? 0 : errorKeys(was, mainDir).length;
@@ -344,4 +351,9 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	if (added.length) return `the ${whole ? "whole-project " : ""}checks fail with ${added.length} error line(s) main does not have:\n${clipOutput(added.join("\n"), 6000)}`;
 	if (!whole) return undefined;
 	return mine < theirs ? undefined : `the whole-project checks fail as much as on main (no error fixed):\n${out.join("\n\n")}`;
+}
+
+/** The failing tests a test run names, without colours and timings (the same test reads the same on main). */
+function failingTests(out: string): string[] {
+	return [...new Set(failureLines(out.replace(/\x1b\[[0-9;]*m/g, ""), Infinity).map((t) => t.replace(/\s+\d+(?:\.\d+)?\s*m?s$/, "").trim()))];
 }
