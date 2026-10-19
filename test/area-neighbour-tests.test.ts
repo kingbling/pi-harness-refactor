@@ -56,6 +56,16 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect(r.output).toMatch(/warning: 1 test file\(s\) of other units fail on main too, not counted against this unit: tests\/n2\.spec/);
 	});
 
+	it("a unit with no linked or changed test (a reopened DB unit) names its own: a neighbour red on main does not block it", async () => {
+		ledger.createUnit({ id: "db1", tier: "T1", deps: [], meta: {}, symbolIds: [] });
+		write(join(wt, "db/schema.sql"), "create table t();\n"); // its change, no test touched
+		// without the caller's list every test is its own, and the red neighbour blocks it
+		expect((await runPortedTests({ ledger, unitId: "db1", adapter, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 30_000 })).ok).toBe(false);
+		const r = await runPortedTests({ ledger, unitId: "db1", adapter, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 30_000, own: ["tests/own.spec"] });
+		expect(r.ok).toBe(true);
+		expect(r.output).toMatch(/fail on main too, not counted against this unit: tests\/n2\.spec/);
+	});
+
 	it("a neighbour green on main that fails with the unit's code counts against it, named", async () => {
 		write(join(wt, "broken.txt"), "tests/n1.spec\n");
 		const r = await run();

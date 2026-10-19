@@ -44,6 +44,8 @@ export interface GateInput {
 	stackId?: string;
 	/** Paths an approved tidy task names (sanctioned splits, moves, new shared topics). */
 	sanctioned?: string[];
+	/** Test files the caller knows are this unit's own (a DB unit's from its earlier green attempts): they must pass, the rest only must not break. */
+	ownTests?: string[];
 	/** The source adapter's legacy file kinds (SourceAdapter.legacyWords): no target name may carry one. */
 	legacyWords?: string[];
 	/**
@@ -175,7 +177,7 @@ export async function runGate(g: GateInput): Promise<GateReport> {
 	// some uncounted because the worktree was on an older main (the gate brings main's new commits in first)
 	const tests = g.testFiles.map((x) => x.path);
 	const checked = !!g.cleanCheck && tests.length > 0 && !g.cleanCheck.text.includes(FAIL_ON_MAIN_TOO) && !g.cleanCheck.text.includes(STALE_NOT_COUNTED) && [...g.cleanCheck.tests].sort().join("\0") === [...tests].sort().join("\0");
-	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : checked ? Promise.resolve({ ok: true, output: `${fromCheck}\n${clipOutput(g.cleanCheck!.text, 1000)}` }) : runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests, mainDir: g.mainDir, timeoutMs: timeout, slot: cpu, catchUp: true }))))) return done();
+	if (!(await step("ported_tests_green", () => (none !== undefined ? Promise.resolve({ ok: true, output: `no runtime behaviour to pin (the tester's reason: ${none}); the reviewer judges it` }) : !g.testFiles.length ? Promise.resolve({ ok: false, output: cases ? `${cases} truth case(s) but no ported test file: nothing proves the behaviour` : "no truth cases, no ported test file and no reason from the tester why there is nothing to pin: nothing proves the behaviour" }) : checked ? Promise.resolve({ ok: true, output: `${fromCheck}\n${clipOutput(g.cleanCheck!.text, 1000)}` }) : runPortedTests({ ledger: g.ledger, unitId: g.unitId, adapter: g.adapter, dir: g.targetProjectDir, tests, mainDir: g.mainDir, timeoutMs: timeout, slot: cpu, catchUp: true, own: g.ownTests }))))) return done();
 
 	// 8. a reviewer model with tools: real code, connected, on the chosen stack (outside the CPU slot)
 	if (!(await step("wired_ok", () => (g.review ? g.review(changed, nearDuplicates) : Promise.resolve({ ok: true, output: NO_REVIEWER, judged: false }))))) return done();

@@ -116,7 +116,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 			promptSnippet: "check_my_tests: run the gate's test step on the data dirs' tests now",
 			parameters: Type.Object({}),
 			execute: async () => {
-				const r = await runPortedTests({ ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, tests: (await dataTests(targetProjectDir, dataDirs, adapter)).map((t) => t.path), mainDir, timeoutMs: 240_000, slot: gateSlot });
+				const r = await runPortedTests({ ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, tests: (await dataTests(targetProjectDir, dataDirs, adapter)).map((t) => t.path), mainDir, timeoutMs: 240_000, slot: gateSlot, own });
 				return { content: [{ type: "text" as const, text: `${r.ok ? "TESTS GREEN" : "TESTS RED"}\n${r.output.slice(-6000)}` }], details: {} };
 			},
 		} as unknown as ToolDefinition,
@@ -156,7 +156,7 @@ export async function runDbUnit(o: UnitRunOptions, place: { stackId: string }): 
 					return r;
 				}
 			: undefined;
-		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot, mainDir, sanctioned: [...own, ...disputed.keys()] });
+		gate = await gateFn({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, writeGlobs, testFiles, root: o.root, stackId: place.stackId, review, slot: gateSlot, mainDir, sanctioned: [...own, ...disputed.keys()], ownTests: own });
 		gate = await unitNameStep(gate, o.unitId, targetProjectDir);
 		gate = await migrateFreshStep(gate, { ledger: o.ledger, unitId: o.unitId, adapter, dir: targetProjectDir, mainDir, slot: gateSlot });
 		o.ledger.endAttempt(attempt, { outcome: gate.ok ? "gate_green" : `gate_red:${gate.failedStep}`, costUsd: res.usage.cost, tokensIn: res.usage.input, tokensOut: res.usage.output, gateReport: gate });

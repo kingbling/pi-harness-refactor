@@ -72,8 +72,8 @@ export function checkTests(targetProjectDir: string, adapter: TargetAdapter, nam
  * The unit's own ported tests among `tests` (the area's): the files its truth cases are linked to, and test files new
  * or changed in its worktree (the tester's). The rest are other units' tests. No own file found (or no git): all of them count.
  */
-export async function ownTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = []): Promise<string[]> {
-	const own = await onlyOwnTests(ledger, unitId, dir, tests, ignored);
+export async function ownTests(ledger: Ledger, unitId: string, dir: string, tests: string[], ignored: string[] = [], known: string[] = []): Promise<string[]> {
+	const own = [...new Set([...(await onlyOwnTests(ledger, unitId, dir, tests, ignored)), ...tests.filter((t) => known.includes(t))])];
 	return own.length ? own : tests;
 }
 
@@ -207,12 +207,14 @@ async function greenThere(main: string, files: string[], test: (dir: string, fil
  * before they count; a clash with main counts none of them (the merge puts the code on the current main, and the
  * gate after it checks them). Without it (the session's own checks) they do not count either: the gate decides.
  * `slot`: the gate pool slot, taken around each test run only, never while waiting for main's turn.
+ * `own`: test files the caller knows are the unit's (a DB unit has no truth cases to link them, and a reopened one
+ * may change none of its tests): without them, a unit with no own file found would count every test as its own.
  */
-export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapter: TargetAdapter; dir: string; tests: string[]; mainDir?: string; timeoutMs: number; slot?: Slot; catchUp?: boolean }): Promise<TestRun> {
+export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapter: TargetAdapter; dir: string; tests: string[]; mainDir?: string; timeoutMs: number; slot?: Slot; catchUp?: boolean; own?: string[] }): Promise<TestRun> {
 	const slot = o.slot ?? (<T>(fn: () => Promise<T>) => fn());
 	const test = (dir: string, files: string[]) => slot(() => runTests(o.adapter, dir, files, o.timeoutMs));
 	if (o.tests.length < 2) return test(o.dir, o.tests);
-	const own = await ownTests(o.ledger, o.unitId, o.dir, o.tests, o.adapter.toolchain.ignoredPaths);
+	const own = await ownTests(o.ledger, o.unitId, o.dir, o.tests, o.adapter.toolchain.ignoredPaths, o.own);
 	const mine = await test(o.dir, own);
 	const others = o.tests.filter((t) => !own.includes(t));
 	if (!mine.ok || !others.length) return mine;
