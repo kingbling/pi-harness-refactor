@@ -97,6 +97,16 @@ describe("session error recovery", () => {
 		expect(providerSwitches).toBe(0);
 	});
 
+	it("a hung Codex request (no answer for idleMs, cut) goes on in the same session on OpenRouter, without sending the task twice", async () => {
+		const s = scripted(["model_hang: no model activity for 300s, the request was cut", "model_hang: no model activity for 300s, the request was cut", undefined]);
+		let providerSwitches = 0;
+		expect(isTransientError("model_hang: no model activity for 300s, the request was cut")).toBe(true);
+		expect(await promptWithRecovery({ prompt: "TASK", ...s.opts, toFallbackProvider: async () => void providerSwitches++ })).toBeUndefined();
+		expect(providerSwitches).toBe(1);
+		expect(s.sent).toEqual(["TASK", expect.stringMatching(/^Your previous response was cut off/), expect.stringMatching(/^Your previous response was cut off/)]);
+		expect(s.tierSwitches()).toBe(0);
+	});
+
 	it("continues the same session after a drop, with backoff, without a tier fallback", async () => {
 		const s = scripted(["terminated", "Connection error.", undefined]);
 		const err = await promptWithRecovery({ prompt: "TASK", ...s.opts });

@@ -19,7 +19,7 @@ import { askViaModel, FOR_TESTER } from "../jev/ask.ts";
 import { sameQuestion } from "../jev/same.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
-import { globToRegExp, spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
+import { globToRegExp, isProviderFailure, spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, missingTestImports, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
 import { changedFiles, errorSignature, findingKey, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, SKIPPED_TEST, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
@@ -236,7 +236,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// run: expected values come from running the old code; read: it cannot run here (decided once per workspace,
 	// or for this unit after running failed), so the tester writes them from reading it — marked in the ledger
 	let lastTesterText = "";
-	/** The last tester session failed before doing any work (the model provider did not answer): no retest of its own. */
+	/** The last tester session ended because the model provider failed (before any work, or hung or dropped midway): no retest of its own. */
 	let lastTesterDead = false;
 	// the writes the last tester session was refused (a quarantine's red attempt carries them)
 	let lastTesterBlocked: string[] = [];
@@ -373,7 +373,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		}
 		cost += res.usage.cost;
 		lastTesterText = res.text;
-		lastTesterDead = !!res.error && res.toolCalls === 0;
+		lastTesterDead = !!res.error && (res.toolCalls === 0 || isProviderFailure(res.error));
 		// tests of earlier units prove accepted behaviour: the tester may add to them, but a changed or removed line it
 		// did not dispute with evidence is undone (and it is told)
 		const changedOthers = await othersTestsChanged(targetProjectDir, o.unitId, (f) => adapter.layout.isTestFile(f), [...tidyPaths, ...disputedOthers]);

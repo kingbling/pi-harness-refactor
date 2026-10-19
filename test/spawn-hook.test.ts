@@ -108,6 +108,21 @@ describe("runaway control inside a model session (run.maxUnitTokens, run.idleMs)
 		expect(stops).toHaveLength(1);
 	});
 
+	it("with onHang, the first quiet spells are hung requests (the clock starts again), the one after them stops", () => {
+		vi.useFakeTimers();
+		const stops: string[] = [];
+		const hangs: string[] = [];
+		const l = sessionLimits({ maxTokens: 0, idleMs: 60_000, onStop: (why) => stops.push(why), onHang: (why) => hangs.push(why), hangs: 2 });
+		vi.advanceTimersByTime(61_000);
+		expect(hangs).toEqual(["model_hang: no model activity for 60s, the request was cut"]);
+		expect(l.stopped()).toBeUndefined();
+		vi.advanceTimersByTime(60_000);
+		expect([hangs.length, stops.length]).toEqual([2, 0]);
+		vi.advanceTimersByTime(60_000);
+		expect(stops).toEqual(["idle_timeout: no model or tool activity for 60s"]);
+		l.end();
+	});
+
 	it("a running tool is no idleness: a check waiting 30 min for a gate slot is not stopped", () => {
 		vi.useFakeTimers();
 		const { stops, l } = limits(250_000, 60_000);

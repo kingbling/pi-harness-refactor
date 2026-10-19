@@ -265,8 +265,8 @@ describe("truth case ids stay put", () => {
 						write(join(ws, "migrated", SPEC), "it('u1#1', () => {});\n");
 						return { text: "done", ...ok };
 					}
-					// the provider never answers: no tool call, an error
-					return { text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 }, error: "idle_timeout: no model or tool activity for 300s" };
+					// the provider never answers, or goes quiet after a few tool calls
+					return { text: "", toolCalls: tests === 3 ? 2 : 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 }, error: "idle_timeout: no model or tool activity for 300s" };
 				},
 				dispose() {},
 			}) as unknown as LeafSession;

@@ -165,8 +165,14 @@ export function isCapacityError(msg: string): boolean {
 
 /** Network drops that outlived Pi's own quick retries: continue the same session later, never a triage round or a tier change. */
 export function isTransientError(msg: string): boolean {
-	return !isCapacityError(msg) && /\bterminated\b|connection error|request timed out|timed out|ECONNRESET|socket hang up|fetch failed|other side closed/i.test(msg);
+	return !isCapacityError(msg) && /\bterminated\b|connection error|request timed out|timed out|ECONNRESET|socket hang up|fetch failed|other side closed|^model_hang:/i.test(msg);
 }
+
+/** The model went quiet in the middle of a request (no event for idleMs): the request is cut and the session goes on. */
+export const isHangError = (msg: string): boolean => msg.startsWith("model_hang:");
+
+/** The session ended because the model provider failed (dropped, hung, quiet), not because of the work it did. */
+export const isProviderFailure = (msg: string): boolean => isTransientError(msg) || isHangError(msg) || msg.startsWith("idle_timeout:");
 
 /** Orchestrator-level recovery after a prompt: capacity → standard tier once; transient → continue the same session (cap, backoff). */
 export async function promptWithRecovery(o: {
@@ -189,12 +195,13 @@ export async function promptWithRecovery(o: {
 	let error = o.takeError();
 	// the user stopped it: no other provider or tier, never the prompt again
 	if (o.aborting?.()) return error;
-	// Codex failed for any reason but a network drop (usage limit, auth, capacity, model missing): OpenRouter takes
-	// over in the same session, same prompt — with its own tier recovery below.
-	if (error && o.toFallbackProvider && !isTransientError(error)) {
+	// Codex failed for any reason but a network drop (usage limit, auth, capacity, model missing, a request that hung):
+	// OpenRouter takes over in the same session — with its own tier recovery below. After a hang the session goes on
+	// from where it was, the prompt is not sent twice.
+	if (error && o.toFallbackProvider && (!isTransientError(error) || isHangError(error))) {
 		o.record({ type: "provider_fallback", from: "openai-codex", to: "openrouter", error });
 		await o.toFallbackProvider();
-		await o.send(o.prompt);
+		await o.send(isHangError(error) ? CONTINUE_AFTER_DROP : o.prompt);
 		error = o.takeError();
 		if (o.aborting?.()) return error;
 	}
@@ -347,8 +354,11 @@ export function compactionReserve(contextWindow: number, share: number): number 
  * Runaway control inside one model session: fresh tokens (input + output, cache reads excluded) over `maxTokens`, or
  * no model or tool activity for `idleMs`, stops it once (`onStop` with the reason). What it wrote still goes to the gate.
  * A running tool is activity: a check waiting for a gate slot or a long test run is not an idle session.
+ * With `onHang`, the first `hangs` quiet spells are a hung request instead (the caller cuts it and goes on); the
+ * next one stops the session.
  */
-export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (why: string) => void }) {
+export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (why: string) => void; onHang?: (why: string) => void; hangs?: number }) {
+	let hangsLeft = o.onHang ? (o.hangs ?? 3) : 0;
 	let stopped: string | undefined;
 	const stop = (why: string) => {
 		if (stopped) return;
@@ -359,7 +369,14 @@ export function sessionLimits(o: { maxTokens: number; idleMs: number; onStop: (w
 	let tools = 0;
 	const active = () => {
 		clearTimeout(idle);
-		if (!stopped && !tools) idle = setTimeout(() => stop(`idle_timeout: no model or tool activity for ${Math.round(o.idleMs / 1000)}s`), o.idleMs);
+		if (!stopped && !tools)
+			idle = setTimeout(() => {
+				const secs = Math.round(o.idleMs / 1000);
+				if (hangsLeft-- > 0) {
+					o.onHang!(`model_hang: no model activity for ${secs}s, the request was cut`);
+					active();
+				} else stop(`idle_timeout: no model or tool activity for ${secs}s`);
+			}, o.idleMs);
 	};
 	active();
 	return {
@@ -491,11 +508,14 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 			blocked = 0;
 			let text = "";
 			let error: string | undefined;
+			let hung: string | undefined;
 			const usage = { input: 0, output: 0, cost: 0 };
 			const limits = sessionLimits({
 				maxTokens: opts.config.run.maxUnitTokens,
 				idleMs: opts.config.run.idleMs,
 				onStop: (why) => (record({ type: "session_stopped", why }), session.abort()),
+				// a hung request is cut; promptWithRecovery goes on in the same session (OpenRouter after a Codex hang)
+				onHang: (why) => ((hung = why), record({ type: "model_hang", why }), session.abort()),
 			});
 			const unsub = session.subscribe((ev: any) => {
 				if (ev.type === "tool_execution_start") limits.toolStart();
@@ -532,8 +552,8 @@ export async function spawnLeaf(opts: SpawnOptions): Promise<LeafSession> {
 					prompt,
 					send: (p) => session.prompt(p),
 					takeError: () => {
-						const e = error;
-						error = undefined;
+						const e = hung ?? error;
+						hung = error = undefined;
 						return e;
 					},
 					toFallbackProvider: model.provider === CODEX_PROVIDER ? async () => session.setModel(await resolveRoleModel(role)) : undefined,
