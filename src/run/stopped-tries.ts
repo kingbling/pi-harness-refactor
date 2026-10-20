@@ -1,6 +1,8 @@
+import { basename } from "node:path";
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { stubOwnersAcceptedSince } from "./gate.ts";
+import { tidyTasks } from "./tidy.ts";
 
 /** The gate step's output when the run stopped before the review judged the try. */
 export const NOT_JUDGED_STOPPING = "not judged: the run is stopping";
@@ -74,6 +76,39 @@ export function returnLateStubTries(ledger: Ledger, config: Config): string[] {
 		ledger.updateUnit(r.id, { meta: { lateStubTryReturned: true, triesUsed: maxTotal - 1, retryNote: `${late.join(", ")} was accepted while your last try ran: its stubs (TODO(br:${late[0]})) no longer stand. Use its code (target_lookup) instead.` } });
 		ledger.transitionUnit(r.id, "planned", `its last try was refused only for stubs of ${late.join(", ")}, accepted while it ran: the try is given back`);
 		out.push(r.id);
+	}
+	return out;
+}
+
+/**
+ * Units parked for a tidy task of their area they were told to do themselves (before 0.4.59; the tidy job does them):
+ * their last failure names a file of an approved task (U702: CampaignEditPage of T5599 renamed, 203 tests failing; U3050:
+ * U2fFormat of T5597). Planned again with one try left and a note to keep the task's files as on main. Once per unit, not
+ * when the owner chose to leave it parked.
+ */
+export function returnTidyTries(ledger: Ledger, config: Config, areaOf: (meta: string) => { stackId: string; area: string }): string[] {
+	const maxTotal = config.run.maxImplementAttempts + config.run.maxEscalateAttempts;
+	const tasks = tidyTasks(ledger).filter((t) => t.status === "approved");
+	if (!tasks.length) return [];
+	const rows = ledger.db
+		.prepare(
+			`SELECT u.id, u.meta, a.gate_report report, (SELECT MAX(t.created_at) FROM transitions t WHERE t.entity = 'unit' AND t.entity_id = u.id AND t.to_state = 'quarantined') at FROM units u
+			 JOIN attempts a ON a.id = (SELECT b.id FROM attempts b WHERE b.unit_id = u.id AND b.gate_report LIKE '%"steps"%' ORDER BY b.id DESC LIMIT 1)
+			 WHERE u.state = 'quarantined' AND json_extract(u.meta, '$.tidyTryReturned') IS NULL`,
+		)
+		.all() as Array<{ id: string; meta: string; report: string; at: string }>;
+	const out: string[] = [];
+	for (const r of rows) {
+		const { stackId, area } = areaOf(r.meta);
+		const failed = (JSON.parse(r.report) as { steps: Array<{ ok: boolean; output: string }> }).steps.find((s) => !s.ok)?.output ?? "";
+		// a task's file named by its old name (U2fFormat, CampaignEditPage) in what failed
+		const hit = tasks.find((t) => t.stack === stackId && t.area === area && t.from.some((f) => new RegExp(`\\b${basename(f).replace(/\.[^.]+$/, "")}\\b`).test(failed)));
+		if (!hit) continue;
+		if (ledger.db.prepare("SELECT 1 FROM questions WHERE unit_id = ? AND point = 'quarantine' AND answered_by LIKE 'human%' AND answer LIKE 'leave%' AND answered_at >= ?").get(r.id, r.at)) continue;
+		for (const q of ledger.openQuestions().filter((x) => x.unit_id === r.id && x.point === "quarantine")) ledger.withdrawQuestion(q.id, `it was told to do tidy task ${hit.id} itself, which the tidy job does: it gets a try back`);
+		ledger.updateUnit(r.id, { meta: { tidyTryReturned: hit.id, triesUsed: maxTotal - 1, retryNote: `Tidy task ${hit.id} (${hit.op}: ${hit.from.join(", ")} → ${hit.to.join(", ")}) is done by the orchestrator, not by you. Your earlier code did part of it: put its files back as main has them (names, places, contents) and keep only the changes your unit needs.` } });
+		ledger.transitionUnit(r.id, "planned", `parked for tidy task ${hit.id}, which the tidy job does: a try is given back`);
+		out.push(`${r.id} (${hit.id})`);
 	}
 	return out;
 }

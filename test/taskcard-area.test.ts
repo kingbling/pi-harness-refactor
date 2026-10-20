@@ -110,11 +110,14 @@ describe("task card area module", () => {
 		expect(text).toContain("## Tidy tasks for this area (do these too)");
 		expect(text).toContain("- rename: src/features/agency/agency-list.service.ts → src/features/agency/agency.service.ts (one service per area)");
 		expect(text).not.toContain("campaign/x.ts");
-		// in a run the tidy job does them: the unit is not told to
+		// in a run the tidy job does them: the unit is told not to
 		const adapter = await getTargetAdapter("nestjs");
 		const place = placeUnit(config, ledger.getUnit("agency_report")!.meta, ws);
-		const byJob = await buildTaskCard(ledger, config, "agency_report", { targetProjectDir: api, writeGlobs: [], adapter, place, moduleDir: placementDir(adapter.layout, place), root: ws, noTidy: true });
-		expect(renderTaskCard(byJob, config, { includeSource: false })).not.toContain("## Tidy tasks");
+		const byJob = await buildTaskCard(ledger, config, "agency_report", { targetProjectDir: api, writeGlobs: [], adapter, place, moduleDir: placementDir(adapter.layout, place), root: ws, tidyByJob: true });
+		const told = renderTaskCard(byJob, config, { includeSource: false });
+		expect(told).not.toContain("do these too");
+		expect(told).toContain("## Tidy tasks the orchestrator does for this area (never do them yourself)");
+		expect(told).toContain("agency-list.service.ts → src/features/agency/agency.service.ts");
 	});
 
 	it("an empty module says so; big areas are cut with explicit omitted lines", async () => {

@@ -77,6 +77,8 @@ export interface TaskCard {
 	reuseCandidates: Array<{ legacy: string; capability: Capability }>;
 	/** Approved tidy tasks of the unit's area (rendered list; empty = none). */
 	tidyTasks: string;
+	/** The run's tidy job does them, not the unit. */
+	tidyByJob?: boolean;
 	targetProjectDir: string;
 	writeGlobs: string[];
 	sharedDirs: string[];
@@ -118,7 +120,7 @@ const MAX_SIBLING_FILES = 6;
 /** Gives the event loop back for a moment (between the task card's parts). */
 const breathe = () => new Promise<void>((r) => setImmediate(r));
 
-export async function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string; noTidy?: boolean }): Promise<TaskCard> {
+export async function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string; tidyByJob?: boolean }): Promise<TaskCard> {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
 	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]>; stubFiles?: string[] };
@@ -208,12 +210,12 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 	const sharedHelpers = sharedSymbols(ledger, opts.adapter.layout.sharedDirs, undefined, 30, stackId);
 	const reuseHints = similarTargetSymbols(ledger, symbols.map((s) => s.name), 15, stackId);
 	const candidates = reuseCandidates(ledger, unitId, { stack: stackId, limit: 8 });
-	const tidy = opts.place && !opts.noTidy ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
+	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
 	await breathe();
 	const area = opts.place && opts.moduleDir ? areaModule(ledger, config, unitId, opts.place, opts.moduleDir, opts) : undefined;
-	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, otherStackStubs: found.other, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area, routeSyntax: routes.length ? routeSyntax(opts.root) : undefined, routeGroups: giantRouteGroups((JSON.parse(unit.meta) as { loc?: number }).loc ?? 0, routes) };
+	return { unit, facts: unitFacts(ledger, unit, config.source.path), files, symbols, resolvedDeps, unresolvedDeps, depOwners, waitingStubs, otherStackStubs: found.other, callers, wiring: wiringFiles?.length ? { stack: stackId, files: wiringFiles } : undefined, dupCandidates, routes, queries, dynamicMarkers: meta.dynamic_markers ?? [], cutDeps: meta.cutDeps ?? [], ambiguous: meta.ambiguous ?? {}, frameworkRefs: fwRefs, callTree: tree, truthCases, truthRead, noBehaviour: noBehaviour(ledger, unitId), sharedHelpers, reuseHints, reuseCandidates: candidates, tidyTasks: tidy, tidyByJob: opts.tidyByJob, targetProjectDir: opts.targetProjectDir, writeGlobs: opts.writeGlobs, sharedDirs: opts.adapter.layout.sharedDirs, dataAccessHint: opts.adapter.layout.dataAccessHint, place: opts.place, moduleDir: opts.moduleDir, areaModule: area, routeSyntax: routes.length ? routeSyntax(opts.root) : undefined, routeGroups: giantRouteGroups((JSON.parse(unit.meta) as { loc?: number }).loc ?? 0, routes) };
 }
 
 /** Current state of the unit's area module: files on disk, their indexed exports, and the other units placed there. */
@@ -323,7 +325,9 @@ export function renderTaskCard(card: TaskCard, config: Config, opts: { includeSo
 	L.push(`Source files (${config.source.stack}, read-only, relative to ${config.source.path}): ${card.files.join(", ")}`);
 	L.push(`Target: ${card.place?.stackId ?? config.target.stacks.join(" + ")} project at ${card.targetProjectDir}. You may write only: ${card.writeGlobs.join(", ")}`);
 	if (card.areaModule) renderAreaModule(card.areaModule, L);
-	if (card.tidyTasks) L.push("", "## Tidy tasks for this area (do these too)", card.tidyTasks, "Moves whose source is already gone were done by the orchestrator: update the imports. Merged sources are removed once every target exists.");
+	// the run's tidy job does them: a unit that did one too left half of it (a renamed file another unit's test still uses)
+	if (card.tidyTasks && card.tidyByJob) L.push("", "## Tidy tasks the orchestrator does for this area (never do them yourself)", card.tidyTasks, "Keep these files under the names and in the places main has them now; if your code changed one of them for the task, put it back as on main.");
+	else if (card.tidyTasks) L.push("", "## Tidy tasks for this area (do these too)", card.tidyTasks, "Moves whose source is already gone were done by the orchestrator: update the imports. Merged sources are removed once every target exists.");
 	L.push("");
 	L.push("## Symbols you must account for (every one needs a ledger_prove call)");
 	for (const s of card.symbols) L.push(`- ${s.id}  [${s.kind}${s.exported ? "" : ", private"}]${s.signature ? ` ${s.signature}` : ""}`);

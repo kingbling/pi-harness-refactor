@@ -231,7 +231,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	};
 
 	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck, mainDir, runStartedAt: o.runStartedAt };
-	const card = await buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root, noTidy: o.tidyByJob });
+	const card = await buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root, tidyByJob: o.tidyByJob });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
 	for (const f of card.waitingStubs) if (!writeGlobs.includes(f)) writeGlobs.push(f);
