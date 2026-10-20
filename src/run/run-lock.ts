@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Ledger } from "../ledger/db.ts";
 import { statePath } from "../config.ts";
@@ -34,6 +35,38 @@ export function acquireRunLock(root: string): () => void {
 	return () => {
 		if (liveRun(root) === process.pid) rmSync(lockPath(root), { force: true });
 	};
+}
+
+/** Whether `pid` is a migration run (Pi's run process or a terminal br run), not another program that got its number. */
+export async function isRunProcess(pid: number): Promise<boolean> {
+	const cmd = await new Promise<string>((done) => execFile("ps", ["-o", "command=", "-p", String(pid)], (_e, so) => done(String(so ?? ""))));
+	return /\b(?:run-child|cli)\.[cm]?[tj]s\b/.test(cmd);
+}
+
+/**
+ * A run started while an earlier one still holds the workspace (Pi was quit and its run is finishing its gates):
+ * the earlier run is asked to stop (SIGTERM: it stops as when Pi goes away) and this one waits, looking every
+ * `everyMs`, until it has ended. Returns false when `stopped` ended the wait first.
+ */
+export async function waitForEarlierRun(root: string, o: { log: (l: string) => void; stopped: () => boolean; everyMs?: number }): Promise<boolean> {
+	const pid = liveRun(root);
+	if (pid === undefined || pid === process.pid || !(await isRunProcess(pid))) return true;
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch {
+		// gone already
+	}
+	o.log(`a run is still going in this workspace (pid ${pid}): it was asked to stop; this run starts once it has ended (looked at every minute; /br stop ends the wait)`);
+	const every = o.everyMs ?? 60_000;
+	for (let waited = 0; liveRun(root) === pid; waited += every) {
+		for (let t = 0; t < every; t += Math.min(1000, every)) {
+			if (o.stopped()) return false;
+			await new Promise((r) => setTimeout(r, Math.min(1000, every)));
+		}
+		if (liveRun(root) === pid) o.log(`still waiting for the earlier run (pid ${pid}) to end: ${Math.round((waited + every) / 60_000)} min`);
+	}
+	o.log(`the earlier run (pid ${pid}) has ended: this run starts`);
+	return !o.stopped();
 }
 
 /** States a live run is working on: hands off while it runs. */

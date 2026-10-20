@@ -56,7 +56,9 @@ async function work(a: ChildArgs): Promise<{ error?: string; lines?: string[] }>
 	const { runScheduler } = (process.env["BR_RUN_CHILD_SCHEDULER"] ? await import(process.env["BR_RUN_CHILD_SCHEDULER"]) : await import("./run.ts")) as typeof import("./run.ts");
 	const { OpenRouterClient } = await import("../models/openrouter.ts");
 	// one run per workspace (a br run in a terminal counts too)
-	const { acquireRunLock } = await import("./run-lock.ts");
+	const { acquireRunLock, waitForEarlierRun } = await import("./run-lock.ts");
+	// Pi was quit and started again while its run still finishes: that run is asked to stop and this one waits for it
+	if (!dry && !(await waitForEarlierRun(root, { log: (l) => progress.log(l), stopped: () => progress.stopping }))) return { error: "stopped by the user" };
 	const release = dry ? () => {} : acquireRunLock(root);
 	const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
 	let runDone = false;
@@ -195,6 +197,10 @@ async function main(a: ChildArgs) {
 	process.on("disconnect", () => {
 		for (const done of answers.values()) done(undefined);
 		answers.clear();
+		if (progress.running && !progress.aborting) void progress.stop("abort");
+	});
+	// a later run asks this one to stop (SIGTERM): it stops as when Pi goes away, and ends, so the later one can start
+	process.on("SIGTERM", () => {
 		if (progress.running && !progress.aborting) void progress.stop("abort");
 	});
 	// a stray error in a lane must not end the whole run (inside Pi the host caught these)
