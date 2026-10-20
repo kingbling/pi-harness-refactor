@@ -309,3 +309,31 @@ describe("a hint carried to the next attempt says who gave it", () => {
 		expect(JSON.parse(ledger.getUnit("byOwner")!.meta).retryNote).toMatch(/^The owner's hint: the reviewer is wrong/);
 	});
 });
+
+describe("a wait answer", () => {
+	it("a model's wait holds the unit for a while, then it runs again; the owner's wait holds until a newer answer (U3053: 7 hours on a resolver's wait over a short provider outage)", async () => {
+		const { ConfigSchema } = await import("../src/config.ts");
+		const { Ledger } = await import("../src/ledger/db.ts");
+		const { MODEL_HOLD_MS, resubmitParkedUnits } = await import("../src/run/run.ts");
+		const { RESOLVER } = await import("../src/jev/resolve.ts");
+		const { mkdtempSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const ws = mkdtempSync(join(tmpdir(), "br-wait-"));
+		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
+		const ledger = new Ledger(":memory:");
+		for (const [id, by] of [["byModel", RESOLVER], ["byOwner", "human"]] as const) {
+			ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+			ledger.transitionUnit(id, "truth", "test");
+			ledger.transitionUnit(id, "implementing", "test");
+			const q = ledger.askQuestion({ unitId: id, point: "env", question: "sessions failed: fetch failed", options: ["retry — run again", "wait — keep the unit waiting"], askedBy: "orchestrator" });
+			ledger.answerQuestion(q, "wait — keep the unit waiting", by);
+		}
+		const resubmit = () => resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, new Map());
+		expect(await resubmit()).toEqual([]);
+		expect(await resubmit()).toEqual([]); // held
+		ledger.db.prepare("UPDATE questions SET answered_at = ?").run(new Date(Date.now() - MODEL_HOLD_MS - 1000).toISOString());
+		expect(await resubmit()).toEqual(["byModel"]);
+		expect(ledger.getUnit("byModel")!.state).toBe("planned");
+		expect(ledger.getUnit("byOwner")!.state).toBe("implementing");
+	});
+});

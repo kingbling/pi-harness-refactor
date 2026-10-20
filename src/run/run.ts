@@ -1551,6 +1551,15 @@ export async function run(opts: { units?: string[]; slice?: string; limit?: numb
 
 export { errorSignature };
 
+/** How long a model's "wait" answer holds a unit; then it runs again (the owner's wait holds until a newer answer). */
+export const MODEL_HOLD_MS = 30 * 60_000;
+
+/** Whether the wait answered on this question was a model's and has run out. */
+function modelHoldOver(ledger: Ledger, questionId: number, now = Date.now()): boolean {
+	const q = ledger.db.prepare("SELECT answered_by, answered_at FROM questions WHERE id = ?").get(questionId) as { answered_by: string | null; answered_at: string | null } | undefined;
+	return !!q?.answered_at && MODEL_ANSWERERS.includes(q.answered_by ?? "") && now - Date.parse(q.answered_at) >= MODEL_HOLD_MS;
+}
+
 /**
  * Parked units (state kept, attempt closed, waiting on a question) go back to planned as soon as the cause is
  * gone: their question was answered, or (environment failures) the target project or stack config changed.
@@ -1584,7 +1593,9 @@ export async function resubmitParkedUnits(ledger: Ledger, config: Config, root: 
 		const meta = JSON.parse(u.meta) as { parked?: { question?: number; diagnosis?: { summary?: string; note?: string } }; hold?: number; applied?: number; ownLook?: boolean };
 		// its own question, or the one it waits on with other units
 		const q = ledger.db.prepare("SELECT id, unit_id, point, answer, options, answered_by FROM questions WHERE (unit_id = ? OR id IN (SELECT question_id FROM question_waiters WHERE unit_id = ?)) AND status IN ('answered','auto') AND id > ? ORDER BY id DESC LIMIT 1").get(u.id, u.id, meta.applied ?? 0) as { id: number; unit_id: string | null; point: string; answer: string; options: string | null; answered_by: string | null } | undefined;
-		if (meta.hold && (!q || q.id <= meta.hold)) continue; // the owner said wait: only a newer answer or br requeue moves it
+		// the owner said wait: only a newer answer or br requeue moves it. A model's wait ends after a while: U3053 waited
+		// 7 hours on a resolver's wait over a provider outage of minutes
+		if (meta.hold && (!q || q.id <= meta.hold) && !modelHoldOver(ledger, meta.hold)) continue;
 		const a = applyParkedAnswer(q?.answer, q?.options ? (JSON.parse(q.options) as string[]) : []);
 		if (a.action === "hold") {
 			ledger.updateUnit(u.id, { meta: { hold: q!.id, applied: q!.id } });
