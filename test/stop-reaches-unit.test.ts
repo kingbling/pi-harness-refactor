@@ -55,7 +55,7 @@ beforeEach(() => {
 });
 
 describe("a stop reaches a running unit", () => {
-	it("stopped during an implement try: no review, no tester, no next try; back to planned with its tries counted", async () => {
+	it("stopped during an implement try: no review, no tester, no next try; back to planned, the try not judged is not counted", async () => {
 		let stop = false;
 		const calls: string[] = [];
 		const spawn = sessions(calls, (n) => {
@@ -69,16 +69,16 @@ describe("a stop reaches a running unit", () => {
 		expect(calls).toEqual(["implement"]);
 		expect(reviews).toBe(0);
 		expect(ledger.db.prepare("SELECT outcome FROM attempts WHERE unit_id = 'u1' ORDER BY id").all()).toEqual([{ outcome: "stopped" }]);
-		expect(ledger.transitionsOf("unit", "u1").at(-1)!.reason).toMatch(/^run stopped after 1 try/);
-		expect(JSON.parse(ledger.getUnit("u1")!.meta)).toMatchObject({ triesUsed: 1, retryNote: expect.stringMatching(/run was stopped/) });
+		expect(ledger.transitionsOf("unit", "u1").at(-1)!.reason).toMatch(/^run stopped after 0 try/);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta)).toMatchObject({ triesUsed: 0, retryNote: expect.stringMatching(/run was stopped/) });
 
-		// the next run goes on from try 1: two tries are left, not three
+		// the review never judged that try: the next run has all three tries
 		stop = false;
 		calls.length = 0;
 		const again = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls, () => {}), gate: reviewGate, reviewer, stopped: () => stop, log: () => {} });
 		expect(again.attempts).toBe(3);
-		expect(calls.filter((c) => c !== "test")).toHaveLength(2);
-		expect(JSON.parse(ledger.getUnit("u1")!.meta).triesUsed).toBeUndefined();
+		expect(calls.filter((c) => c !== "test")).toHaveLength(3);
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).triesUsed ?? 0).toBe(0);
 	});
 
 	it("stopped before it starts its tries: back to planned without an implement session", async () => {

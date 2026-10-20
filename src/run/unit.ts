@@ -8,6 +8,7 @@ import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 // static on purpose: Pi loads plugins without a module cache, and units starting together that each import a
 // module the first time get half-loaded copies of what it imports ("Cannot read properties of undefined")
 import { ownTests as ownMergedTests, runDbUnit } from "./db-unit.ts";
+import { NOT_JUDGED_STOPPING, unjudgedByStop } from "./stopped-tries.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { commitAll, mainBranch } from "../git.ts";
@@ -955,8 +956,11 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (!o.stopped?.()) return undefined;
 		if (attempt !== undefined) o.ledger.endAttempt(attempt, { outcome: "stopped", gateReport: report });
 		savePorted();
-		o.ledger.updateUnit(o.unitId, { meta: { triesUsed: attemptNo, retryNote: `The run was stopped while this unit was being worked on (after ${attemptNo} of ${maxTotal} tries). Check what is done, then finish it.` } });
-		o.ledger.transitionUnit(o.unitId, "planned", `run stopped after ${attemptNo} try(s); its code is kept for the next run`);
+		// a try the stop cut off before its review judged it is no used try: 27 lanes lost one at a stop, and five
+		// campaigns templates were parked at the cap soon after the next start
+		const used = unjudgedByStop(report) ? attemptNo - 1 : attemptNo;
+		o.ledger.updateUnit(o.unitId, { meta: { triesUsed: used, retryNote: `The run was stopped while this unit was being worked on (after ${used} of ${maxTotal} tries). Check what is done, then finish it.` } });
+		o.ledger.transitionUnit(o.unitId, "planned", `run stopped after ${used} try(s); its code is kept for the next run`);
 		log(pc.yellow(`  the run is stopping: ${o.unitId} goes back to planned, its code is kept`));
 		return { unitId: o.unitId, state: "planned", attempts: attemptNo, gate, costUsd: cost, stopped: true };
 	};
@@ -1121,7 +1125,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 					const reuse = !disputed.length && !truthChanged.length && lastReview?.key === key;
 					if (reuse) log(pc.dim(approvedBefore ? "  only clashing or wiring files changed since the approved review: its verdict stands (no new review)" : "  code and tests unchanged since the last review: its verdict stands (no new review)"));
 					// the run is stopping: no review session; the red gate hands the lane back below
-					if (!reuse && o.stopped?.()) return { ok: false, judged: false, output: "not judged: the run is stopping" };
+					if (!reuse && o.stopped?.()) return { ok: false, judged: false, output: NOT_JUDGED_STOPPING };
 					setStep(`review ${o.unitId}`);
 					const ra = reuse ? undefined : o.ledger.startAttempt(o.unitId, "review", o.config.models.escalate.id);
 					let r = reuse
