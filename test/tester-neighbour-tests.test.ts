@@ -176,6 +176,34 @@ describe("tests of earlier units in a retest", () => {
 		expect(JSON.parse(ledger.getMeta("tests_disputed:u1")!)).toEqual([OTHER]);
 	});
 
+	it("the unit's own test merged in a folder it moved away from is its tester's to fix, move or delete", async () => {
+		const STRAY = "src/shared/common/agency.old.spec.ts";
+		write(join(target, STRAY), "it('u1#2 old place', () => {});\n");
+		git("add", "-A");
+		git("commit", "-qm", "u1 before it moved");
+		ledger.endAttempt(ledger.startAttempt("u1", "implement"), { outcome: "gate_green", gateReport: { changedFiles: [STRAY] } });
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();
+		const globs: string[][] = [];
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> =>
+			({
+				run: async () => (opts.role === "test" && globs.push(opts.writeGlobs), { text: opts.role === "test" ? "TESTER DONE" : "IMPLEMENTER DONE", ...ok }),
+				dispose() {},
+			}) as unknown as LeafSession;
+		// no test in its folder yet: the tester runs, and may write the old one
+		let sanctioned: string[] = [];
+		const gate = async (g: GateInput) => ((sanctioned = g.sanctioned ?? []), green(g));
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate, log: () => {} });
+		expect(globs[0]).toContain(`migrated/${STRAY}`);
+		// with its test in place the gate runs and does not take a change there for an earlier unit's
+		write(join(target, SPEC), "it('u1#1 creates', () => {});\n");
+		git("add", "-A");
+		git("commit", "-qm", "own");
+		ledger.db.prepare("UPDATE units SET state = 'planned' WHERE id = 'u1'").run();
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate, log: () => {} });
+		expect(sanctioned).toContain(STRAY);
+	});
+
 	it("a coverage retest is told the ids it wrote into an earlier unit's file were undone", async () => {
 		ledger.addEvidence("u1", "truth_green_on_old", {});
 		ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, created_at) VALUES ('u1#1','u1','s','[]','1',1,'t')").run();

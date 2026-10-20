@@ -7,7 +7,7 @@ import { keepOverrides, linkedDirs, overridesPath, setupLogPath } from "../adapt
 import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 // static on purpose: Pi loads plugins without a module cache, and units starting together that each import a
 // module the first time get half-loaded copies of what it imports ("Cannot read properties of undefined")
-import { runDbUnit } from "./db-unit.ts";
+import { ownTests as ownMergedTests, runDbUnit } from "./db-unit.ts";
 import type { SourceAdapter, TargetAdapter } from "../adapters/types.ts";
 import type { Config } from "../config.ts";
 import { commitAll, mainBranch } from "../git.ts";
@@ -260,7 +260,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	let truthMode: TruthMode = envMode;
 	// the tester runs in the workspace (truth dir + the target's test folders); it is told these exact globs, absolute
 	const testerTestGlobs = adapter.layout.testFileGlobs(moduleDir).map((g) => `${targetRel}/${g}`);
-	const testerWriteGlobs = [`${truthDirRel}/**`, ...testerTestGlobs];
+	// tests this unit merged before it moved to another folder (its catch-all topic was replaced): still its own, and
+	// outside its test folder now, so its tester may fix, move or delete them (else a builder re-open for one loops)
+	const strayOwn = ownMergedTests(o.ledger, o.unitId, (f) => adapter.layout.isTestFile(f)).filter((f) => existsSync(join(targetProjectDir, f)) && !testerTestGlobs.some((g) => globToRegExp(g).test(`${targetRel}/${f}`)));
+	const testerWriteGlobs = [`${truthDirRel}/**`, ...testerTestGlobs, ...strayOwn.map((f) => `${targetRel}/${f}`)];
 	const absGlob = (g: string) => join(o.root, g);
 	// the truth as code loads it now (the tester's check_ported_tests and the verification after its session)
 	// in read mode a small per-unit script the tester got running still counts as run when it is green on the old code
@@ -308,7 +311,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		const overrides = keepOverrides(o.root, stackId); // the gate's commands are the setup fixer's, never the tester's
 		let overridesChanged = false;
 		const disputed = (f: string) => !!more.disputeText && (more.disputeText.includes(f) || more.disputeText.includes(basename(f)));
-		const sanctioned = [...tidyPaths, ...disputedOthers, ...(more.disputeText ? (await trackedFiles(targetProjectDir)).filter((f) => adapter.layout.isTestFile(f) && disputed(f)) : [])];
+		const sanctioned = [...tidyPaths, ...disputedOthers, ...strayOwn, ...(more.disputeText ? (await trackedFiles(targetProjectDir)).filter((f) => adapter.layout.isTestFile(f) && disputed(f)) : [])];
 		lastTesterBlocked = [];
 		// the tester called no_behaviour_to_pin (the decision model checked it against the legacy code)
 		let declaredNone = false;
@@ -904,7 +907,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		if (attemptNo >= maxTotal && !regateOnly && lastRetest.progress && !(gate?.failedStep === "wired_ok" && !reviewWeakOnly)) regate = true;
 	};
 	// what the gate is given (check_my_code runs its code-only steps on the same input before the session ends)
-	const gateInput = (): GateInput => ({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) });
+	const gateInput = (): GateInput => ({ ledger: o.ledger, unitId: o.unitId, adapter, targetProjectDir, mainDir, writeGlobs, appendOnlyGlobs, testFiles, moduleDir, area, root: o.root, stackId, sanctioned: [...tidyPaths, ...card.waitingStubs, ...disputedOthers, ...strayOwn], legacyWords: legacyWordsFor(sourceAdapter.legacyWords, adapter) });
 	const reports: Array<{ owner: string; target: string; problem: string; evidence: string }> = [];
 	let reviewJudged = true;
 	const providerDown = async (facts: string) => {
