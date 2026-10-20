@@ -110,6 +110,8 @@ describe("the builder", () => {
 		expect(calls).toBe(0); // the repair may not touch tests; the code job may
 		expect(jobs).toHaveLength(2); // one per cycle: a job that merged nothing ends the cycle
 		expect(jobs[0]).toMatch(/grep -q ok src\/a\.txt[\s\S]*run these commands yourself/i);
+		// two tests that demand opposite behaviour: the legacy code decides which one is corrected, the job does not stop there
+		expect(jobs[0]).toMatch(/opposite behaviour[\s\S]*read the legacy code, correct the test that disagrees with it/);
 		// what the builder did stays readable after the live log scrolled away
 		const kept = readFileSync(builderLogPath(root), "utf8");
 		expect(kept).toMatch(/^\d{4}-\d\d-\d\dT\S+ builder fake: whole-project check fails: \d+ error line\(s\)/m);

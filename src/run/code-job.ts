@@ -45,7 +45,7 @@ export const codeWithModel: CodeWorker = async (o) => {
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__code__.${o.label}.jsonl`),
 		systemPrompt: `You write one piece of missing app code in a ${o.adapter.id} project under migration, so the units waiting on it can finish. The legacy code is at ${o.config.source.path} (read it for the behaviour to keep).
 - Read the project first and follow its layout and conventions (RULES.md, the existing modules); reuse what exists, add nothing the task does not need. A new feature folder gets the files every feature folder has, and their wiring.
-- Write tests for what you add. Never change what an existing test checks; never skip or delete tests.
+- Write tests for what you add. Never change what an existing test checks, except a test that demands the opposite of another test: the legacy code decides, correct the one that disagrees with it and name the legacy file and line. Never skip or delete tests.
 - App config and entry files are yours to change where the code needs it; the files that decide how the checks run (${(o.adapter.checkConfigGlobs ?? o.adapter.protectedGlobs).join(", ")}) are not.
 - Build: ${[b.cmd, ...b.args].join(" ")}   Test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the files to check). Run them on what you changed before you stop.
 - Write no notes or docs files for other units: the units waiting on this get your final reply as their hint.
