@@ -74,6 +74,9 @@ describe("the tidy job", () => {
 		await new Promise((r) => setTimeout(r, 80));
 		expect(j.holds("fake", "a")).toBe(false); // units start again
 		expect(j.heldAreas().size).toBe(0);
+		// and as long later the hold comes back, so the area empties and the task gets its turn (T5597 waited 4 hours)
+		await new Promise((r) => setTimeout(r, 50));
+		expect(j.holds("fake", "a")).toBe(true);
 		// the task still runs once the area is idle
 		busy = false;
 		j.next();

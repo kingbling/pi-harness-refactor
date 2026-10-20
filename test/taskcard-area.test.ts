@@ -110,6 +110,11 @@ describe("task card area module", () => {
 		expect(text).toContain("## Tidy tasks for this area (do these too)");
 		expect(text).toContain("- rename: src/features/agency/agency-list.service.ts → src/features/agency/agency.service.ts (one service per area)");
 		expect(text).not.toContain("campaign/x.ts");
+		// in a run the tidy job does them: the unit is not told to
+		const adapter = await getTargetAdapter("nestjs");
+		const place = placeUnit(config, ledger.getUnit("agency_report")!.meta, ws);
+		const byJob = await buildTaskCard(ledger, config, "agency_report", { targetProjectDir: api, writeGlobs: [], adapter, place, moduleDir: placementDir(adapter.layout, place), root: ws, noTidy: true });
+		expect(renderTaskCard(byJob, config, { includeSource: false })).not.toContain("## Tidy tasks");
 	});
 
 	it("an empty module says so; big areas are cut with explicit omitted lines", async () => {

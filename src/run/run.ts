@@ -792,7 +792,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				await addWorktree(config.target.path, wt, branch);
 				await linkAll(wt);
 				log(pc.cyan(`◇ ${unitId}`) + pc.dim("  truth ahead (deps still migrating)"));
-				const res = await runUnit({ ledger, config, root: o.root, unitId, client: o.client, accept: false, workDir: wt, truthOnly: true, gateSlot: (fn) => gates.run(fn), log: (l) => log(`  ${l}`), spawn: o.spawn, gate: o.gate });
+				const res = await runUnit({ ledger, config, root: o.root, unitId, client: o.client, accept: false, workDir: wt, truthOnly: true, gateSlot: (fn) => gates.run(fn), log: (l) => log(`  ${l}`), spawn: o.spawn, gate: o.gate, tidyByJob: !o.spawn });
 				cost += res.costUsd;
 				log(ledger.hasEvidence(unitId, "truth_ahead") ? pc.cyan(`◆ ${unitId}: truth ready`) : pc.yellow(`⏸ ${unitId}: truth ahead failed (waiting on a question)`));
 			} catch (e: any) {
@@ -888,6 +888,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 						// a stop reaches the running unit: it hands its lane back at the next safe point, its code kept
 						stopped: () => stop,
 						runStartedAt: startedAt,
+						// the tidy job does the area's approved tidy tasks (none runs when the sessions are faked)
+						tidyByJob: !o.spawn,
 					});
 					if (!mergeOnly) cost += res!.costUsd;
 					mergeOnly = false;

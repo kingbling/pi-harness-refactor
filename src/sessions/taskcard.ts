@@ -118,7 +118,7 @@ const MAX_SIBLING_FILES = 6;
 /** Gives the event loop back for a moment (between the task card's parts). */
 const breathe = () => new Promise<void>((r) => setImmediate(r));
 
-export async function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string }): Promise<TaskCard> {
+export async function buildTaskCard(ledger: Ledger, config: Config, unitId: string, opts: { targetProjectDir: string; writeGlobs: string[]; adapter: TargetAdapter; place?: Placement; moduleDir?: string; root?: string; noTidy?: boolean }): Promise<TaskCard> {
 	const unit = ledger.getUnit(unitId);
 	if (!unit) throw new Error(`unit ${unitId} not found`);
 	const meta = JSON.parse(unit.meta) as { files?: string[]; dynamic_markers?: string[]; cutDeps?: string[]; ambiguous?: Record<string, string[]>; stubFiles?: string[] };
@@ -208,7 +208,7 @@ export async function buildTaskCard(ledger: Ledger, config: Config, unitId: stri
 	const sharedHelpers = sharedSymbols(ledger, opts.adapter.layout.sharedDirs, undefined, 30, stackId);
 	const reuseHints = similarTargetSymbols(ledger, symbols.map((s) => s.name), 15, stackId);
 	const candidates = reuseCandidates(ledger, unitId, { stack: stackId, limit: 8 });
-	const tidy = opts.place ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
+	const tidy = opts.place && !opts.noTidy ? tidyTaskCard(ledger, stackId, opts.place.area) : "";
 	const stateOf = db.prepare("SELECT state FROM symbols WHERE id = ?");
 	const tree = callTree(ledger, files, { stateOf: (id) => (stateOf.get(id) as { state: string } | undefined)?.state });
 	await breathe();

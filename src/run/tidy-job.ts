@@ -66,7 +66,7 @@ export interface TidyJobs {
 	readonly busy: Promise<void> | undefined;
 }
 
-/** The longest an approved task keeps its area's new units waiting for the units already running there to end. */
+/** The longest an approved task keeps its area's new units waiting at a time; then they start for as long, and it holds again. */
 export const TIDY_HOLD_MAX_MS = 45 * 60_000;
 
 export function createTidyJobs(o: {
@@ -82,18 +82,20 @@ export function createTidyJobs(o: {
 	/** A unit of this area is running: its task waits so the two do not conflict. */
 	areaBusy: (stackId: string, area: string) => boolean;
 	worker?: TidyWorker | false;
-	/** How long a task holds its area's new units back while a running unit keeps the area busy (default TIDY_HOLD_MAX_MS). */
+	/** How long a task holds its area's new units back at a time while a running unit keeps the area busy (default TIDY_HOLD_MAX_MS). */
 	holdMaxMs?: number;
 }): TidyJobs {
 	const worker = o.worker === false ? undefined : (o.worker ?? tidyWithModel);
 	const todo = (t: TidyTask) => t.status === "approved" && !onlyCase(t) && o.adapters.has(t.stack);
 	let running: Promise<void> | undefined;
 	// when each task began to hold its area: one slow unit there kept 27 units from starting for 6 hours while its
-	// task waited for it. After the limit units start again and the task runs when the area is next idle
+	// task waited for it. The hold takes turns: held for the limit, then free for as long, then held again. Free for
+	// good, the area's units never all ended at once and T5597 waited more than 4 hours
 	const since = new Map<string, number>();
 	const holding = (t: TidyTask) => {
 		if (!since.has(t.id)) since.set(t.id, Date.now());
-		return Date.now() - since.get(t.id)! < (o.holdMaxMs ?? TIDY_HOLD_MAX_MS);
+		const max = o.holdMaxMs ?? TIDY_HOLD_MAX_MS;
+		return (Date.now() - since.get(t.id)!) % (2 * max) < max;
 	};
 
 	const run = async (t: TidyTask, work: TidyWorker) => {

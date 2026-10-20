@@ -106,6 +106,8 @@ export interface UnitRunOptions {
 	stopped?: () => boolean;
 	/** When this run of the orchestrator started (ISO): report_migrated_bug counts this unit's reports since then. */
 	runStartedAt?: string;
+	/** Approved tidy tasks are done by the run's tidy job: the unit is neither told to do them nor given their files. */
+	tidyByJob?: boolean;
 }
 
 /** What an approved review saw: each changed file's hash, and the tests with the tester's answers as one hash. */
@@ -199,9 +201,10 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const sourceAdapter = getSourceAdapter(o.config.source.stack);
 	// one legacy area = one feature module (or, for code ≥ 2 areas use, the shared dir + area)
 	const moduleDir = placementDir(adapter.layout, place);
-	// approved tidy tasks of the area: their files are in scope (existing shared ones too). The tidy job does the
-	// work and the scheduler holds units back meanwhile; a unit sees one only when no tidy job runs (tests, simulation)
-	const tidy = tidyTasks(o.ledger, stackId, area).filter((t) => t.status === "approved");
+	// approved tidy tasks of the area: their files are in scope (existing shared ones too), only when no tidy job runs
+	// (tests, simulation). In a run the job does the work: on the live run units started while T5597 waited for an idle
+	// area each did half the rename (U2fFormat.php deleted, another unit's test still using it) and failed
+	const tidy = o.tidyByJob ? [] : tidyTasks(o.ledger, stackId, area).filter((t) => t.status === "approved");
 	const tidyPaths = [...new Set(tidy.flatMap((t) => [...t.from, ...t.to]))];
 	// wiring files the stack names (route table, main module) when no code regenerates them: the unit registers itself
 	const wiring = adapter.generateRegistration ? [] : (adapter.layout.wiringFiles ?? []);
@@ -228,7 +231,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	};
 
 	const deps = { ledger: o.ledger, config: o.config, unitId: o.unitId, root: o.root, targetProjectDir, adapter, moduleDir, client: o.client, wholeCheck: o.wholeCheck, mainDir, runStartedAt: o.runStartedAt };
-	const card = await buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root });
+	const card = await buildTaskCard(o.ledger, o.config, o.unitId, { targetProjectDir, writeGlobs, adapter, place, moduleDir, root: o.root, noTidy: o.tidyByJob });
 	if (card.unresolvedDeps.length) log(pc.yellow(`note: ${card.unresolvedDeps.length} dependencies not migrated yet: ${card.unresolvedDeps.join(", ")}`));
 	// stubs earlier units left for this unit's code: it replaces them where they are (the card names them)
 	for (const f of card.waitingStubs) if (!writeGlobs.includes(f)) writeGlobs.push(f);
