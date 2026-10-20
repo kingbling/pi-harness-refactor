@@ -64,6 +64,22 @@ describe("judging parity differences", () => {
 		}
 	});
 
+	it("a unit that came back from a parity re-open without changing any code is not re-opened again: the question is asked", async () => {
+		const { root, config, ledger, run, ids } = workspace();
+		const judge = (r: number): ParityJudge => async () => [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "the session row differs", fix: "save it like the old Session helper" }];
+		const first = run([{ step: "one", path: "data.sessions", legacy: "a", target: "b" }]);
+		expect((await judgeRun({ ledger, config, root, runId: first, slice: "invoices", judge: judge(first), log: () => {} })).reopened).toEqual(["U1"]);
+		// its implementer found nothing to change: accepted again with the same code
+		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'U1'").run();
+		ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', 'U1', 'review', 'accepted', 'merged (no changes)', datetime('now'))").run();
+		const again = run([{ step: "one", path: "data.sessions", legacy: "a", target: "b" }]);
+		expect((await judgeRun({ ledger, config, root, runId: again, slice: "invoices", judge: judge(again), log: () => {} })).reopened).toEqual([]);
+		expect(ledger.getUnit("U1")!.state).toBe("accepted");
+		const q = ledger.openQuestions().filter((q) => q.point === "parity");
+		expect(q).toHaveLength(1);
+		expect(`${q[0]!.question} ${q[0]!.context}`).toMatch(/without changing any code/);
+	});
+
 	it("a quirk goes to the owner, never dropped on the judge's word; once dropped the same difference is allowed, once kept it is a bug", async () => {
 		const { root, config, ledger, run, ids, status } = workspace();
 		const r1 = run([{ step: "list", path: "body.items[0].name", legacy: "Acme ", target: "Acme" }]);

@@ -264,7 +264,10 @@ export async function judgeRun(o: {
 		if (u?.state !== "accepted") continue; // it is being worked on: the next parity check of the slice sees it again
 		const { parityReopens: n = 0, parityLeft } = JSON.parse(u.meta) as { parityReopens?: number; parityLeft?: number };
 		const note = `The new app answers differently from the old one (parity check of slice "${o.slice}": the same requests sent to both):\n${found.map((f) => `- ${f}`).join("\n")}\nMake the new code behave like the old code here.`;
-		if (n < MAX_PARITY_REOPENS) {
+		// it came back from its last parity re-open without changing anything: the same differences come again, so
+		// one more re-open proves nothing (U1740 went round eight times on a session row its code does not write)
+		const unchanged = cameBackUnchanged(o.ledger, unitId);
+		if (n < MAX_PARITY_REOPENS && !unchanged) {
 			reopenUnit(o.ledger, unitId, note, `parity: answers differ from the old app (${found.length})`);
 			o.ledger.updateUnit(unitId, { meta: { parityReopens: n + 1 } });
 			reopened.push(unitId);
@@ -273,7 +276,7 @@ export async function judgeRun(o: {
 		} else {
 			await askViaModel(
 				{ ledger: o.ledger, config: o.config, root: o.root, client: o.client },
-				{ point: "parity", unitId, facts: `${note}\nThe unit was re-opened ${n} times for this and still differs.`, options: [{ value: "retry", facts: "re-open it once more" }, { value: "leave", facts: "leave it as it is" }], recommended: "leave", blocks: "none", askedBy: "parity", sameAs: parityProblem(db, o.runId, unitId) },
+				{ point: "parity", unitId, facts: `${note}\n${unchanged ? "After its last re-open for this the unit was accepted again without changing any code (its implementer found nothing in its own files to change), so re-opening it again gives the same answer; the cause is likely in code other units share." : `The unit was re-opened ${n} times for this and still differs.`}`, options: [{ value: "retry", facts: "re-open it once more" }, { value: "leave", facts: "leave it as it is" }], recommended: "leave", blocks: "none", askedBy: "parity", sameAs: parityProblem(db, o.runId, unitId) },
 			).catch(() => undefined);
 		}
 	}
@@ -284,6 +287,15 @@ export async function judgeRun(o: {
 	if (onlySetup.n && onlySetup.s === onlySetup.n) db.prepare("UPDATE parity_runs SET outcome = 'same', note = COALESCE(note, '') || ? WHERE id = ? AND outcome = 'differs'").run(`; the ${onlySetup.n} difference(s) left come only from the test setup`, o.runId);
 	log(pc.cyan(`parity ${o.slice}: ${bugCount} bug(s)${reopened.length ? ` → re-opened ${reopened.join(", ")}` : ""}${sharedIds.size ? ` → shared cause ${[...sharedIds].join(", ")} (one code job)` : ""}, ${quirks} quirk(s) for the owner, ${allowed} allowed${setup ? `, ${setup} from the test setup` : ""}${stillOpen ? `, ${stillOpen} not judged` : ""}`));
 	return { reopened, bugs: bugCount, quirks, setup, allowed, open: stillOpen, shared: [...sharedIds] };
+}
+
+/** The unit's last acceptance changed no code, and came after a parity re-open (directly or through a retry answer). */
+export function cameBackUnchanged(ledger: Ledger, unitId: string): boolean {
+	const ts = ledger.transitionsOf("unit", unitId).reverse();
+	const lastAccept = ts.findIndex((t) => t.to_state === "accepted");
+	if (lastAccept < 0 || !ts[lastAccept]!.reason?.startsWith("merged (no changes)")) return false;
+	const reopen = ts.slice(lastAccept + 1).find((t) => t.from_state === "accepted");
+	return !!reopen?.reason?.startsWith("parity:");
 }
 
 const short = (v: string | null, n = 200) => (v && v.length > n ? `${v.slice(0, n)}…` : (v ?? "null"));
