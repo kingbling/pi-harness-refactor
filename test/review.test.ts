@@ -154,6 +154,8 @@ describe("wired_ok: the reviewer model", () => {
 		const spawn = (async (opts: SpawnOptions) => ((system = opts.systemPrompt ?? ""), { run: async () => ({ text: "", toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} })) as never;
 		await reviewWithModel({ ledger, config, root: dir, unitId: "u1", adapter, targetProjectDir: dir, moduleDir: "src/features/campaign", legacyFiles: [], changedFiles: [], spawn });
 		expect(system).toContain("TODO(br:<the owning unit>): that is not a finding");
+		// a newline style is no behaviour: U2081 was held for the old page's CRLF bytes after parity stopped comparing them
+		expect(system).toMatch(/Line endings \(CRLF against LF\)[^.]* are never a finding/);
 		expect(system).toMatch(/A stub marked TODO\(br:u1\) \(grep for it\) that stands in for this unit's own legacy code[^:]*: one still there[^.]* is a finding/);
 	});
 
