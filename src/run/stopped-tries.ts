@@ -23,7 +23,8 @@ export function returnStoppedTries(ledger: Ledger, config: Config): string[] {
 		.all() as Array<{ id: string; why: string | null; at: string | null }>;
 	const out: string[] = [];
 	for (const r of rows) {
-		if (!r.why?.includes("attempt cap")) continue;
+		// parked for its used-up tries ("gate still red after 5 attempts …; attempt cap 5 reached" or a triage note instead of the cap)
+		if (!/attempt cap|gate still red after \d+ attempts/.test(r.why ?? "")) continue;
 		// the owner chose to leave it parked since: that stands
 		if (ledger.db.prepare("SELECT 1 FROM questions WHERE unit_id = ? AND point = 'quarantine' AND answered_by LIKE 'human%' AND answer LIKE 'leave%' AND answered_at >= ?").get(r.id, r.at)) continue;
 		const stopped = (ledger.db.prepare("SELECT gate_report FROM attempts WHERE unit_id = ? AND outcome = 'stopped' AND gate_report IS NOT NULL").all(r.id) as Array<{ gate_report: string }>).filter((a) => unjudgedByStop(JSON.parse(a.gate_report))).length;

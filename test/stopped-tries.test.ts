@@ -37,6 +37,9 @@ describe("tries a stop cut off before they were judged", () => {
 		// parked at the cap again later: the tries were given back already
 		ledger.transitionUnit("u1", "quarantined", `attempt cap ${maxTotal} reached`);
 		expect(returnStoppedTries(ledger, config)).toEqual([]);
+		// parked after its tries with the triage's note instead of the cap's words (U806 on the live run)
+		parked(ledger, "u2", notJudged, `gate still red after ${maxTotal} attempts (ported_tests_green); decision model unavailable (fetch failed); playbook by attempt count`);
+		expect(returnStoppedTries(ledger, config)).toEqual(["u2 (1)"]);
 	});
 
 	it("leaves alone a try the review judged, a park not at the cap, and a park the owner chose to keep", () => {
