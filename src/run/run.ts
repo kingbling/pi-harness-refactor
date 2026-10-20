@@ -29,7 +29,7 @@ import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
 import { decide } from "../jev/decide.ts";
 import { SYSTEMIC_FAILURE, JEV_ACT, noulOf } from "../jev/questions.ts";
-import { returnStoppedTries } from "./stopped-tries.ts";
+import { returnLateStubTries, returnStoppedTries } from "./stopped-tries.ts";
 import { applyPlacementAnswers, placementDir, placeUnit, renameMisspelledAreaDirs, replaceCatchAllTopics, resolvePlacements, unplacedReason } from "./placement.ts";
 import { syncTaxonomyAnswers } from "./taxonomy.ts";
 import { maybeCurateRules } from "../rules/living.ts";
@@ -339,6 +339,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const adapters = new Map(await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const)));
 	for (const m of replaceCatchAllTopics(ledger, config, o.root)) log(pc.cyan(`↻ placed in the topic its answer named: ${m}`));
 	for (const m of returnStoppedTries(ledger, config)) log(pc.cyan(`↻ tries a stop cut off before they were judged given back: ${m}`));
+	for (const m of returnLateStubTries(ledger, config)) log(pc.cyan(`↻ a try refused for stubs of a unit accepted while it ran given back: ${m}`));
 	// area folders the plugin now spells differently move in git first, so new units land next to the old code
 	if (!o.dry && await isRepo(config.target.path)) {
 		try {

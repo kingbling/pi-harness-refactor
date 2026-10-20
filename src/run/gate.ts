@@ -871,6 +871,22 @@ async function stubsLeftFor(dir: string, names: string[]): Promise<Array<{ file:
 	});
 }
 
+/**
+ * The owners of the stub marks the scope step refused only because that owner was accepted at or after `since` (while
+ * the try ran): the stub was right when it was written. Undefined when the step failed for anything else.
+ */
+export function stubOwnersAcceptedSince(ledger: Ledger, output: string, since: string): string[] | undefined {
+	const lines = output.split("\n").map((l) => l.trim()).filter(Boolean);
+	const owners = lines.map((l) => /TODO\(br:([^)]*)\) names \1, which is accepted:/.exec(l)?.[1]);
+	if (!owners.length || owners.some((x) => !x)) return undefined;
+	const late = [...new Set(owners as string[])];
+	for (const x of late) {
+		const at = ledger.transitionsOf("unit", x).reverse().find((t) => t.to_state === "accepted")?.created_at;
+		if (!at || at < since) return undefined;
+	}
+	return late;
+}
+
 /** Why a stub mark TODO(br:<owner>) cannot stand: the owner is no unit, this unit, or a unit already done (it would never come back to replace it). */
 export function stubOwnerProblem(ledger: Ledger, unitId: string, owner: string): string | undefined {
 	const u = ledger.getUnit(owner);

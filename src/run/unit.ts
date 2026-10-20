@@ -23,7 +23,7 @@ import type { ModelClient } from "../models/types.ts";
 import { globToRegExp, isProviderFailure, spawnLeaf, type LeafSession } from "../sessions/spawn.ts";
 import { buildTaskCard, renderTaskCard } from "../sessions/taskcard.ts";
 import { implementerTools, missingTestImports, portedLayout, testerTools, type ToolDeps } from "../sessions/tools.ts";
-import { changedFiles, errorSignature, findingKey, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, SKIPPED_TEST, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
+import { changedFiles, errorSignature, findingKey, noBehaviour, othersTestsChanged, renderGate, reusableCheck, runGate, sha1, SKIPPED_TEST, stubOwnersAcceptedSince, trackedFiles, type GateInput, type GateReport } from "./gate.ts";
 export { errorSignature };
 import { recordDrift } from "./layout-check.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
@@ -856,6 +856,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	// the next one is progress, and that round gives its try back, a few times per run
 	let openBefore: number | undefined = openFindings().length || undefined;
 	let progressRounds = 0;
+	// stub owners accepted while a try ran (its stub was right when written): each gives back one try, once
+	const lateOwners = new Set<string>();
 	let testsOnlyRounds = 0;
 	// the reviewer found only weak tests (the code is fine): after the tester's retest the gate runs again on the same
 	// code, with no new implementer session and no new attempt
@@ -1183,6 +1185,18 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 
 		lastGateText = `failed step: ${gate.failedStep}\n${gate.steps.find((s) => !s.ok)?.output ?? ""}`;
 		o.ledger.transitionUnit(o.unitId, "implementing", `gate failed: ${gate.failedStep}`);
+
+		// the scope step refused only stubs whose owner was accepted while this try ran (U703 and U704 were parked at
+		// their cap for TODO(br:U747) when U747 landed during their last try): the try could not know, it uses none
+		if (gate.failedStep === "antigaming_ok" && !regateOnly) {
+			const since = (o.ledger.db.prepare("SELECT started_at FROM attempts WHERE id = ?").get(attempt) as { started_at: string } | undefined)?.started_at ?? "";
+			const late = stubOwnersAcceptedSince(o.ledger, gate.steps.find((s) => !s.ok)?.output ?? "", since)?.filter((x) => !lateOwners.has(x));
+			if (late?.length) {
+				for (const x of late) lateOwners.add(x);
+				attemptNo--;
+				log(pc.dim(`  ${late.join(", ")} was accepted while this try ran, so its stubs no longer stand: this try uses none`));
+			}
+		}
 
 		// the reviewer could not judge (its model is down): not the code's fault, so no attempt burned and no triage
 		if (gate.failedStep === "wired_ok" && !reviewJudged) {

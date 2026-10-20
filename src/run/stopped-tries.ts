@@ -1,5 +1,6 @@
 import type { Config } from "../config.ts";
 import type { Ledger } from "../ledger/db.ts";
+import { stubOwnersAcceptedSince } from "./gate.ts";
 
 /** The gate step's output when the run stopped before the review judged the try. */
 export const NOT_JUDGED_STOPPING = "not judged: the run is stopping";
@@ -47,6 +48,32 @@ export function returnStoppedTries(ledger: Ledger, config: Config): string[] {
 		if (!unjudgedByStop(JSON.parse(r.report))) continue;
 		ledger.updateUnit(r.id, { meta: { triesUsed: r.used - 1, stopNotCounted: r.attempt } });
 		out.push(`${r.id} (1)`);
+	}
+	return out;
+}
+
+/**
+ * Units parked at the cap whose last try the scope step refused only for stubs whose owner was accepted while that try
+ * ran (before 0.4.58 it counted): planned again with one try left, their open park question withdrawn. Once per unit.
+ */
+export function returnLateStubTries(ledger: Ledger, config: Config): string[] {
+	const maxTotal = config.run.maxImplementAttempts + config.run.maxEscalateAttempts;
+	const rows = ledger.db
+		.prepare(
+			`SELECT u.id, a.started_at since, a.gate_report report FROM units u
+			 JOIN attempts a ON a.id = (SELECT b.id FROM attempts b WHERE b.unit_id = u.id AND b.gate_report IS NOT NULL ORDER BY b.id DESC LIMIT 1)
+			 WHERE u.state = 'quarantined' AND json_extract(u.meta, '$.lateStubTryReturned') IS NULL AND json_extract(a.gate_report, '$.failedStep') = 'antigaming_ok'`,
+		)
+		.all() as Array<{ id: string; since: string; report: string }>;
+	const out: string[] = [];
+	for (const r of rows) {
+		const report = JSON.parse(r.report) as { steps: Array<{ ok: boolean; output: string }> };
+		const late = stubOwnersAcceptedSince(ledger, report.steps.find((s) => !s.ok)?.output ?? "", r.since);
+		if (!late) continue;
+		for (const q of ledger.openQuestions().filter((x) => x.unit_id === r.id && x.point === "quarantine")) ledger.withdrawQuestion(q.id, `its last try was refused only for stubs of ${late.join(", ")}, accepted while it ran: it gets the try back`);
+		ledger.updateUnit(r.id, { meta: { lateStubTryReturned: true, triesUsed: maxTotal - 1, retryNote: `${late.join(", ")} was accepted while your last try ran: its stubs (TODO(br:${late[0]})) no longer stand. Use its code (target_lookup) instead.` } });
+		ledger.transitionUnit(r.id, "planned", `its last try was refused only for stubs of ${late.join(", ")}, accepted while it ran: the try is given back`);
+		out.push(r.id);
 	}
 	return out;
 }
