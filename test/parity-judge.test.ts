@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { renderStatus } from "../src/dashboard/status.ts";
-import { judgeRun, MAX_PARITY_REOPENS, MAX_SHARED_JOBS, runSharedJob, sharedCauses, sharedJobText, updateShared, type ParityJudge } from "../src/run/parity-judge.ts";
+import { describeDiff, judgeRun, MAX_PARITY_REOPENS, MAX_SHARED_JOBS, runSharedJob, sharedCauses, sharedJobText, updateShared, type ParityJudge } from "../src/run/parity-judge.ts";
 import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain, parityOnAccept } from "../src/run/run.ts";
 import { RESOLVER } from "../src/jev/resolve.ts";
 import { routeOwners } from "../src/run/parity-check.ts";
@@ -399,5 +399,16 @@ describe("judging parity differences", () => {
 		const judge: ParityJudge = async (o) => (expect(o.facts).not.toMatch(/Shared causes/), [{ diffs: ids(r), verdict: "bug", unit: "U1", problem: "401", shared: "new" }]);
 		expect((await judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge, log: () => {} })).reopened).toEqual(["U1"]);
 		expect(sharedCauses(ledger)).toEqual([]);
+	});
+});
+
+describe("a difference in words", () => {
+	it("two pages that start the same are shown from where they first differ (U2081: the debug toolbar, not line endings)", () => {
+		const head = "<!DOCTYPE html>\n<html>\n  <head>\n" + "    <meta charset=\"UTF-8\">\n".repeat(20);
+		const text = describeDiff({ step: "s14", route: "config/players", kind: "body", path: "body", legacy: `${head}    </body>`, target: `${head}    \n<!-- START of Symfony Web Debug Toolbar --></body>` });
+		expect(text).toMatch(/the first \d+ characters are the same; from there old …/);
+		expect(text).toContain("Web Debug Toolbar");
+		// short values as before
+		expect(describeDiff({ step: "s1", route: "r", kind: "status", path: "", legacy: "200", target: "404" })).toBe("step s1 (r) status: old 200, new 404");
 	});
 });

@@ -174,7 +174,7 @@ export async function judgeRun(o: {
 		else if (before?.status === "kept") {
 			const note = `the owner kept the old behaviour (${before.behaviour}); the new app must match it`;
 			set.run("bug", before.unit_id, before.quirk_id, note, d.id);
-			(bugs.get(before.unit_id) ?? bugs.set(before.unit_id, []).get(before.unit_id)!).push(`${describe(d)} — ${note}`);
+			(bugs.get(before.unit_id) ?? bugs.set(before.unit_id, []).get(before.unit_id)!).push(`${describeDiff(d)} — ${note}`);
 		} else if (before) set.run("quirk", before.unit_id, before.quirk_id, "waiting for the owner's keep/drop", d.id), quirks++;
 	}
 
@@ -195,7 +195,7 @@ export async function judgeRun(o: {
 		if (c?.status === "failed") return false;
 		// a slice a failed cause showed in takes no new cause: its jobs did not fix it, the units do (bounds the jobs)
 		if (!c && all.some((x) => x.status === "failed" && x.slices.includes(o.slice))) return false;
-		const examples = these.map((d) => `${o.slice}: ${describe(d)}`);
+		const examples = these.map((d) => `${o.slice}: ${describeDiff(d)}`);
 		if (!c) {
 			c = { id: `S${all.length + 1}`, problem: g.problem, fix: g.fix, slices: [], examples: [], status: "open", jobs: 0 };
 			all.push(c);
@@ -225,7 +225,7 @@ export async function judgeRun(o: {
 			`Slice "${o.slice}". Its units and their legacy files (relative to the old repo):\n${unitList.join("\n")}`,
 			`The requests (steps.json; "target" = how the new app was asked differently):\n${JSON.stringify(steps, null, 1).slice(0, 12_000)}`,
 			`How each app runs here (its setup model's words):\n${Object.entries(loadApps(o.root)).map(([side, a]) => `${side}: ready at ${a.recipe?.ready ?? "?"}; ${a.said ?? ""}`).join("\n")}`,
-			`The differences:\n${open.map((d) => `#${d.id} ${describe(d)}`).join("\n")}`,
+			`The differences:\n${open.map((d) => `#${d.id} ${describeDiff(d)}`).join("\n")}`,
 			...(o.shared ? [`Shared causes (a bug in code many pages share; set "shared" on a bug group: a known id when it is the same behaviour, "new" for another one):\n${known.map((c) => `${c.id} (slices ${c.slices.join(", ")})${c.status === "failed" ? " FAILED: its jobs did not fix it, so its bugs go to the units; do not set shared for it" : ""}: ${c.problem}`).join("\n") || "none known yet"}`] : []),
 		].join("\n\n");
 		const groups = await (o.judge ?? judgeWithModel)({ config: o.config, root: o.root, slice: o.slice, facts, units: units.map((u) => u.id) }).catch((e) => (log(pc.yellow(`parity ${o.slice}: judge failed: ${e?.message ?? e}`)), undefined));
@@ -240,16 +240,16 @@ export async function judgeRun(o: {
 			if (g.verdict === "setup") {
 				// no unit is re-opened for how an app runs here: that app's parity setup is asked (once) to fix it
 				for (const d of these) set.run("setup", null, null, `${g.app}: ${g.problem}`, d.id);
-				if (fixUpLeft(apps[g.app!], "setup")) saveApp(o.root, g.app!, { setupProblem: `${these.map(describe).join("; ").slice(0, 1000)} — ${g.problem}` });
+				if (fixUpLeft(apps[g.app!], "setup")) saveApp(o.root, g.app!, { setupProblem: `${these.map(describeDiff).join("; ").slice(0, 1000)} — ${g.problem}` });
 				setup += these.length;
 			} else if (g.verdict === "bug" && o.shared && g.shared && sharedCause(g, these)) {
 				// recorded once for the code job; no unit is re-opened for it
 			} else if (g.verdict === "bug") {
 				for (const d of these) set.run("bug", g.unit, null, `${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`, d.id);
-				(bugs.get(g.unit) ?? bugs.set(g.unit, []).get(g.unit)!).push(`${these.map(describe).join("; ")} — ${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`);
+				(bugs.get(g.unit) ?? bugs.set(g.unit, []).get(g.unit)!).push(`${these.map(describeDiff).join("; ")} — ${g.problem}${g.fix ? ` Fix: ${g.fix}` : ""}`);
 			} else {
 				// never auto-dropped: the kind the tester's own quirks may drop without asking is not used here
-				const q = recordQuirk({ ledger: o.ledger, root: o.root }, { unitId: g.unit, symbolId: these[0]!.route, kind: g.opinion === "keep" ? "intentional" : "suspected_bug", behaviour: g.problem, example: these.map(describe).join("; ").slice(0, 1000), opinion: g.opinion ?? "drop", why: g.why ?? "found by comparing the old and the new app" });
+				const q = recordQuirk({ ledger: o.ledger, root: o.root }, { unitId: g.unit, symbolId: these[0]!.route, kind: g.opinion === "keep" ? "intentional" : "suspected_bug", behaviour: g.problem, example: these.map(describeDiff).join("; ").slice(0, 1000), opinion: g.opinion ?? "drop", why: g.why ?? "found by comparing the old and the new app" });
 				for (const d of these) set.run("quirk", g.unit, q.id, g.why ?? null, d.id);
 				quirks += these.length;
 				await askPendingQuirks({ ledger: o.ledger, config: o.config, root: o.root, client: o.client }, g.unit).catch(() => undefined);
@@ -298,8 +298,22 @@ export function cameBackUnchanged(ledger: Ledger, unitId: string): boolean {
 	return !!reopen?.reason?.startsWith("parity:");
 }
 
-const short = (v: string | null, n = 200) => (v && v.length > n ? `${v.slice(0, n)}…` : (v ?? "null"));
-const describe = (d: Pick<DiffRow, "step" | "route" | "kind" | "path" | "legacy" | "target">) => `step ${d.step} (${d.route}) ${d.kind}${d.path ? ` at ${d.path}` : ""}: old ${short(d.legacy)}, new ${short(d.target)}`;
+const short = (v: string | null, n = 200, from = 0) => {
+	if (v === null) return "null";
+	const s = from ? `…${v.slice(from)}` : v;
+	return s.length > n ? `${s.slice(0, n)}…` : s;
+};
+/**
+ * One difference in words. Two long values that start the same (a page's HTML) are shown from a little before where
+ * they first differ: from their start both looked alike, and on the live run seven questions on U2081's error pages
+ * guessed at line endings while the new page had the framework's debug toolbar added at its end.
+ */
+export const describeDiff = (d: Pick<DiffRow, "step" | "route" | "kind" | "path" | "legacy" | "target">) => {
+	let same = 0;
+	if (d.legacy && d.target) while (same < d.legacy.length && same < d.target.length && d.legacy[same] === d.target[same]) same++;
+	const from = same > 160 ? same - 40 : 0;
+	return `step ${d.step} (${d.route}) ${d.kind}${d.path ? ` at ${d.path}` : ""}: ${from ? `the first ${same} characters are the same; from there ` : ""}old ${short(d.legacy, 200, from)}, new ${short(d.target, 200, from)}`;
+};
 
 /**
  * The problem a parity question is about: the unit and where its answers differ (route and field, numbers left out).
