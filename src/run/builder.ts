@@ -13,7 +13,7 @@ import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
-import { mentionsCase } from "./ported.ts";
+import { failureLines, mentionsCase } from "./ported.ts";
 import { reopenUnit } from "./recheck.ts";
 import { builderSteps, errorSignature, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { exec } from "../proc.ts";
@@ -193,6 +193,23 @@ export function errorKeys(output: string, dir: string): Array<{ key: string; lin
 	return out;
 }
 
+/** The test names a runner's output says failed, without colours and timings (they differ run to run). */
+export function failingTests(out: string): string[] {
+	return [...new Set(failureLines(out.replace(/\x1b\[[0-9;]*m/g, ""), Infinity).map((t) => t.replace(/\s+\d+(?:\.\d+)?\s*m?s$/, "").trim()))];
+}
+
+/**
+ * How many errors a whole-project check found: a test step counts its failing tests (its output has every line of
+ * each failure, a response body or a trace, so its line count rose when a job fixed a test: 120 to 142 on the live
+ * run), the other steps their error lines. The code job is judged the same way.
+ */
+export function errorCount(problem: string, dir: string): number {
+	return problem.split(/\n\n(?=\$ )/).reduce((n, part) => {
+		const failed = /^\$ .*\(test\)$/m.test(part.split("\n")[0]!) ? failingTests(part) : [];
+		return n + (failed.length || errorKeys(part, dir).length);
+	}, 0);
+}
+
 export interface Builder {
 	/** A unit of this stack was merged into main. */
 	afterMerge(stackId: string): void;
@@ -328,8 +345,8 @@ export function createBuilder(o: {
 			if (!problem) return green(), log(pc.green(`builder ${stackId}: whole project ok`)), false;
 			// red: merges of this stack land only when they add no error (the merge check), while the repair below runs
 			if (!o.ledger.getMeta(buildRedKey(stackId))) o.ledger.setMeta(buildRedKey(stackId), `${new Date().toISOString()} ${(problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? "").slice(0, 200)}`);
-			const errors = errorKeys(problem, dir).length;
-			keepBuilderLine(o.root, `builder ${stackId}: whole-project check fails: ${errors} error line(s); first: ${(problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? "").slice(0, 200)}`);
+			const errors = errorCount(problem, dir);
+			keepBuilderLine(o.root, `builder ${stackId}: whole-project check fails: ${errors} error(s) (failing tests, other steps' error lines); first: ${(problem.split("\n").find((l) => l.trim() && !l.startsWith("$ ")) ?? "").slice(0, 200)}`);
 			if (again && errors >= (jobFrom.get(stackId) ?? Infinity)) return log(pc.yellow(`builder ${stackId}: main has no fewer errors after the last code job (${errors}); the next one after the next merges`)), false;
 			const sig = errorSignature(`build:${stackId}`, problem);
 			// main's errors as a key (numbers left out): the park holds while main fails the same way

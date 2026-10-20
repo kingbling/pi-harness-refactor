@@ -114,7 +114,7 @@ describe("the builder", () => {
 		expect(jobs[0]).toMatch(/opposite behaviour[\s\S]*read the legacy code, correct the test that disagrees with it/);
 		// what the builder did stays readable after the live log scrolled away
 		const kept = readFileSync(builderLogPath(root), "utf8");
-		expect(kept).toMatch(/^\d{4}-\d\d-\d\dT\S+ builder fake: whole-project check fails: \d+ error line\(s\)/m);
+		expect(kept).toMatch(/^\d{4}-\d\d-\d\dT\S+ builder fake: whole-project check fails: \d+ error\(s\)/m);
 		expect(kept).toMatch(/builder fake: code job 1\/3 merged nothing/);
 		expect(kept).not.toMatch(/\x1b\[/);
 	});
@@ -285,4 +285,16 @@ describe("the builder", () => {
 		await b.finish();
 		expect(repairs + jobs).toBe(0);
 	});
+
+	it("a test step counts its failing tests, not its lines: a failure's long output does not read as more errors", async () => {
+		const { errorCount } = await import("../src/run/builder.ts");
+		const test = (bodyLines: number) => `$ php tools/run-phpunit.php a b   (test)\nFailed tests/ATest.php (exit 1)\n${Array.from({ length: bodyLines }, (_, i) => `<p>line ${i}</p>`).join("\n")}\nFailed tests/BTest.php (exit 1)`;
+		const stan = "$ vendor/bin/phpstan analyse   (types)\nsrc/A.php:3 Undefined method\nsrc/B.php:4 Undefined method";
+		expect(errorCount(test(5), "/x")).toBe(2);
+		expect(errorCount(test(40), "/x")).toBe(2);
+		expect(errorCount(`${stan}\n\n${test(40)}`, "/x")).toBe(4);
+		// a test step whose runner names no failing test: its lines, as before
+		expect(errorCount("$ run   (test)\nsomething broke\nbadly", "/x")).toBe(2);
+	});
 });
+

@@ -10,9 +10,8 @@ import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
-import { errorKeys, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
+import { errorKeys, failingTests, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
 import { onlyComments } from "./comment-only.ts";
-import { failureLines } from "./ported.ts";
 import { addedLines, changedFiles, clipOutput, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
 import { markOwner } from "./stub-sweep.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
@@ -353,7 +352,3 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	return mine < theirs ? undefined : `the whole-project checks fail as much as on main (no error fixed):\n${out.join("\n\n")}`;
 }
 
-/** The failing tests a test run names, without colours and timings (the same test reads the same on main). */
-function failingTests(out: string): string[] {
-	return [...new Set(failureLines(out.replace(/\x1b\[[0-9;]*m/g, ""), Infinity).map((t) => t.replace(/\s+\d+(?:\.\d+)?\s*m?s$/, "").trim()))];
-}
