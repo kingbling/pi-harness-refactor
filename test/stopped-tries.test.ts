@@ -51,4 +51,23 @@ describe("tries a stop cut off before they were judged", () => {
 		expect(returnStoppedTries(ledger, config)).toEqual([]);
 		expect(ledger.getUnit("judged")!.state).toBe("quarantined");
 	});
+
+	it("a unit an older stop sent back to planned with the cut-off try counted counts one try less, once", () => {
+		const ledger = new Ledger(":memory:");
+		const stoppedAt = (id: string, used: number, report: unknown, meta: Record<string, unknown> = {}) => {
+			ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
+			const a = ledger.startAttempt(id, "implement");
+			ledger.endAttempt(a, { outcome: "stopped", gateReport: report });
+			ledger.updateUnit(id, { meta: { triesUsed: used, ...meta } });
+			return a;
+		};
+		stoppedAt("old", 4, notJudged);
+		stoppedAt("judged", 4, judged);
+		const a = stoppedAt("new", 3, notJudged);
+		ledger.updateUnit("new", { meta: { stopNotCounted: a } }); // 0.4.54 did not count it at the stop
+		expect(returnStoppedTries(ledger, config)).toEqual(["old (1)"]);
+		expect(JSON.parse(ledger.getUnit("old")!.meta).triesUsed).toBe(3);
+		expect(JSON.parse(ledger.getUnit("new")!.meta).triesUsed).toBe(3);
+		expect(returnStoppedTries(ledger, config)).toEqual([]);
+	});
 });

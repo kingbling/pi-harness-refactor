@@ -34,5 +34,19 @@ export function returnStoppedTries(ledger: Ledger, config: Config): string[] {
 		ledger.transitionUnit(r.id, "planned", `${stopped} try(s) a stop cut off before they were judged are given back`);
 		out.push(`${r.id} (${stopped})`);
 	}
+	// a unit a stop sent back to planned with the cut-off try counted (a stop before 0.4.54): its next run counts one try less
+	const back = ledger.db
+		.prepare(
+			`SELECT u.id, json_extract(u.meta, '$.triesUsed') used, a.id attempt, a.gate_report report FROM units u
+			 JOIN attempts a ON a.id = (SELECT b.id FROM attempts b WHERE b.unit_id = u.id ORDER BY b.id DESC LIMIT 1)
+			 WHERE u.state = 'planned' AND json_extract(u.meta, '$.triesUsed') > 0 AND a.outcome = 'stopped' AND a.gate_report IS NOT NULL
+			   AND IFNULL(json_extract(u.meta, '$.stopNotCounted'), 0) <> a.id AND json_extract(u.meta, '$.stopTriesReturned') IS NULL`,
+		)
+		.all() as Array<{ id: string; used: number; attempt: number; report: string }>;
+	for (const r of back) {
+		if (!unjudgedByStop(JSON.parse(r.report))) continue;
+		ledger.updateUnit(r.id, { meta: { triesUsed: r.used - 1, stopNotCounted: r.attempt } });
+		out.push(`${r.id} (1)`);
+	}
 	return out;
 }

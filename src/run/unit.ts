@@ -959,7 +959,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 		// a try the stop cut off before its review judged it is no used try: 27 lanes lost one at a stop, and five
 		// campaigns templates were parked at the cap soon after the next start
 		const used = unjudgedByStop(report) ? attemptNo - 1 : attemptNo;
-		o.ledger.updateUnit(o.unitId, { meta: { triesUsed: used, retryNote: `The run was stopped while this unit was being worked on (after ${used} of ${maxTotal} tries). Check what is done, then finish it.` } });
+		o.ledger.updateUnit(o.unitId, { meta: { triesUsed: used, ...(used < attemptNo ? { stopNotCounted: attempt } : {}), retryNote: `The run was stopped while this unit was being worked on (after ${used} of ${maxTotal} tries). Check what is done, then finish it.` } });
 		o.ledger.transitionUnit(o.unitId, "planned", `run stopped after ${used} try(s); its code is kept for the next run`);
 		log(pc.yellow(`  the run is stopping: ${o.unitId} goes back to planned, its code is kept`));
 		return { unitId: o.unitId, state: "planned", attempts: attemptNo, gate, costUsd: cost, stopped: true };
