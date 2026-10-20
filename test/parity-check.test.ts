@@ -10,7 +10,7 @@ import { applySlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
 import { LEGACY, loadApps, saveApp } from "../src/run/parity.ts";
-import { checkSlice, compareRuns, dataChanges, fieldValue, loginWall, MAX_SETUP_RETRIES, plainValue, runSteps, selfRedirect, skippedRoutes, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
+import { checkSlice, compareRuns, dataChanges, fieldValue, loginWall, MAX_SETUP_RETRIES, plainValue, textBody, runSteps, selfRedirect, skippedRoutes, stepsProblem, type Step, type StepResult, type StepWriter } from "../src/run/parity-check.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
@@ -159,6 +159,8 @@ describe("comparing the old and the new app", () => {
 	it("each app's own address and a dump's base64 text are the harness's noise, not a difference", async () => {
 		const text = "_GYSS__|history|s:35:\"http://127.0.0.1:18081/api/rest/doc\";";
 		expect(plainValue({ data: { base64: Buffer.from(text).toString("base64") }, n: 1 }, ["127.0.0.1:18081"])).toEqual({ data: '_GYSS__|history|s:35:"http://(this app)/api/rest/doc";', n: 1 });
+		// line endings never make two text answers differ
+		expect(textBody("<html>\r\n  <p>not found</p>\r\n</html>", [])).toBe(textBody("<html>\n  <p>not found</p>\n</html>", []));
 		expect(plainValue("http://localhost:18080/x?to=http%3A%2F%2Flocalhost%3A18080%2Fy", ["localhost:18080"])).toBe(`http://(this app)/x?to=http%3A%2F%2F${encodeURIComponent("(this app)")}%2Fy`);
 		// bytes that are no text stay as they are
 		const bin = { base64: Buffer.from([0xff, 0xfe, 0x00]).toString("base64") };

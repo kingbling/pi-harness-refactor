@@ -191,6 +191,12 @@ export function plainValue(v: unknown, hosts: string[]): unknown {
 	return v;
 }
 
+/**
+ * A text answer as compared: line endings are the same in both apps. A page that differs only in \r\n against \n
+ * looks the same to every client; the judge called it a bug and reopened U2081 for three download error pages.
+ */
+export const textBody = (text: string, hosts: string[]): unknown => plainValue(text.replace(/\r\n?/g, "\n"), hosts);
+
 /** The host:port of an app's base URL, when it names a port (a bare "localhost" is too common to replace). */
 const ownHost = (base: string) => {
 	try {
@@ -244,7 +250,7 @@ export async function runSteps(steps: Step[], o: { side: "legacy" | "target"; ba
 			try {
 				r.body = plainValue(JSON.parse(text), hosts);
 			} catch {
-				r.body = plainValue(text, hosts);
+				r.body = textBody(text, hosts);
 			}
 			const headText = [...res.headers].map(([k, v]) => `${k}: ${v}`).join("\n");
 			for (const [n, re] of Object.entries(s.save ?? {})) {
