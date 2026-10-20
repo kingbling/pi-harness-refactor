@@ -33,7 +33,10 @@ export function findTests(targetProjectDir: string, moduleDir: string, layout: T
 	// walk only the fixed part of each glob (src/Billing/tests/**/*Test.php → src/Billing/tests)
 	for (const g of globs) {
 		const base = g.split("/").filter((_, i, a) => !a.slice(0, i + 1).some((s) => /[*?{[]/.test(s))).join("/");
-		if (existsSync(join(targetProjectDir, base))) visit(join(targetProjectDir, base));
+		const abs = join(targetProjectDir, base);
+		if (!existsSync(abs)) continue;
+		if (statSync(abs).isDirectory()) visit(abs);
+		else if (layout.isTestFile(base) && res.some((re) => re.test(base))) out.add(base);
 	}
 	return [...out].sort();
 }
@@ -113,6 +116,8 @@ type How = { adapter: TargetAdapter; timeoutMs: number; slot: Slot };
 type Ask = How & { files: string[]; at: number; warm: boolean; res: (a: MainAnswer) => void; rej: (e: unknown) => void };
 /** Questions to main waiting for its turn, per main dir: one turn answers all of them with one run. */
 const asks = new Map<string, Ask[]>();
+/** A turn on main may take this many test timeouts (all files, the rest, file by file) before its askers stop waiting. */
+const MAIN_TURN_LIMIT = 6;
 /** Neighbour files lanes asked main about lately (when, and how to run them), per main dir: run again after a merge. */
 const asked = new Map<string, { how: How; files: Map<string, number> }>();
 /** How long a file asked about is run again after merges. */
@@ -142,11 +147,17 @@ function askMain(main: string, files: string[], how: How, warm = false): Promise
 			const run = lanes.length ? lanes : batch;
 			const timeoutMs = Math.max(...run.map((a) => a.timeoutMs));
 			const test = (dir: string, f: string[]) => run[0]!.slot(() => runTests(run[0]!.adapter, dir, f, timeoutMs));
+			// a turn that never ends (a run whose promise never settles) would hold every later ask on this main for
+			// hours: after the limit its askers get no answer and the next turn starts
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const limit = new Promise<never>((_, rej) => (timer = setTimeout(() => rej(new Error(`main's turn took over ${Math.round((MAIN_TURN_LIMIT * timeoutMs) / 60_000)} min`)), MAIN_TURN_LIMIT * timeoutMs)));
 			try {
-				const r = await greenThere(main, [...new Set(run.flatMap((a) => a.files))], test, !lanes.length);
+				const r = await Promise.race([greenThere(main, [...new Set(run.flatMap((a) => a.files))], test, !lanes.length), limit]);
 				for (const a of batch) a.res({ ...r, waitedMs: Date.now() - a.at });
 			} catch (e) {
 				for (const a of batch) a.rej(e);
+			} finally {
+				clearTimeout(timer);
 			}
 		});
 	});
@@ -238,7 +249,13 @@ export async function runPortedTests(o: { ledger: Ledger; unitId: string; adapte
 		const named = failingFiles(n.output, others, o.dir);
 		return { ...mine, output: `${mine.output}\nwarning: test file(s) of other units fail here (${named.length ? named.join(", ") : `${others.length} file(s)`}), but your worktree is on an older main, so they are ${STALE_NOT_COUNTED}: ${why}` };
 	}
-	const ans = await askMain(main, others, { adapter: o.adapter, timeoutMs: o.timeoutMs, slot });
+	let ans: MainAnswer;
+	try {
+		ans = await askMain(main, others, { adapter: o.adapter, timeoutMs: o.timeoutMs, slot });
+	} catch (e) {
+		const named = failingFiles(n.output, others, o.dir);
+		return { ...mine, output: `${mine.output}\nwarning: test file(s) of other units fail here (${named.length ? named.join(", ") : `${others.length} file(s)`}), but main gave no answer on them (${e instanceof Error ? e.message : String(e)}), so they are ${STALE_NOT_COUNTED}` };
+	}
 	const mainWaitMs = ans.waitedMs;
 	const greenThere = others.filter((t) => ans.green.get(t));
 	const redThere = others.filter((t) => !greenThere.includes(t));
@@ -363,14 +380,18 @@ export function testsPass(targetProjectDir: string, adapter: TargetAdapter, file
  * Returns the paths it put back.
  */
 export async function scopeGuard(dir: string, allowed: string[], ignored: string[] = []): Promise<() => Promise<string[]>> {
-	const allow = allowed.map(globToRegExp);
-	const outside = async () => (await changedFiles(dir, ignored)).filter((f) => !allow.some((r) => r.test(f)));
+	const outside = async () => {
+		// A tester may sanction another disputed test during its session.
+		const allow = allowed.map(globToRegExp);
+		return (await changedFiles(dir, ignored)).filter((f) => !allow.some((r) => r.test(f)));
+	};
 	const read = (f: string) => (existsSync(join(dir, f)) && statSync(join(dir, f)).isFile() ? readFileSync(join(dir, f)) : null);
 	const before = new Map((await outside()).map((f) => [f, read(f)] as const));
 	return async () => {
 		const tracked = new Set(await trackedFiles(dir));
 		const put: string[] = [];
 		for (const f of new Set([...before.keys(), ...(await outside())])) {
+			if (allowed.some((g) => globToRegExp(g).test(f))) continue;
 			const now = read(f);
 			const was = before.get(f);
 			if (was !== undefined) {

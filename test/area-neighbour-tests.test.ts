@@ -254,6 +254,21 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect((await first).ok).toBe(false);
 	});
 
+	it("a turn on main that never ends does not hold the lanes: after its limit the lane goes on, the neighbours not counted, and the next turn runs", async () => {
+		write(join(wt, "broken.txt"), "tests/n1.spec\n");
+		// the third slot asked for is main's run: it never starts, so its promise never settles
+		let calls = 0;
+		const stuck = <T>(fn: () => Promise<T>) => (++calls === 3 ? new Promise<T>(() => {}) : fn());
+		const t0 = Date.now();
+		const r = await runPortedTests({ ledger, unitId: "u1", adapter, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 300, slot: stuck });
+		expect(r.ok).toBe(true);
+		expect(r.output).toMatch(/main gave no answer on them \(main's turn took over/);
+		expect(r.output).toContain(STALE_NOT_COUNTED);
+		expect(Date.now() - t0).toBeLessThan(10_000);
+		// main's queue moved on: the next lane gets main's answer
+		expect((await runPortedTests({ ledger, unitId: "u1", adapter, dir: wt, tests: TESTS, mainDir: main, timeoutMs: 300 })).ok).toBe(false);
+	});
+
 	it("after a merge the neighbour files lanes asked about run on main's new tree on the side; the next gate finds the answer", async () => {
 		write(join(wt, "broken.txt"), "tests/n1.spec\n");
 		expect((await run()).ok).toBe(false);
