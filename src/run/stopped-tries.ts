@@ -82,13 +82,14 @@ export function returnLateStubTries(ledger: Ledger, config: Config): string[] {
 
 /**
  * Units parked for a tidy task of their area they were told to do themselves (before 0.4.59; the tidy job does them):
- * their last failure names a file of an approved task (U702: CampaignEditPage of T5599 renamed, 203 tests failing; U3050:
+ * their last failure names a file of a task waiting or done since (U702: CampaignEditPage of T5599 renamed, 203 tests failing; U3050:
  * U2fFormat of T5597). Planned again with one try left and a note to keep the task's files as on main. Once per unit, not
  * when the owner chose to leave it parked.
  */
 export function returnTidyTries(ledger: Ledger, config: Config, areaOf: (meta: string) => { stackId: string; area: string }): string[] {
 	const maxTotal = config.run.maxImplementAttempts + config.run.maxEscalateAttempts;
-	const tasks = tidyTasks(ledger).filter((t) => t.status === "approved");
+	// waiting or done since (the job runs once the area is idle, which the parked units no longer keep busy)
+	const tasks = tidyTasks(ledger).filter((t) => t.status === "approved" || t.status === "done").sort((a, b) => b.questionId - a.questionId); // the newest first: a name renamed twice names the last task
 	if (!tasks.length) return [];
 	const rows = ledger.db
 		.prepare(
@@ -101,8 +102,13 @@ export function returnTidyTries(ledger: Ledger, config: Config, areaOf: (meta: s
 	for (const r of rows) {
 		const { stackId, area } = areaOf(r.meta);
 		const failed = (JSON.parse(r.report) as { steps: Array<{ ok: boolean; output: string }> }).steps.find((s) => !s.ok)?.output ?? "";
-		// a task's file named by its old name (U2fFormat, CampaignEditPage) in what failed
-		const hit = tasks.find((t) => t.stack === stackId && t.area === area && t.from.some((f) => new RegExp(`\\b${basename(f).replace(/\.[^.]+$/, "")}\\b`).test(failed)));
+		// a task's file named by its old name in what failed, also as the start of a longer name (U2fFormat in
+		// U2fFormatCharacterizationTest.php, CampaignEditPage)
+		// (a name of a few letters, or none: .gitkeep, says nothing; a delete leaves no old name another file uses)
+		const hit = tasks.find((t) => t.stack === stackId && t.area === area && t.op !== "delete" && t.from.some((f) => {
+			const name = basename(f).replace(/\.[^.]+$/, "");
+			return name.length >= 4 && new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(failed);
+		}));
 		if (!hit) continue;
 		if (ledger.db.prepare("SELECT 1 FROM questions WHERE unit_id = ? AND point = 'quarantine' AND answered_by LIKE 'human%' AND answer LIKE 'leave%' AND answered_at >= ?").get(r.id, r.at)) continue;
 		for (const q of ledger.openQuestions().filter((x) => x.unit_id === r.id && x.point === "quarantine")) ledger.withdrawQuestion(q.id, `it was told to do tidy task ${hit.id} itself, which the tidy job does: it gets a try back`);

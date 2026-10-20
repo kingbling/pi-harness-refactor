@@ -38,4 +38,17 @@ describe("units parked for a tidy task the tidy job does", () => {
 		ledger.transitionUnit("U702", "quarantined", `attempt cap ${maxTotal} reached`);
 		expect(returnTidyTries(ledger, config, areaOf)).toEqual([]);
 	});
+
+	it("a task done since counts too, a longer name that starts with the old one matches, and a deleted dotfile never does", () => {
+		const ledger = new Ledger(":memory:");
+		ledger.setMeta("tidy_tasks", JSON.stringify([
+			{ id: "T4067", stack: "react", area: "users", op: "delete", from: ["src/Users/Entity/.gitignore"], to: [], why: "empty", questionId: 4067, status: "done" },
+			{ id: "T1253", stack: "react", area: "users", op: "rename", from: ["src/Users/Security/U2fFormat.php"], to: ["src/Users/Security/U2fAttestationFormat.php"], why: "names", questionId: 1253, status: "done" },
+			{ id: "T5597", stack: "react", area: "users", op: "rename", from: ["src/Users/WebAuthn/U2fFormat.php"], to: ["src/Users/WebAuthn/U2fAttestationFormat.php"], why: "names", questionId: 5597, status: "done" },
+		]));
+		parked(ledger, "U3050", "users", "write outside unit scope: tests/Users/U2fFormatCharacterizationTest.php");
+		parked(ledger, "U2478", "users", "expected 2, got 3");
+		// the newest task that renamed the name
+		expect(returnTidyTries(ledger, config, areaOf)).toEqual(["U3050 (T5597)"]);
+	});
 });
