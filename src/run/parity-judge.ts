@@ -9,7 +9,7 @@ import type { ModelClient } from "../models/types.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
 import { loadSteps, sliceFacts } from "./parity-check.ts";
-import { fixUpLeft, loadApps, saveApp } from "./parity.ts";
+import { fixUpLeft, loadApps, MAX_FIXUPS, saveApp } from "./parity.ts";
 import { askPendingQuirks, recordQuirk } from "./quirks.ts";
 import { reopenUnit } from "./recheck.ts";
 
@@ -130,7 +130,7 @@ export const judgeWithModel: ParityJudge = async (o) => {
 		writeGlobs: [],
 		customTools: [verdictTool],
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__parity__.${o.slice}.judge.${Date.now()}.jsonl`),
-		systemPrompt: `You judge differences between an OLD app (${o.config.source.stack}, at ${o.config.source.path}) and the NEW app migrated from it (${o.config.target.stacks.join(" + ")}, at ${o.config.target.path}). The same requests went to both; code compared the answers and what each wrote, and left out everything that differs between two runs of the old app. Read the old and the new code to find each difference's cause. A comment in the new code explaining a difference is a claim, not evidence: decide from what the old code does. Every difference is a bug (the new app is wrong), a quirk (the old app does something odd) or setup (only how one app runs here causes it: its address, its config, a database it lacks; the facts say how each app was set up); a difference in form alone is still a bug or a quirk (a new app answering 303 where the old one answered 302 changes what clients see: a bug, unless the old behaviour is itself odd). Setup only when no unit's code would change it. Name a unit from the list for each bug or quirk. When the facts list shared causes, a bug caused by code many pages share (not one page's own) is marked shared, so one job fixes it once. Answer with parity_verdict once.\n\n${PLAIN_LANGUAGE}`,
+		systemPrompt: `You judge differences between an OLD app (${o.config.source.stack}, at ${o.config.source.path}) and the NEW app migrated from it (${o.config.target.stacks.join(" + ")}, at ${o.config.target.path}). The same requests went to both; code compared the answers and what each wrote, and left out everything that differs between two runs of the old app. Read the old and the new code to find each difference's cause. A comment in the new code explaining a difference is a claim, not evidence: decide from what the old code does. Every difference is a bug (the new app is wrong), a quirk (the old app does something odd) or setup (only how one app runs here causes it: its address, its config, its run mode (a debug toolbar or developer error page added only in a development mode), a database it lacks; the facts say how each app was set up); a difference in form alone is still a bug or a quirk (a new app answering 303 where the old one answered 302 changes what clients see: a bug, unless the old behaviour is itself odd). Setup only when no unit's code would change it. Name a unit from the list for each bug or quirk. When the facts list shared causes, a bug caused by code many pages share (not one page's own) is marked shared, so one job fixes it once. Answer with parity_verdict once.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
 		await session.run(o.facts);
@@ -240,7 +240,12 @@ export async function judgeRun(o: {
 			if (g.verdict === "setup") {
 				// no unit is re-opened for how an app runs here: that app's parity setup is asked (once) to fix it
 				for (const d of these) set.run("setup", null, null, `${g.app}: ${g.problem}`, d.id);
-				if (fixUpLeft(apps[g.app!], "setup")) saveApp(o.root, g.app!, { setupProblem: `${these.map(describeDiff).join("; ").slice(0, 1000)} — ${g.problem}` });
+				// a problem its fix-ups were not about gets one more (the new app's three were used up in the morning, and its
+				// debug toolbar, found later, made 251 of 404 page differences)
+				const app = apps[g.app!]!;
+				const key = [...new Set(these.map((d) => `${d.route} ${d.kind}`))].sort().join("|");
+				const fresh = !fixUpLeft(app, "setup") && !(app.setupFor ?? []).includes(key);
+				if (fixUpLeft(app, "setup") || fresh) saveApp(o.root, g.app!, { setupProblem: `${these.map(describeDiff).join("; ").slice(0, 1000)} — ${g.problem}`, setupFor: [...(app.setupFor ?? []), key], ...(fresh ? { setupProbes: MAX_FIXUPS - 1, setupProbed: undefined } : {}) });
 				setup += these.length;
 			} else if (g.verdict === "bug" && o.shared && g.shared && sharedCause(g, these)) {
 				// recorded once for the code job; no unit is re-opened for it

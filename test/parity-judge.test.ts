@@ -9,7 +9,7 @@ import { describeDiff, judgeRun, MAX_PARITY_REOPENS, MAX_SHARED_JOBS, runSharedJ
 import { applyParityAnswers, MAX_PARITY_ERRORS, parityAgain, parityOnAccept } from "../src/run/run.ts";
 import { RESOLVER } from "../src/jev/resolve.ts";
 import { routeOwners } from "../src/run/parity-check.ts";
-import { LEGACY, loadApps, saveApp } from "../src/run/parity.ts";
+import { LEGACY, loadApps, MAX_FIXUPS, saveApp } from "../src/run/parity.ts";
 
 /**
  * The judge sorts each difference into a bug of the new app (the unit is re-opened with it) or a quirk of the old
@@ -133,6 +133,19 @@ describe("judging parity differences", () => {
 		expect(status(r)).toEqual(["setup"]);
 		expect(ledger.getUnit("U1")!.state).toBe("accepted");
 		expect(loadApps(root)["nestjs"]!.setupProblem).toMatch(/body\.total[\s\S]*without the snapshot data/);
+	});
+
+	it("a setup problem the app's used-up fix-ups were not about gets one more; the same one again does not", async () => {
+		const { root, config, ledger, run, ids } = workspace();
+		saveApp(root, "nestjs", { up: true, setupProbes: MAX_FIXUPS });
+		const setupOf = (r: number) => judgeRun({ ledger, config, root, runId: r, slice: "invoices", judge: async () => [{ diffs: ids(r), verdict: "setup", unit: "", app: "nestjs", problem: "it runs in its development mode: the debug toolbar ends every page" }], log: () => {} });
+		await setupOf(run([{ step: "one", path: "body", legacy: "<p>x</p>", target: "<p>x</p><!-- toolbar -->" }]));
+		expect(loadApps(root)["nestjs"]).toMatchObject({ setupProbes: MAX_FIXUPS - 1, setupProblem: expect.stringMatching(/development mode/) });
+		// the fix-up ran (and used it), the problem is still there: no further one
+		saveApp(root, "nestjs", { setupProblem: undefined, setupProbes: MAX_FIXUPS });
+		ledger.db.prepare("UPDATE parity_diffs SET note = NULL").run();
+		await setupOf(run([{ step: "one", path: "body", legacy: "<p>y</p>", target: "<p>y</p><!-- toolbar -->" }]));
+		expect(loadApps(root)["nestjs"]!.setupProblem).toBeUndefined();
 	});
 
 	it("the same setup difference is not judged again, and a run left with only setup differences answers like the old app", async () => {
