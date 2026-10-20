@@ -66,6 +66,9 @@ export interface TidyJobs {
 	readonly busy: Promise<void> | undefined;
 }
 
+/** The longest an approved task keeps its area's new units waiting for the units already running there to end. */
+export const TIDY_HOLD_MAX_MS = 45 * 60_000;
+
 export function createTidyJobs(o: {
 	config: Config;
 	root: string;
@@ -79,10 +82,19 @@ export function createTidyJobs(o: {
 	/** A unit of this area is running: its task waits so the two do not conflict. */
 	areaBusy: (stackId: string, area: string) => boolean;
 	worker?: TidyWorker | false;
+	/** How long a task holds its area's new units back while a running unit keeps the area busy (default TIDY_HOLD_MAX_MS). */
+	holdMaxMs?: number;
 }): TidyJobs {
 	const worker = o.worker === false ? undefined : (o.worker ?? tidyWithModel);
 	const todo = (t: TidyTask) => t.status === "approved" && !onlyCase(t) && o.adapters.has(t.stack);
 	let running: Promise<void> | undefined;
+	// when each task began to hold its area: one slow unit there kept 27 units from starting for 6 hours while its
+	// task waited for it. After the limit units start again and the task runs when the area is next idle
+	const since = new Map<string, number>();
+	const holding = (t: TidyTask) => {
+		if (!since.has(t.id)) since.set(t.id, Date.now());
+		return Date.now() - since.get(t.id)! < (o.holdMaxMs ?? TIDY_HOLD_MAX_MS);
+	};
 
 	const run = async (t: TidyTask, work: TidyWorker) => {
 		const adapter = o.adapters.get(t.stack)!;
@@ -142,8 +154,8 @@ export function createTidyJobs(o: {
 	};
 
 	return {
-		holds: (stackId, area) => !!worker && tidyTasks(o.ledger, stackId, area).some(todo),
-		heldAreas: () => new Set(worker ? tidyTasks(o.ledger).filter(todo).map((t) => `${t.stack}\0${t.area}`) : []),
+		holds: (stackId, area) => !!worker && tidyTasks(o.ledger, stackId, area).some((t) => todo(t) && holding(t)),
+		heldAreas: () => new Set(worker ? tidyTasks(o.ledger).filter((t) => todo(t) && holding(t)).map((t) => `${t.stack}\0${t.area}`) : []),
 		next() {
 			if (running || !worker) return;
 			const t = tidyTasks(o.ledger).find((x) => todo(x) && !o.areaBusy(x.stack, x.area));

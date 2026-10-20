@@ -48,7 +48,7 @@ async function setup(checkTree?: (dir: string, only?: string[]) => string[], ove
 		git(target, ["merge", "-q", "--ff-only", branch]);
 		return git(target, ["rev-parse", "HEAD"]);
 	};
-	const jobs = (worker: TidyWorker | false, areaBusy = () => false) => createTidyJobs({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix, areaBusy, worker });
+	const jobs = (worker: TidyWorker | false, areaBusy = () => false, holdMaxMs?: number) => createTidyJobs({ config, root, ledger, adapters: new Map([["fake", adapter]]), log: () => {}, linkAll: () => {}, mergeFix, areaBusy, worker, holdMaxMs });
 	return { target, ledger, jobs };
 }
 
@@ -63,6 +63,24 @@ const mover =
 	};
 
 describe("the tidy job", () => {
+	it("holds its area's new units back only for a while: a unit that keeps the area busy for hours does not keep the others waiting", async () => {
+		const { ledger, jobs } = (await setup());
+		let busy = true;
+		const j = jobs(mover(true), () => busy, 50);
+		expect(j.holds("fake", "a")).toBe(true);
+		expect(j.heldAreas().has("fake\0a")).toBe(true);
+		j.next();
+		expect(j.busy).toBeUndefined(); // waits for the running unit
+		await new Promise((r) => setTimeout(r, 80));
+		expect(j.holds("fake", "a")).toBe(false); // units start again
+		expect(j.heldAreas().size).toBe(0);
+		// the task still runs once the area is idle
+		busy = false;
+		j.next();
+		await j.busy;
+		expect(tidyTasks(ledger)[0]!.status).toBe("done");
+	});
+
 	it("moves the file and updates the test that imports it; green is merged and the task is done", async () => {
 		const { target, ledger, jobs } = (await setup());
 		const j = jobs(mover(true));
