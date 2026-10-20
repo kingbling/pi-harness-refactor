@@ -191,18 +191,30 @@ async function greenThere(main: string, files: string[], test: (dir: string, fil
 	for (const t of files) if (!green.has(t) && !existsSync(join(main, t))) green.set(t, false);
 	const present = files.filter((t) => !green.has(t));
 	// all of them at once first. Red on main too: the files the runner names failing are red, the rest run once
-	// more together; only when the runner names none (or that run is red too) file by file, which is slow with
-	// many files and one main run at a time across lanes
-	const all = present.length ? await test(main, present) : { ok: true, output: "" };
-	if (all.ok) for (const t of present) green.set(t, true);
-	else {
-		const red = all.output.endsWith("[timed out]") ? [] : failingFiles(all.output, present, main);
-		for (const t of red) green.set(t, false);
-		const rest = present.filter((t) => !red.includes(t));
-		if (red.length && rest.length && (await test(main, rest)).ok) for (const t of rest) green.set(t, true);
-		// a warm-up never runs file by file (it would hold main's turn for minutes): those files stay unanswered
-		else if (!warm) for (const t of rest) green.set(t, (await test(main, [t])).ok);
-	}
+	// more together; when the runner names none (or that run is red too, or timed out) the files are split in
+	// halves until each red part is one file: one file at a time took hours on 146 files, one main run at a time
+	// across lanes
+	const split = async (files: string[], r?: TestRun): Promise<void> => {
+		r ??= await test(main, files);
+		if (r.ok) for (const t of files) green.set(t, true);
+		else if (files.length === 1) green.set(files[0]!, false);
+		else {
+			const red = r.output.endsWith("[timed out]") ? [] : failingFiles(r.output, files, main);
+			for (const t of red) green.set(t, false);
+			const rest = files.filter((t) => !red.includes(t));
+			if (!rest.length) return;
+			// a warm-up never splits (it would hold main's turn for minutes): those files stay unanswered
+			if (warm) {
+				if (red.length && (await test(main, rest)).ok) for (const t of rest) green.set(t, true);
+				return;
+			}
+			if (red.length) return split(rest);
+			const half = Math.ceil(rest.length / 2);
+			await split(rest.slice(0, half));
+			await split(rest.slice(half));
+		}
+	};
+	if (present.length) await split(present);
 	// a result is kept only when main did not move during the run
 	if (tree && (await headOf())[1] === tree) for (const [t, ok] of green) greenOnMain.set(key(t), ok);
 	return { green, head: head ?? "" };

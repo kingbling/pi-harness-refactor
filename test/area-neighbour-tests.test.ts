@@ -254,6 +254,21 @@ describe("ported tests: the unit's own, and the area's other tests only when the
 		expect((await first).ok).toBe(false);
 	});
 
+	it("many neighbours red on main with a runner that names no file: main splits them in halves, not one run per file", async () => {
+		const many = Array.from({ length: 16 }, (_, i) => `tests/m${i}.spec`);
+		for (const [i, f] of many.entries()) write(join(main, f), i === 5 ? "fail\n" : "pass\n");
+		git(main, "add", "-A");
+		git(main, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "many");
+		git(wt, "pull", "-q");
+		write(join(wt, "broken.txt"), "tests/m9.spec\n");
+		const quiet = { ...adapter, test: (_d: string, files: string[]) => ({ cmd: "sh", args: ["-c", `echo "$PWD $*" >> ${log}; for f; do grep -q pass "$f" || exit 1; grep -qx "$f" broken.txt 2>/dev/null && exit 1; done; exit 0`, "sh", ...files] }) } as unknown as TargetAdapter;
+		const r = await runPortedTests({ ledger, unitId: "u1", adapter: quiet, dir: wt, tests: ["tests/own.spec", ...many], mainDir: main, timeoutMs: 30_000 });
+		expect(r.ok).toBe(false);
+		expect(r.output).toContain("tests/m9.spec");
+		expect(r.output).toMatch(/fail on main too, not counted against this unit: tests\/m5\.spec/);
+		expect(runsIn(main)).toBeLessThan(12);
+	});
+
 	it("a turn on main that never ends does not hold the lanes: after its limit the lane goes on, the neighbours not counted, and the next turn runs", async () => {
 		write(join(wt, "broken.txt"), "tests/n1.spec\n");
 		// the third slot asked for is main's run: it never starts, so its promise never settles
