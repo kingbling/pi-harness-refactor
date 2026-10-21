@@ -1339,6 +1339,17 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					await new Promise((r) => setTimeout(r, 3000));
 					continue;
 				}
+				// a unit waits on a model's wait answer that ends soon (MODEL_HOLD_MS): the run waits for it instead of ending
+				// around it (U3053 sat held when the run finished at 99%)
+				const held = modelHeldUntil(ledger);
+				if (held && !stop && !o.shouldStop?.() && !dayCapHit && underLimit()) {
+					const note = `waiting until ${new Date(held).toISOString().slice(11, 16)} for unit(s) a model said to wait for`;
+					if (note !== waitingNote) log(pc.yellow(note));
+					waitingNote = note;
+					lastResubmitCheck = 0;
+					await new Promise((r) => setTimeout(r, 3000));
+					continue;
+				}
 				// nothing left to run: is the app really done? A code job it merged may let units run again
 				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("finish check: is the app really done", runFinish))) {
 					lastResubmitCheck = 0;
@@ -1553,6 +1564,13 @@ export { errorSignature };
 
 /** How long a model's "wait" answer holds a unit; then it runs again (the owner's wait holds until a newer answer). */
 export const MODEL_HOLD_MS = 30 * 60_000;
+
+/** When the last unit held by a model's wait answer may run again (undefined: none is held so). */
+export function modelHeldUntil(ledger: Ledger, now = Date.now()): number | undefined {
+	const rows = ledger.db.prepare("SELECT q.answered_by, q.answered_at FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.hold') WHERE u.state IN ('truth','implementing','gating','review')").all() as Array<{ answered_by: string | null; answered_at: string | null }>;
+	const ends = rows.filter((r) => r.answered_at && MODEL_ANSWERERS.includes(r.answered_by ?? "")).map((r) => Date.parse(r.answered_at!) + MODEL_HOLD_MS).filter((t) => t > now);
+	return ends.length ? Math.max(...ends) : undefined;
+}
 
 /** Whether the wait answered on this question was a model's and has run out. */
 function modelHoldOver(ledger: Ledger, questionId: number, now = Date.now()): boolean {

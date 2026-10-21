@@ -314,7 +314,7 @@ describe("a wait answer", () => {
 	it("a model's wait holds the unit for a while, then it runs again; the owner's wait holds until a newer answer (U3053: 7 hours on a resolver's wait over a short provider outage)", async () => {
 		const { ConfigSchema } = await import("../src/config.ts");
 		const { Ledger } = await import("../src/ledger/db.ts");
-		const { MODEL_HOLD_MS, resubmitParkedUnits } = await import("../src/run/run.ts");
+		const { MODEL_HOLD_MS, modelHeldUntil, resubmitParkedUnits } = await import("../src/run/run.ts");
 		const { RESOLVER } = await import("../src/jev/resolve.ts");
 		const { mkdtempSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
@@ -331,7 +331,10 @@ describe("a wait answer", () => {
 		const resubmit = () => resubmitParkedUnits(ledger, config, ws, new Set(), () => {}, new Map());
 		expect(await resubmit()).toEqual([]);
 		expect(await resubmit()).toEqual([]); // held
+		// the run waits for the model's wait to end instead of finishing around it; the owner's wait does not keep it
+		expect(modelHeldUntil(ledger)).toBeGreaterThan(Date.now());
 		ledger.db.prepare("UPDATE questions SET answered_at = ?").run(new Date(Date.now() - MODEL_HOLD_MS - 1000).toISOString());
+		expect(modelHeldUntil(ledger)).toBeUndefined();
 		expect(await resubmit()).toEqual(["byModel"]);
 		expect(ledger.getUnit("byModel")!.state).toBe("planned");
 		expect(ledger.getUnit("byOwner")!.state).toBe("implementing");
