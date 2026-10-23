@@ -144,3 +144,25 @@ describe("the strict parity fixture", () => {
 		expect(await isDirty(legacy, { untracked: false })).toBe(true);
 	});
 });
+
+describe("a check the old app cannot complete", () => {
+	it("goes back to preparation until it is rewritten, and leaves the record once it completes", async () => {
+		const { brokenChecks, recordBrokenChecks } = await import("../src/run/parity-check.ts");
+		const root = mkdtempSync(join(tmpdir(), "br-broken-"));
+		const dir = join(root, ".bigrefactor/parity/slices/foundation");
+		mkdirSync(join(dir, "checks"), { recursive: true });
+		writeFileSync(join(dir, "checks/tests.cjs"), "run the old test suite\n");
+		const check = { id: "tests", kind: "command" as const, covers: [], why: "x", command: { cmd: "node", args: [".bigrefactor/parity/slices/foundation/checks/tests.cjs"] }, inputs: [".bigrefactor/parity/slices/foundation/checks/tests.cjs"] };
+		const file = { steps: [], checks: [check] };
+		recordBrokenChecks(root, "foundation", [check], [[{ id: "tests", error: "Refusing to run db tests: lane not in the allowlist" }], [{ id: "tests", error: "Refusing to run db tests" }]]);
+		expect(brokenChecks(root, "foundation", file).join("\n")).toMatch(/check tests does not complete on the old app[\s\S]*allowlist/);
+		// the same check with its driver rewritten is a new one
+		writeFileSync(join(dir, "checks/tests.cjs"), "read the records both apps keep\n");
+		expect(brokenChecks(root, "foundation", file)).toEqual([]);
+		// a later comparison where it completes clears the record
+		writeFileSync(join(dir, "checks/tests.cjs"), "run the old test suite\n");
+		expect(brokenChecks(root, "foundation", file)).toHaveLength(1);
+		recordBrokenChecks(root, "foundation", [check], [[{ id: "tests", observations: { rows: 1 } }], [{ id: "tests", observations: { rows: 1 } }]]);
+		expect(brokenChecks(root, "foundation", file)).toEqual([]);
+	});
+});

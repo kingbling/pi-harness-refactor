@@ -1,7 +1,7 @@
 import type { ObservationContext } from "./parity-command.ts";
 import { isExactJsonNumber, parseExactJson } from "./exact-json.ts";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import pc from "picocolors";
@@ -172,12 +172,35 @@ export function paritySliceReady(ledger: Ledger, slice: string): boolean {
 /** The target stack that serves the new app's pages (a single-page app calling the server stack), if there is one. */
 export const uiStackOf = (config: Config) => config.target.stacks.find((s) => TARGET_ROLES[s] === "ui");
 
-/** What strict verification would still miss in a complete slice's suite (no suite, routes without a step, pages without a browser check on the UI app). */
+const brokenPath = (root: string, slice: string) => join(sliceDir(root, slice), "broken-checks.json");
+/** A check as written: its definition and its driver files' content (a rewritten check is a new one). */
+const checkPrint = (root: string, c: ParityContract) =>
+	digest(JSON.stringify(c) + c.inputs.map((p) => { try { return digest(readFileSync(resolve(root, p))); } catch { return "missing"; } }).join(","));
+
+/** The checks that did not complete on the old app in the slice's last comparison: the check is broken, not the new code. */
+export function recordBrokenChecks(root: string, slice: string, checks: ParityContract[], old: ContractResult[][]): void {
+	const broken = checks.flatMap((c) => {
+		const error = old.flat().find((r) => r.id === c.id && (r.error || !r.observations))?.error;
+		return old.some((run) => { const r = run.find((x) => x.id === c.id); return !r || r.error || !r.observations; }) ? [{ id: c.id, print: checkPrint(root, c), error: String(error ?? "no observations").slice(-600) }] : [];
+	});
+	if (broken.length) writeFileSync(brokenPath(root, slice), JSON.stringify(broken, null, 2) + "\n");
+	else rmSync(brokenPath(root, slice), { force: true });
+}
+
+/** Those checks, while the suite still has them as they were: each must be fixed or replaced. */
+export function brokenChecks(root: string, slice: string, file: StepsFile): string[] {
+	let broken: Array<{ id: string; print: string; error: string }> = [];
+	try { broken = JSON.parse(readFileSync(brokenPath(root, slice), "utf8")); } catch { return []; }
+	return broken.filter((b) => (file.checks ?? []).some((c) => c.id === b.id && checkPrint(root, c) === b.print))
+		.map((b) => `check ${b.id} does not complete on the old app, so it compares nothing: fix it or replace it with one that observes what both apps do (${b.error.replace(/\s+/g, " ").slice(-300)})`);
+}
+
+/** What strict verification would still miss in a complete slice's suite (no suite, routes without a step, pages without a browser check on the UI app, a check the old app cannot complete). */
 export function suiteGaps(ledger: Ledger, root: string, slice: string, ui?: string): string[] {
 	if (!sliceComplete(ledger, slice)) return [];
 	const suite = loadSteps(root, slice);
 	if (!suite || !Array.isArray(suite.steps)) return ["no steps.json"];
-	return strictSuiteProblems(suite, sliceFacts(ledger, slice).routes, root, ui);
+	return [...strictSuiteProblems(suite, sliceFacts(ledger, slice).routes, root, ui), ...brokenChecks(root, slice, suite)];
 }
 
 /** Why these steps cannot be used, or undefined. Every slice route needs a step or a reason it has none. */
@@ -690,7 +713,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	const usableBefore = !o.rewrite && !!suite && !problem;
 	let unprepared: string | undefined;
 	let prepareProgress = false;
-	if (o.prepare && suite && !problem) problem = strictSuiteProblems(suite, routes, o.root, uiStackOf(o.config)).join("; ");
+	if (o.prepare && suite && !problem) problem = [...strictSuiteProblems(suite, routes, o.root, uiStackOf(o.config)), ...brokenChecks(o.root, o.slice, suite)].join("; ");
 	if (!o.strict && (o.rewrite || !existsSync(stepsPath(o.root, o.slice)) || problem)) {
 		const writer = o.writer ?? writeStepsWithModel;
 		const ask = `Slice "${o.slice}". Its routes on the old app: ${routes.join(", ") || "none: this slice needs executable checks"}. The old handlers and the code they use (relative to ${o.config.source.path}): ${files.join(", ")}. The new project: ${o.config.target.path} (stacks ${o.config.target.stacks.join(", ")}; requests go to ${o.serverStack} unless a step's target.stack says otherwise). Write steps.json and try it on the old app until every step does what you meant.${o.prepare ? " Prepare for strict parity: retain existing scenarios and add real browser/data/command/effects checks for the missing behavior. Cover successful workflows, each relevant permission level and failure/boundary cases from the legacy handlers. No routes may be skipped. Do not delete scenarios to remove failures." : ""}${waiting.size ? ` The slice's other routes get their steps later, once their new code exists.` : ""}`;
@@ -715,9 +738,9 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 			}
 		};
 		const ui = uiStackOf(o.config);
-		const strictGaps = (f: StepsFile) => [...strictSuiteProblems(f, routes, o.root, ui), ...(suite ? retainedScenarioProblems(suite, f) : [])];
+		const strictGaps = (f: StepsFile) => [...strictSuiteProblems(f, routes, o.root, ui), ...brokenChecks(o.root, o.slice, f), ...(suite ? retainedScenarioProblems(suite, f) : [])];
 		// a suite that cannot compare, or drops a legacy scenario, is no step forward
-		const gapsOf = (f: StepsFile | undefined) => (!f || stepsProblem(f, routes, o.config.target.stacks, { login }) || (suite && retainedScenarioProblems(suite, f).length) ? Infinity : strictSuiteProblems(f, routes, o.root, ui).length);
+		const gapsOf = (f: StepsFile | undefined) => (!f || stepsProblem(f, routes, o.config.target.stacks, { login }) || (suite && retainedScenarioProblems(suite, f).length) ? Infinity : strictSuiteProblems(f, routes, o.root, ui).length + brokenChecks(o.root, o.slice, f).length);
 		let best = usableBefore ? gapsOf(suite) : Infinity;
 		let improved = false;
 		try {
@@ -819,6 +842,8 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		const s = steps.find((x) => x.id === n.split(" ")[0]);
 		return s ? `${s.id} ${s.method} ${s.path}${n.slice(s.id.length)}` : n;
 	}));
+	// a check the old app cannot complete goes back to the next preparation
+	if (oldChecks.length === 2) recordBrokenChecks(o.root, o.slice, checks, oldChecks);
 	c.diffs.push(...contractDiffs(checks, steps, oldChecks[0] ?? [], oldChecks[1] ?? [], targetChecks));
 	const problems = [...(o.strict ? [...c.notCompared, ...(c.unstable ?? [])] : []), ...contractProblems(checks, oldChecks[0] ?? [], oldChecks[1] ?? [], targetChecks, !o.strict)];
 	let fixture: SliceEvidence["fixture"];
