@@ -7,7 +7,7 @@ import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo, isDirty } from "../src/git.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
 import { appBootTools, fixtureGaps, LEGACY, loadApps, probeApp, type AppFixer, type AppState } from "../src/run/parity.ts";
-import { loadScope, recordFixture, scopeIfValid, scopePath } from "../src/run/parity-scope.ts";
+import { loadScope, oldFailures, recordFixture, recordOldFailures, scopeIfValid, scopePath } from "../src/run/parity-scope.ts";
 
 /**
  * Strict parity replays every slice on both apps from the same starting data. The setup models make that: a reset
@@ -84,6 +84,28 @@ describe("the strict parity fixture", () => {
 		scope.by.nestjs.push(".bigrefactor/worktrees/__parity__/nestjs/.env");
 		writeFileSync(scopePath(root), JSON.stringify(scope));
 		expect((await fixtureGaps(config, root, "nestjs", { ...app, fixtureFor: scopeIfValid(root)!.legacyAt })).join("\n")).toMatch(/cannot be fingerprinted: .*temporary worktree/);
+	});
+
+	it("steps the old app fails on after its reset are a gap of its fixture until the fixture changes", async () => {
+		const { root, config } = await workspace();
+		const seed = fixtureFile(root, "seed.json", '{"users":[{"id":726}]}\n');
+		recordFixture(root, LEGACY, [seed]);
+		const app: AppState = { up: true, recipe: { dir: ".", start: { cmd: "node", args: [] }, ready: "http://localhost:1/", reset: { cmd: "sh", args: ["reset.sh"] } } };
+		recordOldFailures(root, "rms", ["s1 GET /rms/requests (the old app: status 503)"]);
+		recordOldFailures(root, "login", []);
+		expect(oldFailures(root)).toEqual({ rms: ["s1 GET /rms/requests (the old app: status 503)"] });
+		const gaps = (await fixtureGaps(config, root, LEGACY, app)).join("\n");
+		expect(gaps).toMatch(/answers 1 step\(s\) with a server error[\s\S]*rms s1 GET \/rms\/requests \(the old app: status 503\)[\s\S]*the test account needs/);
+		// the new apps are not asked about the old app's failures
+		expect((await fixtureGaps(config, root, "nestjs", { ...app, fixtureFor: scopeIfValid(root)!.legacyAt })).join("\n")).not.toMatch(/server error/);
+		// once the fixture changes, the failures were seen on an older one: the slices must be checked again first
+		await new Promise((r) => setTimeout(r, 5));
+		writeFileSync(join(root, seed), '{"users":[{"id":726}],"agencies":[{"id":1}]}\n');
+		recordFixture(root, LEGACY, [seed]);
+		expect(oldFailures(root)).toEqual({});
+		expect((await fixtureGaps(config, root, LEGACY, app)).join("\n")).not.toMatch(/server error/);
+		recordOldFailures(root, "rms", []);
+		expect(oldFailures(root)).toEqual({});
 	});
 
 	it("the old app's setup adds a reset, records the fixture and declares the config it changed in its copy; then nothing more is asked", async () => {

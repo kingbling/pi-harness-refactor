@@ -48,6 +48,7 @@ import { finishCheck, finishDue, lastFinish, renderFinishLine } from "./finish-c
 import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
 import { paritySliceReady, routeOwners, suiteGaps } from "./parity-check.ts";
+import { oldFailures, scopeIfValid } from "./parity-scope.ts";
 import { syncQuirkAnswers } from "./quirks.ts";
 import { reopenUnsettledQuirks, reopenWeakTests } from "./recheck.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
@@ -517,7 +518,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const plugin = await pluginVersion();
 	const needsPrepare = (slice: string) => prepareTries(ledger, slice, plugin) < MAX_PARITY_ERRORS && suiteGaps(ledger, o.root, slice).length > 0;
 	const pumpParity = () => {
-		if (parityRunning || parityStopped || !parityQueue.length) return;
+		if (parityRunning || parityStopped) return;
+		if (!parityQueue.length) return void fixOldData();
 		const slice = parityQueue.shift()!;
 		parityRunning = (async () => {
 			showParity("checking whether the old and the new app start");
@@ -581,6 +583,31 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			}
 		})()
 			.catch((e) => log(pc.yellow(`parity ${slice}: ${e?.message ?? e}`)))
+			.finally(() => {
+				parityRunning = undefined;
+				showParity();
+				pumpParity();
+			});
+	};
+	// steps the old app answered with a server error on its fixture: once nothing else is queued, its setup model is
+	// asked to add what they need (once per list of failures, a few times per app at most), the new apps load the
+	// same data again, and those slices are compared again
+	const oldDataAsked = new Set<string>();
+	const fixOldData = () => {
+		const fails = oldFailures(o.root), key = JSON.stringify(fails);
+		if (!parityProbe || !Object.keys(fails).length || oldDataAsked.has(key)) return;
+		oldDataAsked.add(key);
+		parityRunning = (async () => {
+			await parityProbe;
+			const { fixUpLeft, loadApps, probeApps } = await import("./parity.ts");
+			const old = loadApps(o.root)["legacy"];
+			if (!old?.up || !fixUpLeft(old, "fixture")) return;
+			showParity(`setting up the old app's data again: ${Object.values(fails).flat().length} step(s) fail on it`);
+			const before = scopeIfValid(o.root)?.legacyAt;
+			await probeApps({ config, root: o.root, linkAll, log, ...probeAsk });
+			if (scopeIfValid(o.root)?.legacyAt !== before) for (const sl of Object.keys(fails)) if (!parityQueue.includes(sl) && sliceDone(sl)) parityQueue.push(sl);
+		})()
+			.catch((e) => log(pc.yellow(`parity setup: ${e?.message ?? e}`)))
 			.finally(() => {
 				parityRunning = undefined;
 				showParity();

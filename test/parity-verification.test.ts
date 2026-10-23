@@ -15,6 +15,7 @@ import { loadApps, saveApp } from "../src/run/parity.ts";
 import { migrationProblems, renderVerification, verifyParity, VERIFICATION_META, verificationPath } from "../src/run/parity-verification.ts";
 import { validateParityProjects } from "../src/run/parity-project-checks.ts";
 import { parityCommand } from "../src/run/parity-cli.ts";
+import { oldFailures } from "../src/run/parity-scope.ts";
 
 const step: Step = { id: "value", route: "GET /value", compare: "data", method: "GET", path: "/value" };
 const freePort = () => new Promise<number>((resolve) => { const s = createServer().listen(0, "127.0.0.1", () => { const port = (s.address() as { port: number }).port; s.close(() => resolve(port)); }); });
@@ -337,6 +338,8 @@ describe("strict parity evidence", () => {
 		const r = await checkSlice({ ledger, config, root, slice: "http", serverStack: "nestjs", linkAll: () => {}, log: () => {} });
 		expect(r).toMatchObject({ outcome: "error", compared: 1, diffs: [] });
 		expect(r.note).toContain("not compared: unavailable (the old app: status 503)");
+		// the old app's setup model is told which steps fail on its fixture
+		expect(oldFailures(root)).toEqual({ http: [expect.stringMatching(/^unavailable GET \/down \(the old app: status 503\)$/)] });
 	});
 
 	it("keeps readiness reporting read-only and treats a live workspace holder as a blocker", async () => {

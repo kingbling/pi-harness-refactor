@@ -14,6 +14,7 @@ import { spawnLeaf } from "../sessions/spawn.ts";
 import { differences } from "./differences.ts";
 import { holdBack, readyRoutes, waitingRoutes } from "./parity-partial.ts";
 import { appRoot, bootApp, dumpData, LEGACY, loadApps, loginFacts, prepareTargetCopy, saveApp, type AppRecipe, type Booted } from "./parity.ts";
+import { recordOldFailures } from "./parity-scope.ts";
 import { contractDiffs, contractInputs, contractProblems, digest, retainedScenarioProblems, runContracts, strictSuiteProblems, type ContractResult, type ParityContract } from "./parity-contracts.ts";
 import type { BehaviorChange } from "./parity-changes.ts";
 
@@ -776,6 +777,11 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// written data is compared only when both apps keep the same tables and both can dump them
 	const withData = o.config.db.strategy === "keep-schema" && !!apps[LEGACY]?.recipe?.dump && stacks.some((s) => apps[s]!.recipe!.dump);
 	const c = compareRuns(steps, old1, old2, neu, withData, o.strict);
+	// the steps the old app itself failed on go to its setup model: its fixture may lack what they need
+	recordOldFailures(o.root, o.slice, c.notCompared.filter((n) => / \(the old app(?:'s second run)?: /.test(n)).map((n) => {
+		const s = steps.find((x) => x.id === n.split(" ")[0]);
+		return s ? `${s.id} ${s.method} ${s.path}${n.slice(s.id.length)}` : n;
+	}));
 	c.diffs.push(...contractDiffs(checks, steps, oldChecks[0] ?? [], oldChecks[1] ?? [], targetChecks));
 	const problems = [...(o.strict ? [...c.notCompared, ...(c.unstable ?? [])] : []), ...contractProblems(checks, oldChecks[0] ?? [], oldChecks[1] ?? [], targetChecks, !o.strict)];
 	let fixture: SliceEvidence["fixture"];

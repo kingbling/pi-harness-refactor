@@ -17,6 +17,38 @@ export interface VerificationScope {
 
 export const scopePath = (root: string) => join(root, ".bigrefactor", "parity", "scope.json");
 
+const failuresPath = (root: string) => join(root, ".bigrefactor", "parity", "old-failures.json");
+
+/**
+ * The steps the old app answered with a server error (or not at all) in a slice's last check: compared nowhere,
+ * often because its fixture lacks rows the test account needs there. Kept for the old app's current fixture only.
+ */
+export function recordOldFailures(root: string, slice: string, lines: string[]): void {
+	const at = scopeIfValid(root)?.legacyAt ?? "";
+	let cur: { at?: string; slices?: Record<string, string[]> } = {};
+	try {
+		cur = JSON.parse(readFileSync(failuresPath(root), "utf8"));
+	} catch {
+		/* none recorded yet */
+	}
+	const slices = cur.at === at ? { ...(cur.slices ?? {}) } : {};
+	if (lines.length) slices[slice] = lines;
+	else delete slices[slice];
+	mkdirSync(dirname(failuresPath(root)), { recursive: true });
+	writeFileSync(`${failuresPath(root)}.tmp`, JSON.stringify({ at, slices }, null, 2) + "\n");
+	renameSync(`${failuresPath(root)}.tmp`, failuresPath(root));
+}
+
+/** The old app's failing steps per slice, as seen on its current fixture (a changed fixture must be checked again). */
+export function oldFailures(root: string): Record<string, string[]> {
+	try {
+		const cur = JSON.parse(readFileSync(failuresPath(root), "utf8")) as { at?: string; slices?: Record<string, string[]> };
+		return cur.at === (scopeIfValid(root)?.legacyAt ?? "") ? (cur.slices ?? {}) : {};
+	} catch {
+		return {};
+	}
+}
+
 /** Why a recorded fixture file cannot be fingerprinted later, or undefined. */
 export function fixtureFileProblem(root: string, f: string): string | undefined {
 	const p = resolve(root, f);

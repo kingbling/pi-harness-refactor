@@ -19,7 +19,7 @@ import { readFile, rm } from "node:fs/promises";
 import { setStep } from "./watchdog.ts";
 import { recordOwnedTool, whileSettingUp } from "./cleanup.ts";
 import { legacyTree } from "./parity-legacy-tree.ts";
-import { fixtureFileProblem, recordFixture, scopeIfValid } from "./parity-scope.ts";
+import { fixtureFileProblem, oldFailures, recordFixture, scopeIfValid } from "./parity-scope.ts";
 
 /**
  * Differential parity, step one: can the OLD app and the NEW app each be started here as a local server that
@@ -563,6 +563,11 @@ export async function fixtureGaps(config: Config, root: string, side: string, cu
 	const stale = (scope?.by?.[side] ?? []).map((f) => fixtureFileProblem(root, f)).filter((x): x is string => !!x);
 	if (stale.length) gaps.push(`its recorded files cannot be fingerprinted: ${stale.slice(0, 5).join("; ")}${stale.length > 5 ? ` (${stale.length} in all)` : ""}; record them again with set_fixture_files`);
 	if (!legacy && cur.fixtureFor !== scope!.legacyAt) gaps.push(`the old app's fixture (${(scope!.by?.[LEGACY] ?? []).join(", ")}) is newer than this app's data setup: its reset must load the same business data`);
+	const fails = legacy ? Object.entries(oldFailures(root)) : [];
+	if (fails.length) {
+		const lines = fails.flatMap(([slice, l]) => l.map((x) => `${slice} ${x}`));
+		gaps.push(`after its reset it answers ${lines.length} step(s) with a server error or no answer, so they are compared nowhere: ${lines.slice(0, 40).join("; ")}${lines.length > 40 ? ` and ${lines.length - 40} more` : ""}. Find out why with your tools (its logs, the handlers' code): often the fixture lacks rows the test account needs there (its agency, roles, permissions, linked records); add those rows from the data the app runs on here and keep the fixture small. A step that fails for every user on the full data too, or needs an outside service, stays: say which`);
+	}
 	if (legacy) {
 		try {
 			const pinned = config.source.commit ?? (await headOf(config.source.path));
@@ -629,6 +634,9 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const bad = recipe ? recipeProblem(o.config, o.root, o.side, recipe) : "no recipe saved";
 	const res: { ok: boolean; error?: string; dumpFailed?: boolean; redirectFailed?: boolean } = bad || !recipe ? { ok: false, error: bad } : await checkRecipe(recipe, appRoot(o.config, o.root, o.side), { selfRedirect: redirect ? cur.selfRedirect : undefined });
 	if (fixUp) {
+		// the old app's seed may have been edited without set_fixture_files: its files are fingerprinted again, so a changed fixture counts as changed
+		const legacyFiles = o.side === LEGACY && fixture.length ? scopeIfValid(o.root)?.by?.[LEGACY] : undefined;
+		if (legacyFiles?.length) recordFixture(o.root, LEGACY, legacyFiles);
 		// the app started before: a new recipe that does not work is dropped, the old one stays; one that only fails
 		// on its dump keeps the rest (the reset ran before the app came up, so it works)
 		// one that starts and dumps but still redirects is kept too: it is no worse than the old one
