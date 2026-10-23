@@ -93,9 +93,12 @@ describe("the strict parity fixture", () => {
 		const app: AppState = { up: true, recipe: { dir: ".", start: { cmd: "node", args: [] }, ready: "http://localhost:1/", reset: { cmd: "sh", args: ["reset.sh"] } } };
 		recordOldFailures(root, "rms", ["s1 GET /rms/requests (the old app: status 503)"]);
 		recordOldFailures(root, "login", []);
+		recordOldFailures(root, "logout", ["s4 GET /user/edit (the old app sends it to the login page: the login before it did not hold)"]);
+		expect(Object.keys(oldFailures(root))).toEqual(["rms", "logout"]);
+		recordOldFailures(root, "logout", []);
 		expect(oldFailures(root)).toEqual({ rms: ["s1 GET /rms/requests (the old app: status 503)"] });
 		const gaps = (await fixtureGaps(config, root, LEGACY, app)).join("\n");
-		expect(gaps).toMatch(/answers 1 step\(s\) with a server error[\s\S]*rms s1 GET \/rms\/requests \(the old app: status 503\)[\s\S]*the test account needs/);
+		expect(gaps).toMatch(/fails 1 step\(s\) \(a server error[\s\S]*rms s1 GET \/rms\/requests \(the old app: status 503\)[\s\S]*the test account needs/);
 		// the new apps are not asked about the old app's failures
 		expect((await fixtureGaps(config, root, "nestjs", { ...app, fixtureFor: scopeIfValid(root)!.legacyAt })).join("\n")).not.toMatch(/server error/);
 		// once the fixture changes, the failures were seen on an older one: the slices must be checked again first

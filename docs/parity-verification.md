@@ -137,8 +137,8 @@ of a large database), the files it reads recorded with its `set_fixture_files`
 tool (never files in the temporary parity worktree, which is made again for
 every check: a recorded file that is gone or there is recorded again), and, for
 the old app, each tracked file of its copy changed for local config declared as
-an override. Steps the old app answers with a server error (or not at all)
-after its reset are compared nowhere: once no slice is queued, they go to its
+an override. Steps the old app answers with a server error (or not at all, or with its login
+page although the comparison logged in) after its reset are compared nowhere: once no slice is queued, they go to its
 setup model, which adds the rows they need to the fixture (often the test
 account's own links: its agency, roles, permissions) or says which fail for
 every user; the new apps then load the same data and those slices are compared

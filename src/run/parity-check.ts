@@ -782,8 +782,9 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// written data is compared only when both apps keep the same tables and both can dump them
 	const withData = o.config.db.strategy === "keep-schema" && !!apps[LEGACY]?.recipe?.dump && stacks.some((s) => apps[s]!.recipe!.dump);
 	const c = compareRuns(steps, old1, old2, neu, withData, o.strict);
-	// the steps the old app itself failed on go to its setup model: its fixture may lack what they need
-	recordOldFailures(o.root, o.slice, c.notCompared.filter((n) => / \(the old app(?:'s second run)?: /.test(n)).map((n) => {
+	// the steps the old app itself failed on (or sent to its login page after the login) go to its setup model: its
+	// fixture may lack what they need, or its local copy may not serve them
+	recordOldFailures(o.root, o.slice, c.notCompared.filter((n) => / \(the old app(?:'s second run)?: | \(the old app sends it to the login page/.test(n)).map((n) => {
 		const s = steps.find((x) => x.id === n.split(" ")[0]);
 		return s ? `${s.id} ${s.method} ${s.path}${n.slice(s.id.length)}` : n;
 	}));
