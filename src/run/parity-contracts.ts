@@ -2,8 +2,9 @@ import { isExactJsonNumber, parseExactJson } from "./exact-json.ts";
 import { createHash } from "node:crypto";
 import { observationEnvironment, observationTimeoutMs, runVerificationCommand } from "./parity-command.ts";
 export { runVerificationCommand } from "./parity-command.ts";
-import { accessSync, constants, createReadStream, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { accessSync, constants, createReadStream, existsSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
+import { delimiter, dirname, resolve } from "node:path";
 import type { Config } from "../config.ts";
 import { differences } from "./differences.ts";
 import type { Diff, Step, StepsFile } from "./parity-check.ts";
@@ -113,15 +114,32 @@ export function strictSuiteProblems(file: StepsFile, routes: string[], root: str
 	return problems;
 }
 
+const require = createRequire(import.meta.url);
+/** The folder holding the plugin's Playwright: on NODE_PATH, a CommonJS driver's require("playwright") finds it. */
+export const playwrightModules = () => dirname(dirname(require.resolve("playwright/package.json")));
+let browserReady: Promise<void> | undefined;
+
+/** Downloads Playwright's Chromium once when this machine does not have it yet (as `npx playwright install chromium`). */
+export function ensureBrowser(): Promise<void> {
+	browserReady ??= (async () => {
+		const { chromium } = require("playwright") as { chromium: { executablePath(): string } };
+		if (existsSync(chromium.executablePath())) return;
+		await runVerificationCommand({ cmd: process.execPath, args: [resolve(playwrightModules(), "playwright", "cli.js"), "install", "chromium"] }, process.cwd(), 30 * 60_000, process.env, { label: "installing Playwright's Chromium" });
+	})().catch((e) => { browserReady = undefined; throw e; });
+	return browserReady;
+}
+
 /** A driver runs against each reset app, twice on legacy. Stdout is a JSON object of actual observations. */
 export async function runContracts(checks: ParityContract[], o: { root: string; config: Config; side: "legacy" | "target"; appDir: string; urls: Record<string, string>; targetDir?: string; slice?: string; timeoutMs?: number }): Promise<ContractResult[]> {
 	const out: ContractResult[] = [];
+	const nodePath = [playwrightModules(), ...(process.env.NODE_PATH ? [process.env.NODE_PATH] : [])].join(delimiter);
 	for (const c of checks) {
 		try {
+			if (c.kind === "browser") await ensureBrowser();
 			const { stdout: raw } = await runVerificationCommand(c.command, o.root, observationTimeoutMs(o.timeoutMs ?? c.timeoutMs, 120_000), {
 				...process.env, BR_PARITY_SIDE: o.side, BR_PARITY_APP_DIR: o.appDir,
 				BR_PARITY_URLS: JSON.stringify(o.urls), BR_PARITY_SOURCE_DIR: o.config.source.path,
-				BR_PARITY_TARGET_DIR: o.targetDir ?? "", BR_PARITY_CHECK: c.id,
+				BR_PARITY_TARGET_DIR: o.targetDir ?? "", BR_PARITY_CHECK: c.id, NODE_PATH: nodePath,
 				...observationEnvironment({ side: o.side, slice: o.slice, phase: "contract" }),
 			});
 			const observations = parseExactJson(raw);

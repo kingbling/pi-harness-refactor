@@ -51,6 +51,24 @@ describe("bounded observations in the actual scenario", () => {
 		const result = await runContracts([contract(contextCode)], { root: dir, config, side: "legacy", slice: "data", appDir: dir, urls: {} });
 		expect(result[0]?.observations).toEqual({ context: [{ SIDE: "legacy", SLICE: "data", PHASE: "contract", STEP: "" }] });
 	});
+	it("a browser check's driver can require the plugin's Playwright and open a page in headless Chromium", async () => {
+		const dir = temp(), config = ConfigSchema.parse({ source: { path: dir, stack: "php" }, target: { path: dir, stacks: ["nestjs"] }, models: {} });
+		const server = createServer((_q, r) => r.end("<title>Deals</title><script>document.write('<p>rendered by script</p>')</script>")).listen(0, "127.0.0.1");
+		await new Promise<void>((resolve) => server.once("listening", resolve));
+		writeFileSync(join(dir, "page.cjs"), `const { chromium } = require("playwright");
+(async () => {
+	const browser = await chromium.launch({ headless: true }), page = await browser.newPage();
+	await page.goto(JSON.parse(process.env.BR_PARITY_URLS).legacy);
+	console.log(JSON.stringify({ title: await page.title(), text: await page.locator("p").innerText() }));
+	await browser.close();
+})().catch((e) => { console.error(e); process.exit(1); });
+`);
+		try {
+			const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/`;
+			const [result] = await runContracts([{ id: "page", kind: "browser", why: "the page renders", covers: [], inputs: ["page.cjs"], command: { cmd: process.execPath, args: ["page.cjs"] } }], { root: dir, config, side: "legacy", appDir: dir, urls: { legacy: url } });
+			expect(result).toEqual({ id: "page", observations: { title: "Deals", text: "rendered by script" } });
+		} finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+	}, 60_000);
 	it("honors a dump's explicit time limit", async () => {
 		const r = recipe("setTimeout(()=>console.log('{\"rows\":[]}'),300)"); r.dump!.timeoutMs = 80;
 		await expect(dumpData(r, temp())).rejects.toThrow(/timed out after 80ms/);

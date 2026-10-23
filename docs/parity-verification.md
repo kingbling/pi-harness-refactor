@@ -212,7 +212,10 @@ Extend a slice's existing `steps.json` with executable checks. For example:
 `stacks` names any extra target servers a check needs; omit it when the backend
 already serves the built frontend. Each `page` step needs a browser check naming
 its id in `covers`: an HTTP status check does not establish UI behavior. Browser
-drivers should use the app's browser runner (e.g. Playwright), load its real entry
+drivers use Playwright, which the plugin ships: checks run with the plugin's
+Playwright on `NODE_PATH`, so a CommonJS driver (`checks/*.cjs`) can
+`require("playwright")` and launch headless Chromium (downloaded once, before
+the first browser check, when the machine does not have it). They load the real entry
 point, log in as the scenario's role, interact through controls, assert the
 expected observations, and emit business results. Never supply test-only props
 or bypass production loaders. Selectors and paths can differ between the old UI
