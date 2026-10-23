@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import type { Ledger } from "../ledger/db.ts";
 import { statePath } from "../config.ts";
 
@@ -31,9 +32,30 @@ export function liveRun(root: string): number | undefined {
 export function acquireRunLock(root: string): () => void {
 	const pid = liveRun(root);
 	if (pid !== undefined) throw new Error(`a run is already going in this workspace (pid ${pid}); stop it first, or wait until it ends`);
-	writeFileSync(lockPath(root), String(process.pid));
+	// A check followed by writing the PID is not atomic across processes, especially when both see a stale PID.
+	// Hold an OS-backed SQLite write lock for the lease. Process death releases it; the PID file stays compatible
+	// with existing status/stop tools. This database is separate from the migration ledger.
+	const lease = new DatabaseSync(`${lockPath(root)}.sqlite`, { timeout: 0 });
+	try {
+		lease.exec("BEGIN IMMEDIATE");
+		const owner = liveRun(root);
+		if (owner !== undefined) throw new Error(`a run is already going in this workspace (pid ${owner}); stop it first, or wait until it ends`);
+		writeFileSync(lockPath(root), String(process.pid));
+	} catch (e) {
+		lease.close();
+		const code = (e as { errcode?: number }).errcode;
+		if (typeof code === "number" && [5, 6].includes(code & 255)) {
+			const owner = liveRun(root);
+			throw new Error(`a run is already going or acquiring this workspace${owner === undefined ? "" : ` (pid ${owner})`}; stop it first, or wait until it ends`);
+		}
+		throw e;
+	}
+	let released = false;
 	return () => {
-		if (liveRun(root) === process.pid) rmSync(lockPath(root), { force: true });
+		if (released) return;
+		released = true;
+		try { if (liveRun(root) === process.pid) rmSync(lockPath(root), { force: true }); }
+		finally { try { lease.exec("ROLLBACK"); } finally { lease.close(); } }
 	};
 }
 

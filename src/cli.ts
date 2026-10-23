@@ -45,6 +45,8 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
                                --fresh: the tester drafts the interface and tests again (truth cases stay)
   br reopen <unit...> [--why text]   accepted units back to planned, code kept (e.g. DB units after br order changed the table plan)
   br parity --probe [--again]  can the old app and the new app each start here as a local server? a setup model finds out, code starts each once to confirm
+  br parity --verify [--report] [--json]  strict final replay on one frozen commit; nonzero exit on gaps/differences; --report is read-only; --json prints the complete report
+  br parity <slice> --prepare  author missing browser/data/command/effects checks from legacy behavior, try them on legacy, then compare and resolve differences
   br parity <slice> [--rewrite] [--no-judge]  send the same requests to the old app (twice) and the new app, compare the answers and the written data; a judge model re-opens the units that answer wrong and turns odd old behaviour into quirks for you (br run does this by itself when a slice is finished); --rewrite writes the requests anew
   br recheck [--limit n] [--again]   accepted units under the newer checks (truth from the old code, ported tests on main, the reviewer model on the code as it is now); failures go back to planned, code kept
   br status                    ledger dashboard
@@ -65,9 +67,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 `);
 	},
 	status: async () => {
-		const { ledger, root } = open();
+		const { ledger, root, config } = open();
 		const { liveRun } = await import("./run/run-lock.ts");
-		console.log(renderStatus(ledger, { runLive: liveRun(root) !== undefined }));
+		const { headOf } = await import("./git.ts");
+		console.log(renderStatus(ledger, { runLive: liveRun(root) !== undefined, targetHead: await headOf(config.target.path) }));
 	},
 	lanes: async (args) => {
 		const { lanes, parseLanesArgs } = await import("./run/lanes.ts");
@@ -94,8 +97,9 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	},
 	forecast: async () => {
 		const { forecast, renderForecast } = await import("./run/forecast.ts");
-		const { ledger } = open();
-		console.log(renderForecast(forecast(ledger)));
+		const { ledger, config } = open();
+		const { headOf } = await import("./git.ts");
+		console.log(renderForecast(forecast(ledger, { targetHead: await headOf(config.target.path) })));
 	},
 	why: async (args) => {
 		const id = args[0];
@@ -280,8 +284,8 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 	parity: async (args) => {
 		const { parityCommand } = await import("./run/parity-cli.ts");
 		const { config, root, ledger } = open();
-		await refuseDuringRun(root, "br parity"); // the run's own parity job uses the same worktree and ports
-		for (const l of await parityCommand({ ledger, config, root, client: makeClient(), args })) console.log(l);
+		if (!(args.includes("--verify") && args.includes("--report"))) await refuseDuringRun(root, "br parity"); // report is read-only
+		for (const l of await parityCommand({ ledger, config, root, client: args.includes("--verify") ? undefined : makeClient(), args, log: args.includes("--verify") ? (line) => console.error(line) : undefined, onVerification: (passed) => { if (!passed) process.exitCode = 1; } })) console.log(l);
 	},
 	finish: async () => {
 		const { finishCommand } = await import("./run/finish-cli.ts");

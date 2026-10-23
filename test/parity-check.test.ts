@@ -305,7 +305,8 @@ describe("comparing the old and the new app", () => {
 		writeFileSync(broken, "");
 		const asked: string[] = [];
 		const fixes = async (side: string, error: string) => (asked.push(`${side}: ${error}`), rmSync(broken), true);
-		expect(await check(fixes)).toMatchObject({ outcome: "same", compared: 1 });
+		// The reset is fixed and the list compares, but skipped routes prevent a whole-slice pass.
+		expect(await check(fixes)).toMatchObject({ outcome: "error", compared: 1, note: expect.stringContaining("skipped") });
 		expect(asked).toHaveLength(1);
 		expect(asked[0]).toMatch(/^legacy: the data reset failed \(.* it exited with status 1\); its output: OrbStack is already running/);
 		// a fixer that says it fixed it but did not: tried MAX_SETUP_RETRIES times, then recorded as setup with what failed
@@ -331,7 +332,7 @@ describe("comparing the old and the new app", () => {
 		writeFileSync(join(root, ".bigrefactor", "parity", "apps.json"), JSON.stringify({ legacy: { up: true, recipe: recipe(oldPort) }, nestjs: { up: true, recipe: starts(newPort) } }));
 		writeFileSync(down, "");
 		asked.length = 0;
-		expect(await check(async (side, error) => (asked.push(`${side}: ${error}`), rmSync(down), true))).toMatchObject({ outcome: "same", compared: 1 });
+		expect(await check(async (side, error) => (asked.push(`${side}: ${error}`), rmSync(down), true))).toMatchObject({ outcome: "error", compared: 1 });
 		expect(asked).toEqual([expect.stringMatching(/^nestjs: the start command exited with 5/)]);
 		// one its setup cannot fix: after MAX_SETUP_RETRIES tries it is main's code, the builder's
 		writeFileSync(down, "");

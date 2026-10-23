@@ -203,6 +203,59 @@ describe("the code a quarantined unit keeps", () => {
 });
 
 describe("quarantine questions", () => {
+	it.each(["gate_tests_weak", "review_weak_tests"])("uses the current %s diagnostic instead of an older command failure", async (outcome) => {
+		const { root, config, ledger, quarantined } = workspace();
+		quarantined("U1", "nestjs", "obsolete PHPStan failure");
+		ledger.updateUnit("U1", { meta: { stuck: true } });
+		const note = "weak tests: execute the real synchronization workflow and assert push-before-mail ordering";
+		const gateReport = outcome === "review_weak_tests" ? { output: note } : { ok: false, failedStep: "wired_ok", steps: [{ name: "wired_ok", ok: false, output: note }] };
+		ledger.endAttempt(ledger.startAttempt("U1", outcome === "review_weak_tests" ? "review" : "implement"), { outcome, gateReport });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		const q = ledger.openQuestions()[0]!;
+		expect(q.question).toContain(note);
+		expect(q.question).not.toContain("obsolete PHPStan failure");
+		expect(JSON.parse(q.context!).failureKind).toMatch(/^wired_ok:/);
+		ledger.close();
+	});
+	it("replaces an unanswered machine question when its diagnostic no longer describes the latest failure", async () => {
+		const { root, config, ledger, quarantined } = workspace();
+		quarantined("U1", "nestjs", "obsolete PHPStan failure");
+		ledger.updateUnit("U1", { meta: { stuck: true } });
+		await askStuckUnits({ ledger, config, root });
+		const previous = ledger.openQuestions()[0]!;
+		ledger.endAttempt(ledger.startAttempt("U1", "review"), { outcome: "review_weak_tests", gateReport: { output: "weak tests: missing audit side effects" } });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(1);
+		expect(ledger.getQuestion(previous.id)!.status).toBe("withdrawn");
+		const current = ledger.openQuestions()[0]!;
+		expect(current.id).not.toBe(previous.id);
+		expect(current.question).toContain("missing audit side effects");
+		expect(JSON.parse(ledger.getUnit("U1")!.meta).healQuestion).toBe(current.id);
+		expect(await askStuckUnits({ ledger, config, root })).toBe(0);
+		ledger.close();
+	});
+	it("preserves an answered question even when a newer failure has different facts", async () => {
+		const { root, config, ledger, quarantined } = workspace();
+		quarantined("U1", "nestjs", "obsolete PHPStan failure");
+		ledger.updateUnit("U1", { meta: { stuck: true } });
+		await askStuckUnits({ ledger, config, root });
+		const q = ledger.openQuestions()[0]!;
+		ledger.answerQuestion(q.id, "leave", "human (pi)");
+		ledger.endAttempt(ledger.startAttempt("U1", "review"), { outcome: "review_weak_tests", gateReport: { output: "weak tests: missing audit side effects" } });
+		expect(await askStuckUnits({ ledger, config, root })).toBe(0);
+		expect(ledger.getQuestion(q.id)).toMatchObject({ status: "answered", answer: "leave", answered_by: "human (pi)" });
+		ledger.close();
+	});
+	it("a later failing command supersedes an earlier weak-test review", async () => {
+		const { root, config, ledger, quarantined } = workspace();
+		quarantined("U1", "nestjs", "old build failure");
+		ledger.updateUnit("U1", { meta: { stuck: true } });
+		ledger.endAttempt(ledger.startAttempt("U1", "review"), { outcome: "review_weak_tests", gateReport: { output: "obsolete weak-test finding" } });
+		ledger.endAttempt(ledger.startAttempt("U1", "implement"), { outcome: "gate_red:ported_tests_green", gateReport: { steps: [{ name: "ported_tests_green", ok: false, output: "expected persistence before notification" }] } });
+		await askStuckUnits({ ledger, config, root });
+		expect(ledger.openQuestions()[0]!.question).toContain("expected persistence before notification");
+		expect(ledger.openQuestions()[0]!.question).not.toContain("obsolete weak-test finding");
+		ledger.close();
+	});
 	it("share one question only when the last failures match, whatever the unit id; the facts show the failure", async () => {
 		const { root, config, ledger, quarantined } = workspace();
 		quarantined("U1", "nestjs", "src/Billing/U1.php: Class Invoice not found");

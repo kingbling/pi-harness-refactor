@@ -74,6 +74,8 @@ export class Ledger {
 		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('parity_runs') WHERE name = 'commit_sha'").get())) this.db.exec("ALTER TABLE parity_runs ADD COLUMN commit_sha TEXT");
 		// ledgers from before parity_runs.skipped
 		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('parity_runs') WHERE name = 'skipped'").get())) this.db.exec("ALTER TABLE parity_runs ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0");
+		// Existing runtime results may have been rounded before being stored; provenance defaults to unproven.
+		if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('truth_cases') WHERE name = 'numeric_version'").get())) this.db.exec("ALTER TABLE truth_cases ADD COLUMN numeric_version INTEGER NOT NULL DEFAULT 0");
 		// ledgers from before the "setup" outcome: a comparison an app's start or data reset stopped (the plugin's own
 		// notes) is no error of the code and must not use up the slice's tries; once
 		if (!this.getMeta("parity_setup_outcome")) {
@@ -210,6 +212,7 @@ export class Ledger {
 		const u = this.getUnit(id);
 		if (!u) throw new LedgerError(`unknown unit ${id}`);
 		if (to === "accepted") {
+			if (JSON.parse(u.meta).weakTestsNote) throw new LedgerError(`unit ${id} cannot be accepted; unresolved weak tests need a clean review`);
 			const missing = REQUIRED_FOR_ACCEPTED.filter((t) => !this.hasEvidence(id, t));
 			if (missing.length) throw new LedgerError(`unit ${id} cannot be accepted; missing evidence: ${missing.join(", ")}`);
 			// a skipped step (whole-project build not run yet, no reviewer) is no pass: it needs its verdict first

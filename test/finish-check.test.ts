@@ -100,6 +100,8 @@ describe("finish check", () => {
 		ledger.updateUnit("U1_done", { meta: { slice: "booking" } });
 		ledger.addEvidence("U1_done", "truth_read", {});
 		expect(notProven(ledger)).toEqual({ readNotRun: 1, neverCompared: ["booking"] });
+		ledger.addEvidence("U1_done", "truth_none", { reason: "checked declaration supersedes the earlier read capture" });
+		expect(notProven(ledger).readNotRun).toBe(0);
 	});
 
 	it("the finder is told to follow the app from its entry, match frontend calls with backend routes and check the stacks are joined", () => {

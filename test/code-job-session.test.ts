@@ -27,6 +27,9 @@ describe("the code job's session", () => {
 		} as unknown as TargetAdapter;
 		await codeWithModel({ config, root: "/r", adapter, dir: "/p", what: "add the endpoint", label: "q1" });
 		const o = seen[0]!;
+		expect(o.systemPrompt).toContain("Preserve the marks and remaining behavior of open units this job does not serve");
+		expect(o.systemPrompt).toContain("change only the assertions for that exact behavior, cite its quirk id");
+		expect(o.systemPrompt).toContain("Never skip or delete tests, or change legacy truth observations to match the target");
 		const gate = makeWriteGate({ cwd: o.cwd, sourceRoot: "/legacy", writeGlobs: o.writeGlobs, protectedGlobs: o.protectedGlobs ?? [], isProtected: o.isProtected });
 		expect(gate("tsconfig.app.json")).toMatch(/protected path/);
 		expect(gate("src/main.tsx")).toMatch(/protected path/);

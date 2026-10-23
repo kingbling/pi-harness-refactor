@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { Ledger, LedgerError } from "../src/ledger/db.ts";
+import { REQUIRED_FOR_ACCEPTED } from "../src/ledger/schema.ts";
 
 function seed() {
 	const l = new Ledger(":memory:");
@@ -16,6 +17,17 @@ function seed() {
 }
 
 describe("ledger invariants", () => {
+	it("cannot accept unresolved weak tests even when every gate evidence type exists", () => {
+		const l = seed();
+		l.createUnit({ id: "U1", tier: "T1", symbolIds: [], meta: { weakTestsNote: "tests compare literals" } });
+		for (const type of REQUIRED_FOR_ACCEPTED) l.addEvidence("U1", type, {});
+		expect(() => l.transitionUnit("U1", "accepted")).toThrow(/unresolved weak tests/);
+		expect(l.getUnit("U1")!.state).toBe("planned");
+		l.updateUnit("U1", { meta: { weakTestsNote: undefined } });
+		l.transitionUnit("U1", "accepted");
+		expect(l.getUnit("U1")!.state).toBe("accepted");
+		l.close();
+	});
 	it("starts with every symbol discovered and unaccounted", () => {
 		const l = seed();
 		const s = l.status();

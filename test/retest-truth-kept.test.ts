@@ -62,6 +62,25 @@ const green = (g: GateInput): GateReport => ({ ok: true, steps: [], changedFiles
 const testOutcomes = () => (ledger.db.prepare("SELECT outcome, gate_report FROM attempts WHERE unit_id = 'u1' AND role = 'test' ORDER BY id").all() as Array<{ outcome: string; gate_report: string }>);
 
 describe("a retest keeps the recorded truth", () => {
+	it("does not mark a quirk decision applied when its tester session fails but existing truth still loads", async () => {
+		ledger.db.prepare("INSERT INTO quirks(unit_id,symbol_id,kind,behaviour,opinion,why,status,applied,decided_by,created_at) VALUES ('u1','s','intentional','legacy special value','drop','keep it','kept','drop','human','t0')").run();
+		let gated = false;
+		const spawn = async (opts: SpawnOptions): Promise<LeafSession> => ({ run: async () => ({ text: "", ...(opts.role === "test" ? { error: "provider unavailable" } : {}), toolCalls: 0, blocked: 0, usage: { input: 0, output: 0, cost: 0 } }), dispose() {} }) as unknown as LeafSession;
+		const result = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawn as never, gate: async (g) => (gated = true, green(g)), log: () => {} });
+		expect(result.state).toBe("planned");
+		expect(gated).toBe(false);
+		expect(ledger.db.prepare("SELECT applied FROM quirks WHERE unit_id='u1'").get()).toEqual({ applied: "drop" });
+	});
+	it("does not accept a unit when retesting a changed quirk decision fails", async () => {
+		ledger.db.prepare("INSERT INTO quirks(unit_id,symbol_id,kind,behaviour,opinion,why,status,applied,decided_by,created_at) VALUES ('u1','s','intentional','legacy special value','drop','keep it','kept','drop','human','t0')").run();
+		let gated = false;
+		const result = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(() => write(join(truthDir(), "cases.json"), "[]"), []), gate: async (g) => (gated = true, green(g)), log: () => {} });
+		expect(result.state).toBe("quarantined");
+		expect(gated).toBe(false);
+		expect(ledger.db.prepare("SELECT applied FROM quirks WHERE unit_id='u1'").get()).toEqual({ applied: "drop" });
+		expect(readFileSync(join(truthDir(), "cases.json"), "utf8")).toBe(CASES);
+		expect(ledger.db.prepare("SELECT expected FROM truth_cases WHERE id='u1#1'").get()).toEqual({ expected: "1" });
+	});
 	it("reused read truth is loaded from cases.json in a retest: no 'cases do not load', no red truth", async () => {
 		const checks: string[] = [];
 		let n = 0;

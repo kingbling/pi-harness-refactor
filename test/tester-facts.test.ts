@@ -225,6 +225,32 @@ describe("truth case ids stay put", () => {
 	const rows = () => ledger.db.prepare("SELECT id, inputs, ported_test_path FROM truth_cases WHERE unit_id = 'u1' ORDER BY id").all();
 	beforeEach(() => writeFileSync(join(ws, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "read" })));
 
+	it("a partial runtime import marks only the cases it actually revalidated", async () => {
+		writeFileSync(join(ws, ".bigrefactor", "legacy-env.json"), JSON.stringify({ root: config.source.path, mode: "run" }));
+		write(join(truthDir(), "import.json"), JSON.stringify({ inputKeys: { s: ["value"] }, retainRecordedCases: true }));
+		write(join(config.source.path, "app/agency/create.cmd.php"), "<?php function legacy_value($i) { return $i * 10; }\n");
+		for (const i of [1, 2]) ledger.db.prepare("INSERT INTO truth_cases(id,unit_id,symbol_id,inputs,expected,verified_on_old,ported_test_path,created_at) VALUES (?,'u1','s',?,?,1,?,'t0')").run(`u1#${i}`, JSON.stringify({value:i}), JSON.stringify(i*10), SPEC);
+		ledger.addEvidence("u1", "truth_green_on_old", {});
+		write(join(truthDir(), "cases.php"), "<?php require 'app/agency/create.cmd.php'; echo json_encode([['symbol'=>'s','inputs'=>[1],'expected'=>legacy_value(1)]]);\n");
+		write(join(ws, "migrated", SPEC), "it('u1#1', () => {}); it('u1#2', () => {});\n");
+		const spawn = async (): Promise<LeafSession> => ({run:async()=>({text:"done",...ok}),dispose(){}}) as unknown as LeafSession;
+		await runUnit({ ledger, config, root:ws, unitId:"u1", spawn:spawn as never, gate:async(g)=>green(g), log:()=>{} });
+		expect(ledger.db.prepare("SELECT id,numeric_version,ported_test_path FROM truth_cases ORDER BY id").all()).toEqual([{id:"u1#1",numeric_version:1,ported_test_path:SPEC},{id:"u1#2",numeric_version:0,ported_test_path:SPEC}]);
+	});
+	it("reviewed partial named/positional imports keep distinct cases, ids and links on repeated imports", async () => {
+		write(join(truthDir(), "import.json"), JSON.stringify({ inputKeys: { s: ["value"] }, retainRecordedCases: true }));
+		ledger.addEvidence("u1", "truth_read", {});
+		for (const i of [1, 2, 3]) ledger.db.prepare("INSERT INTO truth_cases(id, unit_id, symbol_id, inputs, expected, verified_on_old, ported_test_path, created_at) VALUES (?, 'u1', 's', ?, ?, 0, ?, 't0')").run(`u1#${i}`, JSON.stringify({ value: i }), JSON.stringify(i * 10), SPEC);
+		write(join(ws, "migrated", SPEC), "it('u1#1', () => {}); it('u1#2', () => {}); it('u1#3', () => {}); it('u1#4', () => {});\n");
+		const spawn = async (): Promise<LeafSession> => ({ run: async () => ({ text: "done", ...ok }), dispose() {} }) as unknown as LeafSession;
+		for (const inputs of [[1, 4, 3], [3, 1, 4], [1, 4, 3]]) {
+			write(join(truthDir(), "cases.json"), casesOf(inputs));
+			await runUnit({ ledger, config, root: ws, unitId: "u1", spawn: spawn as never, gate: async (g) => green(g), log: () => {} });
+			expect(rows()).toEqual([1, 2, 3, 4].map((i) => ({ id: `u1#${i}`, inputs: JSON.stringify({ value: i }), ported_test_path: SPEC })));
+		}
+		expect(ledger.db.prepare("SELECT created_at FROM truth_cases WHERE id='u1#2'").get()).toEqual({ created_at: "t0" });
+	});
+
 	it("a re-run with a case inserted at position 2 keeps the old ids and links; the new case gets the next number", async () => {
 		write(join(truthDir(), "cases.json"), casesOf([1, 2, 3]));
 		ledger.addEvidence("u1", "truth_read", {});

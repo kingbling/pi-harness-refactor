@@ -34,6 +34,8 @@ export interface GateInput {
 	appendOnlyGlobs?: string[];
 	/** The area's ported test files (this unit's and earlier units'), with their hashes at hand-over time. */
 	testFiles: Array<{ path: string; sha1: string }>;
+	/** Test paths an authorized tester removed before hand-over. They must stay absent during implementation. */
+	removedTests?: string[];
 	/** Main's checkout of the unit's project: another unit's test that fails here counts only if it passes there. */
 	mainDir?: string;
 	/** The unit's placement: module dir (relative to targetProjectDir) and legacy area, for the structure check. */
@@ -212,8 +214,9 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 	const appendOnly = (g.appendOnlyGlobs ?? []).map(globToRegExp);
 	// the unit's own ported tests are the tester's (a re-port edits one already on main): the hash check below covers them
 	const own = new Set(g.testFiles.map((t) => t.path));
+	const removed = new Set((g.removedTests ?? []).filter((f) => g.adapter.layout.isTestFile(f)));
 	for (const f of changed) {
-		if (own.has(f) || allow.some((r) => r.test(f))) continue;
+		if (own.has(f) || removed.has(f) || allow.some((r) => r.test(f))) continue;
 		if (appendOnly.some((r) => r.test(f))) {
 			if (tracked.has(f)) problems.push(`edited an existing shared file (add-only zone): ${f}`);
 			continue;
@@ -228,7 +231,11 @@ export async function antigamingCheck(g: GateInput, { changed, tracked, prodFile
 		else if (sha1(readFileSync(p)) !== t.sha1) problems.push(`test file modified after hand-over: ${t.path}`);
 		else if (mine.has(t.path) && g.adapter.layout.skipMarker.test(readFileSync(p, "utf8"))) problems.push(`${SKIPPED_TEST} in ${t.path}`);
 	}
-	for (const f of await othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), g.sanctioned)) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
+	for (const f of g.removedTests ?? []) {
+		if (!g.adapter.layout.isTestFile(f)) problems.push(`non-test path in tester deletion hand-over: ${f}`);
+		else if (existsSync(join(g.targetProjectDir, f))) problems.push(`test file restored after hand-over: ${f}`);
+	}
+	for (const f of await othersTestsChanged(g.targetProjectDir, g.unitId, (x) => g.adapter.layout.isTestFile(x), [...(g.sanctioned ?? []), ...removed])) problems.push(`changed a test of an earlier unit: ${f} (it proves accepted behaviour; report a wrong one with dispute_test / report_migrated_bug)`);
 	// a comment that silences the type check or the linter hides an error instead of fixing it (only lines this unit added)
 	const silence = g.adapter.layout.suppressMarker;
 	if (silence) for (const f of prodFiles) for (const l of await addedLines(g.targetProjectDir, f, tracked.has(f))) if (silence.test(l.text)) problems.push(`check silenced in ${f}:${l.line} (${l.text.trim().slice(0, 80)}): fix the error instead`);

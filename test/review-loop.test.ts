@@ -217,8 +217,29 @@ describe("the implementer answers the reviewer", () => {
 
 describe("weak-tests-only reviews", () => {
 	const weak = "- agency.service.spec.ts: only checks it renders";
+	it.each([0, 2])("escalates persistent weak coverage after revisions, including %i recorded earlier revisions", async (earlier) => {
+		if (earlier) ledger.updateUnit("u1", { meta: { weakRounds: earlier } });
+		const calls: Array<{ role: string; task: string }> = [];
+		const models: Array<string | undefined> = [];
+		const inner = sessions(calls,
+			async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"),
+			async (_o, _t, n) => (write(join(ws, "migrated", SPEC), `it('u1#1 revised ${n}', () => {});\n`), "agency.service.spec.ts: fixed — revised assertions\nTESTER DONE 1 cases"));
+		const spawn = (async (opts: SpawnOptions) => {
+			if (opts.role === "test") models.push(opts.modelOverride?.id);
+			return (inner as unknown as (o: SpawnOptions) => Promise<LeafSession>)(opts);
+		}) as never;
+		let reviews = 0;
+		const reviewer = async () => ++reviews <= 2 ? { ok: false, judged: true, output: weak, weakTests: weak, findings: [] } : { ok: true, judged: true, output: "coverage now exercises the workflow", findings: [] };
+		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
+		expect(models).toEqual([earlier ? config.models.escalate.id : undefined, config.models.escalate.id]);
+		expect(r.state).toBe("review");
+		expect(r.gate?.ok).toBe(true);
+		expect(calls.filter((c) => c.role === "implement")).toHaveLength(1);
+		expect(reviews).toBe(3);
+	});
 
 	it("are not implementer failures; the tester's kept answers reach the next review", async () => {
+		ledger.updateUnit("u1", { meta: { weakTestsNote: "historical unresolved weakness" } });
 		const calls: Array<{ role: string; task: string }> = [];
 		const spawn = sessions(
 			calls,
@@ -237,6 +258,7 @@ describe("weak-tests-only reviews", () => {
 		]);
 		// the unit passed: its weak-tests count starts again for a later round
 		expect(JSON.parse(ledger.getUnit("u1")!.meta)).toMatchObject({ weakRounds: 0 });
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toBeUndefined();
 	});
 
 	it("a tester that keeps every test unchanged and only answers still gets a fresh review that reads its answers", async () => {
@@ -257,7 +279,7 @@ describe("weak-tests-only reviews", () => {
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toBeUndefined();
 	});
 
-	it("a tester that agrees but changes no test never earns the waiver: its round does not count, the next runs on the escalate model", async () => {
+	it("a tester that agrees but changes no test leaves the review red; the next round uses the escalate model", async () => {
 		const models: Array<string | undefined> = [];
 		const calls: Array<{ role: string; task: string }> = [];
 		const inner = sessions(
@@ -281,7 +303,7 @@ describe("weak-tests-only reviews", () => {
 		expect(inputs.every((i) => !i.testerKept)).toBe(true);
 	});
 
-	it("a tester that changed the tests but says it could not rewrite one gets no waiver", async () => {
+	it("a tester that changed tests but could not repair one leaves the review red", async () => {
 		ledger.updateUnit("u1", { meta: { weakRounds: 1 } });
 		const calls: Array<{ role: string; task: string }> = [];
 		const spawn = sessions(
@@ -313,7 +335,7 @@ describe("weak-tests-only reviews", () => {
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).testerCouldNot).toBeUndefined();
 	});
 
-	it("a stopping run's skipped tester round never counts toward the waiver", async () => {
+	it("a stopping run's skipped tester round records no test revision", async () => {
 		const calls: Array<{ role: string; task: string }> = [];
 		let stop = false;
 		const spawn = sessions(
@@ -331,14 +353,14 @@ describe("weak-tests-only reviews", () => {
 		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakRounds).toBe(1);
 	});
 
-	it("count across runs of the unit: tester rounds of an earlier run count toward the waiver", async () => {
+	it("tester revisions from an earlier run cannot waive a fresh weak review", async () => {
 		ledger.updateUnit("u1", { meta: { weakRounds: 2 } });
 		const calls: Array<{ role: string; task: string }> = [];
 		const spawn = sessions(calls, async () => (write(join(ws, "migrated", CODE), "export class AgencyService {}\n"), "IMPLEMENTER DONE"));
 		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests:\n${weak}`, weakTests: weak, findings: [] });
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn, gate: reviewGate, reviewer, log: () => {} });
-		expect(calls.map((c) => c.role)).toEqual(["implement"]);
-		expect(r.state).toBe("review");
-		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toMatch(/after 2 tester rounds/);
+		expect(calls.some((c) => c.role === "test")).toBe(true);
+		expect(r.state).toBe("quarantined");
+		expect(r.gate?.ok).toBe(false);
 	});
 });

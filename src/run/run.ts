@@ -1,4 +1,6 @@
 import { forecast, renderForecastLine } from "./forecast.ts";
+import { renderVerification, verificationSummary, type VerificationReport } from "./parity-verification.ts";
+import { pluginVersion } from "./plugin-version.ts";
 import { execFile } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { cp, rm } from "node:fs/promises";
@@ -23,7 +25,7 @@ import { getSourceAdapter, getTargetAdapter } from "../adapters/registry.ts";
 import { probeLegacyEnv, type ProbeAnswer, type ProbeAsker } from "./legacy-env.ts";
 import { resolveChoices } from "../init/stack.ts";
 import { indexTarget } from "../inventory/target.ts";
-import { applySlicePlan, blockingOrder, planSlices, renderSlicePlan, type SliceOverrides } from "../inventory/slices.ts";
+import { applySlicePlan, blockingOrder, needsSlicePlan, planSlices, renderSlicePlan, type SliceOverrides } from "../inventory/slices.ts";
 import type { Ledger } from "../ledger/db.ts";
 import type { ModelClient } from "../models/types.ts";
 import { Semaphore } from "./pool.ts";
@@ -45,7 +47,9 @@ import { createStubSweep, resolveOwnersWithModel } from "./stub-sweep.ts";
 import { finishCheck, finishDue, lastFinish, renderFinishLine } from "./finish-check.ts";
 import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
-import { routeOwners } from "./parity-check.ts";
+import { paritySliceReady, routeOwners, suiteGaps } from "./parity-check.ts";
+import { syncQuirkAnswers } from "./quirks.ts";
+import { reopenUnsettledQuirks, reopenWeakTests } from "./recheck.ts";
 import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type ApprovedReview, type UnitRunOptions, type UnitRunResult } from "./unit.ts";
 import { clipOutput, conflictMarkers, verdictsAtMerge, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
@@ -169,8 +173,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		}
 	}
 
-	// ---- slices: computed once per inventory, stored in unit meta
-	if (!ledger.getMeta("slice_plan") || o.dry) {
+	// ---- slices: refreshed when inventory changes the unit graph or source routes
+	if (needsSlicePlan(ledger) || o.dry) {
 		const plan = planSlices(ledger, loadOverrides(o.root));
 		applySlicePlan(ledger, plan);
 		log(renderSlicePlan(plan));
@@ -178,23 +182,20 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 
 	// ---- crash recovery
 	setStep("crash recovery");
-	const open = ledger.db.prepare("SELECT id, unit_id FROM attempts WHERE ended_at IS NULL").all() as Array<{ id: number; unit_id: string }>;
-	for (const a of open) {
-		ledger.endAttempt(a.id, { outcome: "aborted:crash" });
-		const u = ledger.getUnit(a.unit_id);
-		if (u && ["truth", "implementing", "gating"].includes(u.state)) {
-			ledger.db.prepare("UPDATE units SET state = 'planned', updated_at = ? WHERE id = ?").run(new Date().toISOString(), a.unit_id);
-			ledger.clearStale(a.unit_id);
-			ledger.db.prepare("INSERT INTO transitions(entity, entity_id, from_state, to_state, reason, created_at) VALUES ('unit', ?, ?, 'planned', 'crash recovery: attempt left open', ?)").run(a.unit_id, u.state, new Date().toISOString());
-			await removeWorktree(config.target.path, worktreeDir(o.root, a.unit_id));
-		}
+	if (!o.dry) {
+		const recovered = await recoverCrashedAttempts({ ledger, config, root: o.root });
+		if (recovered.attempts) log(pc.yellow(`recovered ${recovered.attempts} attempt(s) left open by a previous run; kept work for ${recovered.preserved.length} unit(s)`));
 	}
-	if (open.length) log(pc.yellow(`recovered ${open.length} attempt(s) left open by a previous run`));
 	// accepted with no wiring verdict (no reviewer ran then): back for the reviewer's judgement, code kept
 	if (!o.dry && !o.spawn) {
 		const { reopenUnjudgedWiring } = await import("./recheck.ts");
 		const back = reopenUnjudgedWiring(ledger);
 		if (back.length) log(pc.yellow(`${back.length} accepted unit(s) never had their wiring judged: back to planned (code kept) for the reviewer`));
+		const weak = reopenWeakTests(ledger);
+		if (weak.length) log(pc.yellow(`${weak.length} accepted unit(s) have unresolved weak tests: back to planned (code and legacy truth kept) for test repair and review`));
+		syncQuirkAnswers({ ledger, root: o.root });
+		const unsettled = reopenUnsettledQuirks(ledger, true);
+		if (unsettled.length) log(pc.yellow(`${unsettled.length} accepted unit(s) have unresolved or unapplied quirk decisions: back to planned (code and legacy truth kept)`));
 	}
 	// ---- truth: can the old code run here? decided once per workspace (run → truth from running it, read → from reading it)
 	if (!o.dry && !o.spawn) {
@@ -509,7 +510,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const sliceOf = (unitId: string) => (JSON.parse(ledger.getUnit(unitId)?.meta ?? "{}") as { slice?: string }).slice;
 	// a slice can be compared once a unit that answers one of its routes is accepted: only those routes' steps are
 	// compared (checkSlice onlyAccepted), and each later route owner's accept compares it again
-	const sliceDone = (slice: string) => routeOwners(ledger, slice).some((u) => u.state === "accepted");
+	const sliceDone = (slice: string) => paritySliceReady(ledger, slice);
+	// a finished slice whose suite strict verification would not accept (no steps, routes without a step, pages
+	// without a browser check) gets its missing checks written against the old app before it is compared, a few
+	// times per plugin version at most
+	const plugin = await pluginVersion();
+	const needsPrepare = (slice: string) => prepareTries(ledger, slice, plugin) < MAX_PARITY_ERRORS && suiteGaps(ledger, o.root, slice).length > 0;
 	const pumpParity = () => {
 		if (parityRunning || parityStopped || !parityQueue.length) return;
 		const slice = parityQueue.shift()!;
@@ -532,7 +538,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			// each app gets a test account from its setup first, so the steps compare the routes behind the login logged in
 			const { ensureTestLogins } = await import("./parity.ts");
 			const ensureLogins = (sides: string[]) => (showParity("finding a test account for the old and the new app"), ensureTestLogins({ config, root: o.root, sides, linkAll, log, ...probeAsk }));
-			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, log, fixSetup, ensureLogins });
+			const prepare = needsPrepare(slice);
+			if (prepare) showParity(`writing the missing checks of ${slice} against the old app`);
+			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, prepare, log, fixSetup, ensureLogins });
+			if (prepare && r.outcome !== "setup") notePrepare(ledger, slice, plugin, r.unprepared ?? (r.outcome === "error" && r.note.startsWith("no usable steps") ? r.note : undefined));
 			// its setup ran out of fixes: a person must look, asked once
 			if (r.setup) await askBootOwner({ root: o.root, side: r.setup.side, error: r.note, ask: probeAsk.ask });
 			// the new app does not start on main: a red main the builder fixes, not only a parity error. A stack with no
@@ -613,11 +622,35 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		// at the start: finished slices never compared, and slices whose last comparison needs another look
 		const { checked, again } = parityAgain(ledger, await headOf(config.target.path));
 		// the slice names straight from SQL: reading and parsing every unit's meta held the run's thread at start
-		const slices = new Set((ledger.db.prepare("SELECT DISTINCT json_extract(meta, '$.slice') AS s FROM units WHERE json_extract(meta, '$.slice') IS NOT NULL").all() as Array<{ s: unknown }>).map((r) => r.s).filter((x): x is string => typeof x === "string" && !!x));
-		// and slices of units the owner said to retry after they ran out of parity re-opens
+		// and slices of units the owner said to retry after they ran out of parity re-opens, and finished slices with checks missing
 		const answered = applyParityAnswers(ledger);
-		for (const sl of slices) if (!checked.has(sl) || again.has(sl) || answered.includes(sl)) queueParity(sl);
+		for (const sl of paritySlices(ledger)) if (!checked.has(sl) || again.has(sl) || answered.includes(sl) || needsPrepare(sl)) queueParity(sl);
 	}
+	// the end of a run: the strict replay of every slice on one frozen commit (br parity --verify), again only once main
+	// moved or a slice was compared since (new checks, a fix). What it leaves that the run can do (slices to compare
+	// again, checks to write, both a few times at most) is queued and the run goes on
+	let verified: { head?: string; upTo?: number; report?: VerificationReport } = {};
+	const lastParityRun = () => (ledger.db.prepare("SELECT COALESCE(MAX(id), 0) n FROM parity_runs").get() as { n: number }).n;
+	// a slice sent back twice in one run waits for the next run (an app that does not start here comes back each time)
+	const sentBack = new Map<string, number>();
+	const finalParity = async (): Promise<boolean> => {
+		if (!parityProbe) return false;
+		await parityProbe;
+		const head = await headOf(config.target.path);
+		if (!head || (verified.head === head && verified.upTo === lastParityRun())) return false;
+		const { verifyParity } = await import("./parity-verification.ts");
+		const { validateParityProjects } = await import("./parity-project-checks.ts");
+		const report = await verifyParity({ ledger, config, root: o.root, linkAll, serverStack, log, runHolds: true, validateProjects: () => validateParityProjects({ config, root: o.root, adapters, linkAll, log }) });
+		verified = { head, upTo: lastParityRun(), report };
+		if (report.status === "passed") return false;
+		const { again } = parityAgain(ledger, head);
+		for (const sl of paritySlices(ledger))
+			if ((again.has(sl) || needsPrepare(sl)) && (sentBack.get(sl) ?? 0) < 2) {
+				sentBack.set(sl, (sentBack.get(sl) ?? 0) + 1);
+				queueParity(sl);
+			}
+		return !!parityRunning;
+	};
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
 	// an area is busy while a unit of it runs; a truth-ahead lane (only tests, in its own worktree) never holds a tidy job back
 	const tidyJobs = createTidyJobs({ config, root: o.root, ledger, adapters, log, linkAll, worker: o.spawn ? false : undefined, mergeFix: (wt, branch, what) => merge.run(async () => await mergeUnit(config, "tidy", wt, branch, "", what)).then((sha) => (pusher.afterMerge(), sha)), areaBusy: (s, a) => [...running.keys()].some((id) => { if (aheadRunning.has(id)) return false; const p = placementOf(ledger.getUnit(id)!.meta); return p.stackId === s && p.area === a; }) });
@@ -706,6 +739,11 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const ready = async (): Promise<string[]> => {
 		applyPlacementAnswers(ledger, config, o.root); // an answered placement question places its unit before it can start
 		syncTaxonomyAnswers({ ledger, root: o.root }); // answered area questions: new area, or the owner excluded the unit
+		if (!o.dry && !o.spawn) {
+			syncQuirkAnswers({ ledger, root: o.root });
+			const changed = reopenUnsettledQuirks(ledger);
+			if (changed.length) log(pc.yellow(`${changed.length} accepted unit(s) have changed quirk decisions: back to planned to apply them (code and legacy truth kept)`));
+		}
 		const blocked = ledger.blockedUnits();
 		decisionBlocked = (await o.blocked?.()) ?? new Map();
 		for (const u of decisionBlocked.keys()) if (!blocked.has(u)) blocked.set(u, []);
@@ -1350,8 +1388,19 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					await new Promise((r) => setTimeout(r, 3000));
 					continue;
 				}
+				// the comparison with the old app is part of the run: the units it re-opens run in this run, not the next
+				if ((parityRunning || sharedRunning) && !stop && !o.shouldStop?.() && !dayCapHit) {
+					await waitOn(parityRunning ? "comparing finished slices with the old app" : "a code job is fixing a difference many slices share", () => (parityRunning ?? sharedRunning)!);
+					lastResubmitCheck = 0;
+					continue;
+				}
 				// nothing left to run: is the app really done? A code job it merged may let units run again
 				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("finish check: is the app really done", runFinish))) {
+					lastResubmitCheck = 0;
+					continue;
+				}
+				// then does it answer like the old app, strictly? Slices it sends back are compared (and fixed) in this run
+				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("strict parity check: does the new app answer like the old one", finalParity))) {
 					lastResubmitCheck = 0;
 					continue;
 				}
@@ -1409,12 +1458,15 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const lanes = stopRecord ? stopRecord.finishing.map((id) => { const st = ledger.getUnit(id)?.state ?? "?"; return { unit: id, state: (st === "planned" && truthAhead(id)) || st }; }) : [];
 	if (stopRecord) log(pc.yellow(`stopped (${stopRecord.reason}); lanes that finished: ${lanes.map((l) => `${l.unit} → ${l.state}`).join(", ") || "none were running"}`));
 	cost = Math.max(cost, progress.tally().costUsd - usageAtStart.costUsd);
-	log(`\nrun ${stopRecord ? "stopped" : "finished"}: ${acceptedNow} accepted, ${quarantined} quarantined, ${waiting} still planned${ledger.ownDecisions(startedAt).length ? `, ${ledger.ownDecisions(startedAt).length} routine question(s) decided from your goals` : ""}${ledger.openQuestions().length ? `, ${ledger.openQuestions().length} question(s) open → br questions` : ""}, $${cost.toFixed(3)}`);
-	if (!o.dry) log(pc.dim(renderForecastLine(forecast(ledger))));
+	log(`\nrun ${stopRecord ? "stopped" : verified.report?.status === "passed" ? "finished, parity verified" : "ended, parity not verified"}: ${acceptedNow} accepted, ${quarantined} quarantined, ${waiting} still planned${ledger.ownDecisions(startedAt).length ? `, ${ledger.ownDecisions(startedAt).length} routine question(s) decided from your goals` : ""}${ledger.openQuestions().length ? `, ${ledger.openQuestions().length} question(s) open → br questions` : ""}, $${cost.toFixed(3)}`);
+	if (!o.dry) log(pc.dim(renderForecastLine(forecast(ledger, { targetHead: await headOf(config.target.path) }))));
 	// finished is not verified: what the last finish check left open and what is not proven yet
 	if (!o.dry && lastFinish(ledger)) log(pc.dim(renderFinishLine(lastFinish(ledger)!)));
+	// the strict replay at the end is what "finished" means; without it (a stop, a budget cap) the last stored one is shown
+	if (!o.dry) for (const l of verified.report ? renderVerification(verified.report).slice(0, 15) : [verificationSummary(ledger)]) log(verified.report?.status === "passed" ? pc.green(l) : pc.yellow(l));
+	for (const u of o.dry ? [] : unpreparedSlices(ledger, plugin)) log(pc.yellow(`parity ${u.slice}: its missing checks could not be written (${MAX_PARITY_ERRORS} tries): ${u.why.slice(0, 200)} → br parity ${u.slice} --prepare`));
 	if (!o.dry) ledger.setMeta(OPEN_RUN, "");
-	if (!o.dry) writeRunRecord(ledger, o.root, { startedAt, endedAt: new Date().toISOString(), outcome: stopRecord ? "stopped" : "finished", stop: stopRecord ? { ...stopRecord, lanes } : undefined, accepted: acceptedNow, quarantined, planned: waiting, openQuestions: ledger.openQuestions().length, costUsd: Number(cost.toFixed(4)), units: ran.map((r) => ({ unit: r.unitId, state: r.state })) });
+	if (!o.dry) writeRunRecord(ledger, o.root, { startedAt, endedAt: new Date().toISOString(), outcome: stopRecord ? "stopped" : "finished", stop: stopRecord ? { ...stopRecord, lanes } : undefined, ...(verified.report ? { parity: { status: verified.report.status, problems: verified.report.problems.length, first: verified.report.problems[0]?.slice(0, 300) } } : {}), accepted: acceptedNow, quarantined, planned: waiting, openQuestions: ledger.openQuestions().length, costUsd: Number(cost.toFixed(4)), units: ran.map((r) => ({ unit: r.unitId, state: r.state })) });
 	return { ran, accepted: acceptedNow, quarantined, waiting, costUsd: cost };
 }
 
@@ -1728,12 +1780,12 @@ async function changesSince(config: Config, root: string, manifests: Map<string,
 
 /** The unit's last red attempt: the failed gate step's output (the reviewer's findings when the review failed), or the tester's error. */
 function lastRedReport(ledger: Ledger, unitId: string): { step: string; output: string } | undefined {
-	const r = ledger.db.prepare("SELECT outcome, gate_report FROM attempts WHERE unit_id = ? AND gate_report IS NOT NULL AND (outcome LIKE 'gate_red%' OR outcome IN ('truth_red', 'review_red')) ORDER BY id DESC LIMIT 1").get(unitId) as { outcome: string; gate_report: string } | undefined;
+	const r = ledger.db.prepare("SELECT outcome, gate_report FROM attempts WHERE unit_id = ? AND gate_report IS NOT NULL AND (outcome LIKE 'gate_red%' OR outcome IN ('truth_red', 'review_red', 'gate_tests_weak', 'review_weak_tests')) ORDER BY id DESC LIMIT 1").get(unitId) as { outcome: string; gate_report: string } | undefined;
 	if (!r) return undefined;
 	try {
 		const g = JSON.parse(r.gate_report) as { failedStep?: string; steps?: Array<{ name: string; ok: boolean; output?: string }>; error?: string; output?: string };
 		const bad = g.steps?.find((s) => !s.ok);
-		return { step: bad?.name ?? r.outcome, output: String(bad?.output ?? g.error ?? g.output ?? "") };
+		return { step: bad?.name ?? (r.outcome === "review_weak_tests" ? "wired_ok" : r.outcome), output: String(bad?.output ?? g.error ?? g.output ?? "") };
 	} catch {
 		return { step: r.outcome, output: r.gate_report };
 	}
@@ -1845,6 +1897,41 @@ export function moduleWaitNote(wait: Map<string, number>, perModule: number): st
 /** Parity comparisons that failed with an error in a row before a slice is left alone (until a unit of it lands again). */
 export const MAX_PARITY_ERRORS = 3;
 
+/** The slice names, straight from SQL: reading and parsing every unit's meta held the run's thread at start. */
+export function paritySlices(ledger: Ledger): string[] {
+	return (ledger.db.prepare("SELECT DISTINCT json_extract(meta, '$.slice') AS s FROM units WHERE json_extract(meta, '$.slice') IS NOT NULL").all() as Array<{ s: unknown }>).map((r) => r.s).filter((x): x is string => typeof x === "string" && !!x);
+}
+
+/** Ledger meta: per slice, the preparations that could not write its missing checks (with the plugin version and why). */
+const PARITY_PREPARE = "parity_prepare";
+type PrepareTries = Record<string, { tries: number; version?: string; why: string; at: string }>;
+const prepareRecord = (ledger: Ledger): PrepareTries => {
+	try {
+		return JSON.parse(ledger.getMeta(PARITY_PREPARE) || "{}") as PrepareTries;
+	} catch {
+		return {};
+	}
+};
+
+/** Failed preparations of a slice under this plugin version: a new version gets fresh tries (it may write them now). */
+export function prepareTries(ledger: Ledger, slice: string, version: string | undefined): number {
+	const t = prepareRecord(ledger)[slice];
+	return t && t.version === version ? t.tries : 0;
+}
+
+/** A preparation's outcome: `why` it could not write the checks, or undefined once they were written. */
+export function notePrepare(ledger: Ledger, slice: string, version: string | undefined, why: string | undefined): void {
+	const all = prepareRecord(ledger);
+	if (why) all[slice] = { tries: prepareTries(ledger, slice, version) + 1, version, why: why.slice(0, 600), at: new Date().toISOString() };
+	else delete all[slice];
+	ledger.setMeta(PARITY_PREPARE, JSON.stringify(all));
+}
+
+/** Slices whose missing checks could not be written, tries used up: what a person must look at. */
+export function unpreparedSlices(ledger: Ledger, version: string | undefined): Array<{ slice: string; why: string }> {
+	return Object.entries(prepareRecord(ledger)).filter(([, t]) => t.version === version && t.tries >= MAX_PARITY_ERRORS).map(([slice, t]) => ({ slice, why: t.why }));
+}
+
 /**
  * Slices compared before (`checked`), and those whose last comparison needs another look at run start (`again`): it
  * ended in an error (a few times in a row at most), left differences nobody judged, holds quirks the owner has
@@ -1877,9 +1964,10 @@ export function parityAgain(ledger: Ledger, head?: string): { checked: Set<strin
 }
 
 /** Whether a unit's accept queues its slice's comparison: a route owner's accept changes what is compared, a slice
- * never compared is queued once, and so is the fix of a unit its last comparison blamed. */
+ * without route owners reruns its checks when complete, a new slice is queued once, and so is a blamed unit's fix. */
 export function parityOnAccept(ledger: Ledger, slice: string, unitId: string): boolean {
-	if (routeOwners(ledger, slice).some((u) => u.id === unitId)) return true;
+	const owners = routeOwners(ledger, slice);
+	if (!owners.length || owners.some((u) => u.id === unitId)) return true;
 	const pa = parityAgain(ledger);
 	return !pa.checked.has(slice) || pa.fixed.has(slice);
 }
@@ -2099,10 +2187,19 @@ export async function askStuckUnits(d: { ledger: Ledger; config: Config; root: s
 	let asked = 0;
 	for (const r of quarantinedUnits(d.ledger)) {
 		const meta = JSON.parse(r.meta) as { autoHeals?: number; healQuestion?: number; stuck?: boolean; retriedOn?: string[] };
-		if (meta.healQuestion !== undefined || (!meta.stuck && (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals)) continue;
 		const last = lastRedReport(d.ledger, r.id);
 		// what a retry may still be: none once the automatic tries are used up; only with a hint (or a job) after one on this kind of failure
 		const kind = failureKind(r.id, r.reason ?? "", last);
+		// Earlier versions omitted weak-test outcomes and asked about an older failure. An unanswered machine
+		// question must follow the actual blocker; preserve answers and questions owned by other units.
+		const previous = meta.healQuestion ? d.ledger.getQuestion(meta.healQuestion) : undefined;
+		const previousKind = previous?.context ? (JSON.parse(previous.context) as { failureKind?: string }).failureKind : undefined;
+		if (previous?.status === "open" && previous.point === "quarantine" && previous.asked_by === "orchestrator" && previous.unit_id === r.id && previousKind && previousKind !== kind) {
+			d.ledger.withdrawQuestion(previous.id, "the latest failure differs from this question's diagnostic");
+			d.ledger.updateUnit(r.id, { meta: { healQuestion: undefined } });
+			delete meta.healQuestion;
+		}
+		if (meta.healQuestion !== undefined || (!meta.stuck && (meta.autoHeals ?? 0) < d.config.run.maxAutoHeals)) continue;
 		const retry = (meta.autoHeals ?? 0) >= d.config.run.maxAutoHeals ? "none" : meta.retriedOn?.includes(kind) ? "with a hint" : undefined;
 		const q = await askViaModel(d, {
 			point: "quarantine",
@@ -2201,6 +2298,40 @@ export async function keepUnitWork(wt: string, unitId: string): Promise<string |
 	} catch {
 		return undefined; // no worktree: nothing to keep
 	}
+}
+
+/** Preserve interrupted unit edits before crash recovery removes their worktrees. The caller holds the run lock. */
+export async function recoverCrashedAttempts(o: { ledger: Ledger; config: Config; root: string }): Promise<{ attempts: number; preserved: string[] }> {
+	const open = o.ledger.db.prepare("SELECT id, unit_id FROM attempts WHERE ended_at IS NULL").all() as Array<{ id: number; unit_id: string | null }>;
+	if (!open.length) return { attempts: 0, preserved: [] };
+	const units = [...new Set(open.flatMap((a) => a.unit_id ? [a.unit_id] : []))].map((id) => o.ledger.getUnit(id)).filter((u) => u && ["truth", "implementing", "gating", "review"].includes(u.state));
+	const preserved: string[] = [];
+	const mainHead = await headOf(o.config.target.path);
+	// Finish all snapshots before closing attempts or deleting anything. A failed snapshot leaves recovery retryable.
+	for (const u of units) {
+		if (!u) continue;
+		const wt = worktreeDir(o.root, u.id);
+		if (!existsSync(wt)) continue;
+		const dirty = (await gitIn(wt, ["status", "--porcelain"])).trim();
+		let keptWork = await keepUnitWork(wt, u.id);
+		if (dirty && !keptWork) throw new Error(`cannot preserve interrupted work for ${u.id}; its worktree was retained at ${wt}`);
+		// A crash after a unit commit but before its merge can leave a clean worktree with unpublished work.
+		if (!keptWork && mainHead && Number(await gitIn(wt, ["rev-list", "--count", `${mainHead}..HEAD`])) > 0) keptWork = await headOf(wt);
+		if (keptWork) {
+			o.ledger.updateUnit(u.id, { meta: { keptWork } });
+			preserved.push(u.id);
+		}
+		const place = placeUnit(o.config, u.meta, o.root);
+		const adapter = await getTargetAdapter(place.stackId);
+		keepPortedTests(o.config, o.root, u.id, u.meta, wt, adapter.layout);
+	}
+	for (const a of open) o.ledger.endAttempt(a.id, { outcome: "aborted:crash" });
+	for (const u of units) {
+		if (!u) continue;
+		o.ledger.transitionUnit(u.id, "planned", "crash recovery: attempt left open");
+		await removeWorktree(o.config.target.path, worktreeDir(o.root, u.id));
+	}
+	return { attempts: open.length, preserved };
 }
 
 /**
@@ -2398,6 +2529,8 @@ export interface RunRecord {
 	/** "ended": the run never reached its end (Pi closed, the process killed); written by the next run from the ledger */
 	outcome: "finished" | "stopped" | "ended";
 	stop?: { at: string; reason: string; finishing: string[]; lanes: Array<{ unit: string; state: string }> };
+	/** The strict parity replay at the run's end (br parity --verify): only "passed" means the app answers like the old one. */
+	parity?: { status: "passed" | "blocked" | "failed"; problems: number; first?: string };
 	accepted: number;
 	quarantined: number;
 	planned: number;
@@ -2468,5 +2601,6 @@ export function renderLastRun(r: RunRecord): string {
 	const when = r.endedAt.slice(0, 16).replace("T", " ");
 	if (r.outcome === "ended") return `last run ended ${when} without finishing (Pi closed or the run process stopped)${r.stop ? `, after ${r.stop.reason}` : ""}: ${r.accepted} accepted, ${r.quarantined} quarantined, ${r.planned} still planned — /br run continues`;
 	if (r.outcome === "stopped" && r.stop) return `last run stopped ${when} (${r.stop.reason}); finished lanes: ${r.stop.lanes.map((l) => `${l.unit} → ${l.state}`).join(", ") || "none"} · ${r.accepted} accepted · ${r.planned} still planned — /br run continues`;
-	return `last run finished ${when}: ${r.accepted} accepted, ${r.quarantined} quarantined, ${r.planned} still planned`;
+	const parity = r.parity?.status === "passed" ? ", parity verified" : r.parity ? `; parity ${r.parity.status} (${r.parity.problems} problem(s)${r.parity.first ? `, first: ${r.parity.first.slice(0, 120)}` : ""})` : "; parity not checked";
+	return `last run ${r.parity?.status === "passed" ? "finished" : "ended"} ${when}: ${r.accepted} accepted, ${r.quarantined} quarantined, ${r.planned} still planned${parity}`;
 }

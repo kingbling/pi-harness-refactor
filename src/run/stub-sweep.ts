@@ -80,6 +80,16 @@ async function allMarks(dir: string): Promise<Array<{ file: string; line: number
 	return marks;
 }
 
+/** Open units retain their stub ownership while a shared integration job works beside them. */
+export async function reservedStubMarks(ledger: Ledger, dir: string, served: string[]): Promise<Array<{ file: string; line: number; owner: string; unit: string }>> {
+	const marks: Array<{ file: string; line: number; owner: string; unit: string }> = [];
+	for (const m of await allMarks(dir)) {
+		const unit = markOwner(ledger, m.owner);
+		if (unit && !served.includes(unit) && ledger.getUnit(unit)?.state !== "accepted") marks.push({ file: m.file, line: m.line, owner: m.owner, unit });
+	}
+	return marks;
+}
+
 /** The marks in `dir`'s tracked files whose owner is accepted or names no unit. */
 export async function deadStubMarks(ledger: Ledger, dir: string): Promise<DeadMark[]> {
 	const out: DeadMark[] = [];

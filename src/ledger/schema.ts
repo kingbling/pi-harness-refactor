@@ -349,7 +349,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS capabilities_fts USING fts5(id UNINDEXED, nam
 CREATE TABLE IF NOT EXISTS truth_cases (
   id TEXT PRIMARY KEY, unit_id TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
   symbol_id TEXT NOT NULL, inputs TEXT NOT NULL, expected TEXT NOT NULL,
-  verified_on_old INTEGER NOT NULL DEFAULT 0, ported_test_path TEXT, created_at TEXT NOT NULL
+  verified_on_old INTEGER NOT NULL DEFAULT 0, numeric_version INTEGER NOT NULL DEFAULT 0, ported_test_path TEXT, created_at TEXT NOT NULL
 );
 
 -- Differential parity: the same requests sent to the old and the new app, answers compared by code.
@@ -370,7 +370,7 @@ CREATE TABLE IF NOT EXISTS parity_diffs (
   slice TEXT NOT NULL,
   step TEXT NOT NULL,
   route TEXT NOT NULL,
-  kind TEXT NOT NULL,                 -- status|redirect|body|data|error
+  kind TEXT NOT NULL,                 -- status|redirect|body|data|header|error
   path TEXT NOT NULL,                 -- where in the answer ('' = the whole answer)
   legacy TEXT, target TEXT,           -- JSON
   status TEXT NOT NULL DEFAULT 'open', -- open|bug|quirk|setup|allowed (judge, then code: allowed = a quirk the owner dropped)

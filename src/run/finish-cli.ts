@@ -6,6 +6,7 @@ import { projectDir } from "../init/init.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { finishCheck, renderFinishLine } from "./finish-check.ts";
 import { linkDependencies } from "./run.ts";
+import { verificationSummary } from "./parity-verification.ts";
 
 /**
  * `br finish` and `/br finish`: the finish check on demand, as a report. It hands nothing on: when no unit is left
@@ -21,6 +22,7 @@ export async function finishCommand(o: { ledger: Ledger; config: Config; root: s
 	const r = await finishCheck({ ledger, config, root, adapters, linkAll, log: o.log ?? (() => {}), label: "finish-now" });
 	return [
 		renderFinishLine(r),
+		verificationSummary(ledger),
 		...r.items.map((i) => `  ${i.human ? "for you" : i.stack}: ${i.problem}\n    → ${i.fix.split("\n")[0]}${i.human ? ` (${i.human})` : ""}`),
 		r.items.some((i) => !i.human) ? "br run hands these to code jobs when no unit is left to run" : "",
 	].filter(Boolean);

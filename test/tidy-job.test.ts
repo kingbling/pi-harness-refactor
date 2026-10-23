@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { TargetAdapter } from "../src/adapters/types.ts";
 import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo } from "../src/git.ts";
@@ -67,16 +67,29 @@ describe("the tidy job", () => {
 		const { ledger, jobs } = (await setup());
 		let busy = true;
 		const j = jobs(mover(true), () => busy, 50);
-		expect(j.holds("fake", "a")).toBe(true);
-		expect(j.heldAreas().has("fake\0a")).toBe(true);
-		j.next();
-		expect(j.busy).toBeUndefined(); // waits for the running unit
-		await new Promise((r) => setTimeout(r, 80));
-		expect(j.holds("fake", "a")).toBe(false); // units start again
-		expect(j.heldAreas().size).toBe(0);
-		// and as long later the hold comes back, so the area empties and the task gets its turn (T5597 waited 4 hours)
-		await new Promise((r) => setTimeout(r, 50));
-		expect(j.holds("fake", "a")).toBe(true);
+		// Model exact hold boundaries; OS scheduling can delay a real 50 ms sleep into another window.
+		const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+		try {
+			expect(j.holds("fake", "a")).toBe(true);
+			expect(j.heldAreas().has("fake\0a")).toBe(true);
+			j.next();
+			expect(j.busy).toBeUndefined(); // waits for the running unit
+			clock.mockReturnValue(49);
+			expect(j.holds("fake", "a")).toBe(true);
+			clock.mockReturnValue(50);
+			expect(j.holds("fake", "a")).toBe(false); // units start again
+			expect(j.heldAreas().size).toBe(0);
+			clock.mockReturnValue(99);
+			expect(j.holds("fake", "a")).toBe(false);
+			// The next hold lets the area empty and the task get its turn (T5597 waited 4 hours).
+			clock.mockReturnValue(100);
+			expect(j.holds("fake", "a")).toBe(true);
+			expect(j.heldAreas().has("fake\0a")).toBe(true);
+			clock.mockReturnValue(150);
+			expect(j.holds("fake", "a")).toBe(false);
+			clock.mockReturnValue(200);
+			expect(j.holds("fake", "a")).toBe(true);
+		} finally { clock.mockRestore(); }
 		// the task still runs once the area is idle
 		busy = false;
 		j.next();

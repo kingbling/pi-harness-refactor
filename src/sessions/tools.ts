@@ -1,7 +1,8 @@
+import { parseExactJson } from "../run/exact-json.ts";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ModelClient } from "../models/types.ts";
-import { caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
+import { truthImportConfig, caseIds, NO_BEHAVIOUR_FILE, READ_CASES_FILE, type TruthResult } from "../run/legacy-env.ts";
 import { catchUpWithMain, caseCoverage, checkTests, holds, ownTests, runPortedTests, sameAsAt } from "../run/ported.ts";
 import { antigamingCheck, buildFiles, changedFiles, clipOutput, gateFiles, othersTestsChanged, structureCheck, type GateInput } from "../run/gate.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -569,6 +570,8 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			let ids: string[];
 			if (truth?.ok) {
 				ids = caseIds(d.unitId, d.ledger.db.prepare("SELECT id, symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(d.unitId) as Array<{ id: string; symbol_id: string; inputs: string }>, truth.cases);
+				if (truthImportConfig(join(d.root, ".bigrefactor", "truth", d.unitId)).retainRecordedCases)
+					ids = [...new Set([...ids, ...(d.ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = ?").all(d.unitId) as Array<{ id: string }>).map((r) => r.id)])];
 				if (truth.none) out.push(`No runtime behaviour declared (${truth.none}): no case needs a test.`);
 			} else {
 				ids = (d.ledger.db.prepare("SELECT id FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(d.unitId) as Array<{ id: string }>).map((r) => r.id);
@@ -580,6 +583,11 @@ export function checkPortedTestsTool(d: ToolDeps): ToolDefinition {
 			out.push(cov.missing.length ? `MISSING: ${cov.missing.length} of ${ids.length} case id(s) appear in no test file: ${cov.missing.join(", ")}. Put each id unchanged ("#" included) in its test's name, or next to the test in a comment or description.` : `All ${ids.length} case id(s) found.`);
 			const LISTED = 20;
 			out.push(`Searched ${cov.files.length} test file(s) matching ${cov.globs.join(", ")} in ${d.targetProjectDir}${cov.files.length ? `: ${cov.files.slice(0, LISTED).join(", ")}${cov.files.length > LISTED ? `, and ${cov.files.length - LISTED} more` : ""}` : ": none found"}.`);
+			if (cov.missing.length) {
+				const recorded = d.ledger.db.prepare("SELECT id, symbol_id, inputs, expected, verified_on_old FROM truth_cases WHERE unit_id = ?").all(d.unitId) as Array<{ id: string; symbol_id: string; inputs: string; expected: string; verified_on_old: number }>;
+				const missing = recorded.filter((c) => cov.missing.includes(c.id));
+				if (missing.length) out.push(`Recorded payloads for missing tests (ids are not positions in cases.php or cases.json):\n${missing.map((c) => `${c.id}: ${JSON.stringify({ symbol: c.symbol_id, inputs: parseExactJson(c.inputs), expected: parseExactJson(c.expected), verified_on_old: !!c.verified_on_old })}`).join("\n")}`);
+			}
 			// what the test files really import counts too: a leftover or renamed test can import a path code_files does not name
 			const imported = missingTestImports(d.targetProjectDir, cov.files, d.adapter.layout.sourceExtensions);
 			const codeFiles = [...new Set([...(p.code_files ?? []).map((f) => f.replace(/^\.\//, "")).filter((f) => !existsSync(join(d.targetProjectDir, f))), ...imported.keys()])];

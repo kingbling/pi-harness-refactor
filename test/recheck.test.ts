@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { renderStatus } from "../src/dashboard/status.ts";
 import { Ledger } from "../src/ledger/db.ts";
-import { recheckAccepted } from "../src/run/recheck.ts";
+import { recheckAccepted, reopenUnsettledQuirks, reopenWeakTests } from "../src/run/recheck.ts";
 import type { Reviewer, ReviewInput } from "../src/run/review.ts";
 
 /**
@@ -35,11 +35,54 @@ function workspace(stacks = ["nestjs"]) {
 		mkdirSync(join(root, ".bigrefactor", "truth", id), { recursive: true });
 		writeFileSync(join(root, ".bigrefactor", "truth", id, "cases.php"), id === "typed" ? "<?php require 'app/offer.php'; echo json_encode([['symbol'=>'s','inputs'=>null,'expected'=>123.45]]);" : "<?php require 'app/offer.php'; echo json_encode([['symbol'=>'s','inputs'=>null,'expected'=>net()]]);");
 	}
+	ledger.db.prepare("UPDATE truth_cases SET numeric_version=1").run();
 	return { root, config, ledger };
 }
 const green = async () => ({ ok: true, output: "ok" });
 
 describe("br recheck", () => {
+	it("recovers accepted weak-test waivers without deleting their code proofs or raw truth", () => {
+		const { ledger } = workspace();
+		ledger.updateUnit("fine", { meta: { weakTestsNote: "the tests compare literals instead of calling net()" } });
+		const before = ledger.db.prepare("SELECT * FROM truth_cases ORDER BY id").all();
+		expect(reopenWeakTests(ledger)).toEqual(["fine"]);
+		expect(ledger.getUnit("fine")!.state).toBe("planned");
+		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("mapped");
+		expect(ledger.hasEvidence("fine", "truth_green_on_old")).toBe(true);
+		expect(ledger.db.prepare("SELECT * FROM truth_cases ORDER BY id").all()).toEqual(before);
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).retryNote).toContain("compare literals instead of calling net()");
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).weakTestsNote).toBeTruthy();
+		expect(reopenWeakTests(ledger)).toEqual([]);
+		ledger.close();
+	});
+	it("clears a historical weakness note only when recheck judges the tests clean", async () => {
+		const { root, config, ledger } = workspace();
+		ledger.updateUnit("fine", { meta: { weakTestsNote: "old unresolved weakness" } });
+		ledger.updateUnit("stub", { meta: { weakTestsNote: "still unresolved weakness" } });
+		const reviewer: Reviewer = async (o) => o.unitId === "stub" ? { ok: false, judged: true, output: "weak tests", weakTests: "still compares literals" } : { ok: true, judged: true, output: "tests exercise the behavior" };
+		await recheckAccepted({ root, config, ledger, reviewer, runTests: green, log: () => {} });
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).weakTestsNote).toBeUndefined();
+		expect(JSON.parse(ledger.getUnit("stub")!.meta).weakTestsNote).toBe("still unresolved weakness");
+		ledger.close();
+	});
+	it("reopens late unresolved or unapplied quirk decisions without losing code proofs or raw legacy truth", () => {
+		const { ledger } = workspace();
+		const insert = ledger.db.prepare("INSERT INTO quirks(unit_id,symbol_id,kind,behaviour,opinion,why,status,applied,created_at) VALUES (?,'s','suspected_bug','old oddity','keep','reason',?,?,'t0')");
+		insert.run("fine", "kept", "drop");
+		insert.run("typed", "pending", "keep");
+		insert.run("stub", "dropped", "drop");
+		const old = ledger.db.prepare("SELECT * FROM truth_cases ORDER BY id").all();
+		expect(reopenUnsettledQuirks(ledger)).toEqual(["fine"]);
+		expect(ledger.getUnit("fine")!.state).toBe("planned");
+		expect(ledger.getSymbol("app/offer.php::fine")!.state).toBe("mapped");
+		expect(ledger.hasEvidence("fine", "truth_green_on_old")).toBe(true);
+		expect(ledger.getUnit("typed")!.state).toBe("accepted");
+		expect(ledger.getUnit("stub")!.state).toBe("accepted");
+		expect(reopenUnsettledQuirks(ledger, true)).toEqual(["typed"]);
+		expect(reopenUnsettledQuirks(ledger, true)).toEqual([]);
+		expect(ledger.db.prepare("SELECT * FROM truth_cases ORDER BY id").all()).toEqual(old);
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).retryNote).toContain("raw legacy truth observations");
+	});
 	it("re-opens what fails the newer checks, code kept, findings as the next note; keeps the rest", async () => {
 		const { root, config, ledger } = workspace();
 		const reviewer: Reviewer = async (o) => (o.unitId === "stub" ? { ok: false, judged: true, output: "reviewer findings:\n- src/offer/offer.service.ts:4: net() returns 0 → port the discount rules" } : { ok: true, judged: true, output: "fine" });
@@ -233,6 +276,53 @@ describe("truth read from the old code, run once it can", () => {
 });
 
 describe("truth read from the old code, run once it can: values compared where both sides have them", () => {
+	it("revalidates historical verified truth without reopening code when the exact value still matches", async () => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		ledger.db.prepare("UPDATE truth_cases SET numeric_version=0 WHERE unit_id='fine'").run();
+		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), `# app/offer.php\necho '[{"symbol":"s","inputs":null,"expected":'"$(printf %s.%s 123 45)"'}]'\n`);
+		const before = ledger.db.prepare("SELECT inputs,expected,ported_test_path FROM truth_cases WHERE unit_id='fine'").get();
+		const result = await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		expect(result.upgraded).toContain("fine");
+		expect(ledger.getUnit("fine")!.state).toBe("accepted");
+		expect(ledger.db.prepare("SELECT numeric_version v FROM truth_cases WHERE unit_id='fine'").get()).toEqual({v:1});
+		expect(ledger.db.prepare("SELECT inputs,expected,ported_test_path FROM truth_cases WHERE unit_id='fine'").get()).toEqual(before);
+		expect((await upgradeReadTruth({ ledger, config, root, source, log: () => {} })).upgraded).toEqual([]);
+	});
+	it.each([false, true])("reopens historical rounded inputs without allowing one fresh case to prove two recorded cases (duplicate=%s)", async (duplicate) => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(join(config.source.path, "app"), { recursive: true });
+		ledger.db.prepare("UPDATE truth_cases SET numeric_version=0,inputs='[9007199254740992]',expected='1' WHERE unit_id='fine'").run();
+		if (duplicate) ledger.db.prepare("INSERT INTO truth_cases(id,unit_id,symbol_id,inputs,expected,verified_on_old,ported_test_path,created_at) VALUES ('fine#2','fine','s','[9007199254740992]','1',1,'src/offer/fine.spec.ts','t')").run();
+		const printed = duplicate ? '[{"symbol":"s","inputs":[9007199254740992],"expected":1},{"symbol":"s","inputs":[9007199254740993],"expected":1}]' : '[{"symbol":"s","inputs":[9007199254740993],"expected":1}]';
+		writeFileSync(join(config.source.path, "app/offer.php"), "printf '%s' '" + printed + "'\n");
+		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), "sh app/offer.php\n");
+		const result = await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		expect(result.upgraded).not.toContain("fine");
+		expect(result.redone).toContain("fine");
+		expect(ledger.getUnit("fine")!.state).toBe("planned");
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).retryNote).toContain("earlier JSON parsing rounded");
+	});
+	it("reopens rounded read truth when the actual legacy result is a distinct exact number", async () => {
+		const { root, config, ledger } = workspace();
+		const { upgradeReadTruth } = await import("../src/run/recheck.ts");
+		const source = { id: "shell", truth: { scriptName: "cases.sh", run: (_r: string, s: string) => ({ cmd: "sh", args: [s] }), instructions: "" } } as never;
+		mkdirSync(config.source.path, { recursive: true });
+		ledger.db.prepare("UPDATE truth_cases SET verified_on_old=0, expected='9007199254740992' WHERE unit_id='fine'").run();
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id='fine'").run();
+		ledger.addEvidence("fine", "truth_read", {});
+		mkdirSync(join(config.source.path, "app"), { recursive: true });
+		writeFileSync(join(config.source.path, "app/offer.php"), "printf '%s' '9007199254740993'\n");
+		writeFileSync(join(root, ".bigrefactor", "truth", "fine", "cases.sh"), `value=$(sh app/offer.php)\nprintf '[{"symbol":"s","inputs":null,"expected":%s}]' "$value"\n`);
+		const result = await upgradeReadTruth({ ledger, config, root, source, log: () => {} });
+		expect(result.redone).toContain("fine");
+		expect(ledger.getUnit("fine")!.state).toBe("planned");
+		expect(JSON.parse(ledger.getUnit("fine")!.meta).retryNote).toContain("9007199254740993");
+	});
 	it("a key only one side has proves nothing, so the unit stays; a value both sides hold that differs redoes it", async () => {
 		const { root, config, ledger } = workspace();
 		const { upgradeReadTruth } = await import("../src/run/recheck.ts");

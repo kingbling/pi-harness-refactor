@@ -13,7 +13,8 @@ import { globToRegExp, spawnLeaf } from "../sessions/spawn.ts";
 import { errorKeys, failingTests, FULL_OUTPUT, newErrorLines, runCmd } from "./builder.ts";
 import { onlyComments } from "./comment-only.ts";
 import { addedLines, changedFiles, clipOutput, stubOwnerProblem, testsImporting, trackedFiles, wholeProjectSteps } from "./gate.ts";
-import { markOwner } from "./stub-sweep.ts";
+import { markOwner, reservedStubMarks } from "./stub-sweep.ts";
+import { quirksOf } from "./quirks.ts";
 import { checkTree, STRAY, strayDirs } from "./layout-check.ts";
 import { exec } from "../proc.ts";
 
@@ -44,7 +45,8 @@ export const codeWithModel: CodeWorker = async (o) => {
 		transcriptPath: join(o.root, ".bigrefactor", "sessions", `__code__.${o.label}.jsonl`),
 		systemPrompt: `You write one piece of missing app code in a ${o.adapter.id} project under migration, so the units waiting on it can finish. The legacy code is at ${o.config.source.path} (read it for the behaviour to keep).
 - Read the project first and follow its layout and conventions (RULES.md, the existing modules); reuse what exists, add nothing the task does not need. A new feature folder gets the files every feature folder has, and their wiring.
-- Write tests for what you add. Never change what an existing test checks, except a test that demands the opposite of another test: the legacy code decides, correct the one that disagrees with it and name the legacy file and line. Never skip or delete tests.
+- Write tests for what you add. Preserve existing assertions, except a test that contradicts another test or a recorded decided quirk supplied in the task. For contradictory tests, the legacy code decides: name its file and line. For a decided quirk, change only the assertions for that exact behavior, cite its quirk id, and test the intended behavior when dropped or the legacy behavior when kept. Preserve unrelated assertions. Never skip or delete tests, or change legacy truth observations to match the target.
+- TODO(br:<owner>) marks reserve unfinished work for their owner. Preserve the marks and remaining behavior of open units this job does not serve. The task lists those marks and the units this job serves. Supply shared integration beside that work; removing another open unit's mark makes the entire job fail its check. Do not rename a mark or invent an owner.
 - App config and entry files are yours to change where the code needs it; the files that decide how the checks run (${(o.adapter.checkConfigGlobs ?? o.adapter.protectedGlobs).join(", ")}) are not.
 - Build: ${[b.cmd, ...b.args].join(" ")}   Test: ${[t.cmd, ...t.args].join(" ")}   ({files} = the files to check). Run them on what you changed before you stop.
 - Write no notes or docs files for other units: the units waiting on this get your final reply as their hint.
@@ -184,7 +186,10 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		if (o.unitWork) o.log(pc.dim(`code job ${o.label}: ${withUnit ? `starts from main plus ${o.unitWork.unitId}'s current work` : `${o.unitWork.unitId}'s work does not apply on main; starts from main`}`));
 		await o.linkAll(wt);
 		const dir = join(wt, relative(repo, projectDir(o.config, o.adapter.id)));
-		const what = withUnit ? `${o.what}\n\nThe worktree already holds the current work of unit ${o.unitWork!.unitId} (uncommitted, on top of main): use it and keep it. It is checked and merged together with your code.` : o.what;
+		const served = [...new Set([o.forUnit, o.unitWork?.unitId, ...(o.waiting ?? [])].filter((u): u is string => !!u))];
+		const reserved = o.whole ? [] : await reservedStubMarks(o.ledger, dir, served);
+		const decisions = served.flatMap((unit) => quirksOf(o, unit).filter((q) => q.status === "kept" || q.status === "dropped").map((q) => `- Quirk #${q.id} (${unit}, ${q.symbol_id}): ${q.behaviour}${q.example ? ` Example: ${q.example}` : ""}\n  Decision: ${q.status === "dropped" ? "DROP this legacy behavior; test the intended behavior" : "KEEP this legacy behavior"}${q.decided_by ? ` (decided by ${q.decided_by})` : ""}. Reason: ${q.why}`));
+		const what = `${o.what}${withUnit ? `\n\nThe worktree already holds the current work of unit ${o.unitWork!.unitId} (uncommitted, on top of main): use it and keep it. It is checked and merged together with your code.` : ""}${decisions.length ? `\n\nRecorded behavior decisions for the units this job serves (these govern only the described behavior):\n${decisions.join("\n")}` : ""}${o.whole ? "" : `\n\nStub ownership: this job serves ${served.join(", ") || "no specific open unit"}. Preserve the marks and remaining unfinished work owned by other open units:\n${reserved.map((m) => `${m.file}:${m.line}: TODO(br:${m.owner}) belongs to ${m.unit}`).join("\n") || "(none found)"}`}`;
 		const reply = (await (o.worker ?? codeWithModel)({ config: o.config, root: o.root, adapter: o.adapter, dir, what, label: o.label, onLocked })) || "";
 		// its last paragraph: it carries what the waiting units need (route, fields …), capped so the hint stays short
 		const said = (reply.trim().split(/\n\s*\n/).at(-1) ?? "").trim().slice(-1500);
@@ -194,7 +199,7 @@ async function run(o: Parameters<typeof runCodeJob>[0]): Promise<string | undefi
 		if (locked.diffs.length) o.onLocked?.({ files: [...locked.files], diff: locked.diffs.join("\n").slice(0, 8000) });
 		const changed = await changedFiles(dir, o.adapter.toolchain.ignoredPaths);
 		const problem = changed.length
-			? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger, [o.forUnit, o.unitWork?.unitId, ...(o.waiting ?? [])].filter((u): u is string => !!u))
+			? await check(o.adapter, dir, changed, projectDir(o.config, o.adapter.id), !!o.whole, o.ledger, served)
 			: locked.files.size ? `only files that decide how the checks run were changed (put back): ${[...locked.files].slice(0, 5).join(", ")}` : "nothing was changed";
 		if (problem) {
 			o.ledger.endAttempt(attempt, { outcome: "no_change", gateReport: { said, changedFiles: changed, lockedFiles: [...locked.files], problem: problem.slice(0, 4000), what: o.what.slice(0, 2000) } });
@@ -351,4 +356,3 @@ async function check(adapter: TargetAdapter, dir: string, changed: string[], mai
 	if (!whole) return undefined;
 	return mine < theirs ? undefined : `the whole-project checks fail as much as on main (no error fixed):\n${out.join("\n\n")}`;
 }
-

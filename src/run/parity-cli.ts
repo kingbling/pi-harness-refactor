@@ -11,41 +11,58 @@ import { judgeRun } from "./parity-judge.ts";
 import type { ProbeAsker } from "./legacy-env.ts";
 import { ensureTestLogins, probeApps, setupFixer } from "./parity.ts";
 import { linkDependencies } from "./run.ts";
+import { acquireRunLock } from "./run-lock.ts";
 
-export const PARITY_USAGE = "parity --probe [--again] | parity <slice> [--rewrite] [--no-judge]";
+export const PARITY_USAGE = "parity --verify [--report] [--json] | parity --probe [--again] | parity <slice> [--prepare|--rewrite] [--no-judge]";
 
 /** `br parity` and `/br parity`: probe the apps, or compare one slice (and judge it). Returns the lines to show. */
-export async function parityCommand(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; args: string[]; log?: (l: string) => void }): Promise<string[]> {
+export async function parityCommand(o: { ledger: Ledger; config: Config; root: string; client?: ModelClient; args: string[]; log?: (l: string) => void; onVerification?: (passed: boolean) => void }): Promise<string[]> {
 	const { ledger, config, root, client, args } = o;
 	const slice = args.find((a) => !a.startsWith("--"));
-	if (!args.includes("--probe") && !slice) throw new Error(`usage: ${PARITY_USAGE}`);
+	if (!args.includes("--probe") && !args.includes("--verify") && !slice) throw new Error(`usage: ${PARITY_USAGE}`);
+	if (args.includes("--verify") && args.some((a) => a !== "--verify" && a !== "--report" && a !== "--json")) throw new Error(`strict verification takes no slice or repair flags; usage: ${PARITY_USAGE}`);
+	if (args.includes("--report") && !args.includes("--verify")) throw new Error(`--report requires --verify; usage: ${PARITY_USAGE}`);
+	if (args.includes("--json") && !args.includes("--verify")) throw new Error(`--json requires --verify; usage: ${PARITY_USAGE}`);
+	if (args.includes("--prepare") && args.includes("--rewrite")) throw new Error(`choose --prepare (extend existing coverage) or --rewrite; usage: ${PARITY_USAGE}`);
 	const adapters = await Promise.all(config.target.stacks.map(async (id) => [id, await getTargetAdapter(id)] as const));
 	const linkAll = async (wt: string) => {
 		for (const [id, a] of adapters) await linkDependencies(projectDir(config, id), join(wt, relative(config.target.path, projectDir(config, id))), a.toolchain.worktreeLinks, loadCommandOverrides(root, id).worktreeCopy ?? []);
 	};
-	if (slice) {
-		const serverStack = adapters.find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
-		const ask = async (q: Parameters<ProbeAsker>[0]) => (await askViaModel({ ledger, config, root, client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id;
-		const answer = (id: number) => answerValue(ledger.getQuestion(id)?.answer);
-		const ensureLogins = (sides: string[]) => ensureTestLogins({ config, root, sides, linkAll, log: o.log, ask, answer });
-		const r = await checkSlice({ ledger, config, root, slice, linkAll, serverStack, rewrite: args.includes("--rewrite"), log: o.log, fixSetup: setupFixer({ config, root, log: o.log }), ensureLogins });
-		const lines = [`${slice}: ${r.outcome} — ${r.note}`];
-		if (r.runId !== undefined && r.outcome === "differs" && !args.includes("--no-judge")) {
-			const j = await judgeRun({ ledger, config, root, runId: r.runId, slice, client, log: o.log });
-			lines.push(`judge: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you, ${j.allowed} allowed${j.setup ? `, ${j.setup} from the test setup (br parity --probe fixes it)` : ""}${j.open ? `, ${j.open} not judged` : ""}`);
-		}
-		for (const d of r.diffs.slice(0, 30)) lines.push(`  ${d.step} ${d.route} ${d.kind}${d.path ? ` ${d.path}` : ""}: old ${JSON.stringify(d.legacy)?.slice(0, 120)} · new ${JSON.stringify(d.target)?.slice(0, 120)}`);
-		if (r.diffs.length > 30) lines.push(`  … ${r.diffs.length - 30} more (ledger: parity_diffs, run ${r.runId})`);
-		return lines;
+	if (args.includes("--verify")) {
+		const { verifyParity, renderVerification, verificationPath } = await import("./parity-verification.ts");
+		const { validateParityProjects } = await import("./parity-project-checks.ts");
+		const report = await verifyParity({ ledger, config, root, linkAll, serverStack: adapters.find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!, reportOnly: args.includes("--report"), log: o.log, validateProjects: () => validateParityProjects({ config, root, adapters: new Map(adapters), linkAll, log: o.log }) });
+		o.onVerification?.(report.status === "passed");
+		if (args.includes("--json")) return [JSON.stringify(report, null, 2)];
+		return [...renderVerification(report), ...(args.includes("--report") ? [] : [`Report: ${verificationPath(root)}`])];
 	}
-	const up = await probeApps({
-		config,
-		root,
-		linkAll,
-		log: o.log,
-		again: args.includes("--again"),
-		ask: async (q) => (await askViaModel({ ledger, config, root, client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
-		answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
-	});
-	return Object.entries(up).map(([side, ok]) => `${side.padEnd(12)} ${ok ? "starts" : "does not start"}`);
+	// Manual parity in either Pi or the CLI shares ports/worktrees with migration.
+	const release = acquireRunLock(root);
+	try {
+		if (slice) {
+			const serverStack = adapters.find(([, a]) => a.role === "server")?.[0] ?? config.target.stacks[0]!;
+			const ask = async (q: Parameters<ProbeAsker>[0]) => (await askViaModel({ ledger, config, root, client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id;
+			const answer = (id: number) => answerValue(ledger.getQuestion(id)?.answer);
+			const ensureLogins = (sides: string[]) => ensureTestLogins({ config, root, sides, linkAll, log: o.log, ask, answer });
+			const r = await checkSlice({ ledger, config, root, slice, linkAll, serverStack, rewrite: args.includes("--rewrite"), prepare: args.includes("--prepare"), log: o.log, fixSetup: setupFixer({ config, root, log: o.log }), ensureLogins });
+			const lines = [`${slice}: ${r.outcome} — ${r.note}`];
+			if (r.runId !== undefined && r.outcome === "differs" && !args.includes("--no-judge")) {
+				const j = await judgeRun({ ledger, config, root, runId: r.runId, slice, client, log: o.log });
+				lines.push(`judge: ${j.bugs} bug(s)${j.reopened.length ? ` → re-opened ${j.reopened.join(", ")}` : ""}, ${j.quirks} quirk(s) for you, ${j.allowed} allowed${j.setup ? `, ${j.setup} from the test setup (br parity --probe fixes it)` : ""}${j.open ? `, ${j.open} not judged` : ""}`);
+			}
+			for (const d of r.diffs.slice(0, 30)) lines.push(`  ${d.step} ${d.route} ${d.kind}${d.path ? ` ${d.path}` : ""}: old ${JSON.stringify(d.legacy)?.slice(0, 120)} · new ${JSON.stringify(d.target)?.slice(0, 120)}`);
+			if (r.diffs.length > 30) lines.push(`  … ${r.diffs.length - 30} more (ledger: parity_diffs, run ${r.runId})`);
+			return lines;
+		}
+		const up = await probeApps({
+			config,
+			root,
+			linkAll,
+			log: o.log,
+			again: args.includes("--again"),
+			ask: async (q) => (await askViaModel({ ledger, config, root, client }, { point: "parity_probe", facts: q.facts, options: q.options, recommended: q.recommended, blocks: "none", askedBy: "orchestrator" })).id,
+			answer: (id) => answerValue(ledger.getQuestion(id)?.answer),
+		});
+		return Object.entries(up).map(([side, ok]) => `${side.padEnd(12)} ${ok ? "starts" : "does not start"}`);
+	} finally { release(); }
 }

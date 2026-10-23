@@ -55,6 +55,37 @@ afterEach(() => {
 });
 
 describe("gate: own scope", () => {
+	it("keeps a tester-approved deletion in hand-over after a renamed test replaces it outside the production scope", async () => {
+		const old = "tests/agency/old.spec.ts", renamed = "tests/agency/renamed.spec.ts";
+		write(old, "it('u0#1 accepted behavior', () => {});\n"); commit();
+		rmSync(join(project, old));
+		write(renamed, "it('u0#1 accepted behavior', () => {});\n");
+		const testFiles = [{ path: renamed, sha1: sha1(renamed) }];
+		const before = await gate({ sanctioned: [old], testFiles });
+		expect(step(before, "antigaming_ok")?.output).toContain(`write outside unit scope: ${old}`);
+		const after = await gate({ sanctioned: [old], testFiles, removedTests: [old] });
+		expect(step(after, "antigaming_ok")?.ok).toBe(true);
+		// Merely sanctioning the old file is insufficient: its absent state must be handed over explicitly.
+		const absentSnapshot = await gate({ testFiles });
+		expect(step(absentSnapshot, "antigaming_ok")?.ok).toBe(false);
+	});
+
+	it("does not let implementation restore a removed test or delete its replacement after hand-over", async () => {
+		const old = "tests/agency/old.spec.ts", renamed = "tests/agency/renamed.spec.ts";
+		write(old, "it('u0#1 old test', () => {});\n"); commit();
+		rmSync(join(project, old)); write(renamed, "it('u0#1 replacement', () => {});\n");
+		const testFiles = [{ path: renamed, sha1: sha1(renamed) }];
+		write(old, "it.skip('hidden test', () => {});\n");
+		expect(step(await gate({ testFiles, removedTests: [old] }), "antigaming_ok")?.output).toContain(`test file restored after hand-over: ${old}`);
+		rmSync(join(project, old)); rmSync(join(project, renamed));
+		expect(step(await gate({ testFiles, removedTests: [old] }), "antigaming_ok")?.output).toContain(`test file removed: ${renamed}`);
+	});
+
+	it("a deletion hand-over cannot authorize production files", async () => {
+		const r = await gate({ removedTests: ["src/shared/unsafe.ts"] });
+		expect(step(r, "antigaming_ok")?.output).toContain("non-test path in tester deletion hand-over: src/shared/unsafe.ts");
+	});
+
 	it("a re-ported test of this unit in the add-only zone is not 'edited an existing shared file'", async () => {
 		write("src/shared/agency/agency.spec.ts", "it('u1#1 re-ported', () => {});\n");
 		const testFiles = [{ path: "src/shared/agency/agency.spec.ts", sha1: sha1("src/shared/agency/agency.spec.ts") }];

@@ -1,3 +1,4 @@
+import { EXACT_JSON_VERSION, isExactJsonNumber, parseExactJson } from "./exact-json.ts";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import pc from "picocolors";
@@ -91,7 +92,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 				const script = join(truthDir, source.truth.scriptName);
 				let badTruth = false;
 				if (o.ledger.hasEvidence(u.id, "truth_green_on_old") && existsSync(script)) {
-					const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ? AND verified_on_old = 1").all(u.id) as Array<{ symbol_id: string; inputs: string; expected: string }>).map((c): TruthCase => ({ symbol: c.symbol_id, inputs: JSON.parse(c.inputs), expected: JSON.parse(c.expected) }));
+					const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ? AND verified_on_old = 1").all(u.id) as Array<{ symbol_id: string; inputs: string; expected: string }>).map((c): TruthCase => ({ symbol: c.symbol_id, inputs: parseExactJson(c.inputs), expected: parseExactJson(c.expected) }));
 					const why = notFromOldCode(readFileSync(script, "utf8"), cases, meta.files ?? []);
 					if (why) {
 						badTruth = true;
@@ -134,6 +135,7 @@ export async function recheckAccepted(o: RecheckOptions): Promise<{ checked: num
 						o.ledger.askQuestion({ unitId: u.id, point: "review_outside", question: `The reviewer found problems outside ${u.id}'s files (setup, config, packages):\n${rr.outOfScope}`, options: ["done — fixed outside the code", "ignore — leave it"], blocks: "none", askedBy: "recheck" });
 						log(pc.yellow(`? ${u.id}: problems outside its files — asked, unit stays accepted`));
 					} else if (!r.ok) findings.push(r.output);
+					if (r.judged && r.ok) o.ledger.updateUnit(u.id, { meta: { weakTestsNote: undefined } });
 				}
 				// a sent-back unit nothing judged keeps its old version, so the next recheck tries it again
 				o.ledger.updateUnit(u.id, { meta: { ...JSON.parse(o.ledger.getUnit(u.id)!.meta), rechecked: new Date().toISOString(), ...(judged || findings.length ? { recheckVersion: RECHECK_VERSION } : {}) } });
@@ -194,6 +196,22 @@ export function reopenUnjudgedWiring(ledger: Ledger): string[] {
 	return ids;
 }
 
+/** Older versions waived unresolved weak tests. Preserve their code and truth, then require a clean review. */
+export function reopenWeakTests(ledger: Ledger): string[] {
+	const rows = ledger.db.prepare("SELECT id, json_extract(meta, '$.weakTestsNote') note FROM units WHERE state='accepted' AND COALESCE(json_extract(meta, '$.weakTestsNote'), '') <> '' ORDER BY id").all() as Array<{ id: string; note: string }>;
+	for (const { id, note } of rows) reopenUnit(ledger, id, `This unit was accepted with unresolved weak tests. Keep its existing code and raw legacy truth. Repair the ported tests so they execute the migrated behavior and assert the legacy contract; a reviewer must judge them clean before acceptance. The recorded findings were:\n${note}`, "weak tests were waived without a clean review");
+	return rows.map((r) => r.id);
+}
+
+/** Late quirk questions can arrive after acceptance. Their decisions must still reach the tester and implementation. */
+export function reopenUnsettledQuirks(ledger: Ledger, includePending = false): string[] {
+	const rows = ledger.db.prepare(`SELECT DISTINCT u.id FROM units u JOIN quirks q ON q.unit_id=u.id WHERE u.state='accepted' AND
+		((q.status='kept' AND q.applied IS NOT 'keep') OR (q.status='dropped' AND q.applied IS NOT 'drop')
+		OR (? = 1 AND q.status IN ('pending','asked'))) ORDER BY u.id`).all(includePending ? 1 : 0) as Array<{ id: string }>;
+	for (const { id } of rows) reopenUnit(ledger, id, "This unit has unresolved legacy behavior decisions, or its tests still follow an earlier decision. Keep its existing code and raw legacy truth observations. Ask the pending quirk questions, then update only the affected ported tests and implementation to follow the recorded decisions; preserve unrelated assertions.", "recorded quirk decisions are unresolved or not applied to tests");
+	return rows.map((r) => r.id);
+}
+
 /**
  * The unit's files on main now, relative to its stack's project `dir`: the files its moves point to, plus the files
  * of its commit (repo-relative in git, so only those inside `dir`) that still exist.
@@ -239,7 +257,7 @@ export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root
 	}
 	const left = Math.max(0, todo.length - (o.cap ?? Infinity));
 	const queue = inLine(o.ledger, todo).slice(0, o.cap ?? Infinity);
-	if (queue.length > 20) log(pc.cyan(`truth upgrade: ${queue.length} unit(s) with read-only truth run their script on the old code${left ? ` (${left} in later runs)` : ""}`));
+	if (queue.length > 20) log(pc.cyan(`truth upgrade: ${queue.length} unit(s) with legacy truth needing revalidation run their script on the old code${left ? ` (${left} in later runs)` : ""}`));
 	let down = false;
 	const one = async (id: string) => {
 		const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { files?: string[] };
@@ -268,9 +286,9 @@ export async function upgradeReadTruth(o: { ledger: Ledger; config: Config; root
 	return { upgraded, redone, red, noScript, left, down };
 }
 
-/** Units in `states` with a truth case only read from the old code (never run on it). */
+/** Units whose truth was only read or was parsed before exact-number provenance was recorded. */
 const readTruthUnits = (ledger: Ledger, states: string[]) =>
-	(ledger.db.prepare(`SELECT DISTINCT t.unit_id AS id FROM truth_cases t JOIN units u ON u.id = t.unit_id WHERE t.verified_on_old = 0 AND u.state IN (${states.map(() => "?").join(", ")}) ORDER BY t.unit_id`).all(...states) as Array<{ id: string }>).map((r) => r.id);
+	(ledger.db.prepare(`SELECT DISTINCT t.unit_id AS id FROM truth_cases t JOIN units u ON u.id = t.unit_id WHERE (t.verified_on_old = 0 OR t.numeric_version < ${EXACT_JSON_VERSION}) AND u.state IN (${states.map(() => "?").join(", ")}) ORDER BY t.unit_id`).all(...states) as Array<{ id: string }>).map((r) => r.id);
 
 /**
  * Most useful first: units of slices already compared with the old app (their results lean on these tests), then the
@@ -308,23 +326,34 @@ function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: 
 	const u = ledger.getUnit(id)!;
 	const truthDir = join(root, ".bigrefactor", "truth", id);
 	const recorded = ledger.db.prepare("SELECT id, symbol_id, inputs, expected FROM truth_cases WHERE unit_id = ?").all(id) as Array<{ id: string; symbol_id: string; inputs: string; expected: string }>;
-	const key = (symbol: string, inputs: string) => `${symbol}\u0000${inputs}`;
-	const byKey = new Map(cases.map((c) => [key(c.symbol, JSON.stringify(c.inputs)), c.expected]));
-	const ranFor = (c: { symbol_id: string; inputs: string }) => byKey.get(key(c.symbol_id, c.inputs));
-	const diffs = (c: { symbol_id: string; inputs: string; expected: string }) => differences(JSON.parse(c.expected), ranFor(c));
-	// wrong only where both sides hold a value of the same kind: a key one side lacks proves nothing either way, nor
-	// does another kind of value (read truth of a template's behaviour, {"cursor":"pointer"}, against the text it prints)
-	const kind = (v: unknown) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
-	const wrong = recorded.filter((c) => byKey.has(key(c.symbol_id, c.inputs)) && diffs(c).some((d) => d.a !== undefined && d.b !== undefined && kind(d.a) === kind(d.b)));
-	const unrun = recorded.filter((c) => !byKey.has(key(c.symbol_id, c.inputs)) || diffs(c).length);
-	if (!wrong.length && !unrun.length && recorded.length) {
-		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1 WHERE unit_id = ?").run(id);
+	const key = (symbol: string, inputs: string) => `${symbol}\u0000${JSON.stringify(parseExactJson(inputs))}`;
+	// Match a multiset, not a map: old rounding may have collapsed two distinct inputs
+	// into the same recorded key. Each fresh case can prove at most one recorded case.
+	const unused = new Set(cases);
+	const matched = new Map<string, TruthCase>();
+	for (const record of recorded) {
+		const candidates = [...unused].filter((c) => key(c.symbol, JSON.stringify(c.inputs)) === key(record.symbol_id, record.inputs));
+		const actual = candidates.find((c) => !differences(parseExactJson(record.expected), c.expected).length) ?? candidates[0];
+		if (actual) { matched.set(record.id, actual); unused.delete(actual); }
+	}
+	const ranFor = (c: { id: string }) => matched.get(c.id)?.expected;
+	const diffs = (c: { id: string; expected: string }) => differences(parseExactJson(c.expected), ranFor(c));
+	// Old parsing is emulated only to diagnose lost input precision, never to accept proof.
+	const roundedKey = (symbol: string, inputs: string) => `${symbol}\u0000${JSON.stringify(JSON.parse(inputs))}`;
+	const roundedInputs = [...unused].filter((c) => recorded.some((r) => roundedKey(c.symbol, JSON.stringify(c.inputs)) === roundedKey(r.symbol_id, r.inputs) && differences(c.inputs, parseExactJson(r.inputs)).length));
+	// A missing key or a different kind establishes no equality. Numeric holders still
+	// have numeric kind, so a newly observed exact value can invalidate rounded truth.
+	const kind = (v: unknown) => (v === null ? "null" : isExactJsonNumber(v) ? "number" : Array.isArray(v) ? "array" : typeof v);
+	const wrong = recorded.filter((c) => matched.has(c.id) && diffs(c).some((d) => d.a !== undefined && d.b !== undefined && kind(d.a) === kind(d.b)));
+	const unrun = recorded.filter((c) => !matched.has(c.id) || diffs(c).length);
+	if (!wrong.length && !unrun.length && !unused.size && recorded.length) {
+		ledger.db.prepare("UPDATE truth_cases SET verified_on_old = 1, numeric_version = ? WHERE unit_id = ?").run(EXACT_JSON_VERSION, id);
 		ledger.addEvidence(id, "truth_green_on_old", { cases: recorded.length, script: relative(root, join(truthDir, source.truth.scriptName)), upgradedFromRead: true });
 		return "upgraded";
 	}
-	if (!wrong.length) return "other";
-	const note = `The expected values of this unit were written from reading the old code; now that it runs, it returns other values for ${wrong.length} case(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${JSON.stringify(ranFor(c)).slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
-	if (u.state === "accepted") reopenUnit(ledger, id, note, `truth upgrade: ${wrong.length} case(s) differ when run on the old code`, true);
+	if (!wrong.length && !roundedInputs.length) return "other";
+	const note = `${roundedInputs.length ? `${roundedInputs.length} legacy input case(s) differ because earlier JSON parsing rounded their values. ` : ""}The recorded truth differs from a fresh run of the old code for ${wrong.length} expected value(s): ${wrong.slice(0, 5).map((c) => `${c.id} expected ${c.expected.slice(0, 120)}, the old code returns ${JSON.stringify(ranFor(c)).slice(0, 120)}`).join("; ")}. The truth is made again from running the old code; start from the existing code.`;
+	if (u.state === "accepted") reopenUnit(ledger, id, note, `truth upgrade: ${wrong.length} expected value(s) and ${roundedInputs.length} rounded input case(s) differ on the old code`, true);
 	else {
 		ledger.db.prepare("DELETE FROM truth_cases WHERE unit_id = ?").run(id);
 		ledger.db.prepare("DELETE FROM evidence WHERE unit_id = ? AND type IN ('truth_green_on_old', 'truth_read', 'truth_none', 'truth_ahead')").run(id);
@@ -334,8 +363,8 @@ function judgeRunTruth(ledger: Ledger, root: string, source: SourceAdapter, id: 
 }
 
 /** The old code's environment as a short hash: work tried on it is tried again only once it changes. */
-/** Bump when how scripts are run changes (2: absolute legacy-repo paths made relative), so scripts tried before are tried again. */
-const RUN_RULES = 2;
+/** Bump when how scripts are run changes (3: revalidate truth using exact JSON numbers), so scripts tried before are tried again. */
+const RUN_RULES = 3;
 const envHash = (root: string, config: Config) => createHash("sha1").update(JSON.stringify({ ...loadLegacyEnv(root, config), why: undefined, rules: RUN_RULES })).digest("hex").slice(0, 12);
 /**
  * The same plus the setup fixes made since (each one that worked adds a line to legacy-env.log; a fix often changes
@@ -397,12 +426,12 @@ export async function writeTruthScripts(o: { ledger: Ledger; config: Config; roo
 	res.left = Math.max(0, ids.length - o.cap);
 	if (!ids.length) return res;
 	const queue = inLine(o.ledger, ids).slice(0, o.cap);
-	log(pc.cyan(`truth scripts: ${queue.length} of ${ids.length} accepted unit(s) with read-only truth get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
+	log(pc.cyan(`truth scripts: ${queue.length} of ${ids.length} accepted unit(s) with legacy truth needing revalidation get a script that runs the old code${res.left ? ` (${res.left} in later runs)` : ""}`));
 	let down = false;
 	const one = async (id: string) => {
 		const meta = JSON.parse(o.ledger.getUnit(id)!.meta) as { files?: string[] };
 		const truthDir = join(o.root, ".bigrefactor", "truth", id);
-		const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(id) as Array<{ symbol_id: string; inputs: string }>).map((c) => ({ symbol: c.symbol_id, inputs: JSON.parse(c.inputs) as unknown }));
+		const cases = (o.ledger.db.prepare("SELECT symbol_id, inputs FROM truth_cases WHERE unit_id = ? ORDER BY rowid").all(id) as Array<{ symbol_id: string; inputs: string }>).map((c) => ({ symbol: c.symbol_id, inputs: parseExactJson(c.inputs) as unknown }));
 		if (!cases.length) return;
 		res.tried++;
 		const before = existsSync(join(truthDir, source.truth.scriptName)) ? await verifyTruthOnOld(truthDir, o.config, source, o.root, meta.files ?? []) : undefined;

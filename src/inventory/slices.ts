@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Ledger } from "../ledger/db.ts";
 
 /**
@@ -232,6 +233,22 @@ export function blockingOrder(units: Array<{ id: string; deps: string[]; rank: n
 	return out;
 }
 
+/** Only graph inputs invalidate the plan; unit progress and test evidence do not change its topology. */
+function topologyHash(ledger: Ledger): string {
+	const units = ledger.listUnits().map((u) => {
+		const m = JSON.parse(u.meta) as { files?: string[]; loc?: number; softDeps?: string[]; lane?: string };
+		return { id: u.id, tier: u.tier, deps: (JSON.parse(u.deps) as string[]).sort(), files: [...(m.files ?? [])].sort(), soft: [...(m.softDeps ?? [])].sort(), loc: m.loc, lane: m.lane };
+	}).sort((a, b) => a.id.localeCompare(b.id));
+	const routes = ledger.db.prepare("SELECT method, path, handler_symbol FROM index_routes WHERE side = 'source' ORDER BY method, path, handler_symbol").all();
+	return createHash("sha256").update(JSON.stringify({ units, routes })).digest("hex");
+}
+
+/** Inventory can add units after the initial plan. A cached plan must never leave those units unassigned. */
+export function needsSlicePlan(ledger: Ledger): boolean {
+	return !ledger.getMeta("slice_plan") || ledger.getMeta("slice_plan_topology") !== topologyHash(ledger)
+		|| ledger.listUnits().some((u) => !(JSON.parse(u.meta) as { slice?: string }).slice);
+}
+
 /** Persist the plan into unit meta so the scheduler and dashboard can use it without recomputing. */
 export function applySlicePlan(ledger: Ledger, plan: SlicePlan): void {
 	const rank = new Map(plan.slices.map((s) => [s.name, s.rank]));
@@ -240,6 +257,7 @@ export function applySlicePlan(ledger: Ledger, plan: SlicePlan): void {
 		ledger.updateUnit(u.id, { meta: { ...JSON.parse(u.meta), slice, sliceRank: rank.get(slice) ?? 99, depth: plan.depth.get(u.id) ?? 0 } });
 	}
 	ledger.setMeta("slice_plan", JSON.stringify(plan.slices.map((s) => ({ name: s.name, rank: s.rank, units: s.units.length, loc: s.loc, entryPoints: s.entryPoints }))));
+	ledger.setMeta("slice_plan_topology", topologyHash(ledger));
 }
 
 export function renderSlicePlan(plan: SlicePlan): string {

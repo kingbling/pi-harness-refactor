@@ -1,9 +1,13 @@
+import { jsonNumberKey } from "./exact-json.ts";
+
 /** Shared by parity (old vs new app) and the truth check (two runs of the old code). */
 
 export type Found = { path: string; a: unknown; b: unknown };
 
 /** Every place two JSON values differ: object keys by name, arrays by position. */
 export function differences(a: unknown, b: unknown, path = ""): Found[] {
+	const numberA = jsonNumberKey(a), numberB = jsonNumberKey(b);
+	if (numberA !== undefined || numberB !== undefined) return numberA !== undefined && numberA === numberB ? [] : [{ path, a, b }];
 	const obj = (v: unknown) => v !== null && typeof v === "object" && !Array.isArray(v);
 	if (obj(a) && obj(b)) {
 		const x = a as Record<string, unknown>;

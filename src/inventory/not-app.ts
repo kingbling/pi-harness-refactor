@@ -37,8 +37,12 @@ export function loadNotApp(workspace: string | undefined): NotAppFolder[] {
 	}
 }
 
+/** Nested classifications override a broader folder, independently of profile ordering. */
 export function notAppOf(path: string, folders: NotAppFolder[]): NotAppFolder | undefined {
-	return folders.find((f) => path.startsWith(f.path));
+	let closest: NotAppFolder | undefined;
+	for (const folder of folders)
+		if (path.startsWith(folder.path) && (!closest || folder.path.length > closest.path.length)) closest = folder;
+	return closest;
 }
 
 /**

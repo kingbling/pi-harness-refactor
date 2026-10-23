@@ -1,3 +1,5 @@
+import { parseExactJson } from "./exact-json.ts";
+import { MAX_OBSERVATION_TIMEOUT_MS, observationEnvironment, observationTimeoutMs, runVerificationCommand, type ObservationContext } from "./parity-command.ts";
 import { spawn } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,7 +41,7 @@ export interface AppRecipe {
 	/** Puts the app's data back to its starting state; runs before every start, so runs are comparable. */
 	reset?: { cmd: string; args: string[] };
 	/** Prints the app's data as JSON {"table": [rows ordered by primary key]}; read before and after steps that change data. */
-	dump?: { cmd: string; args: string[] };
+	dump?: { cmd: string; args: string[]; timeoutMs?: number };
 	env?: Record<string, string>;
 }
 
@@ -337,37 +339,16 @@ export async function checkRecipe(recipe: AppRecipe, appDir: string, o: { timeou
 export const MAX_DUMP_MB = 100;
 
 /** The app's data as {table: rows}, from the recipe's dump command. Throws when it prints anything else. */
-export async function dumpData(recipe: AppRecipe, appDir: string): Promise<Record<string, unknown[]>> {
+export async function dumpData(recipe: AppRecipe, appDir: string, context: ObservationContext = {}): Promise<Record<string, unknown[]>> {
 	if (!recipe.dump) return {};
 	setStep(`parity: data dump of the app in ${appDir}`);
-	// stdout is counted as it comes: a dump over the limit (a whole production database) is stopped there, not written out
-	const outText = await new Promise<string>((done, fail) => {
-		const child = spawn(recipe.dump!.cmd, recipe.dump!.args, { cwd: resolve(appDir, recipe.dir), env: { ...process.env, ...recipe.env }, stdio: ["ignore", "pipe", "pipe"] });
-		const chunks: Buffer[] = [];
-		let size = 0;
-		let err = "";
-		let tooBig = false;
-		// a real database dump takes minutes (all tables as JSON)
-		const timer = setTimeout(() => child.kill("SIGKILL"), 600_000);
-		child.stdout.on("data", (c: Buffer) => {
-			if (tooBig) return;
-			size += c.length;
-			if (size > MAX_DUMP_MB * 1024 * 1024) {
-				tooBig = true;
-				child.kill("SIGKILL");
-			} else chunks.push(c);
+	const timeout = observationTimeoutMs(recipe.dump.timeoutMs, 600_000);
+	const { stdout: outText } = await runVerificationCommand(recipe.dump, resolve(appDir, recipe.dir), timeout,
+		{ ...process.env, ...recipe.env, ...observationEnvironment(context) }, {
+			maxBytes: MAX_DUMP_MB * 1024 * 1024, label: "data dump",
+			outputProblem: `the dump printed more than the ${MAX_DUMP_MB} MB a comparison reads: use a complete bounded observation (such as row counts and full-row digests), or only the tables this workflow writes`,
 		});
-		child.stderr.on("data", (c: Buffer) => (err = (err + c.toString()).slice(-4000)));
-		child.on("error", (e) => (clearTimeout(timer), fail(e)));
-		child.on("close", (code, signal) => {
-			clearTimeout(timer);
-			// too big: the setup model learns what to change
-			if (tooBig) fail(new Error(`the dump printed more than the ${MAX_DUMP_MB} MB a comparison reads: dump a small test data set or only the tables the app's routes write, not the whole database`));
-			else if (code !== 0) fail(new Error(`the dump command failed (${signal ?? `exit ${code}`}): ${err.trim().slice(-1000)}`));
-			else done(Buffer.concat(chunks).toString("utf8"));
-		});
-	});
-	const data = JSON.parse(outText.slice(outText.indexOf("{"))) as unknown;
+	const data = parseExactJson(outText.slice(outText.indexOf("{")));
 	if (!data || typeof data !== "object" || Array.isArray(data) || !Object.values(data).every(Array.isArray)) throw new Error('the dump must print {"table": [rows]}');
 	return data as Record<string, unknown[]>;
 }
@@ -392,24 +373,26 @@ const RecipeParams = Type.Object({
 	stopArgs: Type.Optional(Type.Array(Type.String())),
 	resetCmd: Type.Optional(Type.String({ description: "puts the app's data back to its starting state (e.g. reloads the database from the schema/snapshot); runs before every start" })),
 	resetArgs: Type.Optional(Type.Array(Type.String())),
-	dumpCmd: Type.Optional(Type.String({ description: `prints the app's data as JSON {"table": [rows ordered by primary key]}, nothing else on stdout; at most ${MAX_DUMP_MB} MB (a small test data set or the tables the app writes, not a whole production database)` })),
+	dumpCmd: Type.Optional(Type.String({ description: `prints the app's data as JSON {"table": [rows ordered by primary key]}, nothing else on stdout; at most ${MAX_DUMP_MB} MB (complete bounded observations (full-row hashes and counts), or the tables this workflow writes)` })),
 	dumpArgs: Type.Optional(Type.Array(Type.String())),
+	dumpTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_OBSERVATION_TIMEOUT_MS, description: "Explicit time budget for a complete data observation, in milliseconds; default 600000" })),
 	env: Type.Optional(Type.Record(Type.String(), Type.String())),
 	why: Type.Optional(Type.String()),
 });
-type RecipeInput = { dir: string; cmd: string; args: string[]; ready: string; stopCmd?: string; stopArgs?: string[]; resetCmd?: string; resetArgs?: string[]; dumpCmd?: string; dumpArgs?: string[]; env?: Record<string, string>; why?: string };
+type RecipeInput = { dir: string; cmd: string; args: string[]; ready: string; stopCmd?: string; stopArgs?: string[]; resetCmd?: string; resetArgs?: string[]; dumpCmd?: string; dumpArgs?: string[]; dumpTimeoutMs?: number; env?: Record<string, string>; why?: string };
 const toRecipe = (p: RecipeInput): AppRecipe => ({
 	dir: p.dir || ".",
 	start: { cmd: p.cmd, args: p.args },
 	ready: p.ready,
 	...(p.stopCmd ? { stop: { cmd: p.stopCmd, args: p.stopArgs ?? [] } } : {}),
 	...(p.resetCmd ? { reset: { cmd: p.resetCmd, args: p.resetArgs ?? [] } } : {}),
-	...(p.dumpCmd ? { dump: { cmd: p.dumpCmd, args: p.dumpArgs ?? [] } } : {}),
+	...(p.dumpCmd ? { dump: { cmd: p.dumpCmd, args: p.dumpArgs ?? [], ...(p.dumpTimeoutMs !== undefined ? { timeoutMs: p.dumpTimeoutMs } : {}) } } : {}),
 	...(p.env ? { env: p.env } : {}),
 });
 
 /** Why this recipe cannot be used for this side, or undefined. Checked by code, before anything starts. */
 export function recipeProblem(config: Config, root: string, side: string, r: AppRecipe): string | undefined {
+	try { observationTimeoutMs(r.dump?.timeoutMs, 600_000); } catch (e) { return String(e); }
 	if (isAbsolute(r.dir) || r.dir.split(/[\\/]/).includes("..")) return `dir must be relative to the app's root and stay inside it, got ${r.dir}`;
 	if (!isLocal(r.ready)) return `the ready URL must be on this machine (http://localhost:<port>/…), got ${r.ready}`;
 	if (side === LEGACY && resolve(appRoot(config, root, side)) === resolve(config.source.path)) return "the legacy repo is read-only and a running app writes into its folder: call make_legacy_copy first, the old app runs in the copy";

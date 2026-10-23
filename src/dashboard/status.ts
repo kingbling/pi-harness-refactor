@@ -2,6 +2,7 @@ import { forecast, renderForecastLine } from "../run/forecast.ts";
 import { buildParkedKey } from "../run/builder.ts";
 import { lastFinish, notProven, renderFinishLine } from "../run/finish-check.ts";
 import { renderLastRun, type RunRecord } from "../run/run.ts";
+import { verificationSummary } from "../run/parity-verification.ts";
 import pc from "picocolors";
 import type { Ledger } from "../ledger/db.ts";
 
@@ -10,7 +11,8 @@ import type { Ledger } from "../ledger/db.ts";
  * (`/br status` → transcript entry), so it must stay plain and compact; color: false yields pure text.
  */
 /** `runLive`: a run is going on, so only the questions its resolver model handed on are the owner's (Ledger.ownerQuestions). */
-export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: boolean } = {}): string {
+/** `targetHead`: main's HEAD now, so a strict parity pass for it counts as verified (without it none does). */
+export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: boolean; targetHead?: string } = {}): string {
 	const s = ledger.status();
 	const c = opts.color === false ? plain : pc;
 	const lines: string[] = [];
@@ -19,7 +21,7 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 	{
 		const r = ledger.getMeta("last_run");
 		if (r) lines.push(c.dim(renderLastRun(JSON.parse(r) as RunRecord)));
-		lines.push(renderForecastLine(forecast(ledger)) + c.dim("  (br forecast)"));
+		lines.push(renderForecastLine(forecast(ledger, { targetHead: opts.targetHead })) + c.dim("  (br forecast)"));
 	}
 	const totalSym = Object.values(s.symbols).reduce((a, b) => a + b, 0);
 	const acc = (s.symbols["accepted"] ?? 0) + (s.symbols["dropped"] ?? 0);
@@ -75,6 +77,7 @@ export function renderStatus(ledger: Ledger, opts: { color?: boolean; runLive?: 
 		if (f) lines.push(c.dim(`${renderFinishLine(f)}  (br finish)`));
 		else if (never.length && (u["accepted"] ?? 0)) lines.push(c.yellow(`parity  ${never.length} slice${never.length > 1 ? "s" : ""} never compared with the old app (${never.slice(0, 4).join(", ")}${never.length > 4 ? " …" : ""})`));
 	}
+	lines.push(verificationSummary(ledger));
 	const accepted = u["accepted"] ?? 0;
 	lines.push(`first-pass accepted ${s.firstPassAccepted}/${accepted}${accepted ? ` (${Math.round((100 * s.firstPassAccepted) / accepted)}%)` : ""}   cost $${s.costUsd.toFixed(3)}`);
 	for (const r of s.costByModel) lines.push(`  ${r.role.padEnd(11)} ${r.model.padEnd(28)} ${String(r.n).padStart(4)} calls  $${r.c.toFixed(3)}`);

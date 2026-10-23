@@ -39,7 +39,8 @@ describe("the freeze watchdog", () => {
 		const logged: string[] = [];
 		const stop = startWatchdog(root, (l) => logged.push(l));
 		function holdTheThreadForTheTest() {
-			busy(1500);
+			const until = Date.now() + 1500;
+			while (Date.now() < until) { /* the named function itself holds the thread */ }
 		}
 		try {
 			setStep("scheduling pass");
@@ -58,10 +59,12 @@ describe("the freeze watchdog", () => {
 		const logged: string[] = [];
 		const stop = startWatchdog(root, (l) => logged.push(l));
 		function firstFreeze() {
-			busy(1300);
+			const until = Date.now() + 1300;
+			while (Date.now() < until) { /* distinct leaf frames, independent of helper inlining */ }
 		}
 		function secondFreeze() {
-			busy(1300);
+			const until = Date.now() + 1300;
+			while (Date.now() < until) { /* distinct leaf frames, independent of helper inlining */ }
 		}
 		try {
 			await tick(300);

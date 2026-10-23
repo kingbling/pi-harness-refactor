@@ -114,7 +114,9 @@ describe("a parked unit reaches the owner when a person is needed", () => {
 		ledger.updateUnit("S1", { meta: { parkedAt: Date.now() - 60_000 } });
 		askAboutParked(ledger);
 		const q = ledger.openQuestions()[0]!;
-		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: Date.now() })).toEqual(["S1"]);
+		// A later change must be strictly after the failure, even when fixture setup fits within one clock tick.
+		const changedAt = Date.now() + 1;
+		expect(await healQuarantined(ledger, config, root, new Set(), () => {}, noManifests, { since: changedAt, now: changedAt })).toEqual(["S1"]);
 		expect(ledger.getQuestion(q.id)!.status).toBe("withdrawn");
 	});
 });

@@ -1,0 +1,10 @@
+allowBuilds:
+  '@ast-grep/cli': true
+  '@google/genai': true
+  esbuild: true
+  prisma: false
+  protobufjs: true
+  tree-sitter-javascript: true
+  tree-sitter-php: true
+  tree-sitter-typescript: true
+  workerd: false

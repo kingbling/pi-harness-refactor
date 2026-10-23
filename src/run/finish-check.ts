@@ -115,7 +115,7 @@ export async function stubMarkCount(dir: string): Promise<number> {
 
 /** What is not proven by "accepted": expected values read but never run on the old code, slices never compared. */
 export function notProven(ledger: Ledger): { readNotRun: number; neverCompared: string[] } {
-	const readNotRun = (ledger.db.prepare("SELECT COUNT(*) n FROM units u WHERE u.state = 'accepted' AND EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_read') AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_green_on_old')").get() as { n: number }).n;
+	const readNotRun = (ledger.db.prepare("SELECT COUNT(*) n FROM units u WHERE u.state = 'accepted' AND EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type = 'truth_read') AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND e.type IN ('truth_green_on_old','truth_none'))").get() as { n: number }).n;
 	const compared = new Set((ledger.db.prepare("SELECT DISTINCT slice FROM parity_runs WHERE outcome IN ('same', 'differs')").all() as Array<{ slice: string }>).map((r) => r.slice));
 	const slices = new Set(ledger.listUnits().map((u) => (JSON.parse(u.meta) as { slice?: string }).slice).filter((s): s is string => !!s));
 	return { readNotRun, neverCompared: [...slices].filter((s) => !compared.has(s)).sort() };

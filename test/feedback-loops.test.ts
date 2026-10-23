@@ -3,7 +3,6 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ConfigSchema, type Config } from "../src/config.ts";
-import { renderStatus } from "../src/dashboard/status.ts";
 import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
@@ -46,7 +45,7 @@ const sessions = (calls: Call[], implementerTool?: { name: string; args: object 
 		({
 			run: async (task: string) => {
 				calls.push({ role: opts.role, task });
-				// each tester round changes its test (a round that changes nothing never counts toward the weak-tests waiver)
+				// Each tester round changes its test; a changed file alone does not establish stronger assertions.
 				if (opts.role === "test") write(join(ws, "migrated", SPEC), `it('u1#1 creates an agency with its id (round ${calls.filter((c) => c.role === "test").length})', () => {});\n`);
 				const tool = implementerTool && opts.role !== "test" && calls.filter((c) => c.role !== "test").length === 1 ? opts.customTools!.find((t) => t.name === implementerTool.name) : undefined;
 				if (tool) await (tool as unknown as { execute: (i: string, p: object) => Promise<unknown> }).execute("x", implementerTool!.args);
@@ -144,7 +143,7 @@ describe("models fix each other's work", () => {
 		expect(lines.join("\n")).toMatch(/open findings went from 4 to 3: getting there, this round uses no try \(1\/5\)/);
 	});
 
-	it("tests still called weak after 2 tester rounds: the code passes with a note on the unit, no owner question", async () => {
+	it("tests still called weak after two revisions never earn a clean gate", async () => {
 		const calls: Call[] = [];
 		const weak = "- agency.service.spec.ts: only checks it renders";
 		const reviewer = async () => ({ ok: false, judged: true, output: `weak tests (the tester rewrites them):\n${weak}`, weakTests: weak, findings: [] });
@@ -153,17 +152,15 @@ describe("models fix each other's work", () => {
 			return r.ok ? green(g) : red(g, "wired_ok", r.output);
 		};
 		const r = await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: sessions(calls), gate, reviewer, log: () => {} });
-		expect(asked(calls).map((c) => c.role)).toEqual(["implement", "test", "test"]);
-		expect(r).toMatchObject({ state: "review", attempts: 1 });
-		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toMatch(/after 2 tester rounds[\s\S]*only checks it renders/);
-		// the owner sees it in br status once the unit is accepted
-		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'u1'").run();
-		expect(renderStatus(ledger, { color: false })).toMatch(/accepted with tests the reviewer still finds weak \(1\):\n\s+u1: - agency\.service\.spec\.ts: only checks it renders/);
+		expect(asked(calls).filter((c) => c.role === "test")).toHaveLength(2);
+		expect(r.state).toBe("quarantined");
+		expect(r.gate?.ok).toBe(false);
+		expect(ledger.db.prepare("SELECT COUNT(*) n FROM attempts WHERE outcome='review_ok' OR outcome='gate_green'").get()).toEqual({ n: 0 });
 		expect(ledger.db.prepare("SELECT COUNT(*) n FROM questions").get()).toEqual({ n: 0 });
 	});
 
-	// disputes and weak tests have their own 2 tester rounds each: the waiver comes only after 2 weak-tests rounds
-	it("tester rounds spent on disputes do not count toward the weak-tests pass: weak tests are never waved through untried", async () => {
+	// Disputes and weak tests retain separate revision budgets; neither budget can waive a red review.
+	it("tester rounds spent on disputes do not consume weak-test repairs or waive their findings", async () => {
 		const calls: Call[] = [];
 		const weak = "- agency.service.spec.ts: only checks it renders";
 		// the implementer disputes a test in every attempt; the first two gates fail on the tests, then only the review is red
@@ -188,8 +185,8 @@ describe("models fix each other's work", () => {
 		const testerTasks = asked(calls).filter((c) => c.role === "test").map((c) => c.task);
 		expect(testerTasks.filter((t) => /The implementer disputes these tests/.test(t))).toHaveLength(2);
 		expect(testerTasks.filter((t) => /The reviewer finds these tests too weak/.test(t))).toHaveLength(2);
-		expect(r.state).toBe("review");
-		expect(JSON.parse(ledger.getUnit("u1")!.meta).weakTestsNote).toMatch(/after 2 tester rounds/);
+		expect(r.state).toBe("quarantined");
+		expect(r.gate?.ok).toBe(false);
 	});
 
 	it("a dispute after 2 weak-tests rounds still reaches the tester (its own budget)", async () => {

@@ -1,3 +1,4 @@
+import { isExactJsonNumber, jsonNumberKey, parseExactJson } from "./exact-json.ts";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -104,8 +105,27 @@ export function caseIds(unitId: string, recorded: Array<{ id: string; symbol_id:
 	const left = [...recorded];
 	let next = Math.max(0, ...recorded.map((r) => Number(r.id.slice(r.id.lastIndexOf("#") + 1)) || 0));
 	return cases.map((c) => {
-		const i = left.findIndex((r) => r.symbol_id === c.symbol && r.inputs === JSON.stringify(c.inputs));
+		const i = left.findIndex((r) => r.symbol_id === c.symbol && JSON.stringify(parseExactJson(r.inputs)) === JSON.stringify(c.inputs));
 		return i >= 0 ? left.splice(i, 1)[0]!.id : `${unitId}#${++next}`;
+	});
+}
+
+/** Optional, reviewed import bookkeeping; never infers named argument order from JSON property order. */
+export function truthImportConfig(dir: string): { inputKeys?: Record<string, string[]>; retainRecordedCases?: boolean } {
+	const file = join(dir, "import.json");
+	return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
+}
+
+export function normalizeTruthInputs(dir: string, cases: TruthCase[]): TruthCase[] {
+	const { inputKeys = {} } = truthImportConfig(dir);
+	return cases.map((c) => {
+		const keys = inputKeys[c.symbol];
+		if (!keys) return c;
+		if (!keys.length || new Set(keys).size !== keys.length || keys.some((k) => typeof k !== "string")) throw new Error(`Invalid input keys for ${c.symbol}`);
+		const values = Array.isArray(c.inputs) ? c.inputs : null;
+		if (values ? values.length !== keys.length : !c.inputs || typeof c.inputs !== "object" || isExactJsonNumber(c.inputs) || Object.keys(c.inputs).length !== keys.length || keys.some((k) => !Object.hasOwn(c.inputs as object, k)))
+			throw new Error(`Inputs do not match configured argument keys for ${c.symbol}`);
+		return { ...c, inputs: Object.fromEntries(keys.map((k, i) => [k, values ? values[i] : (c.inputs as Record<string, unknown>)[k]])) };
 	});
 }
 
@@ -159,7 +179,7 @@ export async function verifyTruthOnOld(truthDirAbs: string, config: Config, sour
 		const again = lastJsonArray(await exec(cmd, args, { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024 }));
 		const unstable = differences(cases.map((c) => c.expected), (again as TruthCase[] | undefined)?.map((c) => c?.expected) ?? []);
 		if (unstable.length) return { ok: false, cases: [], error: `expected values differ between two runs of the old code, so no new code can match them: ${unstable.slice(0, 3).map((d) => `case ${d.path.replace(/^\[(\d+)\]/, (_, n) => `#${Number(n) + 1}`)}: ${JSON.stringify(d.a)} then ${JSON.stringify(d.b)}`).join("; ")}. Give the code a fixed input (clock, seed, sorted order), or leave that value out of expected.` };
-		return { ok: true, cases };
+		return { ok: true, cases: normalizeTruthInputs(truthDirAbs, cases) };
 	} catch (e: any) {
 		// stderr carries the runtime's own message ("Failed opening required …"); it is captured, never printed into the UI
 		return { ok: false, cases: [], error: [e?.stderr, e?.stdout].map((x) => String(x ?? "").trim()).filter(Boolean).join("\n").slice(-800) || String(e?.message ?? e) };
@@ -175,7 +195,7 @@ function lastJsonArray(out: string): unknown[] | undefined {
 	for (let i = lines.length - 1; i >= 0; i--) {
 		if (!lines[i]!.trimStart().startsWith("[")) continue;
 		try {
-			const v = JSON.parse(lines.slice(i).join("\n"));
+			const v = parseExactJson(lines.slice(i).join("\n"));
 			if (Array.isArray(v)) return v;
 		} catch {
 			/* not the start of the array: look further up */
@@ -183,7 +203,7 @@ function lastJsonArray(out: string): unknown[] | undefined {
 	}
 	// the array printed right after other text on the same line
 	try {
-		const v = JSON.parse(out.slice(out.indexOf("[")));
+		const v = parseExactJson(out.slice(out.indexOf("[")));
 		return Array.isArray(v) ? v : undefined;
 	} catch {
 		return undefined;
@@ -214,12 +234,21 @@ export function loadsFile(script: string, file: string): boolean {
 export function notFromOldCode(script: string, cases: TruthCase[], legacyFiles: string[]): string | undefined {
 	if (legacyFiles.length && !legacyFiles.some((f) => loadsFile(script, f))) return `the script loads none of this unit's legacy files (${legacyFiles.join(", ")}): the expected values must come from running them`;
 	const leaves = (v: unknown): string[] =>
-		typeof v === "string" ? (v.length >= 4 ? [v] : []) : typeof v === "number" ? (String(v).length >= 4 ? [String(v)] : []) : v && typeof v === "object" ? Object.values(v).flatMap(leaves) : [];
+		typeof v === "string" ? (v.length >= 4 ? [v] : []) : typeof v === "number" || isExactJsonNumber(v) ? (String(v).length >= 4 ? [String(v)] : []) : v && typeof v === "object" ? Object.values(v).flatMap(leaves) : [];
 	let checked = 0;
 	let typed = 0;
 	for (const c of cases) {
 		const inputs = JSON.stringify(c.inputs ?? null);
-		const own = leaves(c.expected).filter((l) => !inputs.includes(l) && !inputs.includes(JSON.stringify(l).slice(1, -1)));
+		const numbers = (v: unknown): string[] => {
+			const key = jsonNumberKey(v);
+			return key !== undefined ? [key] : v && typeof v === "object" ? Object.values(v).flatMap(numbers) : [];
+		};
+		const inputNumbers = new Set(numbers(c.inputs));
+		const own = leaves(c.expected).filter((l) => {
+			if (inputs.includes(l) || inputs.includes(JSON.stringify(l).slice(1, -1))) return false;
+			try { if (inputNumbers.has(jsonNumberKey(parseExactJson(l)) ?? "")) return false; } catch { /* textual leaf */ }
+			return true;
+		});
 		if (!own.length) continue;
 		checked++;
 		if (own.every((l) => typedIn(script, l))) typed++;
@@ -229,7 +258,10 @@ export function notFromOldCode(script: string, cases: TruthCase[], legacyFiles: 
 
 /** The value is written in the script as a literal of its own: a quoted string, or a number standing alone (not part of a longer name). */
 function typedIn(script: string, value: string): boolean {
-	if (/^-?\d+(\.\d+)?$/.test(value)) return new RegExp(String.raw`(?<![\w.])${esc(value)}(?![\w.])`).test(script);
+	try {
+		const key = jsonNumberKey(parseExactJson(value));
+		if (key !== undefined) return [...script.matchAll(/(?<![\w.])(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)(?![\w.])/g)].some((m) => jsonNumberKey(parseExactJson(m[1]!)) === key);
+	} catch { /* a string rather than a numeric leaf */ }
 	const quoted = (q: string) => script.includes(`${q}${value}${q}`) || script.includes(`${q}${value.replaceAll(q, `\\${q}`)}${q}`);
 	return quoted('"') || quoted("'") || quoted("`");
 }
@@ -240,10 +272,10 @@ export function loadReadTruth(truthDirAbs: string): TruthResult {
 	const none = noBehaviourReason(truthDirAbs);
 	if (!existsSync(file)) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `tester did not write ${READ_CASES_FILE}` };
 	try {
-		const cases = JSON.parse(readFileSync(file, "utf8")) as TruthCase[];
+		const cases = parseExactJson(readFileSync(file, "utf8")) as TruthCase[];
 		if (!Array.isArray(cases) || !cases.length) return none ? { ok: true, cases: [], none } : { ok: false, cases: [], error: `${READ_CASES_FILE} holds no cases ${NO_CASES_HINT}` };
 		if (cases.some((c) => typeof c?.symbol !== "string" || !("expected" in c))) return { ok: false, cases: [], error: `every case in ${READ_CASES_FILE} needs a symbol and an expected value` };
-		return { ok: true, cases };
+		return { ok: true, cases: normalizeTruthInputs(truthDirAbs, cases) };
 	} catch (e: any) {
 		return { ok: false, cases: [], error: `${READ_CASES_FILE} is not valid JSON: ${e?.message ?? e}` };
 	}

@@ -2,12 +2,34 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { inventory } from "../src/inventory/run.ts";
-import { applySlicePlan, authWord, planSlices } from "../src/inventory/slices.ts";
+import { applySlicePlan, authWord, needsSlicePlan, planSlices } from "../src/inventory/slices.ts";
 import { Ledger } from "../src/ledger/db.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/mini-app");
 
 describe("vertical slices over the dependency DAG", () => {
+	it("refreshes cached plans after inventory adds units or changes routes, preserving explicit overrides", async () => {
+		const ledger = new Ledger(":memory:");
+		const config = ConfigSchema.parse({ source: { path: FIXTURE, stack: "php" }, target: { path: "/tmp/x", stacks: ["nestjs"] }, models: {} });
+		await inventory(config, FIXTURE, ledger);
+		expect(needsSlicePlan(ledger)).toBe(true);
+		const overrides = { overrides: { added: "invoices" } };
+		applySlicePlan(ledger, planSlices(ledger, overrides));
+		expect(needsSlicePlan(ledger)).toBe(false);
+		ledger.createUnit({ id: "added", tier: "T1", deps: ["U004_src_Pricing"], meta: { files: ["src/Extra.php"] }, symbolIds: [] });
+		expect(needsSlicePlan(ledger)).toBe(true);
+		applySlicePlan(ledger, planSlices(ledger, overrides));
+		expect(JSON.parse(ledger.getUnit("added")!.meta).slice).toBe("invoices");
+		expect(needsSlicePlan(ledger)).toBe(false);
+		ledger.updateUnit("added", { meta: { ...JSON.parse(ledger.getUnit("added")!.meta), weakTestsNote: "test metadata is not graph topology" } });
+		expect(needsSlicePlan(ledger)).toBe(false);
+		ledger.db.prepare("UPDATE index_routes SET path = '/renamed' WHERE side = 'source'").run();
+		expect(needsSlicePlan(ledger)).toBe(true);
+		applySlicePlan(ledger, planSlices(ledger, overrides));
+		expect(needsSlicePlan(ledger)).toBe(false);
+		ledger.db.prepare("UPDATE units SET deps = '[]' WHERE id = 'added'").run();
+		expect(needsSlicePlan(ledger)).toBe(true);
+	});
 	it("foundation = shared leaves, one feature from the routes, deep units first, deterministic", async () => {
 		const ledger = new Ledger(":memory:");
 		const config = ConfigSchema.parse({ source: { path: FIXTURE, stack: "php" }, target: { path: "/tmp/x", stacks: ["nestjs"] }, models: {} });

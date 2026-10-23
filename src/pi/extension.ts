@@ -59,7 +59,7 @@ const SUBCOMMANDS: Record<string, string> = {
 	requeue: "requeue <unit...> | --all [--fresh]: put quarantined or waiting units back into the queue (after a fix); --fresh: the tester drafts the interface and tests again",
 	recheck: "recheck [--limit N] [--again] [--then-run]: accepted units under the newer checks; failures go back to planned with their code kept (background); --then-run starts the migration run when it is done",
 	finish: "finish: is the new app really done? stub marks left, pages the entry never feeds, frontend calls with no backend route, stacks not joined, migrations on an empty database (background report; br run does it at the end and hands the gaps to code jobs)",
-	parity: "parity --probe [--again]: can the old and the new app start here · parity <slice> [--rewrite] [--no-judge]: send the same requests to both, compare, judge (background; br run does it by itself for finished slices)",
+	parity: "parity --verify [--report] [--json]: strict final replay; --report lists readiness blockers · parity <slice> --prepare: author and compare missing workflow checks · parity --probe [--again]: can both apps start · parity <slice> [--rewrite] [--no-judge]: compare one slice (background)",
 	answer: "answer: walk through the open questions one dialog at a time (identical ones together) · answer <id> <text>",
 	init: "init: give the old and the new folder; gathers data, asks the decisions, builds the workspace",
 	start: "start: same as init",
@@ -282,7 +282,7 @@ function statusText(d: Durable): string {
 	const open = d.questions;
 	const left = f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}), ${f.remaining.hours[1] < 48 ? `${f.remaining.hours[1].toFixed(1)} h` : `${(f.remaining.hours[1] / 24).toFixed(1)} days`} [${f.confidence}]` : "";
 	// the % is legacy lines weighted by difficulty, not units: small units land first, so it trails the unit count
-	return `br ${pluginVersion()} · ${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% of the code · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
+	return `br ${pluginVersion()} · ${(f.done * 100).toFixed(f.done < 0.1 ? 1 : 0)}% done (code ${(f.progress * 100).toFixed(0)}% · parity ${f.parity.same}/${f.parity.slices}${f.parity.verified ? " verified" : ""}) · ✓ ${d.accepted}/${f.units.total} accepted · ■ ${d.quarantined} quarantined${d.waiting ? ` · ⏸ ${d.waiting} waiting` : ""} · spent ${money(d.spentUsd)} total${left}${open ? ` · ${open} question${open > 1 ? "s" : ""} for you (/br answer)` : ""}`;
 }
 
 /** Warnings: a toast with a UI, the console without one (print mode swallows notify). */
@@ -346,7 +346,7 @@ export function renderProgress(s: ProgressSnapshot, width = 100, totals?: Durabl
 		if (s.waiting) L.push(`${pc.yellow(`${spinner(now)} ${s.waiting.what}`)} ${pc.dim(`(${ELAPSED(now - s.waiting.since)})`)}`.slice(0, width + 20));
 		if (totals) {
 			const f = totals.forecast;
-			L.push(pc.dim(`${(f.progress * 100).toFixed(f.progress < 0.1 ? 1 : 0)}% done · spent ${money(totals.spentUsd)} total${f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}) [${f.confidence}]` : ""} · /br forecast`.slice(0, width)));
+			L.push(pc.dim(`${(f.done * 100).toFixed(f.done < 0.1 ? 1 : 0)}% done (code ${(f.progress * 100).toFixed(0)}% · parity ${f.parity.same}/${f.parity.slices}${f.parity.verified ? " verified" : ""}) · spent ${money(totals.spentUsd)} total${f.remaining ? ` · left ≈ ${money(f.remaining.usd[1])} (${money(f.remaining.usd[0])}–${money(f.remaining.usd[2])}) [${f.confidence}]` : ""} · /br forecast`.slice(0, width)));
 		}
 		const lastDone = [...s.steps].reverse().find((x) => x.status !== "running");
 		if (lastDone) L.push(pc.dim(`last: ${lastDone.status === "done" ? "✓" : lastDone.status === "skipped" ? "⏸" : "■"} ${lastDone.name}${lastDone.note ? `  ${lastDone.note}` : ""}`.slice(0, width)));
@@ -798,7 +798,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			if (sub === "parity") {
-				return startJob(pi, ctx, rest.includes("--probe") ? "parity: can the apps start" : `parity check of ${rest.find((a) => !a.startsWith("--")) ?? "?"}`, async () => {
+				return startJob(pi, ctx, rest.includes("--verify") ? "strict final parity verification" : rest.includes("--probe") ? "parity: can the apps start" : `parity check of ${rest.find((a) => !a.startsWith("--")) ?? "?"}`, async () => {
 					const cp = findConfigPath(ctx.cwd);
 					if (!cp) return { error: "no bigrefactor.config.json here" };
 					const { config, root } = loadConfig(cp);
@@ -806,7 +806,7 @@ export default function (pi: ExtensionAPI) {
 					const { OpenRouterClient } = await import("../models/openrouter.ts");
 					const ledger = new Ledger(join(root, STATE_DIR, "ledger.sqlite"));
 					try {
-						return { lines: await parityCommand({ ledger, config, root, client: new OpenRouterClient(), args: rest, log: (l) => progress.log(l) }) };
+						return { lines: await parityCommand({ ledger, config, root, client: rest.includes("--verify") ? undefined : new OpenRouterClient(), args: rest, log: (l) => progress.log(l) }) };
 					} catch (e: any) {
 						return { error: String(e?.message ?? e) };
 					} finally {
@@ -1017,7 +1017,11 @@ export default function (pi: ExtensionAPI) {
 					const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
 					text = await checkLayout(config, root, ledger).then((r) => renderLayout(r).join("\n"), (e) => `layout check failed: ${e?.message ?? e}`);
 				}
-				else text = renderStatus(ledger, { color: false, runLive: runLive(loadConfig(findConfigPath(ctx.cwd)!).root) });
+				else {
+					const { config, root } = loadConfig(findConfigPath(ctx.cwd)!);
+					const { headOf } = await import("../git.ts");
+					text = renderStatus(ledger, { color: false, runLive: runLive(root), targetHead: await headOf(config.target.path) });
+				}
 				show(ctx, sub, text);
 			} finally {
 				ledger.close();

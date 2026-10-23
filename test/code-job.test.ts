@@ -13,7 +13,7 @@ import { runCodeJob } from "../src/run/code-job.ts";
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 describe("the code job", () => {
-	async function job(worker: (dir: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; boot?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean; checkConfigGlobs?: string[]; test?: (dir: string, files: string[]) => { cmd: string; args: string[] }; probeTest?: { path: string; content: string; failing?: string }; unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> }; forUnit?: string; waiting?: string[] } = {}) {
+	async function job(worker: (dir: string, what: string) => string | Promise<string>, protectedGlobs: string[] = [], checkTree?: (dir: string, only?: string[]) => string[], wiringFiles: string[] = [], o: { main?: Record<string, string>; build?: { cmd: string; args: string[] }; boot?: { cmd: string; args: string[] }; ledger?: Ledger; whole?: boolean; checkConfigGlobs?: string[]; test?: (dir: string, files: string[]) => { cmd: string; args: string[] }; probeTest?: { path: string; content: string; failing?: string }; unitWork?: { unitId: string; apply: (wt: string) => Promise<boolean> }; forUnit?: string; waiting?: string[] } = {}) {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "br-code-job-")));
 		const target = join(root, "new");
 		mkdirSync(join(target, "src"), { recursive: true });
@@ -59,7 +59,7 @@ describe("the code job", () => {
 				return undefined;
 			},
 			log: () => {},
-			worker: async ({ dir }) => worker(dir),
+			worker: async ({ dir, what }) => worker(dir, what),
 			onRefused: (p, d) => ((refused = p), (diff = d)),
 			onLocked: (l) => (locked = l),
 			unitWork: o.unitWork,
@@ -127,6 +127,24 @@ describe("the code job", () => {
 		expect(r.onMain["src/renderer.txt"]).toBe("class StatusMailRenderer\n");
 		expect(r.onMain["src/b.txt"]).toBe("code\n");
 	});
+	it("supplies only decided behavior contracts of the served units, including kept behavior", async () => {
+		const ledger = new Ledger(":memory:");
+		for (const id of ["requester", "waiting", "unrelated"]) ledger.createUnit({ id, tier: "T1", symbolIds: [] });
+		const insert = ledger.db.prepare("INSERT INTO quirks(unit_id,symbol_id,kind,behaviour,opinion,why,status,decided_by,created_at) VALUES (?,?,'suspected_bug',?,'drop','saved migration goal',?,'human',?)");
+		insert.run("requester", "waitingApprovals", "suppresses all waiting rows", "dropped", new Date().toISOString());
+		insert.run("waiting", "limit", "returns at most ten rows", "kept", new Date().toISOString());
+		insert.run("requester", "pending", "undecided behavior", "asked", new Date().toISOString());
+		insert.run("unrelated", "other", "unrelated behavior", "dropped", new Date().toISOString());
+		let task = "";
+		const r = await job((dir, what) => ((task = what), code(dir), "added b"), [], undefined, [], { ledger, forUnit: "requester", waiting: ["waiting"] });
+		expect(r.merged).toBe(true);
+		expect(task).toContain("Quirk #1 (requester, waitingApprovals): suppresses all waiting rows");
+		expect(task).toContain("DROP this legacy behavior; test the intended behavior (decided by human)");
+		expect(task).toContain("Quirk #2 (waiting, limit): returns at most ten rows");
+		expect(task).toContain("KEEP this legacy behavior");
+		expect(task).not.toContain("undecided behavior");
+		expect(task).not.toContain("unrelated behavior");
+	});
 	it("no code at all fails the check: the job was to write code", async () => {
 		const r = await job((dir) => (writeFileSync(join(dir, "notes.md"), "todo\n"), "wrote notes"));
 		expect(r.merged).toBe(false);
@@ -193,6 +211,19 @@ describe("the code job", () => {
 		// the unit is accepted: its marks are anyone's to remove
 		ledger.db.prepare("UPDATE units SET state = 'accepted' WHERE id = 'billing'").run();
 		expect((await job(unmark, [], undefined, [], main)).merged).toBe(true);
+	});
+	it("tells the worker which open-unit marks are reserved before it writes shared integration", async () => {
+		const ledger = new Ledger(":memory:");
+		for (const id of ["requester", "U2232_players_controller", "accepted"]) ledger.createUnit({ id, tier: "T1", symbolIds: [] });
+		ledger.db.prepare("UPDATE units SET state='accepted' WHERE id='accepted'").run();
+		const main = { "src/entry.txt": "// TODO(br:U2232) player details\n", "src/own.txt": "// TODO(br:requester) own work\n", "src/done.txt": "// TODO(br:accepted) already accepted\n" };
+		let task = "";
+		const result = await job((dir, what) => { task = what; code(dir); return "added shared integration beside player details"; }, [], undefined, [], { main, ledger, forUnit: "requester" });
+		expect(result.merged).toBe(true);
+		expect(task).toContain("this job serves requester");
+		expect(task).toContain("src/entry.txt:1: TODO(br:U2232) belongs to U2232_players_controller");
+		expect(task).not.toContain("TODO(br:requester) belongs");
+		expect(task).not.toContain("TODO(br:accepted) belongs");
 	});
 	it("a loose mark of a unit not accepted yet is that unit's too; a new mark must name a unit still to come; files with only comments and tests on a mark are refused", async () => {
 		const ledger = new Ledger(":memory:");
