@@ -137,8 +137,9 @@ omitted historical cases as revalidated.
 `br run` has each app's setup model make what this needs (at most 3 tries per app,
 at the run's start and after a strict replay that did not pass): a data reset
 that empties the database and loads its schema and a small fixture (seed data
-with the test account and enough rows for real pages, never a second full copy
-of a large database), the files it reads recorded with its `set_fixture_files`
+with the test account, every row it is linked to in tables of any size, and
+enough rows for real pages, never a second full copy of a large database; the
+new app served as its production deployment serves it), the files it reads recorded with its `set_fixture_files`
 tool (never files in the temporary parity worktree, which is made again for
 every check: a recorded file that is gone or there is recorded again), and, for
 the old app, each tracked file of its copy changed for local config declared as
