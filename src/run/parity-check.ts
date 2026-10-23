@@ -92,14 +92,55 @@ export interface Diff {
 const sliceDir = (root: string, slice: string) => join(root, ".bigrefactor", "parity", "slices", slice.replace(/[^\w.-]+/g, "_"));
 const stepsPath = (root: string, slice: string) => join(sliceDir(root, slice), "steps.json");
 
-/** The slice's routes on the old side ("GET /invoices") and its units' legacy files. */
+/** The slice's routes on the old side ("GET /invoices") and its units' legacy files, with the framework routes it covers (frameworkRoutes). */
 export function sliceFacts(ledger: Ledger, slice: string): { routes: string[]; files: string[]; units: Array<{ id: string; state: string }> } {
 	const units = ledger.db.prepare("SELECT id, state, meta FROM units WHERE json_extract(meta, '$.slice') = ?").all(slice) as Array<{ id: string; state: string; meta: string }>;
 	const files = units.flatMap((u) => (JSON.parse(u.meta) as { files?: string[] }).files ?? []);
 	const own = new Set(files);
 	const rows = ledger.db.prepare("SELECT method, path, handler_symbol FROM index_routes WHERE side = 'source'").all() as Array<{ method: string | null; path: string; handler_symbol: string | null }>;
 	const routes = [...new Set(rows.filter((r) => r.handler_symbol && own.has(r.handler_symbol.split("::")[0]!)).map((r) => `${r.method ?? "ANY"} ${r.path}`))];
-	return { routes, files, units: units.map((u) => ({ id: u.id, state: u.state })) };
+	const extra = [...frameworkRoutes(ledger)].filter(([, f]) => f.slice === slice);
+	return { routes: [...routes, ...extra.map(([r]) => r)], files: [...new Set([...files, ...extra.flatMap(([, f]) => (f.file ? [f.file] : []))])], units: units.map((u) => ({ id: u.id, state: u.state })) };
+}
+
+const firstSegment = (path: string) => path.replace(/^\/+/, "").split("/")[0] ?? "";
+
+/**
+ * Source routes no unit's files hold (the framework's own: post_command, robots.txt, sitemap.xml), each given to
+ * one slice whose steps compare it too: the slice whose own routes share its first path segment most, else the slice
+ * with the most routes. Strict verification needs a compared step for every route; one the old app does not serve
+ * here is compared too (both answer 404).
+ */
+export function frameworkRoutes(ledger: Ledger): Map<string, { slice: string; file?: string }> {
+	const fileSlice = new Map<string, string>();
+	for (const u of ledger.db.prepare("SELECT meta FROM units WHERE json_extract(meta, '$.slice') IS NOT NULL").all() as Array<{ meta: string }>) {
+		const m = JSON.parse(u.meta) as { slice: string; files?: string[] };
+		for (const f of m.files ?? []) fileSlice.set(f, m.slice);
+	}
+	const rows = ledger.db.prepare("SELECT method, path, handler_symbol FROM index_routes WHERE side = 'source'").all() as Array<{ method: string | null; path: string; handler_symbol: string | null }>;
+	const bySegment = new Map<string, Map<string, number>>();
+	const total = new Map<string, number>();
+	const unowned: Array<{ key: string; path: string; file?: string }> = [];
+	for (const r of rows) {
+		const file = r.handler_symbol?.split("::")[0];
+		const slice = file ? fileSlice.get(file) : undefined;
+		if (!slice) {
+			unowned.push({ key: `${r.method ?? "ANY"} ${r.path}`, path: r.path, file });
+			continue;
+		}
+		const seg = bySegment.get(firstSegment(r.path)) ?? new Map<string, number>();
+		seg.set(slice, (seg.get(slice) ?? 0) + 1);
+		bySegment.set(firstSegment(r.path), seg);
+		total.set(slice, (total.get(slice) ?? 0) + 1);
+	}
+	const most = (counts: Map<string, number> | undefined) => [...(counts ?? [])].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+	const fallback = most(total);
+	const out = new Map<string, { slice: string; file?: string }>();
+	for (const r of unowned) {
+		const slice = most(bySegment.get(firstSegment(r.path))) ?? fallback;
+		if (slice && !out.has(r.key)) out.set(r.key, { slice, file: r.file });
+	}
+	return out;
 }
 
 /** The slice's units that hold one of its routes' handlers: once these are accepted, the slice can be compared. */

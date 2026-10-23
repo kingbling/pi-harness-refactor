@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Ledger } from "../src/ledger/db.ts";
-import { sliceComplete, suiteGaps } from "../src/run/parity-check.ts";
+import { frameworkRoutes, sliceComplete, sliceFacts, suiteGaps } from "../src/run/parity-check.ts";
 import { MAX_PARITY_ERRORS, notePrepare, paritySlices, prepareTries, unpreparedSlices } from "../src/run/run.ts";
 import { lastRun, renderLastRun, writeRunRecord } from "../src/run/run.ts";
 
@@ -40,6 +40,19 @@ describe("br run prepares missing parity checks", () => {
 		expect(suiteGaps(ledger, root, "web").join("\n")).toMatch(/no compared scenario for GET \/?web/);
 		suite("web", { steps: [{ id: "s1", route: "GET /web", compare: "page", method: "GET", path: "/web" }] });
 		expect(suiteGaps(ledger, root, "web").join("\n")).toMatch(/page s1: needs a browser check/);
+	});
+
+	it("gives each framework route no unit holds to one slice: the one sharing its first path segment, else the biggest", () => {
+		ledger.db.prepare("INSERT INTO index_routes(id,side,method,path,handler_symbol) VALUES ('j','source','GET','jobs/list','U1.php::run')").run();
+		ledger.db.prepare("INSERT INTO index_routes(id,side,method,path,handler_symbol) VALUES ('j2','source','GET','jobs/run','U2.php::run')").run();
+		ledger.db.prepare("INSERT INTO index_routes(id,side,method,path,handler_symbol) VALUES ('f1','source',NULL,'web/process','gyro/scheduler.php::process')").run();
+		ledger.db.prepare("INSERT INTO index_routes(id,side,method,path,handler_symbol) VALUES ('f2','source',NULL,'robots.txt','gyro/robots.php::txt')").run();
+		expect([...frameworkRoutes(ledger)]).toEqual([["ANY web/process", { slice: "web", file: "gyro/scheduler.php" }], ["ANY robots.txt", { slice: "jobs", file: "gyro/robots.php" }]]);
+		// the slice's steps must compare them, and its step writer reads their handlers
+		expect(sliceFacts(ledger, "jobs")).toMatchObject({ routes: ["GET jobs/list", "GET jobs/run", "ANY robots.txt"], files: ["U1.php", "U2.php", "gyro/robots.php"] });
+		accept("U1", "U2");
+		suite("jobs", { steps: [{ id: "s1", route: "GET jobs/list", compare: "data", method: "GET", path: "/jobs/list" }, { id: "s2", route: "GET jobs/run", compare: "data", method: "GET", path: "/jobs/run" }] });
+		expect(suiteGaps(ledger, root, "jobs").join("\n")).toMatch(/no compared scenario for ANY \/?robots.txt/);
 	});
 
 	it("counts failed preparations per plugin version and forgets them once the checks are written", () => {

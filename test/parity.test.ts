@@ -106,7 +106,7 @@ describe("starting the apps for parity", () => {
 		expect(problems).toHaveLength(3);
 	});
 
-	it("a data reset is checked once for a full copy of a large database; a recipe saved without it keeps no reset, and no reset is asked for again", async () => {
+	it("a data reset is checked once for a full copy of a large database; a recipe saved without it is asked for a reset that loads a small fixture instead", async () => {
 		const { root, config: base } = workspace();
 		const config = ConfigSchema.parse({ ...base, db: { strategy: "keep-schema", from: ["mariadb"], to: "postgresql" } });
 		const port = await freePort();
@@ -116,12 +116,14 @@ describe("starting the apps for parity", () => {
 		const problems: string[] = [];
 		const drop: AppFixer = async (o) => (problems.push(o.problem), await call(tool(appBootTools(o.config, o.root, o.side), "set_app_boot"), { ...serverRecipe(port), ...dump }), "dropped the reset");
 		expect(await probeApp({ config, root, side: LEGACY, fixer: drop, log: () => {} })).toBe(true);
-		expect(problems[0]).toMatch(/full second copy[\s\S]*take the reset out of the recipe/);
+		expect(problems[0]).toMatch(/full second copy[\s\S]*replace the restore from that copy with loading the schema and a small fixture/);
 		expect(loadApps(root)[LEGACY]).toMatchObject({ up: true, resetSpaceChecked: true });
 		expect(loadApps(root)[LEGACY]!.recipe!.reset).toBeUndefined();
-		// decided: the app has a dump, so no reset is asked for again
-		expect(await probeApp({ config, root, side: LEGACY, fixer: drop, log: () => {} })).toBe(true);
-		expect(problems).toHaveLength(1);
+		// strict parity needs every run to start from the same data: a reset loading a small fixture, MAX_FIXUPS times at most
+		for (let i = 0; i < MAX_FIXUPS + 1; i++) expect(await probeApp({ config, root, side: LEGACY, fixer: drop, log: () => {} })).toBe(true);
+		expect(problems).toHaveLength(MAX_FIXUPS);
+		expect(problems[1]).toMatch(/replays every slice on both apps from the same starting data, and it has no data reset[\s\S]*small fixture[\s\S]*set_fixture_files/);
+		expect(loadApps(root)[LEGACY]).toMatchObject({ fixtureProbes: MAX_FIXUPS });
 	});
 
 	it("a new recipe whose reset works but whose dump fails keeps its reset; a dump bigger than any buffer is read whole", async () => {

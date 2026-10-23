@@ -129,7 +129,24 @@ omitted historical cases as revalidated.
 
 ## Fixture provenance
 
-Create `.bigrefactor/parity/scope.json`:
+`br run` has each app's setup model make what this needs (at most 3 tries per app,
+at the run's start and after a strict replay that did not pass): a data reset
+that empties the database and loads its schema and a small fixture (seed data
+with the test account and enough rows for real pages, never a second full copy
+of a large database), the files it reads recorded with its `set_fixture_files`
+tool, and, for the old app, each tracked file of its copy changed for local
+config declared as an override. A new app's reset is made to load the same
+business data as the old app's fixture, again whenever that fixture's content
+changes. Untracked files in the read-only legacy repo do not count as changes;
+its tracked files must match the pinned commit. Source routes no unit holds
+(the framework's own, such as `post_command` or `robots.txt`) are given to one
+slice each (the one whose routes share the first path segment, else the slice
+with the most routes), whose suite must compare them; a route the old app does
+not serve here is compared too (both answer 404). Once nothing else is left to
+run, the run keeps writing and running truth scripts on the old code, a batch at
+a time, while each batch leaves fewer units to do.
+
+By hand, `.bigrefactor/parity/scope.json` looks like this:
 
 ```json
 {

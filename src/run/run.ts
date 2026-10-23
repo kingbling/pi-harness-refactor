@@ -629,27 +629,37 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	// the end of a run: the strict replay of every slice on one frozen commit (br parity --verify), again only once main
 	// moved or a slice was compared since (new checks, a fix). What it leaves that the run can do (slices to compare
 	// again, checks to write, both a few times at most) is queued and the run goes on
-	let verified: { head?: string; upTo?: number; report?: VerificationReport } = {};
+	let verified: { head?: string; upTo?: number; inputs?: string; report?: VerificationReport } = {};
 	const lastParityRun = () => (ledger.db.prepare("SELECT COALESCE(MAX(id), 0) n FROM parity_runs").get() as { n: number }).n;
+	// the apps' recipes and the fixture's scope: a setup model that changed them gives the replay new inputs
+	const replayInputs = async () => {
+		const { loadApps } = await import("./parity.ts");
+		const { scopeIfValid } = await import("./parity-scope.ts");
+		return JSON.stringify([Object.entries(loadApps(o.root)).map(([s, a]) => [s, a.recipe]), scopeIfValid(o.root) ?? null]);
+	};
 	// a slice sent back twice in one run waits for the next run (an app that does not start here comes back each time)
 	const sentBack = new Map<string, number>();
 	const finalParity = async (): Promise<boolean> => {
 		if (!parityProbe) return false;
 		await parityProbe;
 		const head = await headOf(config.target.path);
-		if (!head || (verified.head === head && verified.upTo === lastParityRun())) return false;
+		if (!head || (verified.head === head && verified.upTo === lastParityRun() && verified.inputs === (await replayInputs()))) return false;
 		const { verifyParity } = await import("./parity-verification.ts");
 		const { validateParityProjects } = await import("./parity-project-checks.ts");
 		const report = await verifyParity({ ledger, config, root: o.root, linkAll, serverStack, log, runHolds: true, validateProjects: () => validateParityProjects({ config, root: o.root, adapters, linkAll, log }) });
-		verified = { head, upTo: lastParityRun(), report };
+		verified = { head, upTo: lastParityRun(), inputs: await replayInputs(), report };
 		if (report.status === "passed") return false;
+		// what the replay needs of each app's setup (a data reset loading a small fixture, its files recorded, the old
+		// app's config overlays declared): the setup models make it, a few times per app at most (fixtureGaps)
+		const { probeApps } = await import("./parity.ts");
+		await probeApps({ config, root: o.root, linkAll, log, ...probeAsk }).catch((e) => log(pc.yellow(`parity setup: ${e?.message ?? e}`)));
 		const { again } = parityAgain(ledger, head);
 		for (const sl of paritySlices(ledger))
 			if ((again.has(sl) || needsPrepare(sl)) && (sentBack.get(sl) ?? 0) < 2) {
 				sentBack.set(sl, (sentBack.get(sl) ?? 0) + 1);
 				queueParity(sl);
 			}
-		return !!parityRunning;
+		return !!parityRunning || verified.inputs !== (await replayInputs());
 	};
 	// approved tidy tasks run once each as their own job on main; units of the area wait for it
 	// an area is busy while a unit of it runs; a truth-ahead lane (only tests, in its own worktree) never holds a tidy job back
@@ -703,15 +713,27 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	if (o.handleSigint !== false) process.once("SIGINT", onSigint);
 	// accepted units with only read truth, on the side: their scripts run on the old code (a few at once, capped), then the
 	// tester writes a script for those with none (capped; one at a time, more while lanes are free). A stop ends both.
-	const truthScripts = o.dry || o.spawn
-		? undefined
-		: import("./recheck.ts")
-				.then(async ({ upgradeReadTruth, writeTruthScripts }) => {
+	// truth read but never run on the old code keeps strict parity from passing: a batch on the side at the start, and
+	// once nothing else is left to run more batches, as long as each one leaves fewer units to do (`truthMore`)
+	let truthLeft: number | undefined;
+	let truthMore = false;
+	const truthBatch = () =>
+		import("./recheck.ts")
+			.then(async ({ upgradeReadTruth, writeTruthScripts }) => {
+				truthMore = false;
+				let left = 0;
+				if (config.run.truthUpgradesPerRun > 0) {
+					const u = await upgradeReadTruth({ ledger, config, root: o.root, states: ["accepted"], cap: config.run.truthUpgradesPerRun, stopped: () => !!stopRecord, log });
 					// the old code's runtime is down: writing scripts now would only pay models to chase the outage
-					if (config.run.truthUpgradesPerRun > 0 && (await upgradeReadTruth({ ledger, config, root: o.root, states: ["accepted"], cap: config.run.truthUpgradesPerRun, stopped: () => !!stopRecord, log })).down) return;
-					await writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, freeLanes: () => (stopRecord ? 0 : laneLimit - running.size), log });
-				})
-				.catch((e) => log(pc.yellow(`truth scripts: ${e?.message ?? e}`)));
+					if (u.down) return;
+					left += u.left;
+				}
+				left += (await writeTruthScripts({ ledger, config, root: o.root, cap: config.run.truthScriptsPerRun, stopped: () => !!stopRecord, freeLanes: () => (stopRecord ? 0 : laneLimit - running.size), log })).left;
+				truthMore = left > 0 && (truthLeft === undefined || left < truthLeft);
+				truthLeft = left;
+			})
+			.catch((e) => log(pc.yellow(`truth scripts: ${e?.message ?? e}`)));
+	let truthScripts = o.dry || o.spawn ? undefined : truthBatch();
 
 	// accepted units' drops, on the side: the ones that read like work not done are judged by a model, a few per run
 	const dropCheck = o.dry || o.spawn
@@ -1393,6 +1415,15 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					await waitOn(parityRunning ? "comparing finished slices with the old app" : "a code job is fixing a difference many slices share", () => (parityRunning ?? sharedRunning)!);
 					lastResubmitCheck = 0;
 					continue;
+				}
+				// nothing else to run: more truth scripts in this run, not in later ones (what they redo runs next)
+				if (truthScripts && !stop && !o.shouldStop?.() && !dayCapHit) {
+					await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts!);
+					if (truthMore && !stop) {
+						truthScripts = truthBatch();
+						lastResubmitCheck = 0;
+						continue;
+					}
 				}
 				// nothing left to run: is the app really done? A code job it merged may let units run again
 				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("finish check: is the app really done", runFinish))) {

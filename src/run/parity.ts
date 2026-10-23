@@ -18,6 +18,8 @@ import { exec } from "../proc.ts";
 import { readFile, rm } from "node:fs/promises";
 import { setStep } from "./watchdog.ts";
 import { recordOwnedTool, whileSettingUp } from "./cleanup.ts";
+import { legacyTree } from "./parity-legacy-tree.ts";
+import { recordFixture, scopeIfValid } from "./parity-scope.ts";
 
 /**
  * Differential parity, step one: can the OLD app and the NEW app each be started here as a local server that
@@ -82,6 +84,10 @@ export interface AppState {
 	bootQuestion?: number;
 	/** Set once its setup checked whether the data reset keeps a full second copy of a large database (which is then dropped). */
 	resetSpaceChecked?: boolean;
+	/** How often its setup was asked for what strict parity needs of its data (fixtureGaps), at most MAX_FIXUPS. */
+	fixtureProbes?: number;
+	/** A new app only: the old app's fixture (scope.json legacyAt) its reset was last made to load the same data as. */
+	fixtureFor?: string;
 	/** The test account the comparison logs in with on this app, found or made by its setup model (set_test_login). */
 	login?: TestLogin;
 	/** How often its setup model was asked for a test account (at most MAX_LOGIN_TRIES until the owner says retry). */
@@ -114,9 +120,9 @@ export const LEGACY = "legacy";
 
 /** An app that is up is probed again over the same kind of problem at most this often (a model that gave up once may not twice). */
 export const MAX_FIXUPS = 3;
-type FixKind = "data" | "redirect" | "setup" | "boot";
+type FixKind = "data" | "redirect" | "setup" | "boot" | "fixture";
 const fixUps = (a: AppState, kind: FixKind) =>
-	kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : kind === "boot" ? (a.bootProbes ?? 0) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
+	kind === "fixture" ? (a.fixtureProbes ?? 0) : kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : kind === "boot" ? (a.bootProbes ?? 0) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
 /** Whether the app may still be probed again over this kind of problem. */
 export const fixUpLeft = (a: AppState | undefined, kind: FixKind) => !!a && fixUps(a, kind) < MAX_FIXUPS;
 
@@ -480,7 +486,21 @@ export function appBootTools(config: Config, root: string, side: string): ToolDe
 			return out(`saved: the test account${p.user ? ` ${p.user}` : ""} (${p.steps.length} login request(s))`);
 		},
 	};
-	return [check, set, tryRequests, setLogin] as unknown as ToolDefinition[];
+	const setFixture = {
+		name: "set_fixture_files",
+		label: "Record the fixture files",
+		description: `Record the files this app's data reset, dump and start read (the seed data, the scripts, config files), so the strict parity check fingerprints them; replaces what this app recorded before.${side === LEGACY ? " overrides: each tracked file of the legacy copy you changed for local config (path relative to the legacy repo, and why); the check compares every other tracked file with the pinned source. Leave overrides out to keep the declared ones." : ""}`,
+		promptSnippet: "set_fixture_files: record the files the data reset, dump and start read",
+		parameters: Type.Object({
+			files: Type.Array(Type.String({ description: "relative to the workspace, or absolute" })),
+			...(side === LEGACY ? { overrides: Type.Optional(Type.Array(Type.Object({ path: Type.String(), why: Type.String() }))) } : {}),
+		}),
+		execute: async (_id: string, p: { files: string[]; overrides?: Array<{ path: string; why: string }> }) => {
+			const bad = recordFixture(root, side, p.files, side === LEGACY ? p.overrides : undefined);
+			return out(bad ? `refused: ${bad}` : `recorded ${p.files.length} fixture file(s)${p.overrides ? ` and ${p.overrides.length} override(s)` : ""}`);
+		},
+	};
+	return [check, set, tryRequests, setLogin, setFixture] as unknown as ToolDefinition[];
 }
 
 // ---- the probe -------------------------------------------------------------------------------------------
@@ -521,10 +541,43 @@ function problemFor(config: Config, root: string, side: string): string {
 		.filter(([s, a]) => s !== side && a.recipe)
 		.map(([s, a]) => `${s} uses port ${portOf(a.recipe!.ready)}`);
 	const db = config.db.strategy !== "none" && (config.db.from.length || config.db.schemaFiles.length || config.db.snapshot)
-		? ` The app uses ${config.db.from.join(" + ") || "a database"}${config.db.to && side !== LEGACY ? ` (the new app: ${config.db.to})` : ""}; schema/data inputs from setup (relative to the old repo ${config.source.path}): ${[...config.db.schemaFiles, ...(config.db.snapshot ? [config.db.snapshot] : [])].join(", ") || "none given"}. Start a database with that schema (and data, when there is a snapshot) if the app needs one to answer. Then also give the recipe a dump (prints the data as JSON {"table": [rows ordered by primary key]}): the tool compares what each app writes. Add a reset (puts that data back to its starting state before every run) only when it is cheap: never keep a second full copy of a large database (more than a few GB) just to restore it; then leave the reset out, the data then stays as the runs leave it.`
+		? ` The app uses ${config.db.from.join(" + ") || "a database"}${config.db.to && side !== LEGACY ? ` (the new app: ${config.db.to})` : ""}; schema/data inputs from setup (relative to the old repo ${config.source.path}): ${[...config.db.schemaFiles, ...(config.db.snapshot ? [config.db.snapshot] : [])].join(", ") || "none given"}. Start a database with that schema (and data, when there is a snapshot) if the app needs one to answer. Then also give the recipe a dump (prints the data as JSON {"table": [rows ordered by primary key]}): the tool compares what each app writes. And a reset that puts the data back to the same starting state before every run: it loads the schema and a small fixture (seed data with the test account and enough rows that pages show real data), never a second full copy of a large database (more than a few GB). Record the files it reads with set_fixture_files.`
 		: "";
 	const where = side === LEGACY ? `The old app's root (after make_legacy_copy): the copy.` : `The new project is at ${appRoot(config, root, side)} (a worktree of the migration's main branch; its dependencies are linked in).`;
 	return `Find out whether this app can be started here as a local server that answers HTTP requests on this machine. ${where}${db}${ports.length ? ` Both apps run at the same time: ${ports.join(", ")}; use another port.` : ""} The app does not have to be complete: any answer on the ready URL (a login page, a redirect, a 404 from the framework) proves it runs. When the app is no HTTP server at all (a command-line tool, a library), say so and stop. Try more than one way before giving up.`;
+}
+
+/**
+ * What strict parity still needs of this app's data (empty: nothing). Every slice is replayed on both apps from the
+ * same starting data, so each app needs a reset loading a small fixture, its files in scope.json, the old app's
+ * changed config files declared, and a new app the same data as the old app's fixture (it waits for that fixture).
+ */
+export async function fixtureGaps(config: Config, root: string, side: string, cur: AppState): Promise<string[]> {
+	if (config.db.strategy === "none" || !cur.recipe) return [];
+	const scope = scopeIfValid(root);
+	const legacy = side === LEGACY;
+	if (!legacy && !scope?.legacyAt) return [];
+	const gaps: string[] = [];
+	if (!cur.recipe.reset) gaps.push("it has no data reset, so no two runs start from the same data");
+	if (!scope?.by?.[side]?.length) gaps.push("the files its data reset, dump and start read are not recorded (set_fixture_files)");
+	if (!legacy && cur.fixtureFor !== scope!.legacyAt) gaps.push(`the old app's fixture (${(scope!.by?.[LEGACY] ?? []).join(", ")}) is newer than this app's data setup: its reset must load the same business data`);
+	if (legacy) {
+		try {
+			const pinned = config.source.commit ?? (await headOf(config.source.path));
+			if (!pinned) throw new Error("the legacy repo has no commit");
+			const tree = await legacyTree(config.source.path, appRoot(config, root, LEGACY), pinned, (scope?.legacyOverrides ?? []).map((x) => x.path));
+			if (tree.mismatches.length) gaps.push(`these tracked files of the copy differ from the pinned source and are not declared: ${tree.mismatches.slice(0, 30).join(", ")}${tree.mismatches.length > 30 ? ` and ${tree.mismatches.length - 30} more` : ""}. Declare each that is local config (database, URLs, http) as an override with why (set_fixture_files); put any other back as the source has it`);
+		} catch (e: any) {
+			gaps.push(`its copy cannot be compared with the pinned source: ${String(e?.message ?? e).slice(0, 400)}`);
+		}
+	}
+	return gaps;
+}
+
+function fixtureText(config: Config, root: string, side: string, gaps: string[]): string {
+	const legacy = side === LEGACY;
+	const scope = scopeIfValid(root);
+	return `the strict parity check replays every slice on both apps from the same starting data, and ${gaps.join("; and ")}. Give the recipe a reset that empties this app's database and loads its schema and a small fixture before every start: seed data with what the comparison needs (the test account, and enough rows that the pages and commands show real data; take them from the data the app runs on here). Never a second full copy of a large database. Keep the seed and scripts in ${join(parityDir(root), "fixture")}. Two resets in a row must leave the same data (its dump shows the same). ${legacy ? "The new app loads the same business data from your seed later, so keep it plain (SQL inserts or JSON rows per table)." : `Load the same business data the old app's fixture holds (${(scope?.by?.[LEGACY] ?? []).join(", ")}) into this app's database${config.db.to ? ` (${config.db.to})` : ""}: the same rows and values in this app's schema, so both apps start alike.`} The test account must still log in after the reset. Then call set_fixture_files with every file the reset, the dump and the start read (seed, scripts, config)${legacy ? ", and the overrides" : ""}`;
 }
 
 /** A red new app is probed again once main has moved on, at most this many probes in a row. */
@@ -552,15 +605,19 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const setup = cur.up === true && !!cur.recipe && !!cur.setupProblem && fixUpLeft(cur, "setup");
 	// a slice check could not start it (its data reset or start failed): it is asked to fix that
 	const boot = cur.up === true && !!cur.recipe && !!cur.bootProblem && fixUpLeft(cur, "boot");
+	// what strict parity needs of its data (a reset loading a small fixture, its files recorded, the old app's config overlays declared)
+	const legacyAt = scopeIfValid(o.root)?.legacyAt;
+	const fixture = cur.up === true && !!cur.recipe && fixUpLeft(cur, "fixture") ? await fixtureGaps(o.config, o.root, o.side, cur) : [];
 	// each kind at most MAX_FIXUPS times, whatever came of it
-	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup || boot || space;
+	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup || boot || space || fixture.length > 0;
 	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
 	const appDir = appRoot(o.config, o.root, o.side);
 	const missing = [
 		...(lacksData ? [`it has ${!cur.recipe!.reset && !cur.recipe!.dump ? "no data reset and no data dump" : !cur.recipe!.reset ? "no data reset" : "no data dump"}, so what the apps write is never compared`] : []),
 		...(redirect ? [`it answers requests over http with a redirect to itself on another scheme (${cur.selfRedirect}), so no request reaches its handlers and nothing is compared: make plain http reach the handlers in this local copy. Switch off the app's or its web server's setting that forces https, in the copy's local config only (never the app's code): the comparison sends the same plain-http requests to both apps and compares what the handlers answer, it does not check the https rule, so keeping that rule on here only hides every handler. check_app_boot sends that request again and says whether it still redirects`] : []),
 		...(setup ? [`a slice check found a problem that only its setup here causes (${cur.setupProblem}): fix that in its setup (start, data reset, data dump, local config), not in the app's code`] : []),
-		...(space ? [`its data reset (${[cur.recipe!.reset!.cmd, ...cur.recipe!.reset!.args].join(" ")}) may restore from a full second copy of the data (a copied database, volume or folder). Find out with your tools what it restores from and how much disk that takes. When it is a full copy of a large database (more than a few GB), take the reset out of the recipe (save it without resetCmd), or, when the reset also does other work the app needs (such as writing local config back), only the restore from that copy; once check_app_boot shows the app still starts, delete that copy: only that copy, never the data the app runs on or anything another project uses. When the reset costs little disk, keep it`] : []),
+		...(space ? [`its data reset (${[cur.recipe!.reset!.cmd, ...cur.recipe!.reset!.args].join(" ")}) may restore from a full second copy of the data (a copied database, volume or folder). Find out with your tools what it restores from and how much disk that takes. When it is a full copy of a large database (more than a few GB), replace the restore from that copy with loading the schema and a small fixture (seed data with the test account and enough rows that pages show real data; record its files with set_fixture_files); once check_app_boot shows the app still starts, delete that copy: only that copy, never the data the app runs on or anything another project uses. When the reset costs little disk, keep it`] : []),
+		...(fixture.length ? [fixtureText(o.config, o.root, o.side, fixture)] : []),
 		...(boot ? [`it did not start for a slice check just now (${cur.bootProblem}). Find out why with your tools (is each service and container it needs running, does its reset script still work, what does the command print when you run it). Fix that in its setup here (start, data reset, the services it needs, local config), not in the app's code; check_app_boot shows whether it starts again. When the cause is the app's own code, change nothing and say so: that goes to whoever fixes the code`] : []),
 	];
 	const problem = fixUp ? `${problemFor(o.config, o.root, o.side)}\n\nThe app already starts with the saved recipe (${[cur.recipe!.start.cmd, ...cur.recipe!.start.args].join(" ")}, ready at ${cur.recipe!.ready}), but ${missing.join("; and ")}. Keep how it starts; fix what is missing and save the recipe again.` : problemFor(o.config, o.root, o.side);
@@ -576,8 +633,9 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		const kept = res.ok || (res.redirectFailed && !res.dumpFailed) ? recipe! : res.dumpFailed && recipe ? { ...recipe, dump: undefined } : cur.recipe!;
 		// the redirect is gone when the check sent the request again and it was not redirected (also when only the dump failed)
 		const redirectGone = redirect && !!recipe && !bad && !res.redirectFailed && (res.ok || !!res.dumpFailed);
-		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}), ...(space ? { resetSpaceChecked: true } : {}) });
-		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${boot ? `; did not start for a slice check: ${res.ok ? "starts again" : "still does not start"}` : ""}${space ? `; data reset: ${kept.reset ? "kept" : "dropped (it kept a full copy of the data)"}` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
+		// a reset the fixture task saved loads a small fixture (it was told never a full copy): no space check for it
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}), ...(space ? { resetSpaceChecked: true } : {}), ...(fixture.length ? { fixtureProbes: fixUps(cur, "fixture") + 1, ...(res.ok ? { resetSpaceChecked: true, ...(o.side !== LEGACY ? { fixtureFor: legacyAt } : {}) } : {}) } : {}) });
+		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${boot ? `; did not start for a slice check: ${res.ok ? "starts again" : "still does not start"}` : ""}${space ? `; data reset: ${kept.reset ? "kept" : "dropped (it kept a full copy of the data)"}` : ""}${fixture.length ? `; strict parity fixture: ${res.ok && kept.reset ? "reset saved" : "still missing"} (${fixture.length} gap(s) asked)` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
 	}

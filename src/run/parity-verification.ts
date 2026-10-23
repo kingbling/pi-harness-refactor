@@ -18,16 +18,11 @@ import { mentionsCase } from "./ported.ts";
 import { assessChanges, changeDecisionProblems, type VerifiedChange } from "./parity-changes.ts";
 import { verificationEngine, verificationWorkspace, type FileProvenance } from "./parity-provenance.ts";
 import { legacyTree } from "./parity-legacy-tree.ts";
+import { loadScope, type VerificationScope } from "./parity-scope.ts";
 
 export const VERIFICATION_META = "parity_verification";
 
-/** These are test inputs, not exemptions for mismatching outputs. All are retained in the proof. */
-export interface VerificationScope {
-	version: 1;
-	fixture: { name: string; files: string[] };
-	/** Runtime configuration overlays only. Business behavior must still come from the pinned source. */
-	legacyOverrides?: Array<{ path: string; why: string }>;
-}
+export type { VerificationScope } from "./parity-scope.ts";
 
 interface Snapshot {
 	engine: { plugin?: string; node: string; comparator: "strict-v3"; code: FileProvenance };
@@ -121,15 +116,6 @@ export function migrationProblems(ledger: Ledger, targetCommit?: string, explici
 	return problems;
 }
 
-function loadScope(root: string): VerificationScope {
-	const scope = JSON.parse(readFileSync(join(root, ".bigrefactor", "parity", "scope.json"), "utf8")) as VerificationScope;
-	if (scope?.version !== 1 || typeof scope.fixture?.name !== "string" || !scope.fixture.name.trim() || !Array.isArray(scope.fixture.files) || !scope.fixture.files.length || scope.fixture.files.some((p) => typeof p !== "string" || !p.trim()))
-		throw new Error("scope.json needs version:1 and fixture:{name,files:[snapshot/reset/config input paths]}");
-	if (scope.legacyOverrides !== undefined && (!Array.isArray(scope.legacyOverrides) || scope.legacyOverrides.some((p) => !p || typeof p.path !== "string" || !p.path || p.path.startsWith("/") || p.path.split(/[\\/]/).includes("..") || typeof p.why !== "string" || !p.why.trim())))
-		throw new Error("scope.json legacyOverrides need source-relative path and why");
-	return scope;
-}
-
 async function snapshot(o: VerifyOptions): Promise<Snapshot> {
 	const sourceCommit = await headOf(o.config.source.path), targetCommit = await headOf(o.config.target.path);
 	if (!sourceCommit || !targetCommit) throw new Error("both apps need committed git snapshots");
@@ -196,8 +182,10 @@ export async function verifyParity(o: VerifyOptions): Promise<VerificationReport
 		report.problems.push(...migrationProblems(o.ledger, report.targetCommit, explicitScenarios(o)));
 		const pinned = o.config.source.commit ?? o.ledger.getMeta("source_commit");
 		if (!pinned || report.sourceCommit !== pinned) report.problems.push("legacy HEAD does not match a pinned source commit");
-		for (const [name, path] of [["legacy", o.config.source.path], ["target", o.config.target.path]])
-			if (await isDirty(path!).catch(() => true)) report.problems.push(`${name} checkout has uncommitted changes; verification requires a clean pinned checkout`);
+		// the old app runs in a copy whose tracked files legacyTree compares with the pinned ones: an untracked file
+		// in the read-only legacy repo (an editor's empty .tmp) changes nothing the proof relies on
+		for (const [name, path, untracked] of [["legacy", o.config.source.path, false], ["target", o.config.target.path, true]] as const)
+			if (await isDirty(path, { untracked }).catch(() => true)) report.problems.push(`${name} checkout has uncommitted changes; verification requires a clean pinned checkout`);
 		const apps = loadApps(o.root);
 		if (!apps[LEGACY]?.up || !apps[LEGACY]?.recipe) report.problems.push("legacy app has no working start recipe (br parity --probe)");
 		if (resolve(appRoot(o.config, o.root, LEGACY)) === resolve(o.config.source.path)) report.problems.push("legacy must run in a workspace copy; the pinned source repo is read-only");
@@ -262,8 +250,8 @@ export async function verifyParity(o: VerifyOptions): Promise<VerificationReport
 			try {
 				if (JSON.stringify(report.snapshot) !== JSON.stringify(await snapshot(o))) report.problems.push("verification inputs, migration evidence or code changed during replay; run again on frozen inputs");
 			} catch (e) { report.problems.push(`cannot revalidate verification inputs: ${String(e)}`); }
-			for (const [name, path] of [["legacy", o.config.source.path], ["target", o.config.target.path]])
-				if (await isDirty(path!).catch(() => true)) report.problems.push(`${name} checkout changed during replay`);
+			for (const [name, path, untracked] of [["legacy", o.config.source.path, false], ["target", o.config.target.path, true]] as const)
+				if (await isDirty(path, { untracked }).catch(() => true)) report.problems.push(`${name} checkout changed during replay`);
 			report.problems.push(...migrationProblems(o.ledger, report.targetCommit, explicitScenarios(o)));
 			if (liveRun(o.root) !== process.pid) report.problems.push("workspace ownership changed during verification");
 			report.status = report.problems.length ? "failed" : "passed";

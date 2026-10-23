@@ -52,8 +52,9 @@ export async function headOf(path: string): Promise<string | undefined> {
 	}
 }
 
-export async function isDirty(path: string): Promise<boolean> {
-	return (await git(path, ["status", "--porcelain"])).length > 0;
+/** `untracked: false` counts only changes to tracked files (submodules' untracked files too). */
+export async function isDirty(path: string, o: { untracked?: boolean } = {}): Promise<boolean> {
+	return (await git(path, ["status", "--porcelain", ...(o.untracked === false ? ["--untracked-files=no", "--ignore-submodules=untracked"] : [])])).length > 0;
 }
 
 /** Files changed between two commits (paths relative to repo root). */
