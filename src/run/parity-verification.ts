@@ -6,7 +6,7 @@ import type { Config } from "../config.ts";
 import { headOf, isDirty } from "../git.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { REQUIRED_FOR_ACCEPTED } from "../ledger/schema.ts";
-import { checkSlice, loadSteps, sliceFacts, type SliceCheck, type Step } from "./parity-check.ts";
+import { checkSlice, loadSteps, sliceFacts, uiStackOf, type SliceCheck, type Step } from "./parity-check.ts";
 import { contractInputs, digest, routeCovered, strictSuiteProblems } from "./parity-contracts.ts";
 import { lastFinish, notProven } from "./finish-check.ts";
 import { loadApps, appRoot, LEGACY } from "./parity.ts";
@@ -199,7 +199,7 @@ export async function verifyParity(o: VerifyOptions): Promise<VerificationReport
 			const file = loadSteps(o.root, slice);
 			if (!file || !Array.isArray(file.steps)) report.problems.push(`${slice}: missing/invalid steps.json; author its scenarios before verification`);
 			else {
-				report.problems.push(...strictSuiteProblems(file, sliceFacts(o.ledger, slice).routes, o.root).map((p) => `${slice}: ${p}`));
+				report.problems.push(...strictSuiteProblems(file, sliceFacts(o.ledger, slice).routes, o.root, uiStackOf(o.config)).map((p) => `${slice}: ${p}`));
 				report.problems.push(...changeDecisionProblems(file, o.ledger).map((p) => `${slice}: ${p}`));
 			}
 		}

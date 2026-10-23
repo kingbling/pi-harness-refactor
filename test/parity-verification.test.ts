@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ConfigSchema, type Config } from "../src/config.ts";
 import type { TargetAdapter } from "../src/adapters/types.ts";
@@ -530,6 +530,17 @@ describe("coverage and observation safeguards", () => {
 		expect(strictSuiteProblems({ steps: [{ ...step, compare: "page" }] }, ["GET /value"], root).join("\n")).toMatch(/needs a browser check/);
 		expect(strictSuiteProblems({ steps: [] }, [], root)).toEqual(["this slice has no HTTP routes: add an executable data/command/browser/effects check"]);
 		expect(strictSuiteProblems({ steps: [step], skipped: { "POST /value": "not ready" } }, ["GET|POST /value"], root).join("\n")).toMatch(/POST value/);
+	});
+
+	it("when the new app has a UI app, a page's browser check must run there: the server stack alone never shows the pages", () => {
+		const page = { ...step, compare: "page" as const };
+		const browser = { id: "pages", kind: "browser" as const, covers: [page.id], why: "the page shows the value", command: { cmd: process.execPath, args: ["-e", "0"] }, inputs: ["steps.json"].map((f) => relative(root, suitePath("http")).replace(/steps\.json$/, f)) };
+		const onServer = strictSuiteProblems({ steps: [page], checks: [browser] }, ["GET /value"], root, "react");
+		expect(onServer.join("\n")).toMatch(/the new app's pages are its react app: list "react" in stacks and open the pages at BR_PARITY_URLS.react/);
+		expect(strictSuiteProblems({ steps: [page], checks: [browser], stacks: ["react"] }, ["GET /value"], root, "react")).toEqual([]);
+		// without a UI app, or without pages, nothing more is asked
+		expect(strictSuiteProblems({ steps: [page], checks: [browser] }, ["GET /value"], root)).toEqual([]);
+		expect(strictSuiteProblems({ steps: [step] }, ["GET /value"], root, "react")).toEqual([]);
 	});
 
 	it("preparation cannot remove or weaken legacy scenarios while adding coverage", () => {

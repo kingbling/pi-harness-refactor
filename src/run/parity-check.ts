@@ -8,6 +8,7 @@ import pc from "picocolors";
 import { Type } from "typebox";
 import type { Config } from "../config.ts";
 import { headOf, isDirty, removeWorktree } from "../git.ts";
+import { TARGET_ROLES } from "../adapters/registry.ts";
 import type { Ledger } from "../ledger/db.ts";
 import { PLAIN_LANGUAGE } from "../policy.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
@@ -168,12 +169,15 @@ export function paritySliceReady(ledger: Ledger, slice: string): boolean {
 	return sliceComplete(ledger, slice);
 }
 
-/** What strict verification would still miss in a complete slice's suite (no suite, routes without a step, pages without a browser check). */
-export function suiteGaps(ledger: Ledger, root: string, slice: string): string[] {
+/** The target stack that serves the new app's pages (a single-page app calling the server stack), if there is one. */
+export const uiStackOf = (config: Config) => config.target.stacks.find((s) => TARGET_ROLES[s] === "ui");
+
+/** What strict verification would still miss in a complete slice's suite (no suite, routes without a step, pages without a browser check on the UI app). */
+export function suiteGaps(ledger: Ledger, root: string, slice: string, ui?: string): string[] {
 	if (!sliceComplete(ledger, slice)) return [];
 	const suite = loadSteps(root, slice);
 	if (!suite || !Array.isArray(suite.steps)) return ["no steps.json"];
-	return strictSuiteProblems(suite, sliceFacts(ledger, slice).routes, root);
+	return strictSuiteProblems(suite, sliceFacts(ledger, slice).routes, root, ui);
 }
 
 /** Why these steps cannot be used, or undefined. Every slice route needs a step or a reason it has none. */
@@ -550,6 +554,7 @@ export type StepWriter = (o: { config: Config; root: string; slice: string; dir:
 
 export const writeStepsWithModel: StepWriter = async (o) => {
 	const logins = loginFacts(o.root, o.config.target.stacks);
+	const ui = uiStackOf(o.config);
 	const session = await spawnLeaf({
 		role: "test",
 		...(o.stronger ? { modelOverride: o.config.models.escalate } : {}),
@@ -562,7 +567,7 @@ export const writeStepsWithModel: StepWriter = async (o) => {
 		systemPrompt: `You write the HTTP requests a migration tool sends to the OLD app and to the NEW app, to compare their answers. Write them to steps.json in your folder. You try them on the old app with try_on_old_app; you never see the new app's answers, and you never shape a request to make the apps look alike. Read the old handlers to know what each route expects (parameters, form fields, login, tokens) and the new project to know where each route went.\n\nsteps.json: {"steps": [Step, …], "skipped": {"<route>": "why it has no step"}}. A Step: {"id": "s1", "route": "<one of the slice routes, or setup>", "compare": "data" | "redirect" | "page" | "none", "method": "GET", "path": "/…", "headers"?: {}, "body"?: <JSON>, "form"?: {field: value}, "save"?: {"name": "regex with one group"}, "target"?: {"method"?, "path"?, "headers"?, "body"?, "form"?, "stack"?}, "why"?: "…"}.\n- compare: data = an answer with data (JSON or text) where status, redirect and body must match; redirect = status and where it sends to; page = an HTML page (its status and what it writes are compared, not its HTML); none = preparation such as a login.\n- Steps run in order with one cookie jar, so a login step holds for the steps after it. "{{name}}" in a later step is replaced by a value saved earlier (a CSRF token, a new id).\n- target: only what the new app needs differently (the route moved, it takes JSON instead of a form, another target stack answers it: ${o.config.target.stacks.join(", ")}).\n- Every slice route gets at least one compared step. Skip a route (with its reason in skipped) only when it cannot be called here at all (it needs an outside service, say). A route that needs a login or an existing id is not skipped: log in, and take the id from the data the old app has (its answers, its handlers) or create it in an earlier step and save it. At most half the routes may be skipped.\n- ${logins.text}${logins.login ? ' Log in first with these: a step with route "setup" and compare "none" (with the new app\'s login as its target when it differs). Steps that check the logged-out answer go before it.' : ""}\n- ${loadApps(o.root)[LEGACY]?.recipe?.reset ? "Steps that write data are fine: the data is reset before every run." : "The data is NOT reset between runs: a step that writes must still work when it runs again (use new names, or save the id it creates)."}\nEnd with one sentence.\n\n${PLAIN_LANGUAGE}`,
 	});
 	try {
-		const r = await session.run(`${o.problem}\n\nExecutable checks are supported in steps.json: checks:[{id,kind:"browser"|"data"|"command"|"effects",covers:[compared step ids],why,command:{cmd,args},inputs:[script/fixture paths]}]. Additional target servers: stacks:[stack ids]. You may write driver files under checks/. Commands run from the workspace ${o.root}; use workspace-relative script paths (your suite lives at ${join(o.dir, "checks")}). They get BR_PARITY_SIDE=legacy|target, BR_PARITY_APP_DIR (runtime project directory), BR_PARITY_URLS (JSON map legacy→URL or target stack→URL), BR_PARITY_TARGET_DIR (target worktree on target side) and BR_PARITY_CHECK. They print exactly one non-empty JSON object of actual business observations; logs go to stderr and failed assertions exit nonzero. The same observations must match on both apps, including changed UI/route/schema representations. A browser check must load the real app entry with its production loaders and interact through Playwright: a CommonJS driver (checks/*.cjs) can require("playwright") and launch headless Chromium (both provided); never inject test-only props or hand back constant success. Use data checks to reconcile migrated records and effects checks for captured emails/queues/external calls. Use try_on_old_app to execute checks; do not run or inspect the new app's responses while authoring. Read new code only to map paths, selectors and interfaces. Do not change existing expected behavior to match new code. Each page step needs a browser check covering its id for final verification. A slice without HTTP routes may have steps:[] but needs executable checks. Include driver dependency/fixture files in inputs. Do not install tools or start external services from drivers; report unavailable tooling/setup precisely.`);
+		const r = await session.run(`${o.problem}\n\nExecutable checks are supported in steps.json: checks:[{id,kind:"browser"|"data"|"command"|"effects",covers:[compared step ids],why,command:{cmd,args},inputs:[script/fixture paths]}]. Additional target servers: stacks:[stack ids]. You may write driver files under checks/. Commands run from the workspace ${o.root}; use workspace-relative script paths (your suite lives at ${join(o.dir, "checks")}). They get BR_PARITY_SIDE=legacy|target, BR_PARITY_APP_DIR (runtime project directory), BR_PARITY_URLS (JSON map legacy→URL or target stack→URL), BR_PARITY_TARGET_DIR (target worktree on target side) and BR_PARITY_CHECK. They print exactly one non-empty JSON object of actual business observations; logs go to stderr and failed assertions exit nonzero. The same observations must match on both apps, including changed UI/route/schema representations. A browser check must load the real app entry with its production loaders and interact through Playwright: a CommonJS driver (checks/*.cjs) can require("playwright") and launch headless Chromium (both provided); never inject test-only props or hand back constant success. Use data checks to reconcile migrated records and effects checks for captured emails/queues/external calls. Use try_on_old_app to execute checks; do not run or inspect the new app's responses while authoring. Read new code only to map paths, selectors and interfaces. Do not change existing expected behavior to match new code. Each page step needs a browser check covering its id for final verification.${ui ? ` The new app's pages are its ${ui} app (a single-page app calling the ${o.config.target.stacks.filter((s) => s !== ui).join(", ")} API): give the suite "stacks":["${ui}"] and open the pages at BR_PARITY_URLS.${ui} on the new app, at the path its router gives them.` : ""} A slice without HTTP routes may have steps:[] but needs executable checks. Include driver dependency/fixture files in inputs. Do not install tools or start external services from drivers; report unavailable tooling/setup precisely.`);
 		const said = r.text.trim().split("\n").at(-1) ?? "";
 		console.log(pc.dim(`  parity steps (${o.slice}): ${r.toolCalls} tool calls, $${r.usage.cost.toFixed(4)} — ${said}${r.error ? pc.red(` ERROR: ${r.error}`) : ""}`));
 		return said;
@@ -657,7 +662,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	if (!facts.routes.length && !o.strict && !o.prepare && !suite?.checks?.length) return fail("this slice has no routes of its own to compare; prepare executable checks with br parity <slice> --prepare");
 	if (o.strict) {
 		if (!suite || !Array.isArray(suite.steps)) return fail("strict verification needs an existing steps.json (steps and executable checks); no suite is generated during verification");
-		const issues = strictSuiteProblems(suite, facts.routes, o.root);
+		const issues = strictSuiteProblems(suite, facts.routes, o.root, uiStackOf(o.config));
 		if (!issues.length && suite.steps.length) {
 			const invalid = stepsProblem(suite, facts.routes, o.config.target.stacks);
 			if (invalid) issues.push(invalid);
@@ -682,7 +687,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// a suite that compares as it is: a preparation that cannot extend it still compares with it
 	const usableBefore = !o.rewrite && !!suite && !problem;
 	let unprepared: string | undefined;
-	if (o.prepare && suite && !problem) problem = strictSuiteProblems(suite, routes, o.root).join("; ");
+	if (o.prepare && suite && !problem) problem = strictSuiteProblems(suite, routes, o.root, uiStackOf(o.config)).join("; ");
 	if (!o.strict && (o.rewrite || !existsSync(stepsPath(o.root, o.slice)) || problem)) {
 		const writer = o.writer ?? writeStepsWithModel;
 		const ask = `Slice "${o.slice}". Its routes on the old app: ${routes.join(", ") || "none: this slice needs executable checks"}. The old handlers and the code they use (relative to ${o.config.source.path}): ${files.join(", ")}. The new project: ${o.config.target.path} (stacks ${o.config.target.stacks.join(", ")}; requests go to ${o.serverStack} unless a step's target.stack says otherwise). Write steps.json and try it on the old app until every step does what you meant.${o.prepare ? " Prepare for strict parity: retain existing scenarios and add real browser/data/command/effects checks for the missing behavior. Cover successful workflows, each relevant permission level and failure/boundary cases from the legacy handlers. No routes may be skipped. Do not delete scenarios to remove failures." : ""}${waiting.size ? ` The slice's other routes get their steps later, once their new code exists.` : ""}`;
@@ -703,7 +708,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 				await writer({ config: o.config, root: o.root, slice: o.slice, dir, stronger: !!o.prepare && i > 0, problem: problem ? `${ask}\n\nThe steps.json you wrote cannot be used: ${problem}` : ask }).catch((e) => log(pc.yellow(`parity ${o.slice}: step writer failed: ${e?.message ?? e}`)));
 				const f = loadSteps(o.root, o.slice);
 				problem = f ? stepsProblem(f, routes, o.config.target.stacks, { login }) : "steps.json is missing or not valid JSON";
-				if (o.prepare && f && !problem) problem = [...strictSuiteProblems(f, routes, o.root), ...(suite ? retainedScenarioProblems(suite, f) : [])].join("; ");
+				if (o.prepare && f && !problem) problem = [...strictSuiteProblems(f, routes, o.root, uiStackOf(o.config)), ...(suite ? retainedScenarioProblems(suite, f) : [])].join("; ");
 				if (!problem) break;
 				if (i === 0) restore();
 			}

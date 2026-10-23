@@ -47,7 +47,7 @@ import { createStubSweep, resolveOwnersWithModel } from "./stub-sweep.ts";
 import { finishCheck, finishDue, lastFinish, renderFinishLine } from "./finish-check.ts";
 import { createCleaner } from "./cleanup.ts";
 import { MAX_PARITY_REOPENS, resumeShared, runSharedJob, sharedCauses, sharedJobText } from "./parity-judge.ts";
-import { paritySliceReady, routeOwners, suiteGaps } from "./parity-check.ts";
+import { paritySliceReady, routeOwners, suiteGaps, uiStackOf } from "./parity-check.ts";
 import { oldFailures, scopeIfValid } from "./parity-scope.ts";
 import { syncQuirkAnswers } from "./quirks.ts";
 import { reopenUnsettledQuirks, reopenWeakTests } from "./recheck.ts";
@@ -516,7 +516,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	// without a browser check) gets its missing checks written against the old app before it is compared, a few
 	// times per plugin version at most
 	const plugin = await pluginVersion();
-	const needsPrepare = (slice: string) => prepareTries(ledger, slice, plugin) < MAX_PARITY_ERRORS && suiteGaps(ledger, o.root, slice).length > 0;
+	const needsPrepare = (slice: string) => prepareTries(ledger, slice, plugin) < MAX_PARITY_ERRORS && suiteGaps(ledger, o.root, slice, uiStackOf(config)).length > 0;
 	const pumpParity = () => {
 		if (parityRunning || parityStopped) return;
 		if (!parityQueue.length) return void fixOldData();

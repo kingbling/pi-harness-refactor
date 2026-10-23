@@ -220,7 +220,11 @@ its id in `covers`: an HTTP status check does not establish UI behavior. Browser
 drivers use Playwright, which the plugin ships: checks run with the plugin's
 Playwright on `NODE_PATH`, so a CommonJS driver (`checks/*.cjs`) can
 `require("playwright")` and launch headless Chromium (downloaded once, before
-the first browser check, when the machine does not have it). They load the real entry
+the first browser check, when the machine does not have it). When the new app
+has a UI stack (a single-page app calling the server stack), its pages are that
+app: a suite with page steps lists the UI stack in `stacks` and its browser check
+opens `BR_PARITY_URLS.<ui stack>` on the new app; the server stack alone never
+shows the pages. They load the real entry
 point, log in as the scenario's role, interact through controls, assert the
 expected observations, and emit business results. Never supply test-only props
 or bypass production loaders. Selectors and paths can differ between the old UI

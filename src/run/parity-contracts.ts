@@ -70,7 +70,7 @@ export function retainedScenarioProblems(before: StepsFile, after: StepsFile): s
 }
 
 /** Strict verification consumes an existing suite. It never asks a model to rewrite it until it passes. */
-export function strictSuiteProblems(file: StepsFile, routes: string[], root: string): string[] {
+export function strictSuiteProblems(file: StepsFile, routes: string[], root: string, ui?: string): string[] {
 	const problems: string[] = [];
 	if (!Array.isArray(file.steps)) return ["steps must be an array"];
 	const stepIds = new Set<string>();
@@ -109,6 +109,9 @@ export function strictSuiteProblems(file: StepsFile, routes: string[], root: str
 	}
 	for (const s of file.steps) if (s.compare === "page" && !checks.some((c) => c.kind === "browser" && c.covers.includes(s.id)))
 		problems.push(`page ${s.id}: needs a browser check through the real app entry; status alone does not verify the page`);
+	// the new app's pages are its UI app (a single-page app calling the server): only a browser check there sees them
+	if (ui && file.steps.some((s) => s.compare === "page") && !(file.stacks ?? []).includes(ui))
+		problems.push(`the new app's pages are its ${ui} app: list "${ui}" in stacks and open the pages at BR_PARITY_URLS.${ui} in the browser check on the new app (BR_PARITY_URLS.legacy on the old one)`);
 	if (!routes.length && !checks.length) problems.push("this slice has no HTTP routes: add an executable data/command/browser/effects check");
 	problems.push(...changeShapeProblems(file));
 	return problems;
