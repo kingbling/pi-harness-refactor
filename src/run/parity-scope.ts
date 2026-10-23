@@ -17,6 +17,15 @@ export interface VerificationScope {
 
 export const scopePath = (root: string) => join(root, ".bigrefactor", "parity", "scope.json");
 
+/** Why a recorded fixture file cannot be fingerprinted later, or undefined. */
+export function fixtureFileProblem(root: string, f: string): string | undefined {
+	const p = resolve(root, f);
+	// the new app's parity worktree is made and removed for every check: its tracked files are the target commit's
+	if (p.startsWith(join(resolve(root), ".bigrefactor", "worktrees") + "/")) return `${f} is inside a temporary worktree (removed after each check): record the file it is made from instead (keep local overlays in .bigrefactor/parity); the new app's own tracked files are covered by its commit`;
+	if (!existsSync(p) || !statSync(p).isFile()) return `${f} is not a file (paths are relative to the workspace ${root}, or absolute)`;
+	return undefined;
+}
+
 export function loadScope(root: string): VerificationScope {
 	const scope = JSON.parse(readFileSync(scopePath(root), "utf8")) as VerificationScope;
 	if (scope?.version !== 1 || typeof scope.fixture?.name !== "string" || !scope.fixture.name.trim() || !Array.isArray(scope.fixture.files) || !scope.fixture.files.length || scope.fixture.files.some((p) => typeof p !== "string" || !p.trim()))
@@ -42,8 +51,8 @@ export function scopeIfValid(root: string): VerificationScope | undefined {
 export function recordFixture(root: string, side: string, files: string[], overrides?: Array<{ path: string; why: string }>): string | undefined {
 	if (!files.length) return "give at least one file (the seed data, the reset script)";
 	for (const f of files) {
-		const p = resolve(root, f);
-		if (!existsSync(p) || !statSync(p).isFile()) return `${f} is not a file (paths are relative to the workspace ${root}, or absolute)`;
+		const bad = fixtureFileProblem(root, f);
+		if (bad) return bad;
 	}
 	if (overrides?.some((o) => !o.path || o.path.startsWith("/") || o.path.split(/[\\/]/).includes("..") || !o.why?.trim())) return "each override needs a path relative to the legacy repo and why";
 	let cur: Partial<VerificationScope> = {};

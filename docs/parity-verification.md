@@ -134,8 +134,10 @@ at the run's start and after a strict replay that did not pass): a data reset
 that empties the database and loads its schema and a small fixture (seed data
 with the test account and enough rows for real pages, never a second full copy
 of a large database), the files it reads recorded with its `set_fixture_files`
-tool, and, for the old app, each tracked file of its copy changed for local
-config declared as an override. A new app's reset is made to load the same
+tool (never files in the temporary parity worktree, which is made again for
+every check: a recorded file that is gone or there is recorded again), and, for
+the old app, each tracked file of its copy changed for local config declared as
+an override. A new app's reset is made to load the same
 business data as the old app's fixture, again whenever that fixture's content
 changes. Untracked files in the read-only legacy repo do not count as changes;
 its tracked files must match the pinned commit. Source routes no unit holds

@@ -19,7 +19,7 @@ import { readFile, rm } from "node:fs/promises";
 import { setStep } from "./watchdog.ts";
 import { recordOwnedTool, whileSettingUp } from "./cleanup.ts";
 import { legacyTree } from "./parity-legacy-tree.ts";
-import { recordFixture, scopeIfValid } from "./parity-scope.ts";
+import { fixtureFileProblem, recordFixture, scopeIfValid } from "./parity-scope.ts";
 
 /**
  * Differential parity, step one: can the OLD app and the NEW app each be started here as a local server that
@@ -489,7 +489,7 @@ export function appBootTools(config: Config, root: string, side: string): ToolDe
 	const setFixture = {
 		name: "set_fixture_files",
 		label: "Record the fixture files",
-		description: `Record the files this app's data reset, dump and start read (the seed data, the scripts, config files), so the strict parity check fingerprints them; replaces what this app recorded before.${side === LEGACY ? " overrides: each tracked file of the legacy copy you changed for local config (path relative to the legacy repo, and why); the check compares every other tracked file with the pinned source. Leave overrides out to keep the declared ones." : ""}`,
+		description: `Record the files this app's data reset, dump and start read (the seed data, the scripts, config files), so the strict parity check fingerprints them; replaces what this app recorded before. Not files in the temporary parity worktree (.bigrefactor/worktrees): it is made again for every check, and the new app's tracked files are covered by its commit; record the overlay you copy into it instead.${side === LEGACY ? " overrides: each tracked file of the legacy copy you changed for local config (path relative to the legacy repo, and why); the check compares every other tracked file with the pinned source. Leave overrides out to keep the declared ones." : ""}`,
 		promptSnippet: "set_fixture_files: record the files the data reset, dump and start read",
 		parameters: Type.Object({
 			files: Type.Array(Type.String({ description: "relative to the workspace, or absolute" })),
@@ -560,6 +560,8 @@ export async function fixtureGaps(config: Config, root: string, side: string, cu
 	const gaps: string[] = [];
 	if (!cur.recipe.reset) gaps.push("it has no data reset, so no two runs start from the same data");
 	if (!scope?.by?.[side]?.length) gaps.push("the files its data reset, dump and start read are not recorded (set_fixture_files)");
+	const stale = (scope?.by?.[side] ?? []).map((f) => fixtureFileProblem(root, f)).filter((x): x is string => !!x);
+	if (stale.length) gaps.push(`its recorded files cannot be fingerprinted: ${stale.slice(0, 5).join("; ")}${stale.length > 5 ? ` (${stale.length} in all)` : ""}; record them again with set_fixture_files`);
 	if (!legacy && cur.fixtureFor !== scope!.legacyAt) gaps.push(`the old app's fixture (${(scope!.by?.[LEGACY] ?? []).join(", ")}) is newer than this app's data setup: its reset must load the same business data`);
 	if (legacy) {
 		try {

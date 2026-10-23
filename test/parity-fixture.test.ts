@@ -47,6 +47,9 @@ describe("the strict parity fixture", () => {
 	it("records each app's files in scope.json; the old app's fixture counts as changed only when its content changes", async () => {
 		const { root } = await workspace();
 		expect(recordFixture(root, LEGACY, ["missing.sql"])).toMatch(/missing.sql is not a file/);
+		mkdirSync(join(root, ".bigrefactor/worktrees/__parity__/nestjs"), { recursive: true });
+		writeFileSync(join(root, ".bigrefactor/worktrees/__parity__/nestjs/.env.local"), "DB=fixture\n");
+		expect(recordFixture(root, "nestjs", [".bigrefactor/worktrees/__parity__/nestjs/.env.local"])).toMatch(/inside a temporary worktree/);
 		const seed = fixtureFile(root, "seed.sql", "INSERT INTO users VALUES (1);\n");
 		expect(recordFixture(root, LEGACY, [seed], [{ path: "config.php", why: "the local database" }])).toBeUndefined();
 		const first = loadScope(root);
@@ -76,6 +79,11 @@ describe("the strict parity fixture", () => {
 		expect(gaps.join("\n")).toMatch(/the old app's fixture \(.bigrefactor\/parity\/fixture\/seed.sql\) is newer than this app's data setup/);
 		recordFixture(root, "nestjs", [fixtureFile(root, "reset.sh", "psql\n")]);
 		expect(await fixtureGaps(config, root, "nestjs", { ...app, fixtureFor: scopeIfValid(root)!.legacyAt })).toEqual([]);
+		// a recorded file that is gone (or was in the temporary worktree, from an older plugin) is recorded again
+		const scope = JSON.parse(readFileSync(scopePath(root), "utf8"));
+		scope.by.nestjs.push(".bigrefactor/worktrees/__parity__/nestjs/.env");
+		writeFileSync(scopePath(root), JSON.stringify(scope));
+		expect((await fixtureGaps(config, root, "nestjs", { ...app, fixtureFor: scopeIfValid(root)!.legacyAt })).join("\n")).toMatch(/cannot be fingerprinted: .*temporary worktree/);
 	});
 
 	it("the old app's setup adds a reset, records the fixture and declares the config it changed in its copy; then nothing more is asked", async () => {
