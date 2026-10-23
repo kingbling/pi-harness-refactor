@@ -72,7 +72,21 @@ describe("model judgments", () => {
 		const d = ws("llm-stack-off");
 		const client = new FakeModelClient();
 		const asked: string[] = [];
-		const prompter = { text: async (m: string, i?: string) => (asked.push(m), m.startsWith("Old") ? join(d, "legacy") : m.startsWith("New") ? join(d, "migrated") : i), select: async (m: string, o: Array<{ value: string }>, i?: string) => (asked.push(m), i ?? o[0]!.value), log: () => {} };
+		const prompter = {
+			text: async (m: string, i?: string) => (asked.push(m), m.startsWith("Old") ? join(d, "legacy") : m.startsWith("New") ? join(d, "migrated") : i),
+			select: async (m: string, options: Array<{ value: string }>, initial?: string) => {
+				asked.push(m);
+				if (m.startsWith("Old")) {
+					// Parallel init tests can populate recent-sources.json. Select this test's actual source,
+					// rather than silently accepting another test's newest folder as the fixture.
+					const ownSource = options.find(option => resolve(d, option.value) === join(d, "legacy"));
+					expect(ownSource).toBeDefined();
+					return ownSource!.value;
+				}
+				return initial ?? options[0]!.value;
+			},
+			log: () => {},
+		};
 		await init(["--no-docs"], { root: d, prompter, client });
 		expect(asked).toEqual(["Old codebase folder (read-only, never written)", "New codebase folder"]);
 		expect(client.calls.length).toBe(0);
