@@ -519,7 +519,10 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	const needsPrepare = (slice: string) => prepareTries(ledger, slice, plugin) < MAX_PARITY_ERRORS && suiteGaps(ledger, o.root, slice, uiStackOf(config)).length > 0;
 	const pumpParity = () => {
 		if (parityRunning || parityStopped) return;
-		if (!parityQueue.length) return void fixOldData();
+		// the old app's data is fixed first, once per run, as soon as steps fail on it (the slices after it then compare
+		// pages the test account can see); later failures wait until nothing else is queued
+		if ((!parityQueue.length || !oldDataAsked.size) && fixOldData()) return;
+		if (!parityQueue.length) return;
 		const slice = parityQueue.shift()!;
 		parityRunning = (async () => {
 			showParity("checking whether the old and the new app start");
@@ -589,13 +592,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				pumpParity();
 			});
 	};
-	// steps the old app answered with a server error on its fixture: once nothing else is queued, its setup model is
-	// asked to add what they need (once per list of failures, a few times per app at most), the new apps load the
-	// same data again, and those slices are compared again
+	// steps the old app failed on its fixture: its setup model is asked to add what they need (once per list of
+	// failures, a few times per app at most), the new apps load the same data again, and those slices are compared
+	// again. Says whether that started.
 	const oldDataAsked = new Set<string>();
-	const fixOldData = () => {
+	const fixOldData = (): boolean => {
 		const fails = oldFailures(o.root), key = JSON.stringify(fails);
-		if (!parityProbe || !Object.keys(fails).length || oldDataAsked.has(key)) return;
+		if (!parityProbe || !Object.keys(fails).length || oldDataAsked.has(key)) return false;
 		oldDataAsked.add(key);
 		parityRunning = (async () => {
 			await parityProbe;
@@ -613,6 +616,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				showParity();
 				pumpParity();
 			});
+		return true;
 	};
 	const queueParity = (slice: string | undefined) => {
 		if (!parityProbe || !slice || parityQueue.includes(slice) || !sliceDone(slice)) return;
