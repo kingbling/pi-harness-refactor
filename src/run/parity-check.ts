@@ -592,6 +592,8 @@ export interface SliceCheck {
 	evidence?: SliceEvidence;
 	/** A preparation that could not write the missing checks: why (the slice was compared with its existing steps). */
 	unprepared?: string;
+	/** That preparation still left fewer gaps than the suite had: its best try was kept, and the next one goes on from it. */
+	prepareProgress?: boolean;
 }
 
 export interface SliceEvidence {
@@ -687,6 +689,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	// a suite that compares as it is: a preparation that cannot extend it still compares with it
 	const usableBefore = !o.rewrite && !!suite && !problem;
 	let unprepared: string | undefined;
+	let prepareProgress = false;
 	if (o.prepare && suite && !problem) problem = strictSuiteProblems(suite, routes, o.root, uiStackOf(o.config)).join("; ");
 	if (!o.strict && (o.rewrite || !existsSync(stepsPath(o.root, o.slice)) || problem)) {
 		const writer = o.writer ?? writeStepsWithModel;
@@ -694,6 +697,16 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 		const backup = o.prepare ? mkdtempSync(join(tmpdir(), "br-parity-prepare-")) : undefined;
 		let usable = false;
 		let backedUp = false;
+		// the backup holds the best suite so far: a try that leaves fewer strict gaps is kept, so the next try (or the
+		// next preparation) goes on from it instead of starting over; a large slice rarely gets every check in one session
+		const save = () => {
+			if (!backup) return;
+			for (const path of ["steps.json", "checks"]) {
+				rmSync(join(backup, path), { recursive: true, force: true });
+				if (existsSync(join(dir, path))) cpSync(join(dir, path), join(backup, path), { recursive: true });
+			}
+			backedUp = true;
+		};
 		const restore = () => {
 			if (!backup || !backedUp) return;
 			for (const path of ["steps.json", "checks"]) {
@@ -701,22 +714,40 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 				if (existsSync(join(backup, path))) cpSync(join(backup, path), join(dir, path), { recursive: true });
 			}
 		};
+		const ui = uiStackOf(o.config);
+		const strictGaps = (f: StepsFile) => [...strictSuiteProblems(f, routes, o.root, ui), ...(suite ? retainedScenarioProblems(suite, f) : [])];
+		// a suite that cannot compare, or drops a legacy scenario, is no step forward
+		const gapsOf = (f: StepsFile | undefined) => (!f || stepsProblem(f, routes, o.config.target.stacks, { login }) || (suite && retainedScenarioProblems(suite, f).length) ? Infinity : strictSuiteProblems(f, routes, o.root, ui).length);
+		let best = usableBefore ? gapsOf(suite) : Infinity;
+		let improved = false;
 		try {
-			for (const path of ["steps.json", "checks"]) if (backup && existsSync(join(dir, path))) cpSync(join(dir, path), join(backup, path), { recursive: true });
-			backedUp = true;
+			save();
 			for (let i = 0; i < 2; i++) {
 				await writer({ config: o.config, root: o.root, slice: o.slice, dir, stronger: !!o.prepare && i > 0, problem: problem ? `${ask}\n\nThe steps.json you wrote cannot be used: ${problem}` : ask }).catch((e) => log(pc.yellow(`parity ${o.slice}: step writer failed: ${e?.message ?? e}`)));
 				const f = loadSteps(o.root, o.slice);
 				problem = f ? stepsProblem(f, routes, o.config.target.stacks, { login }) : "steps.json is missing or not valid JSON";
-				if (o.prepare && f && !problem) problem = [...strictSuiteProblems(f, routes, o.root, uiStackOf(o.config)), ...(suite ? retainedScenarioProblems(suite, f) : [])].join("; ");
+				if (o.prepare && f && !problem) problem = strictGaps(f).join("; ");
 				if (!problem) break;
-				if (i === 0) restore();
+				if (!o.prepare) continue;
+				const gaps = gapsOf(f);
+				if (gaps < best) {
+					best = gaps;
+					improved = true;
+					save();
+				} else restore();
 			}
-			if (problem && !(o.prepare && usableBefore)) return fail(`no usable steps: ${problem}`);
+			if (problem && improved) {
+				// the best try is kept and compared; what it still misses is asked next time
+				restore();
+				problem = strictGaps(loadSteps(o.root, o.slice)!).join("; ");
+			}
+			if (problem && !improved && !(o.prepare && usableBefore)) return fail(`no usable steps: ${problem}`);
 			if (problem) {
 				unprepared = problem;
-				log(pc.yellow(`parity ${o.slice}: the missing checks could not be written (${problem.slice(0, 300)}); compared with the existing steps`));
-			} else usable = true;
+				log(pc.yellow(`parity ${o.slice}: the missing checks could not all be written (${problem.slice(0, 300)}); ${improved ? `kept the try with the fewest gaps (${best})` : "compared with the existing steps"}`));
+			}
+			usable = !problem || improved;
+			prepareProgress = !!problem && improved;
 		} finally {
 			if (backup) {
 				if (!usable) restore();
@@ -833,7 +864,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 	const note = [`${c.compared} step(s) compared`, checks.length ? `${checks.length} executable check(s) compared` : "", skipped.length ? `${skipped.length} of ${routes.length} route(s) skipped` : "", withData ? "written data compared" : "written data not compared", c.notCompared.length ? `not compared: ${c.notCompared.join(", ")}` : "", held.length ? `not compared yet (unit not accepted): ${held.join(", ")}` : ""].filter(Boolean).join("; ");
 	if (c.newLoginFailed) log(pc.yellow(`parity ${o.slice}: the comparison could not log in to the new app (every page after the login went back to it): those pages are not compared and no unit is blamed`));
 	const complete = !c.notCompared.length && !skipped.length && !held.length && !problems.length && !c.newLoginFailed && (c.compared > 0 || checks.length > 0);
-	const res = record({ outcome: c.diffs.length ? "differs" : complete ? "same" : "error", diffs: c.diffs, compared: c.compared, note: `${c.newLoginFailed ? "the new app's login did not hold; " : ""}${note}${problems.length ? `; verification gaps: ${problems.join("; ")}` : ""}${unprepared ? `; missing checks not written: ${unprepared.slice(0, 300)}` : ""}`, ...(evidence ? { evidence } : {}), ...(unprepared ? { unprepared } : {}) }, steps.length, skipped.length);
+	const res = record({ outcome: c.diffs.length ? "differs" : complete ? "same" : "error", diffs: c.diffs, compared: c.compared, note: `${c.newLoginFailed ? "the new app's login did not hold; " : ""}${note}${problems.length ? `; verification gaps: ${problems.join("; ")}` : ""}${unprepared ? `; missing checks not written: ${unprepared.slice(0, 300)}` : ""}`, ...(evidence ? { evidence } : {}), ...(unprepared ? { unprepared } : {}), ...(prepareProgress ? { prepareProgress } : {}) }, steps.length, skipped.length);
 	log(res.outcome === "same" ? pc.green(`parity ${o.slice}: compared scenarios match — ${note}`) : pc.yellow(`parity ${o.slice}: ${res.outcome} — ${res.note}`));
 	return res;
 }

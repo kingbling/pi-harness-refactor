@@ -543,7 +543,7 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			const prepare = needsPrepare(slice);
 			if (prepare) showParity(`writing the missing checks of ${slice} against the old app`);
 			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, prepare, log, fixSetup, ensureLogins });
-			if (prepare && r.outcome !== "setup") notePrepare(ledger, slice, plugin, r.unprepared ?? (r.outcome === "error" && r.note.startsWith("no usable steps") ? r.note : undefined));
+			if (prepare && r.outcome !== "setup") notePrepare(ledger, slice, plugin, r.unprepared ?? (r.outcome === "error" && r.note.startsWith("no usable steps") ? r.note : undefined), r.prepareProgress);
 			// its setup ran out of fixes: a person must look, asked once
 			if (r.setup) await askBootOwner({ root: o.root, side: r.setup.side, error: r.note, ask: probeAsk.ask });
 			// the new app does not start on main: a red main the builder fixes, not only a parity error. A stack with no
@@ -1977,10 +1977,13 @@ export function prepareTries(ledger: Ledger, slice: string, version: string | un
 	return t && t.version === version ? t.tries : 0;
 }
 
-/** A preparation's outcome: `why` it could not write the checks, or undefined once they were written. */
-export function notePrepare(ledger: Ledger, slice: string, version: string | undefined, why: string | undefined): void {
+/**
+ * A preparation's outcome: `why` it could not write the checks, or undefined once they were written. One that still
+ * left fewer gaps (`progress`) uses no try: each such one leaves strictly fewer, so it ends.
+ */
+export function notePrepare(ledger: Ledger, slice: string, version: string | undefined, why: string | undefined, progress = false): void {
 	const all = prepareRecord(ledger);
-	if (why) all[slice] = { tries: prepareTries(ledger, slice, version) + 1, version, why: why.slice(0, 600), at: new Date().toISOString() };
+	if (why) all[slice] = { tries: prepareTries(ledger, slice, version) + (progress ? 0 : 1), version, why: why.slice(0, 600), at: new Date().toISOString() };
 	else delete all[slice];
 	ledger.setMeta(PARITY_PREPARE, JSON.stringify(all));
 }

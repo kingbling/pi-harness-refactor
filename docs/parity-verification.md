@@ -46,6 +46,10 @@ earlier successful comparison.
 Preparation retains the original suite and drivers until the candidate validates.
 An invalid draft is rolled back before retrying with the configured escalation
 model; a failed preparation leaves the original files intact.
+A preparation that cannot write every missing check keeps its best try when it
+leaves fewer gaps than the suite had (still comparing every scenario the suite
+had); the next preparation goes on from it, and such a try uses none of the
+slice's tries.
 
 The claim is **parity for the declared behavior suite at the recorded commits**.
 It does not establish correctness for every possible input or prove that the

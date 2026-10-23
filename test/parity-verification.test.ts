@@ -16,6 +16,7 @@ import { migrationProblems, renderVerification, verifyParity, VERIFICATION_META,
 import { validateParityProjects } from "../src/run/parity-project-checks.ts";
 import { parityCommand } from "../src/run/parity-cli.ts";
 import { oldFailures } from "../src/run/parity-scope.ts";
+import { notePrepare, prepareTries } from "../src/run/run.ts";
 
 const step: Step = { id: "value", route: "GET /value", compare: "data", method: "GET", path: "/value" };
 const freePort = () => new Promise<number>((resolve) => { const s = createServer().listen(0, "127.0.0.1", () => { const port = (s.address() as { port: number }).port; s.close(() => resolve(port)); }); });
@@ -464,6 +465,31 @@ describe("strict parity evidence", () => {
 		expect(readFileSync(suitePath("http"), "utf8")).toBe(original);
 		expect(readFileSync(join(checks, "existing.cjs"), "utf8")).toBe("// original driver\n");
 		expect(existsSync(join(checks, "new.cjs"))).toBe(false);
+	});
+
+	it("keeps a preparation's best try when it leaves fewer gaps, and the next try goes on from it", async () => {
+		const before = existsSync(suitePath("http")) ? readFileSync(suitePath("http"), "utf8") : undefined;
+		const pages = [{ ...step, id: "p1", compare: "page" as const }, { ...step, id: "p2", compare: "page" as const }];
+		write(suitePath("http"), { steps: pages });
+		const check = (covers: string[]) => ({ id: "pages", kind: "browser", covers, why: "the pages show the value", command: { cmd: process.execPath, args: ["-e", "console.log(JSON.stringify({shown:1}))"] }, inputs: [".bigrefactor/parity/slices/http/steps.json"] });
+		const seen: string[] = [];
+		const r = await checkSlice({ ledger, config, root, slice: "http", serverStack: "nestjs", linkAll: () => {}, prepare: true, log: () => {}, writer: async (o) => {
+			seen.push(readFileSync(suitePath("http"), "utf8"));
+			// the cheap try covers one page; the stronger one drops a scenario, which is no step forward
+			write(suitePath("http"), o.stronger ? { steps: [pages[0]], checks: [check(["p1"])] } : { steps: pages, checks: [check(["p1"])] });
+		} });
+		expect(r.prepareProgress).toBe(true);
+		expect(r.unprepared).toMatch(/page p2: needs a browser check/);
+		expect(r.unprepared).not.toMatch(/page p1/);
+		expect(JSON.parse(seen[1]!)).toMatchObject({ checks: [{ covers: ["p1"] }] });
+		expect(JSON.parse(readFileSync(suitePath("http"), "utf8"))).toMatchObject({ steps: pages, checks: [{ covers: ["p1"] }] });
+		// a try that left fewer gaps uses none of the slice's tries
+		notePrepare(ledger, "http", "v1", r.unprepared, r.prepareProgress);
+		expect(prepareTries(ledger, "http", "v1")).toBe(0);
+		notePrepare(ledger, "http", "v1", r.unprepared);
+		expect(prepareTries(ledger, "http", "v1")).toBe(1);
+		notePrepare(ledger, "http", "v1", undefined);
+		if (before !== undefined) writeFileSync(suitePath("http"), before);
 	});
 
 	it("uses the stronger second preparation to produce real executable coverage", async () => {
