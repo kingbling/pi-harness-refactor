@@ -356,7 +356,7 @@ describe("judging parity differences", () => {
 			return id;
 		};
 		const r1 = run([{ step: "one", path: "", legacy: 302, target: 401 }]);
-		const first: ParityJudge = async (o) => (expect(o.facts).toMatch(/Shared causes[\s\S]*none known yet/), [{ diffs: ids(r1), verdict: "bug", unit: "U1", problem: "a logged-out request gets 401, the old app redirects to /login", fix: "redirect to /login in the auth layer", shared: "new" }]);
+		const first: ParityJudge = async (o) => (expect(o.facts).toMatch(/Shared causes[\s\S]*"stack": the target stack whose code holds it, one of nestjs[\s\S]*none known yet/), [{ diffs: ids(r1), verdict: "bug", unit: "U1", problem: "a logged-out request gets 401, the old app redirects to /login", fix: "redirect to /login in the auth layer", shared: "new", stack: "nestjs" }]);
 		const res = await judgeRun({ ledger, config, root, runId: r1, slice: "invoices", judge: first, log: () => {}, shared: true });
 		expect(res).toMatchObject({ reopened: [], bugs: 1, shared: ["S1"] });
 		expect(status(r1)).toEqual(["bug"]);
@@ -367,7 +367,8 @@ describe("judging parity differences", () => {
 		expect((await judgeRun({ ledger, config, root, runId: r2, slice: "dashboard", judge: second, log: () => {}, shared: true })).reopened).toEqual([]);
 		const [c] = sharedCauses(ledger);
 		expect(sharedCauses(ledger)).toHaveLength(1);
-		expect(c).toMatchObject({ id: "S1", slices: ["invoices", "dashboard"], status: "open", jobs: 0 });
+		// the stack the judge named holds the cause: its code job works there
+		expect(c).toMatchObject({ id: "S1", slices: ["invoices", "dashboard"], status: "open", jobs: 0, stack: "nestjs" });
 		expect(sharedJobText(c!)).toMatch(/slices invoices, dashboard[\s\S]*redirect to \/login in the auth layer[\s\S]*dashboard: step s1/);
 
 		// a job landed, yet a later comparison still differs: open for another job; after the last one the units go back

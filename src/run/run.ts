@@ -626,12 +626,14 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	let sharedRunning: Promise<void> | undefined;
 	const pumpShared = () => {
 		if (sharedRunning || parityStopped || !sharedOn || !adapters.has(serverStack) || !sharedCauses(ledger).some((x) => x.status === "open")) return;
+		// the cause's code job works in the stack whose code holds it (a UI cause cannot be fixed from the server's project)
+		const stackOf = (c: { stack?: string }) => (c.stack && adapters.has(c.stack) ? c.stack : serverStack);
 		sharedRunning = runSharedJob(
 			ledger,
 			async (c) => {
 				let merged: string | undefined;
-				const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(serverStack)!, label: `parity-${c.id}-${c.jobs}`, linkAll, log, what: sharedJobText(c), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
-				if (said && merged) noteFix(o.root, serverStack, merged, `parity shared cause ${c.id}: ${said}`);
+				const said = await runCodeJob({ config, root: o.root, ledger, adapter: adapters.get(stackOf(c))!, label: `parity-${c.id}-${c.jobs}`, linkAll, log, what: sharedJobText(c), mergeFix: (wt, branch, msg) => merge.run(async () => await mergeUnit(config, "code", wt, branch, "", msg)).then((sha) => (pusher.afterMerge(), (merged = sha))) });
+				if (said && merged) noteFix(o.root, stackOf(c), merged, `parity shared cause ${c.id}: ${said}`);
 				return !!(said && merged);
 			},
 			(l) => log(pc.yellow(l)),

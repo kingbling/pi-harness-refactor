@@ -45,6 +45,8 @@ export interface JudgeGroup {
 	opinion?: "drop" | "keep";
 	/** bug: the cause is in shared code, not this unit's own: the id of a known shared cause, or "new". */
 	shared?: string;
+	/** shared: the target stack whose code holds that cause (its code job works there). */
+	stack?: string;
 }
 
 /** A bug cause in code many slices share: one code job fixes it (ledger meta `parity_shared`). */
@@ -60,6 +62,8 @@ export interface SharedCause {
 	status: "open" | "running" | "landed" | "failed";
 	jobs: number;
 	landedAt?: string;
+	/** the target stack whose code holds it (the server stack when the judge did not say) */
+	stack?: string;
 }
 
 /** Code jobs one shared cause gets; after that its differences re-open the units as before. */
@@ -115,6 +119,7 @@ export const judgeWithModel: ParityJudge = async (o) => {
 					why: Type.Optional(Type.String()),
 					opinion: Type.Optional(Type.Union([Type.Literal("drop"), Type.Literal("keep")])),
 					shared: Type.Optional(Type.String({ description: "bug only, when the facts list shared causes: the cause is in code many pages share (how a logged-out request is answered, redirects, HTTPS, headers every route gets), not in this unit's own code. The id of a known shared cause when it is the same behaviour, else \"new\". One job fixes it once; no unit is re-opened for it." })),
+					stack: Type.Optional(Type.String({ description: "with shared: the target stack whose code holds the cause (a code job can only change that stack's project)" })),
 				}),
 			),
 		}),
@@ -197,7 +202,7 @@ export async function judgeRun(o: {
 		if (!c && all.some((x) => x.status === "failed" && x.slices.includes(o.slice))) return false;
 		const examples = these.map((d) => `${o.slice}: ${describeDiff(d)}`);
 		if (!c) {
-			c = { id: `S${all.length + 1}`, problem: g.problem, fix: g.fix, slices: [], examples: [], status: "open", jobs: 0 };
+			c = { id: `S${all.length + 1}`, problem: g.problem, fix: g.fix, slices: [], examples: [], status: "open", jobs: 0, ...(g.stack && o.config.target.stacks.includes(g.stack) ? { stack: g.stack } : {}) };
 			all.push(c);
 		}
 		if (!c.slices.includes(o.slice)) c.slices.push(o.slice);
@@ -226,7 +231,7 @@ export async function judgeRun(o: {
 			`The requests (steps.json; "target" = how the new app was asked differently):\n${JSON.stringify(steps, null, 1).slice(0, 12_000)}`,
 			`How each app runs here (its setup model's words):\n${Object.entries(loadApps(o.root)).map(([side, a]) => `${side}: ready at ${a.recipe?.ready ?? "?"}; ${a.said ?? ""}`).join("\n")}`,
 			`The differences:\n${open.map((d) => `#${d.id} ${describeDiff(d)}`).join("\n")}`,
-			...(o.shared ? [`Shared causes (a bug in code many pages share; set "shared" on a bug group: a known id when it is the same behaviour, "new" for another one):\n${known.map((c) => `${c.id} (slices ${c.slices.join(", ")})${c.status === "failed" ? " FAILED: its jobs did not fix it, so its bugs go to the units; do not set shared for it" : ""}: ${c.problem}`).join("\n") || "none known yet"}`] : []),
+			...(o.shared ? [`Shared causes (a bug in code many pages share; set "shared" on a bug group: a known id when it is the same behaviour, "new" for another one, and "stack": the target stack whose code holds it, one of ${o.config.target.stacks.join(", ")}):\n${known.map((c) => `${c.id} (slices ${c.slices.join(", ")})${c.status === "failed" ? " FAILED: its jobs did not fix it, so its bugs go to the units; do not set shared for it" : ""}: ${c.problem}`).join("\n") || "none known yet"}`] : []),
 		].join("\n\n");
 		const groups = await (o.judge ?? judgeWithModel)({ config: o.config, root: o.root, slice: o.slice, facts, units: units.map((u) => u.id) }).catch((e) => (log(pc.yellow(`parity ${o.slice}: judge failed: ${e?.message ?? e}`)), undefined));
 		const openIds = new Set(open.map((d) => d.id));
