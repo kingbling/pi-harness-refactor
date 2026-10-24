@@ -55,7 +55,7 @@ import { afterAccept, envFingerprint, errorSignature, runUnit, setupFiles, type 
 import { clipOutput, conflictMarkers, verdictsAtMerge, wholeProjectSteps } from "./gate.ts";
 import { isWiringFile } from "../rules/layout-rules.ts";
 import { spawnLeaf } from "../sessions/spawn.ts";
-import { exec } from "../proc.ts";
+import { exec, keepAwake } from "../proc.ts";
 
 /**
  * The scheduler: many agent sessions, few gate workers, one merge at a time.
@@ -122,10 +122,12 @@ export interface SchedulerResult {
 export async function runScheduler(o: SchedulerOptions): Promise<SchedulerResult> {
 	// a step that holds the run's event loop over a second is written to .bigrefactor/blocked.log (slow stops and IPC to Pi)
 	const stopWatchdog = startWatchdog(o.root, (l) => (o.log ?? console.log)(pc.yellow(l)));
+	const letSleep = o.dry || o.spawn ? () => {} : keepAwake();
 	try {
 		return await schedule(o);
 	} finally {
 		stopWatchdog();
+		letSleep();
 	}
 }
 
@@ -531,10 +533,14 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			const apps = loadApps(o.root);
 			if (!apps["legacy"]?.up || !apps[serverStack]?.up) return void (parityLast = `off: ${!apps["legacy"]?.up ? "the old app" : "the new app"} does not start here (br parity --probe)`);
 			if (!sliceDone(slice)) return;
-			const { askBootOwner, bootWaits, setupFixer } = await import("./parity.ts");
-			// an app its setup could not get to start: the owner was asked, checks wait for that (each would fail the same way)
+			const { askBootOwner, bootWaits, setupFixer, saveApp, BOOT_RECHECK_MS } = await import("./parity.ts");
+			// an app its setup could not get to start: the owner was asked, checks wait for that (each would fail the same
+			// way). It may start again by itself: every BOOT_RECHECK_MS one check runs without its setup model, and an app
+			// that starts there settles the question
 			const waits = bootWaits(apps, probeAsk.answer);
-			if (waits) return void (parityLast = `off: ${waits === "legacy" ? "the old app" : `the new ${waits} app`} does not start here — waiting for your answer`);
+			const recheck = !!waits && Date.now() - (apps[waits]!.bootRetriedAt ?? 0) >= BOOT_RECHECK_MS;
+			if (waits && !recheck) return void (parityLast = `off: ${waits === "legacy" ? "the old app" : `the new ${waits} app`} does not start here — waiting for your answer`);
+			if (waits) saveApp(o.root, waits, { bootRetriedAt: Date.now() });
 			showParity(`comparing ${slice} with the old app`);
 			const { checkSlice } = await import("./parity-check.ts");
 			// an app that does not start here (its data reset, start or no answer) goes to its setup model first, then the check goes on
@@ -545,7 +551,12 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 			const ensureLogins = (sides: string[]) => (showParity("finding a test account for the old and the new app"), ensureTestLogins({ config, root: o.root, sides, linkAll, log, ...probeAsk }));
 			const prepare = needsPrepare(slice);
 			if (prepare) showParity(`writing the missing checks of ${slice} against the old app`);
-			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, prepare, log, fixSetup, ensureLogins });
+			const r = await checkSlice({ ledger, config, root: o.root, slice, linkAll, serverStack, onlyAccepted: true, prepare, log, fixSetup: recheck ? undefined : fixSetup, ensureLogins });
+			const asked = waits ? apps[waits]!.bootQuestion : undefined;
+			if (asked !== undefined && loadApps(o.root)[waits!]?.bootQuestion === undefined) {
+				ledger.answerQuestion(asked, "auto: it starts again here (it had stopped starting for a while)", "orchestrator");
+				log(pc.green(`parity: ${waits === "legacy" ? "the old app" : `the new ${waits} app`} starts again; question #${asked} is settled`));
+			}
 			if (prepare && r.outcome !== "setup") notePrepare(ledger, slice, plugin, r.unprepared ?? (r.outcome === "error" && r.note.startsWith("no usable steps") ? r.note : undefined), r.prepareProgress);
 			// its setup ran out of fixes: a person must look, asked once
 			if (r.setup) await askBootOwner({ root: o.root, side: r.setup.side, error: r.note, ask: probeAsk.ask });
@@ -602,9 +613,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		oldDataAsked.add(key);
 		parityRunning = (async () => {
 			await parityProbe;
-			const { fixUpLeft, loadApps, probeApps } = await import("./parity.ts");
+			const { fixtureTriesLeft, loadApps, probeApps } = await import("./parity.ts");
 			const old = loadApps(o.root)["legacy"];
-			if (!old?.up || !fixUpLeft(old, "fixture")) return;
+			if (!old?.up || !fixtureTriesLeft(o.root, old)) return;
 			showParity(`setting up the old app's data again: ${Object.values(fails).flat().length} step(s) fail on it`);
 			const before = scopeIfValid(o.root)?.legacyAt;
 			await probeApps({ config, root: o.root, linkAll, log, ...probeAsk });
@@ -1681,17 +1692,20 @@ export { errorSignature };
 /** How long a model's "wait" answer holds a unit; then it runs again (the owner's wait holds until a newer answer). */
 export const MODEL_HOLD_MS = 30 * 60_000;
 
+/** Who answers "wait" for a while only: the models, and the run itself over a model provider that is down. */
+const TIMED_WAITS: readonly string[] = [...MODEL_ANSWERERS, "orchestrator"];
+
 /** When the last unit held by a model's wait answer may run again (undefined: none is held so). */
 export function modelHeldUntil(ledger: Ledger, now = Date.now()): number | undefined {
 	const rows = ledger.db.prepare("SELECT q.answered_by, q.answered_at FROM units u JOIN questions q ON q.id = json_extract(u.meta, '$.hold') WHERE u.state IN ('truth','implementing','gating','review')").all() as Array<{ answered_by: string | null; answered_at: string | null }>;
-	const ends = rows.filter((r) => r.answered_at && MODEL_ANSWERERS.includes(r.answered_by ?? "")).map((r) => Date.parse(r.answered_at!) + MODEL_HOLD_MS).filter((t) => t > now);
+	const ends = rows.filter((r) => r.answered_at && TIMED_WAITS.includes(r.answered_by ?? "")).map((r) => Date.parse(r.answered_at!) + MODEL_HOLD_MS).filter((t) => t > now);
 	return ends.length ? Math.max(...ends) : undefined;
 }
 
 /** Whether the wait answered on this question was a model's and has run out. */
 function modelHoldOver(ledger: Ledger, questionId: number, now = Date.now()): boolean {
 	const q = ledger.db.prepare("SELECT answered_by, answered_at FROM questions WHERE id = ?").get(questionId) as { answered_by: string | null; answered_at: string | null } | undefined;
-	return !!q?.answered_at && MODEL_ANSWERERS.includes(q.answered_by ?? "") && now - Date.parse(q.answered_at) >= MODEL_HOLD_MS;
+	return !!q?.answered_at && TIMED_WAITS.includes(q.answered_by ?? "") && now - Date.parse(q.answered_at) >= MODEL_HOLD_MS;
 }
 
 /**

@@ -321,7 +321,8 @@ describe("a wait answer", () => {
 		const ws = mkdtempSync(join(tmpdir(), "br-wait-"));
 		const config = ConfigSchema.parse({ source: { path: join(ws, "legacy"), stack: "php" }, target: { path: join(ws, "migrated"), stacks: ["nestjs"] }, models: {} });
 		const ledger = new Ledger(":memory:");
-		for (const [id, by] of [["byModel", RESOLVER], ["byOwner", "human"]] as const) {
+		// the run's own wait over a model provider that is down holds like a model's
+		for (const [id, by] of [["byModel", RESOLVER], ["byOwner", "human"], ["byRun", "orchestrator"]] as const) {
 			ledger.createUnit({ id, tier: "T1", deps: [], meta: {}, symbolIds: [] });
 			ledger.transitionUnit(id, "truth", "test");
 			ledger.transitionUnit(id, "implementing", "test");
@@ -335,7 +336,7 @@ describe("a wait answer", () => {
 		expect(modelHeldUntil(ledger)).toBeGreaterThan(Date.now());
 		ledger.db.prepare("UPDATE questions SET answered_at = ?").run(new Date(Date.now() - MODEL_HOLD_MS - 1000).toISOString());
 		expect(modelHeldUntil(ledger)).toBeUndefined();
-		expect(await resubmit()).toEqual(["byModel"]);
+		expect(await resubmit()).toEqual(["byModel", "byRun"]);
 		expect(ledger.getUnit("byModel")!.state).toBe("planned");
 		expect(ledger.getUnit("byOwner")!.state).toBe("implementing");
 	});

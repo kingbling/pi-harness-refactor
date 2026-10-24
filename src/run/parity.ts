@@ -82,10 +82,14 @@ export interface AppState {
 	bootProbes?: number;
 	/** The owner question asked once those fixes ran out: slice checks wait for it, "retry" gives the setup its tries back. */
 	bootQuestion?: number;
+	/** When a slice check last tried to start it again without its setup model while that question is open (BOOT_RECHECK_MS). */
+	bootRetriedAt?: number;
 	/** Set once its setup checked whether the data reset keeps a full second copy of a large database (which is then dropped). */
 	resetSpaceChecked?: boolean;
-	/** How often its setup was asked for what strict parity needs of its data (fixtureGaps), at most MAX_FIXUPS. */
+	/** How often its setup was asked for what strict parity needs of its data (fixtureGaps), at most MAX_FIXUPS per fixtureAt. */
 	fixtureProbes?: number;
+	/** The old app's fixture (scope.json legacyAt) those tries were made on: a changed one gives fresh tries. */
+	fixtureAt?: string;
 	/** A new app only: the old app's fixture (scope.json legacyAt) its reset was last made to load the same data as. */
 	fixtureFor?: string;
 	/** The test account the comparison logs in with on this app, found or made by its setup model (set_test_login). */
@@ -120,11 +124,18 @@ export const LEGACY = "legacy";
 
 /** An app that is up is probed again over the same kind of problem at most this often (a model that gave up once may not twice). */
 export const MAX_FIXUPS = 3;
-type FixKind = "data" | "redirect" | "setup" | "boot" | "fixture";
+type FixKind = "data" | "redirect" | "setup" | "boot";
 const fixUps = (a: AppState, kind: FixKind) =>
-	kind === "fixture" ? (a.fixtureProbes ?? 0) : kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : kind === "boot" ? (a.bootProbes ?? 0) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
+	kind === "data" ? (a.dataProbes ?? (a.dataProbed ? 1 : 0)) : kind === "redirect" ? (a.redirectProbes ?? (a.redirectProbed ? 1 : 0)) : kind === "boot" ? (a.bootProbes ?? 0) : (a.setupProbes ?? (a.setupProbed ? 1 : 0));
 /** Whether the app may still be probed again over this kind of problem. */
 export const fixUpLeft = (a: AppState | undefined, kind: FixKind) => !!a && fixUps(a, kind) < MAX_FIXUPS;
+/**
+ * Fixture tries count on the old app's fixture they were made on. Once it changes (the old app's setup added what its
+ * steps lacked), each new app must load the same data again, and the old app may go on with the failures left: 3 tries
+ * for the life of a workspace left the new apps unable to follow the old app's second change.
+ */
+const fixtureTries = (a: AppState, legacyAt: string | undefined) => (a.fixtureAt === legacyAt ? (a.fixtureProbes ?? 0) : 0);
+export const fixtureTriesLeft = (root: string, a: AppState | undefined) => !!a && fixtureTries(a, scopeIfValid(root)?.legacyAt) < MAX_FIXUPS;
 
 /** A command's error for a person or a model: no colour codes, the start (the tool's own message) and the end (a traceback's last line). */
 export function clipError(e: any, n = 1_200): string {
@@ -614,7 +625,7 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 	const boot = cur.up === true && !!cur.recipe && !!cur.bootProblem && fixUpLeft(cur, "boot");
 	// what strict parity needs of its data (a reset loading a small fixture, its files recorded, the old app's config overlays declared)
 	const legacyAt = scopeIfValid(o.root)?.legacyAt;
-	const fixture = cur.up === true && !!cur.recipe && fixUpLeft(cur, "fixture") ? await fixtureGaps(o.config, o.root, o.side, cur) : [];
+	const fixture = cur.up === true && !!cur.recipe && fixtureTriesLeft(o.root, cur) ? await fixtureGaps(o.config, o.root, o.side, cur) : [];
 	// each kind at most MAX_FIXUPS times, whatever came of it
 	const fixUp = (lacksData && fixUpLeft(cur, "data")) || redirect || setup || boot || space || fixture.length > 0;
 	if (cur.up !== undefined && !retry && !moved && !fixUp && !o.again) return cur.up;
@@ -644,7 +655,7 @@ export async function probeApp(o: { config: Config; root: string; side: string; 
 		// the redirect is gone when the check sent the request again and it was not redirected (also when only the dump failed)
 		const redirectGone = redirect && !!recipe && !bad && !res.redirectFailed && (res.ok || !!res.dumpFailed);
 		// a reset the fixture task saved loads a small fixture (it was told never a full copy): no space check for it
-		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}), ...(space ? { resetSpaceChecked: true } : {}), ...(fixture.length ? { fixtureProbes: fixUps(cur, "fixture") + 1, ...(res.ok ? { resetSpaceChecked: true, ...(o.side !== LEGACY ? { fixtureFor: legacyAt } : {}) } : {}) } : {}) });
+		saveApp(o.root, o.side, { up: true, recipe: kept, ...(lacksData ? { dataProbed: undefined, dataProbes: fixUps(cur, "data") + 1 } : {}), ...(redirect ? { redirectProbed: undefined, redirectProbes: fixUps(cur, "redirect") + 1, ...(redirectGone ? { selfRedirect: undefined } : {}) } : {}), ...(setup ? { setupProbed: undefined, setupProbes: fixUps(cur, "setup") + 1, ...(res.ok ? { setupProblem: undefined } : {}) } : {}), ...(boot ? { bootProbes: fixUps(cur, "boot") + 1, ...(res.ok ? { bootProblem: undefined } : {}) } : {}), ...(space ? { resetSpaceChecked: true } : {}), ...(fixture.length ? { fixtureProbes: fixtureTries(cur, legacyAt) + 1, fixtureAt: legacyAt, ...(res.ok ? { resetSpaceChecked: true, ...(o.side !== LEGACY ? { fixtureFor: legacyAt } : {}) } : {}) } : {}) });
 		appendFileSync(join(parityDir(o.root), "probe.log"), `${new Date().toISOString()} ${o.side} → data: ${kept.reset && kept.dump ? "reset and dump added" : `still ${!kept.reset ? "no reset" : ""}${!kept.reset && !kept.dump ? ", " : ""}${!kept.dump ? "no dump" : ""}`}${redirect ? `; redirect to itself: ${redirectGone ? "gone" : "still there"}` : ""}${setup ? `; setup problem: ${res.ok ? "new recipe saved" : "old recipe kept"}` : ""}${boot ? `; did not start for a slice check: ${res.ok ? "starts again" : "still does not start"}` : ""}${space ? `; data reset: ${kept.reset ? "kept" : "dropped (it kept a full copy of the data)"}` : ""}${fixture.length ? `; strict parity fixture: ${res.ok && kept.reset ? "reset saved" : "still missing"} (${fixture.length} gap(s) asked)` : ""}${res.ok ? "" : ` (the new recipe failed: ${String(res.error).replace(/\s+/g, " ").slice(0, 300)})`}\n`);
 		log(kept.dump ? pc.green(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} can now ${kept.reset ? "reset and " : ""}dump its data`) : pc.yellow(`parity: ${o.side === LEGACY ? "the old app" : `the new ${o.side} app`} still cannot dump its data — written data is not compared`));
 		return true;
@@ -722,9 +733,16 @@ export async function askBootOwner(o: { root: string; side: string; error: strin
 		})
 		.catch(() => undefined);
 	if (qid === undefined) return false;
-	saveApp(o.root, o.side, { bootQuestion: qid });
+	saveApp(o.root, o.side, { bootQuestion: qid, bootRetriedAt: Date.now() });
 	return true;
 }
+
+/**
+ * How often a slice check starts an app again without its setup model while the owner's question about its start is
+ * open: an app often starts again by itself (a Mac that slept overnight, a dropped network, a service someone started),
+ * and the run had waited 10 hours on that question over an old app that started fine again.
+ */
+export const BOOT_RECHECK_MS = 30 * 60_000;
 
 /** The app whose start the owner was asked about and has not said "retry" yet: slice checks wait for that answer. */
 export function bootWaits(apps: Record<string, AppState>, answer: ProbeAnswer): string | undefined {

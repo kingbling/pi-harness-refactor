@@ -670,7 +670,7 @@ export async function checkSlice(o: { ledger: Ledger; config: Config; root: stri
 			const a = loadApps(o.root)[side];
 			if (b.ok) {
 				// it starts again: the next failure gets its own fixes
-				if (a?.bootProbes || a?.bootProblem || a?.bootQuestion !== undefined) saveApp(o.root, side, { bootProbes: undefined, bootProblem: undefined, bootQuestion: undefined });
+				if (a?.bootProbes || a?.bootProblem || a?.bootQuestion !== undefined) saveApp(o.root, side, { bootProbes: undefined, bootProblem: undefined, bootQuestion: undefined, bootRetriedAt: undefined });
 				return b;
 			}
 			if (!o.fixSetup || (fixes.get(side) ?? 0) >= MAX_SETUP_RETRIES) return b;

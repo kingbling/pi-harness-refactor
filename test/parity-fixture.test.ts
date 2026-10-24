@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../src/config.ts";
 import { commitAll, ensureRepo, isDirty } from "../src/git.ts";
 import { legacyCopyTool } from "../src/run/legacy-env.ts";
-import { appBootTools, fixtureGaps, LEGACY, loadApps, probeApp, type AppFixer, type AppState } from "../src/run/parity.ts";
+import { appBootTools, fixtureGaps, fixtureTriesLeft, LEGACY, loadApps, MAX_FIXUPS, probeApp, type AppFixer, type AppState } from "../src/run/parity.ts";
 import { loadScope, oldFailures, recordFixture, recordOldFailures, scopeIfValid, scopePath } from "../src/run/parity-scope.ts";
 
 /**
@@ -109,6 +109,19 @@ describe("the strict parity fixture", () => {
 		expect((await fixtureGaps(config, root, LEGACY, app)).join("\n")).not.toMatch(/server error/);
 		recordOldFailures(root, "rms", []);
 		expect(oldFailures(root)).toEqual({});
+	});
+
+	it("fixture tries count on the old app's fixture they were made on: once it changes every app gets fresh tries (the new apps must load it again)", async () => {
+		const { root } = await workspace();
+		const seed = fixtureFile(root, "seed.json", '{"users":[{"id":1}]}\n');
+		recordFixture(root, LEGACY, [seed]);
+		const at = scopeIfValid(root)!.legacyAt;
+		expect(fixtureTriesLeft(root, { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(false);
+		expect(fixtureTriesLeft(root, { fixtureProbes: MAX_FIXUPS - 1, fixtureAt: at })).toBe(true);
+		await new Promise((r) => setTimeout(r, 5));
+		writeFileSync(join(root, seed), '{"users":[{"id":1}],"agencies":[{"id":1}]}\n');
+		recordFixture(root, LEGACY, [seed]);
+		expect(fixtureTriesLeft(root, { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(true);
 	});
 
 	it("the old app's setup adds a reset, records the fixture and declares the config it changed in its copy; then nothing more is asked", async () => {

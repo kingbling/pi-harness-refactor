@@ -9,7 +9,7 @@ import { Ledger } from "../src/ledger/db.ts";
 import { FakeModelClient } from "../src/models/fake.ts";
 import type { GateInput, GateReport } from "../src/run/gate.ts";
 import { LEGACY_DOWN } from "../src/run/legacy-env.ts";
-import { runUnit } from "../src/run/unit.ts";
+import { MAX_PROVIDER_WAITS, runUnit } from "../src/run/unit.ts";
 import type { LeafSession } from "../src/sessions/spawn.ts";
 
 /**
@@ -428,6 +428,18 @@ describe("runUnit wiring", () => {
 		expect(ledger.db.prepare("SELECT point FROM questions WHERE unit_id = 'u1'").all()).toEqual([{ point: "env" }]);
 		expect(r.attempts).toBe(0);
 		expect(r.state).not.toBe("quarantined");
+		// an outage mostly ends by itself (a Mac that slept overnight: 18 units waited for the owner): the run says wait
+		// itself, so the unit runs again after a while; only once that kept failing is the owner asked
+		expect(ledger.db.prepare("SELECT status, answer, answered_by FROM questions WHERE unit_id = 'u1'").get()).toEqual({ status: "answered", answer: expect.stringMatching(/^wait — the model provider failed before any work/), answered_by: "orchestrator" });
+		ledger.updateUnit("u1", { meta: { providerWaits: MAX_PROVIDER_WAITS } });
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: spawnErr as never, gate, log: () => {} });
+		expect(ledger.db.prepare("SELECT status FROM questions WHERE unit_id = 'u1' ORDER BY id DESC LIMIT 1").get()).toEqual({ status: "open" });
+		// a session that works ends the count
+		ledger.answerQuestion((ledger.db.prepare("SELECT max(id) AS id FROM questions").get() as { id: number }).id, "retry", "human");
+		const ok = { text: "done", toolCalls: 1, blocked: 0, usage: { input: 0, output: 0, cost: 0 } };
+		const okSpawn = async (): Promise<LeafSession> => ({ run: async () => ok, dispose() {} }) as unknown as LeafSession;
+		await runUnit({ ledger, config, root: ws, unitId: "u1", reuseTruth: true, spawn: okSpawn as never, gate, log: () => {} });
+		expect(JSON.parse(ledger.getUnit("u1")!.meta).providerWaits).toBe(0);
 	});
 
 	it("truth ahead with an interface outside the placement stops after the retests but never quarantines; a real run does", async () => {

@@ -139,7 +139,9 @@ export async function recordOwned(root: string, r: Omit<OwnedRecord, "at">): Pro
 
 /**
  * The text of the workspace's setup records (app recipes, their scripts, the legacy runner, the config): a Docker
- * thing or a database they name is in use, even when nothing runs it right now. Logs are history, not use.
+ * thing or a database they name is in use, even when nothing runs it right now. Logs are history, not use, and so
+ * is a copy of a repo or its packages kept there (a git checkout, node_modules): with the pinned source's copy the
+ * text grew past what one string holds and every cleanup failed ("Invalid string length").
  */
 async function recipeText(root: string): Promise<string> {
 	const parts: string[] = [];
@@ -147,7 +149,9 @@ async function recipeText(root: string): Promise<string> {
 		try {
 			const s = await stat(p);
 			if (s.isDirectory()) {
-				for (const n of await readdir(p)) await add(join(p, n));
+				const entries = await readdir(p);
+				if (entries.includes(".git") || p.endsWith("/node_modules")) return;
+				for (const n of entries) await add(join(p, n));
 			} else if (s.size < 2_000_000 && !p.endsWith(".log")) parts.push(await readFile(p, "utf8"));
 		} catch {
 			/* gone */

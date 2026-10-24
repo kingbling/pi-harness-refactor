@@ -134,8 +134,9 @@ omitted historical cases as revalidated.
 
 ## Fixture provenance
 
-`br run` has each app's setup model make what this needs (at most 3 tries per app,
-at the run's start and after a strict replay that did not pass): a data reset
+`br run` has each app's setup model make what this needs (at most 3 tries per app
+for each version of the old app's fixture, at the run's start and after a strict
+replay that did not pass): a data reset
 that empties the database and loads its schema and a small fixture (seed data
 with the test account, every row it is linked to in tables of any size, and
 enough rows for real pages, never a second full copy of a large database; the
@@ -151,7 +152,13 @@ account's own links: its agency, roles, permissions) or says which fail for
 every user; the new apps then load the same data and those slices are compared
 again. A new app's reset is made to load the same
 business data as the old app's fixture, again whenever that fixture's content
-changes. Untracked files in the read-only legacy repo do not count as changes;
+changes (a changed fixture gives every app fresh tries). An app that stops
+starting for slice checks goes to its setup model a few times, then the owner is
+asked; while that question is open, one slice check every 30 minutes starts it
+again without the model, and an app that starts there settles the question (it
+often starts again by itself: a Mac that slept, a dropped network). `br run`
+keeps a Mac awake while it works, and a unit whose model provider fails before any
+work waits a while and runs again (the owner is asked only after hours of that). Untracked files in the read-only legacy repo do not count as changes;
 its tracked files must match the pinned commit. Source routes no unit holds
 (the framework's own, such as `post_command` or `robots.txt`) are given to one
 slice each (the one whose routes share the first path segment, else the slice

@@ -160,3 +160,20 @@ export function exec(cmd: string, args: string[], opts: { cwd?: string; env?: No
 		});
 	});
 }
+
+/**
+ * Keeps the machine awake while a run works (macOS: caffeinate, which ends with this process). A Mac that went to
+ * sleep at night cut every model call and the apps' local servers for 9 hours ("fetch failed"): units were parked
+ * and the old app's start was given up over it. Returns how to let it sleep again.
+ */
+export function keepAwake(): () => void {
+	if (process.platform !== "darwin") return () => {};
+	try {
+		const c = spawn("caffeinate", ["-i", "-w", String(process.pid)], { stdio: "ignore" });
+		c.on("error", () => {});
+		c.unref();
+		return () => void c.kill();
+	} catch {
+		return () => {};
+	}
+}

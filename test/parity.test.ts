@@ -328,6 +328,8 @@ describe("starting the apps for parity", () => {
 		expect(await askBootOwner({ root, side: LEGACY, error: "no answer after 180s", ask })).toBe(true);
 		expect(asked).toHaveLength(1);
 		expect(asked[0]).toMatch(/the old app stopped starting .* no answer after 180s/);
+		// the run starts it again without its setup model every BOOT_RECHECK_MS from now: it often starts again by itself
+		expect(loadApps(root)[LEGACY]!.bootRetriedAt).toBeGreaterThan(Date.now() - 60_000);
 		let answer: string | undefined;
 		expect(bootWaits(loadApps(root), () => answer)).toBe(LEGACY);
 		answer = "skip";

@@ -159,6 +159,8 @@ export const MAX_TESTS_ONLY_ROUNDS = 2;
 
 /** Why read truth was written while the legacy env mode was "read" (the old code could not run anywhere here). */
 const NOT_RUN_HERE = "the old code does not run here";
+/** Waits in a row over a model provider that fails before any work (each a model's wait long: 6 hours in all) before the owner is asked. */
+export const MAX_PROVIDER_WAITS = 12;
 
 /**
  * The key a unit's failure shares a question by. A reviewer's findings (wired_ok) are about the unit's own code: units
@@ -223,6 +225,8 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 	const gateFn = o.gate ?? runGate;
 	let cost = 0;
 	let providerErrors = 0;
+	// the unit waited over a provider outage before: a session that works ends that count
+	let providerWaited = !!(JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { providerWaits?: number }).providerWaits;
 	// reviews in a row that could not judge (the reviewer's model is down): not the implementer's fault
 	let reviewErrors = 0;
 	const askDeps = { ledger: o.ledger, config: o.config, root: o.root, client: o.client };
@@ -952,6 +956,17 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 				{ value: "wait", facts: "keep the unit waiting; the rest of the run goes on" },
 			],
 		});
+		// a provider that fails before any work mostly comes back by itself (a dropped network, a Mac that slept: 9 hours
+		// of "fetch failed" overnight left 18 units waiting for the owner): the unit waits as on a model's wait and runs
+		// again after it. Only when that keeps failing does the owner get the question
+		const waits = (JSON.parse(o.ledger.getUnit(o.unitId)!.meta) as { providerWaits?: number }).providerWaits ?? 0;
+		if (waits < MAX_PROVIDER_WAITS) {
+			o.ledger.answerQuestion(q, "wait — the model provider failed before any work (a dropped network, a machine that slept): the unit runs again after a while", "orchestrator");
+			o.ledger.updateUnit(o.unitId, { meta: { providerWaits: waits + 1 } });
+			providerWaited = true;
+			log(pc.yellow(`  provider failing repeatedly; the unit waits a while and runs again (#${q})`));
+			return;
+		}
 		log(pc.red(`  provider failing repeatedly; asked question #${q} (only this unit waits)`));
 	};
 	const outOfScopeRoute = async (problem: string, setup: boolean): Promise<UnitRunResult | undefined> => {
@@ -1132,6 +1147,7 @@ export async function runUnit(o: UnitRunOptions): Promise<UnitRunResult> {
 			}
 			// the session worked: only errors in a row count
 			providerErrors = 0;
+			if (providerWaited) (o.ledger.updateUnit(o.unitId, { meta: { providerWaits: 0 } }), (providerWaited = false));
 		}
 
 		if (o.ledger.getUnit(o.unitId)!.state === "implementing") o.ledger.transitionUnit(o.unitId, "gating", `attempt ${attemptNo}`);
