@@ -613,9 +613,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 		oldDataAsked.add(key);
 		parityRunning = (async () => {
 			await parityProbe;
-			const { fixtureTriesLeft, loadApps, probeApps } = await import("./parity.ts");
-			const old = loadApps(o.root)["legacy"];
-			if (!old?.up || !fixtureTriesLeft(o.root, old)) return;
+			const { fixtureTriesLeft, loadApps, probeApps, LEGACY } = await import("./parity.ts");
+			const old = loadApps(o.root)[LEGACY];
+			if (!old?.up || !fixtureTriesLeft(o.root, LEGACY, old)) return;
 			showParity(`setting up the old app's data again: ${Object.values(fails).flat().length} step(s) fail on it`);
 			const before = scopeIfValid(o.root)?.legacyAt;
 			await probeApps({ config, root: o.root, linkAll, log, ...probeAsk });
@@ -757,8 +757,8 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 	if (o.handleSigint !== false) process.once("SIGINT", onSigint);
 	// accepted units with only read truth, on the side: their scripts run on the old code (a few at once, capped), then the
 	// tester writes a script for those with none (capped; one at a time, more while lanes are free). A stop ends both.
-	// truth read but never run on the old code keeps strict parity from passing: a batch on the side at the start, and
-	// once nothing else is left to run more batches, as long as each one leaves fewer units to do (`truthMore`)
+	// truth read but never run on the old code is reported with strict parity, not waited for: a batch on the side at the
+	// start, and after the strict replay more batches, as long as each one leaves fewer units to do (`truthMore`)
 	let truthLeft: number | undefined;
 	let truthMore = false;
 	const truthBatch = () =>
@@ -1460,15 +1460,9 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 					lastResubmitCheck = 0;
 					continue;
 				}
-				// nothing else to run: more truth scripts in this run, not in later ones (what they redo runs next)
-				if (truthScripts && !stop && !o.shouldStop?.() && !dayCapHit) {
-					await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts!);
-					if (truthMore && !stop) {
-						truthScripts = truthBatch();
-						lastResubmitCheck = 0;
-						continue;
-					}
-				}
+				// nothing else to run: the truth batch on the side ends first (the strict replay needs a ledger that does not
+				// change under it)
+				if (truthScripts && !stop && !o.shouldStop?.() && !dayCapHit) await waitOn("writing scripts that run read-only truth on the old code", () => truthScripts!);
 				// nothing left to run: is the app really done? A code job it merged may let units run again
 				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("finish check: is the app really done", runFinish))) {
 					lastResubmitCheck = 0;
@@ -1476,6 +1470,13 @@ async function schedule(o: SchedulerOptions): Promise<SchedulerResult> {
 				}
 				// then does it answer like the old app, strictly? Slices it sends back are compared (and fixed) in this run
 				if (!stop && !o.shouldStop?.() && !dayCapHit && (await waitOn("strict parity check: does the new app answer like the old one", finalParity))) {
+					lastResubmitCheck = 0;
+					continue;
+				}
+				// then more truth scripts in this run, not in later ones (what they redo runs next): they come after the strict
+				// replay, which does not wait for them (it reports the expected values not run on the old code)
+				if (truthScripts && truthMore && !stop && !o.shouldStop?.() && !dayCapHit) {
+					truthScripts = truthBatch();
 					lastResubmitCheck = 0;
 					continue;
 				}

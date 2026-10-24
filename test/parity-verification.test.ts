@@ -123,11 +123,23 @@ describe("strict parity evidence", () => {
 		expect(saved).toContain("9007199254740993");
 	}, 30_000);
 
-	it("rejects historical legacy truth without exact-number provenance even when all cases are marked verified", async () => {
-		ledger.db.prepare("UPDATE truth_cases SET numeric_version=0").run();
-		const result = await verify(true);
-		expect(result.problems.join("\n")).toContain("legacy truth cases predate exact JSON parsing");
-		expect(result.status).toBe("blocked");
+	it("passes on the slice replay and reports the expected values not run on the old code (read, or before exact numbers)", async () => {
+		ledger.db.prepare("UPDATE truth_cases SET numeric_version=0 WHERE unit_id='http'").run();
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id='foundation' AND type='truth_green_on_old'").run();
+		ledger.addEvidence("foundation", "truth_read", { cases: 1 });
+		ledger.db.prepare("UPDATE truth_cases SET verified_on_old=0 WHERE unit_id='foundation'").run();
+		const result = await verify();
+		expect(result.status).toBe("passed");
+		expect(result.notes).toEqual(["1 accepted units have expected values read from the old code, not run on it", "1 truth cases were not run on the old code", "1 truth cases ran on the old code before exact number parsing (big numbers may be rounded)"]);
+		expect(renderVerification(result).join("\n")).toContain("not proven on the old code (reported, not blocking");
+	}, 30_000);
+
+	it("still blocks a unit with no expected values at all, or a truth case no ported test holds", async () => {
+		ledger.db.prepare("DELETE FROM evidence WHERE unit_id='foundation' AND type='truth_green_on_old'").run();
+		ledger.db.prepare("UPDATE truth_cases SET ported_test_path=NULL WHERE unit_id='http'").run();
+		const problems = migrationProblems(ledger, await headOf(target)).join("\n");
+		expect(problems).toContain("1 accepted behavior units have no expected values (run or read)");
+		expect(problems).toContain("1 truth cases have no linked ported test");
 	});
 
 	it("rejects a silent test command that exits successfully without execution evidence", async () => {

@@ -71,7 +71,11 @@ include cases that fail when important behavior is deliberately broken.
   even when its legacy framework implementation is not ported as an app unit.
   Every indexed method must be exercised; a skip or dropped symbol cannot cover it.
 - Required gate evidence exists; no stale units, deferred judgments, unresolved
-  weak-test findings, read-only truth cases or unlinked truth cases remain.
+  weak-test findings or truth cases without a linked ported test remain. Every
+  behavior unit has expected values, run on the old code or read from it.
+  Values only read (or run before exact number parsing) do not block a pass: the
+  frozen replay of every slice on both apps is the proof, and the report lists
+  them under "not proven on the old code".
 - Repeated tester revisions never waive a weak-test finding. `br run` reopens
   units accepted under the earlier waiver, keeping their code and raw legacy
   truth. Their weakness note clears only after a judged, clean review.
@@ -129,8 +133,9 @@ Legacy cases record the parser provenance individually. Historical verified
 cases default to unproven provenance because a stored rounded value cannot be
 repaired by changing the parser. Normal truth upgrades re-run these cases, keep
 accepted code when the actual values match, and reopen a unit when they differ.
-Final verification requires that revalidation; partial truth imports cannot mark
-omitted historical cases as revalidated.
+Final verification reports cases without that revalidation as not proven on the
+old code and does not wait for them; partial truth imports cannot mark omitted
+historical cases as revalidated.
 
 ## Fixture provenance
 
@@ -163,9 +168,9 @@ its tracked files must match the pinned commit. Source routes no unit holds
 (the framework's own, such as `post_command` or `robots.txt`) are given to one
 slice each (the one whose routes share the first path segment, else the slice
 with the most routes), whose suite must compare them; a route the old app does
-not serve here is compared too (both answer 404). Once nothing else is left to
-run, the run keeps writing and running truth scripts on the old code, a batch at
-a time, while each batch leaves fewer units to do.
+not serve here is compared too (both answer 404). After the strict replay
+(which does not wait for them), the run keeps writing and running truth scripts
+on the old code, a batch at a time, while each batch leaves fewer units to do.
 
 By hand, `.bigrefactor/parity/scope.json` looks like this:
 

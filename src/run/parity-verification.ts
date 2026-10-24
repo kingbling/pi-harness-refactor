@@ -54,6 +54,8 @@ export interface VerificationReport {
 	sourceCommit?: string;
 	targetCommit?: string;
 	problems: string[];
+	/** not proven on the old code, reported with a pass (truthNotes) */
+	notes?: string[];
 	snapshot?: Snapshot;
 	projectValidation?: ProjectValidation;
 	runs: Array<{ slice: string; runId?: number; outcome: string; note: string; evidence?: string; hash?: string; changes?: VerifiedChange[] }>;
@@ -87,16 +89,12 @@ export function migrationProblems(ledger: Ledger, targetCommit?: string, explici
 	if (unowned.length) problems.push(`${unowned.length} source routes have no inventoried unit owner or explicit compared scenario and would escape slice verification`);
 	const unaccounted = ledger.db.prepare("SELECT COUNT(*) n FROM symbols WHERE state NOT IN ('accepted','dropped')").get() as { n: number };
 	if (unaccounted.n) problems.push(`${unaccounted.n} symbols are not accepted or dropped`);
-	const truth = notProven(ledger);
-	if (truth.readNotRun) problems.push(`${truth.readNotRun} accepted units have truth read but never run on legacy (br recheck / truth upgrade)`);
-	const cases = ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE verified_on_old = 0 OR ported_test_path IS NULL").get() as { n: number };
-	if (cases.n) problems.push(`${cases.n} truth cases lack legacy execution or a linked ported test`);
-	const oldNumeric = ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE verified_on_old = 1 AND numeric_version < ?").get(EXACT_JSON_VERSION) as { n: number };
-	if (oldNumeric.n) problems.push(`${oldNumeric.n} legacy truth cases predate exact JSON parsing and need revalidation (br run / truth upgrade)`);
+	const unlinked = ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE ported_test_path IS NULL").get() as { n: number };
+	if (unlinked.n) problems.push(`${unlinked.n} truth cases have no linked ported test`);
 	const missing = ledger.db.prepare(`SELECT COUNT(*) n FROM units u WHERE state = 'accepted' AND (SELECT COUNT(DISTINCT type) FROM evidence e WHERE e.unit_id = u.id AND type IN (${REQUIRED_FOR_ACCEPTED.map(() => "?").join(",")})) < ?`).get(...REQUIRED_FOR_ACCEPTED, REQUIRED_FOR_ACCEPTED.length) as { n: number };
 	if (missing.n) problems.push(`${missing.n} accepted units lack required gate evidence (br recheck)`);
-	const noTruth = ledger.db.prepare("SELECT COUNT(*) n FROM units u WHERE state = 'accepted' AND COALESCE(kind,'') NOT LIKE 'db_%' AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND type IN ('truth_green_on_old','truth_none'))").get() as { n: number };
-	if (noTruth.n) problems.push(`${noTruth.n} accepted behavior units have neither runtime truth nor a checked no-behavior declaration`);
+	const noTruth = ledger.db.prepare("SELECT COUNT(*) n FROM units u WHERE state = 'accepted' AND COALESCE(kind,'') NOT LIKE 'db_%' AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND type IN ('truth_green_on_old','truth_read','truth_none'))").get() as { n: number };
+	if (noTruth.n) problems.push(`${noTruth.n} accepted behavior units have no expected values (run or read) nor a checked no-behavior declaration`);
 	const noCases = ledger.db.prepare("SELECT COUNT(*) n FROM units u WHERE state = 'accepted' AND COALESCE(kind,'') NOT LIKE 'db_%' AND NOT EXISTS (SELECT 1 FROM truth_cases c WHERE c.unit_id = u.id) AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = u.id AND type = 'truth_none')").get() as { n: number };
 	if (noCases.n) problems.push(`${noCases.n} accepted behavior units have no recorded truth cases or checked no-behavior declaration`);
 	const quirks = ledger.db.prepare("SELECT COUNT(*) n FROM quirks WHERE status IN ('pending','asked') OR (status='kept' AND applied IS NOT 'keep') OR (status='dropped' AND applied IS NOT 'drop')").get() as { n: number };
@@ -114,6 +112,19 @@ export function migrationProblems(ledger: Ledger, targetCommit?: string, explici
 	const deferred = ledger.db.prepare("SELECT COUNT(DISTINCT unit_id) n FROM evidence WHERE id IN (SELECT MAX(id) FROM evidence GROUP BY unit_id, type) AND json_extract(payload, '$.judged') = 0").get() as { n: number };
 	if (deferred.n) problems.push(`${deferred.n} units have checks that were not judged`);
 	return problems;
+}
+
+/** What the units' expected values do not prove on the old code. A pass reports it and does not wait for it:
+ * the frozen replay of every slice on both apps is the proof (the owner's choice; truth upgrades keep running). */
+export function truthNotes(ledger: Ledger): string[] {
+	const notes: string[] = [];
+	const { readNotRun } = notProven(ledger);
+	if (readNotRun) notes.push(`${readNotRun} accepted units have expected values read from the old code, not run on it`);
+	const unrun = ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE verified_on_old = 0").get() as { n: number };
+	if (unrun.n) notes.push(`${unrun.n} truth cases were not run on the old code`);
+	const oldNumeric = ledger.db.prepare("SELECT COUNT(*) n FROM truth_cases WHERE verified_on_old = 1 AND numeric_version < ?").get(EXACT_JSON_VERSION) as { n: number };
+	if (oldNumeric.n) notes.push(`${oldNumeric.n} truth cases ran on the old code before exact number parsing (big numbers may be rounded)`);
+	return notes;
 }
 
 async function snapshot(o: VerifyOptions): Promise<Snapshot> {
@@ -256,6 +267,7 @@ export async function verifyParity(o: VerifyOptions): Promise<VerificationReport
 			if (liveRun(o.root) !== process.pid) report.problems.push("workspace ownership changed during verification");
 			report.status = report.problems.length ? "failed" : "passed";
 		}
+		report.notes = truthNotes(o.ledger);
 		report.at = new Date().toISOString();
 		if (!o.reportOnly) {
 			const path = verificationPath(o.root);
@@ -283,6 +295,7 @@ export function renderVerification(report: VerificationReport): string[] {
 		`strict parity ${report.status} @ ${report.targetCommit?.slice(0, 9) ?? "unknown commit"}: ${report.runs.filter((r) => r.outcome === "same" || r.outcome === "accepted-changes").length}/${report.requiredSlices.length} suites verified${report.runs.some((r) => r.changes?.length) ? ` (${report.runs.reduce((n, r) => n + (r.changes?.length ?? 0), 0)} recorded behavior change(s) verified)` : ""}; scope: ${report.claim}`,
 		...problems.slice(0, 40).map((p) => `  ${p}`),
 		...(problems.length > 40 ? [`  ${problems.length - 40} more groups; use --json for the complete report`] : []),
+		...(report.notes?.length ? [`not proven on the old code (reported, not blocking: the slice replay is the proof): ${report.notes.join("; ")}`] : []),
 		report.status === "passed" ? "All declared scenarios matched or reproduced their explicit recorded behavior changes on this commit; this does not establish behavior outside the recorded suite." : "Unit acceptance and decisions to leave differences cannot establish a parity pass.",
 	];
 }

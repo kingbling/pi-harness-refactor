@@ -111,17 +111,18 @@ describe("the strict parity fixture", () => {
 		expect(oldFailures(root)).toEqual({});
 	});
 
-	it("fixture tries count on the old app's fixture they were made on: once it changes every app gets fresh tries (the new apps must load it again)", async () => {
+	it("a new app's fixture tries count on the old app's fixture they were made on; the old app's own tries do not start again when it changes it", async () => {
 		const { root } = await workspace();
 		const seed = fixtureFile(root, "seed.json", '{"users":[{"id":1}]}\n');
 		recordFixture(root, LEGACY, [seed]);
 		const at = scopeIfValid(root)!.legacyAt;
-		expect(fixtureTriesLeft(root, { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(false);
-		expect(fixtureTriesLeft(root, { fixtureProbes: MAX_FIXUPS - 1, fixtureAt: at })).toBe(true);
+		expect(fixtureTriesLeft(root, "symfony", { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(false);
+		expect(fixtureTriesLeft(root, "symfony", { fixtureProbes: MAX_FIXUPS - 1, fixtureAt: at })).toBe(true);
 		await new Promise((r) => setTimeout(r, 5));
 		writeFileSync(join(root, seed), '{"users":[{"id":1}],"agencies":[{"id":1}]}\n');
 		recordFixture(root, LEGACY, [seed]);
-		expect(fixtureTriesLeft(root, { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(true);
+		expect(fixtureTriesLeft(root, "symfony", { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(true);
+		expect(fixtureTriesLeft(root, LEGACY, { fixtureProbes: MAX_FIXUPS, fixtureAt: at })).toBe(false);
 	});
 
 	it("the old app's setup adds a reset, records the fixture and declares the config it changed in its copy; then nothing more is asked", async () => {
